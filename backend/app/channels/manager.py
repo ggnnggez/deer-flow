@@ -12,6 +12,7 @@ from typing import Any
 
 from app.channels.message_bus import InboundMessage, InboundMessageType, MessageBus, OutboundMessage, ResolvedAttachment
 from app.channels.store import ChannelStore
+from langgraph_sdk.errors import ConflictError
 
 logger = logging.getLogger(__name__)
 
@@ -27,6 +28,7 @@ DEFAULT_RUN_CONTEXT: dict[str, Any] = {
     "subagent_enabled": False,
 }
 STREAM_UPDATE_MIN_INTERVAL_SECONDS = 0.35
+THREAD_BUSY_MESSAGE = "This conversation is already processing another request. Please wait for it to finish and try again."
 
 CHANNEL_CAPABILITIES = {
     "feishu": {"supports_streaming": True},
@@ -37,6 +39,12 @@ CHANNEL_CAPABILITIES = {
 
 class InvalidChannelSessionConfigError(ValueError):
     """Raised when IM channel session overrides contain invalid agent config."""
+
+
+def _is_thread_busy_error(exc: Exception) -> bool:
+    if isinstance(exc, ConflictError):
+        return True
+    return "already running a task" in str(exc)
 
 
 def _as_dict(value: Any) -> dict[str, Any]:
@@ -606,6 +614,7 @@ class ChannelManager:
                 config=run_config,
                 context=run_context,
                 stream_mode=["messages-tuple", "values"],
+                multitask_strategy="reject",
             ):
                 event = getattr(chunk, "event", "")
                 data = getattr(chunk, "data", None)
@@ -652,7 +661,10 @@ class ChannelManager:
                 if attachments:
                     response_text = _format_artifact_text([attachment.virtual_path for attachment in attachments])
                 elif stream_error:
-                    response_text = "An error occurred while processing your request. Please try again."
+                    if _is_thread_busy_error(stream_error):
+                        response_text = THREAD_BUSY_MESSAGE
+                    else:
+                        response_text = "An error occurred while processing your request. Please try again."
                 else:
                     response_text = latest_text or "(No response from agent)"
 
