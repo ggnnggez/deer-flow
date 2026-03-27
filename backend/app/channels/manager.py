@@ -10,9 +10,9 @@ import time
 from collections.abc import Mapping
 from typing import Any
 
+from langgraph_sdk.errors import ConflictError
 from app.channels.message_bus import InboundMessage, InboundMessageType, MessageBus, OutboundMessage, ResolvedAttachment
 from app.channels.store import ChannelStore
-from langgraph_sdk.errors import ConflictError
 
 logger = logging.getLogger(__name__)
 
@@ -41,7 +41,9 @@ class InvalidChannelSessionConfigError(ValueError):
     """Raised when IM channel session overrides contain invalid agent config."""
 
 
-def _is_thread_busy_error(exc: Exception) -> bool:
+def _is_thread_busy_error(exc: BaseException | None) -> bool:
+    if exc is None:
+        return False
     if isinstance(exc, ConflictError):
         return True
     return "already running a task" in str(exc)

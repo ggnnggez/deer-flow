@@ -728,10 +728,10 @@ class TestChannelManager:
         _run(go())
 
     def test_handle_feishu_stream_conflict_sends_busy_message(self, monkeypatch):
-        from app.channels.manager import ChannelManager, THREAD_BUSY_MESSAGE
         import httpx
         from langgraph_sdk.errors import ConflictError
 
+        from app.channels.manager import ChannelManager, THREAD_BUSY_MESSAGE
         monkeypatch.setattr("app.channels.manager.STREAM_UPDATE_MIN_INTERVAL_SECONDS", 0.0)
 
         async def go():
