@@ -731,7 +731,8 @@ class TestChannelManager:
         import httpx
         from langgraph_sdk.errors import ConflictError
 
-        from app.channels.manager import ChannelManager, THREAD_BUSY_MESSAGE
+        from app.channels.manager import THREAD_BUSY_MESSAGE, ChannelManager
+
         monkeypatch.setattr("app.channels.manager.STREAM_UPDATE_MIN_INTERVAL_SECONDS", 0.0)
 
         async def go():

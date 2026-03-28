@@ -11,6 +11,7 @@ from collections.abc import Mapping
 from typing import Any
 
 from langgraph_sdk.errors import ConflictError
+
 from app.channels.message_bus import InboundMessage, InboundMessageType, MessageBus, OutboundMessage, ResolvedAttachment
 from app.channels.store import ChannelStore
 
