@@ -653,7 +653,10 @@ class ChannelManager:
                 last_publish_at = now
         except Exception as exc:
             stream_error = exc
-            logger.exception("[Manager] streaming error: thread_id=%s", thread_id)
+            if _is_thread_busy_error(exc):
+                logger.warning("[Manager] thread busy (concurrent run rejected): thread_id=%s", thread_id)
+            else:
+                logger.exception("[Manager] streaming error: thread_id=%s", thread_id)
         finally:
             result = last_values if last_values is not None else {"messages": [{"type": "ai", "content": latest_text}]}
             response_text = _extract_response_text(result)
