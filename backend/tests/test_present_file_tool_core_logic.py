@@ -10,6 +10,7 @@ def _make_runtime(outputs_path: str) -> SimpleNamespace:
     return SimpleNamespace(
         state={"thread_data": {"outputs_path": outputs_path}},
         context={"thread_id": "thread-1"},
+        config={},
     )
 
 
@@ -58,11 +59,6 @@ def test_present_files_uses_config_thread_id_when_context_missing(tmp_path, monk
 
     monkeypatch.setattr(
         present_file_tool_module,
-        "get_config",
-        lambda: {"configurable": {"thread_id": "thread-from-config"}},
-    )
-    monkeypatch.setattr(
-        present_file_tool_module,
         "get_paths",
         lambda: SimpleNamespace(resolve_virtual_path=lambda thread_id, path: artifact_path),
     )
@@ -70,6 +66,7 @@ def test_present_files_uses_config_thread_id_when_context_missing(tmp_path, monk
     runtime = SimpleNamespace(
         state={"thread_data": {"outputs_path": str(outputs_dir)}},
         context={},
+        config={"configurable": {"thread_id": "thread-from-config"}},
     )
 
     result = present_file_tool_module.present_file_tool.func(

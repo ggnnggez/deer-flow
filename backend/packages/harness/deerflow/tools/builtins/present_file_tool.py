@@ -19,6 +19,11 @@ def _get_thread_id(runtime: ToolRuntime[ContextT, ThreadState]) -> str | None:
     if thread_id:
         return thread_id
 
+    runtime_config = getattr(runtime, "config", None) or {}
+    thread_id = runtime_config.get("configurable", {}).get("thread_id")
+    if thread_id:
+        return thread_id
+
     try:
         return get_config().get("configurable", {}).get("thread_id")
     except RuntimeError:
@@ -48,7 +53,7 @@ def _normalize_presented_filepath(
 
     thread_id = _get_thread_id(runtime)
     if not thread_id:
-        raise ValueError("Thread ID is not available in runtime context")
+        raise ValueError("Thread ID is not available in runtime context or runtime config")
 
     thread_data = runtime.state.get("thread_data") or {}
     outputs_path = thread_data.get("outputs_path")
