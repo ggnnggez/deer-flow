@@ -54,7 +54,7 @@ def _make_file_sandbox_writable(file_path: os.PathLike[str] | str) -> None:
 
 
 def _uses_thread_data_mounts(sandbox_provider: SandboxProvider) -> bool:
-    return sandbox_provider.uses_thread_data_mounts is True
+    return bool(getattr(sandbox_provider, "uses_thread_data_mounts", False))
 
 
 @router.post("", response_model=UploadResponse)
