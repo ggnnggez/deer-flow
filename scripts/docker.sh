@@ -15,6 +15,23 @@ DOCKER_DIR="$PROJECT_ROOT/docker"
 # Docker Compose command with project name
 COMPOSE_CMD="docker compose -p deer-flow-dev -f docker-compose-dev.yaml"
 
+is_wsl() {
+    [ -n "${WSL_DISTRO_NAME:-}" ] || grep -qi microsoft /proc/version 2>/dev/null
+}
+
+is_docker_desktop() {
+    docker info --format '{{.OperatingSystem}}' 2>/dev/null | grep -qi "docker desktop"
+}
+
+default_deer_flow_root() {
+    if is_wsl && command -v wslpath >/dev/null 2>&1 && is_docker_desktop; then
+        wslpath -m "$PROJECT_ROOT"
+        return
+    fi
+
+    echo "$PROJECT_ROOT"
+}
+
 detect_sandbox_mode() {
     local config_file="$PROJECT_ROOT/config.yaml"
     local sandbox_use=""
@@ -191,9 +208,11 @@ start() {
     fi
     echo ""
     
-    # Set DEER_FLOW_ROOT for provisioner if not already set
+    # Set DEER_FLOW_ROOT for provisioner and DooD sandbox mounts if not already
+    # set. Under WSL + Docker Desktop, sandbox containers are created by the
+    # Windows Docker daemon, so pass a Windows-visible path instead of /mnt/*.
     if [ -z "$DEER_FLOW_ROOT" ]; then
-        export DEER_FLOW_ROOT="$PROJECT_ROOT"
+        export DEER_FLOW_ROOT="$(default_deer_flow_root)"
         echo -e "${BLUE}Setting DEER_FLOW_ROOT=$DEER_FLOW_ROOT${NC}"
         echo ""
     fi
@@ -298,7 +317,7 @@ stop() {
     # DEER_FLOW_ROOT is referenced in docker-compose-dev.yaml; set it before
     # running compose down to suppress "variable is not set" warnings.
     if [ -z "$DEER_FLOW_ROOT" ]; then
-        export DEER_FLOW_ROOT="$PROJECT_ROOT"
+        export DEER_FLOW_ROOT="$(default_deer_flow_root)"
     fi
     echo "Stopping Docker development services..."
     cd "$DOCKER_DIR" && $COMPOSE_CMD down

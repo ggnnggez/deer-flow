@@ -104,3 +104,82 @@ sandbox:
 """.strip()
 
     assert _detect_mode_with_config(config) == "local"
+
+
+def test_default_deer_flow_root_uses_windows_path_for_wsl_docker_desktop():
+    """WSL + Docker Desktop needs slash paths that the Windows Docker daemon can bind-mount."""
+    command = rf"""
+source '{SCRIPT_PATH}'
+PROJECT_ROOT='/mnt/e/code/deer-flow'
+export WSL_DISTRO_NAME='Ubuntu'
+docker() {{
+  if [ "$1" = "info" ]; then
+    echo 'Docker Desktop'
+  fi
+}}
+wslpath() {{
+  echo 'E:/code/deer-flow'
+}}
+default_deer_flow_root
+"""
+    output = subprocess.check_output(
+        [BASH_EXECUTABLE, "-lc", command],
+        text=True,
+        encoding="utf-8",
+    ).strip()
+
+    assert output == "E:/code/deer-flow"
+
+
+def test_default_deer_flow_root_keeps_wsl_path_for_linux_docker_engine():
+    """A Docker Engine running inside WSL can resolve the native /mnt path."""
+    command = rf"""
+source '{SCRIPT_PATH}'
+PROJECT_ROOT='/mnt/e/code/deer-flow'
+export WSL_DISTRO_NAME='Ubuntu'
+docker() {{
+  if [ "$1" = "info" ]; then
+    echo 'Docker Engine - Community'
+  fi
+}}
+wslpath() {{
+  echo 'E:/code/deer-flow'
+}}
+default_deer_flow_root
+"""
+    output = subprocess.check_output(
+        [BASH_EXECUTABLE, "-lc", command],
+        text=True,
+        encoding="utf-8",
+    ).strip()
+
+    assert output == "/mnt/e/code/deer-flow"
+
+
+def test_default_deer_flow_root_returns_project_root_on_non_wsl():
+    """Native Linux / macOS hosts must keep PROJECT_ROOT unchanged."""
+    # Override is_wsl to force the non-WSL branch regardless of where the
+    # test actually runs (CI on real WSL machines would otherwise have a
+    # /proc/version matching 'microsoft' and escape this code path).
+    command = rf"""
+source '{SCRIPT_PATH}'
+PROJECT_ROOT='/home/alice/code/deer-flow'
+unset WSL_DISTRO_NAME
+is_wsl() {{ return 1; }}
+docker() {{
+  if [ "$1" = "info" ]; then
+    echo 'Docker Desktop'
+  fi
+}}
+wslpath() {{
+  echo 'SHOULD_NOT_BE_USED'
+}}
+default_deer_flow_root
+"""
+    output = subprocess.check_output(
+        [BASH_EXECUTABLE, "-lc", command],
+        text=True,
+        encoding="utf-8",
+    ).strip()
+
+    assert output == "/home/alice/code/deer-flow"
