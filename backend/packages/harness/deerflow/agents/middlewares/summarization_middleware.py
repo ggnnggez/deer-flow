@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+from collections.abc import Collection
 from dataclasses import dataclass
 from typing import Any, Protocol, runtime_checkable
 
@@ -58,18 +59,6 @@ def _resolve_agent_name(runtime: Runtime) -> str | None:
     return agent_name
 
 
-def _resolve_skills_container_path() -> str:
-    """Return the sandbox container path where skill files live."""
-    try:
-        from deerflow.config import get_app_config
-
-        path = get_app_config().skills.container_path
-    except Exception:
-        logger.exception("Failed to resolve skills container path; falling back to default")
-        return "/mnt/skills"
-    return path or "/mnt/skills"
-
-
 def _tool_call_path(tool_call: dict[str, Any]) -> str | None:
     """Best-effort extraction of a file path argument from a read_file-like tool call."""
     args = tool_call.get("args") or {}
@@ -84,16 +73,6 @@ def _tool_call_path(tool_call: dict[str, Any]) -> str | None:
 
 def _is_skill_tool_call(tool_call: dict[str, Any], skills_root: str) -> bool:
     """Return True when ``tool_call`` reads a file under the skills container path."""
-    name = tool_call.get("name") or ""
-    if name not in {"read_file", "read", "view", "cat"}:
-        return False
-    path = _tool_call_path(tool_call)
-    if not path:
-        return False
-    normalized_root = skills_root.rstrip("/")
-    return path == normalized_root or path.startswith(normalized_root + "/")
-
-
 def _clone_ai_message(
     message: AIMessage,
     tool_calls: list[dict[str, Any]],
@@ -124,6 +103,8 @@ class DeerFlowSummarizationMiddleware(SummarizationMiddleware):
     def __init__(
         self,
         *args,
+        skills_container_path: str | None = None,
+        skill_file_read_tool_names: Collection[str] | None = None,
         before_summarization: list[BeforeSummarizationHook] | None = None,
         preserve_recent_skill_count: int = 5,
         preserve_recent_skill_tokens: int = 25_000,
@@ -131,6 +112,8 @@ class DeerFlowSummarizationMiddleware(SummarizationMiddleware):
         **kwargs,
     ) -> None:
         super().__init__(*args, **kwargs)
+        self._skills_container_path = skills_container_path or "/mnt/skills"
+        self._skill_file_read_tool_names = frozenset(skill_file_read_tool_names or {"read_file", "read", "view", "cat"})
         self._before_summarization_hooks = before_summarization or []
         self._preserve_recent_skill_count = max(0, preserve_recent_skill_count)
         self._preserve_recent_skill_tokens = max(0, preserve_recent_skill_tokens)
@@ -204,8 +187,7 @@ class DeerFlowSummarizationMiddleware(SummarizationMiddleware):
             return to_summarize, preserved
 
         try:
-            skills_root = _resolve_skills_container_path()
-            bundles = self._find_skill_bundles(to_summarize, skills_root)
+            bundles = self._find_skill_bundles(to_summarize, self._skills_container_path)
         except Exception:
             logger.exception("Skill-preserving summarization rescue failed; falling back to default partition")
             return to_summarize, preserved
@@ -259,7 +241,7 @@ class DeerFlowSummarizationMiddleware(SummarizationMiddleware):
             tool_calls = list(msg.tool_calls)
             skill_paths_by_id: dict[str, str] = {}
             for tc in tool_calls:
-                if _is_skill_tool_call(tc, skills_root):
+                if self._is_skill_tool_call(tc, skills_root):
                     tc_id = tc.get("id")
                     path = _tool_call_path(tc)
                     if tc_id and path:
@@ -330,6 +312,17 @@ class DeerFlowSummarizationMiddleware(SummarizationMiddleware):
 
         selected.reverse()
         return selected
+
+    def _is_skill_tool_call(self, tool_call: dict[str, Any], skills_root: str) -> bool:
+        """Return True when ``tool_call`` reads a file under the configured skills root."""
+        name = tool_call.get("name") or ""
+        if name not in self._skill_file_read_tool_names:
+            return False
+        path = _tool_call_path(tool_call)
+        if not path:
+            return False
+        normalized_root = skills_root.rstrip("/")
+        return path == normalized_root or path.startswith(normalized_root + "/")
 
     def _fire_hooks(
         self,

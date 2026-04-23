@@ -34,6 +34,7 @@ def _middleware(
     before_summarization=None,
     trigger=("messages", 4),
     keep=("messages", 2),
+    skill_file_read_tool_names=None,
     preserve_recent_skill_count: int = 0,
     preserve_recent_skill_tokens: int = 0,
     preserve_recent_skill_tokens_per_skill: int = 0,
@@ -46,6 +47,7 @@ def _middleware(
         keep=keep,
         token_counter=len,
         before_summarization=before_summarization,
+        skill_file_read_tool_names=skill_file_read_tool_names,
         preserve_recent_skill_count=preserve_recent_skill_count,
         preserve_recent_skill_tokens=preserve_recent_skill_tokens,
         preserve_recent_skill_tokens_per_skill=preserve_recent_skill_tokens_per_skill,
@@ -254,6 +256,57 @@ def test_skill_rescue_respects_count_budget() -> None:
     assert any(isinstance(m, ToolMessage) and m.content == "beta skill body" for m in preserved)
     assert not any(isinstance(m, ToolMessage) and m.content == "alpha skill body" for m in preserved)
     assert any(isinstance(m, ToolMessage) and m.content == "alpha skill body" for m in summarized)
+
+
+def test_skill_rescue_uses_injected_skills_container_path() -> None:
+    captured: list[SummarizationEvent] = []
+    middleware = _middleware(
+        before_summarization=[captured.append],
+        trigger=("messages", 4),
+        keep=("messages", 2),
+        preserve_recent_skill_count=5,
+        preserve_recent_skill_tokens=10_000,
+        preserve_recent_skill_tokens_per_skill=10_000,
+    )
+    middleware._skills_container_path = "/custom/skills"
+    messages = [
+        HumanMessage(content="u1"),
+        AIMessage(content="", tool_calls=[{"name": "read_file", "id": "t1", "args": {"path": "/custom/skills/demo/SKILL.md"}}]),
+        ToolMessage(content="demo skill body", tool_call_id="t1"),
+        HumanMessage(content="u2"),
+        AIMessage(content="final"),
+    ]
+
+    middleware.before_model({"messages": messages}, _runtime())
+
+    preserved = captured[0].preserved_messages
+    assert any(isinstance(m, ToolMessage) and m.content == "demo skill body" for m in preserved)
+
+
+def test_skill_rescue_uses_configured_skill_read_tool_names() -> None:
+    captured: list[SummarizationEvent] = []
+    middleware = _middleware(
+        before_summarization=[captured.append],
+        trigger=("messages", 4),
+        keep=("messages", 2),
+        skill_file_read_tool_names=["custom_read"],
+        preserve_recent_skill_count=5,
+        preserve_recent_skill_tokens=10_000,
+        preserve_recent_skill_tokens_per_skill=10_000,
+    )
+    middleware._skills_container_path = "/custom/skills"
+    messages = [
+        HumanMessage(content="u1"),
+        AIMessage(content="", tool_calls=[{"name": "custom_read", "id": "t1", "args": {"path": "/custom/skills/demo/SKILL.md"}}]),
+        ToolMessage(content="demo skill body", tool_call_id="t1"),
+        HumanMessage(content="u2"),
+        AIMessage(content="final"),
+    ]
+
+    middleware.before_model({"messages": messages}, _runtime())
+
+    preserved = captured[0].preserved_messages
+    assert any(isinstance(m, ToolMessage) and m.content == "demo skill body" for m in preserved)
 
 
 def test_skill_rescue_respects_per_skill_token_cap() -> None:
