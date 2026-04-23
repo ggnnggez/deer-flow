@@ -65,6 +65,7 @@ def _resolve_skills_container_path() -> str:
 
         path = get_app_config().skills.container_path
     except Exception:
+        logger.exception("Failed to resolve skills container path; falling back to default")
         return "/mnt/skills"
     return path or "/mnt/skills"
 
@@ -93,9 +94,17 @@ def _is_skill_tool_call(tool_call: dict[str, Any], skills_root: str) -> bool:
     return path == normalized_root or path.startswith(normalized_root + "/")
 
 
-def _clone_ai_message(message: AIMessage, tool_calls: list[dict[str, Any]]) -> AIMessage:
-    """Clone an AIMessage while replacing its tool_calls list."""
-    return message.model_copy(update={"tool_calls": tool_calls})
+def _clone_ai_message(
+    message: AIMessage,
+    tool_calls: list[dict[str, Any]],
+    *,
+    content: Any | None = None,
+) -> AIMessage:
+    """Clone an AIMessage while replacing its tool_calls list and optional content."""
+    update: dict[str, Any] = {"tool_calls": tool_calls}
+    if content is not None:
+        update["content"] = content
+    return message.model_copy(update=update)
 
 
 @dataclass
@@ -219,7 +228,7 @@ class DeerFlowSummarizationMiddleware(SummarizationMiddleware):
                 remaining_tool_calls = [tc for tc in msg.tool_calls if tc.get("id") not in bundle.skill_tool_call_ids]
 
                 if rescued_tool_calls:
-                    rescued.append(_clone_ai_message(msg, rescued_tool_calls))
+                    rescued.append(_clone_ai_message(msg, rescued_tool_calls, content=""))
                 if remaining_tool_calls or msg.content:
                     remaining.append(_clone_ai_message(msg, remaining_tool_calls))
                 continue
@@ -263,6 +272,7 @@ class DeerFlowSummarizationMiddleware(SummarizationMiddleware):
             skill_tool_tokens = 0
             skill_key_parts: list[str] = []
             skill_tool_indices: list[int] = []
+            matched_skill_call_ids: set[str] = set()
 
             j = i + 1
             while j < n and isinstance(messages[j], ToolMessage):
@@ -274,6 +284,7 @@ class DeerFlowSummarizationMiddleware(SummarizationMiddleware):
                     skill_tool_tokens += self.token_counter([tool_msg])
                     skill_key_parts.append(skill_paths_by_id[tool_msg.tool_call_id])
                     skill_tool_indices.append(k)
+                    matched_skill_call_ids.add(tool_msg.tool_call_id)
 
             if not skill_tool_indices:
                 i = j
@@ -283,7 +294,7 @@ class DeerFlowSummarizationMiddleware(SummarizationMiddleware):
                 _SkillBundle(
                     ai_index=i,
                     skill_tool_indices=tuple(skill_tool_indices),
-                    skill_tool_call_ids=frozenset(skill_paths_by_id),
+                    skill_tool_call_ids=frozenset(matched_skill_call_ids),
                     skill_tool_tokens=skill_tool_tokens,
                     skill_key="|".join(sorted(skill_key_parts)),
                 )

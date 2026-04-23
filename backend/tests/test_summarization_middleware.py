@@ -360,6 +360,83 @@ def test_skill_rescue_does_not_preserve_non_skill_outputs_from_mixed_tool_calls(
     assert any(isinstance(m, ToolMessage) and m.content == "user notes" for m in summarized)
 
 
+def test_skill_rescue_clears_content_on_rescued_ai_clone() -> None:
+    captured: list[SummarizationEvent] = []
+    middleware = _middleware(
+        before_summarization=[captured.append],
+        trigger=("messages", 4),
+        keep=("messages", 2),
+        preserve_recent_skill_count=5,
+        preserve_recent_skill_tokens=10_000,
+        preserve_recent_skill_tokens_per_skill=10_000,
+    )
+
+    messages = [
+        HumanMessage(content="u1"),
+        AIMessage(
+            content="reading skill and notes",
+            tool_calls=[
+                _skill_read_call("skill-1", "alpha"),
+                {"name": "read_file", "id": "file-1", "args": {"path": "/mnt/user-data/workspace/notes.md"}},
+            ],
+        ),
+        ToolMessage(content="alpha skill body", tool_call_id="skill-1"),
+        ToolMessage(content="user notes", tool_call_id="file-1"),
+        HumanMessage(content="u2"),
+        AIMessage(content="done"),
+    ]
+
+    middleware.before_model({"messages": messages}, _runtime())
+
+    preserved = captured[0].preserved_messages
+    summarized = captured[0].messages_to_summarize
+
+    preserved_ai = next(m for m in preserved if isinstance(m, AIMessage) and m.tool_calls)
+    summarized_ai = next(m for m in summarized if isinstance(m, AIMessage) and m.tool_calls)
+
+    assert preserved_ai.content == ""
+    assert summarized_ai.content == "reading skill and notes"
+
+
+def test_skill_rescue_only_preserves_skill_calls_with_matched_tool_results() -> None:
+    captured: list[SummarizationEvent] = []
+    middleware = _middleware(
+        before_summarization=[captured.append],
+        trigger=("messages", 4),
+        keep=("messages", 2),
+        preserve_recent_skill_count=5,
+        preserve_recent_skill_tokens=10_000,
+        preserve_recent_skill_tokens_per_skill=10_000,
+    )
+
+    messages = [
+        HumanMessage(content="u1"),
+        AIMessage(
+            content="",
+            tool_calls=[
+                _skill_read_call("skill-1", "alpha"),
+                _skill_read_call("skill-2", "beta"),
+            ],
+        ),
+        ToolMessage(content="alpha skill body", tool_call_id="skill-1"),
+        HumanMessage(content="u2"),
+        AIMessage(content="done"),
+    ]
+
+    middleware.before_model({"messages": messages}, _runtime())
+
+    preserved = captured[0].preserved_messages
+    summarized = captured[0].messages_to_summarize
+
+    preserved_ai = next(m for m in preserved if isinstance(m, AIMessage) and m.tool_calls)
+    summarized_ai = next(m for m in summarized if isinstance(m, AIMessage) and m.tool_calls)
+
+    assert [tc["id"] for tc in preserved_ai.tool_calls] == ["skill-1"]
+    assert [tc["id"] for tc in summarized_ai.tool_calls] == ["skill-2"]
+    assert any(isinstance(m, ToolMessage) and m.content == "alpha skill body" for m in preserved)
+    assert not any(isinstance(m, ToolMessage) and getattr(m, "tool_call_id", None) == "skill-2" for m in preserved)
+
+
 def test_memory_flush_hook_preserves_agent_scoped_memory(monkeypatch: pytest.MonkeyPatch) -> None:
     queue = MagicMock()
     monkeypatch.setattr("deerflow.agents.memory.summarization_hook.get_memory_config", lambda: MemoryConfig(enabled=True))
