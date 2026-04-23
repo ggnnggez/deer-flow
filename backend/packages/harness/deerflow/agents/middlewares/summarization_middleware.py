@@ -70,9 +70,6 @@ def _tool_call_path(tool_call: dict[str, Any]) -> str | None:
             return value
     return None
 
-
-def _is_skill_tool_call(tool_call: dict[str, Any], skills_root: str) -> bool:
-    """Return True when ``tool_call`` reads a file under the skills container path."""
 def _clone_ai_message(
     message: AIMessage,
     tool_calls: list[dict[str, Any]],
