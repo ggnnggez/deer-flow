@@ -70,6 +70,7 @@ def _tool_call_path(tool_call: dict[str, Any]) -> str | None:
             return value
     return None
 
+
 def _clone_ai_message(
     message: AIMessage,
     tool_calls: list[dict[str, Any]],
