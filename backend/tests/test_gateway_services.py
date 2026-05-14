@@ -36,6 +36,34 @@ def test_format_sse_no_event_id():
     assert "id:" not in frame
 
 
+def test_sse_profile_enabled(monkeypatch):
+    from app.gateway import services
+
+    monkeypatch.setenv("DEERFLOW_SSE_PROFILE", "1")
+    assert services._sse_profile_enabled() is True
+
+    monkeypatch.setenv("DEERFLOW_SSE_PROFILE", "0")
+    assert services._sse_profile_enabled() is False
+
+
+def test_sse_profile_records_frame_bytes():
+    from app.gateway.services import _SseProfile, format_sse
+
+    frame = format_sse("values", {"text": "你好"})
+    profile = _SseProfile("run-1", None)
+    profile.record("values", frame, 1_500_000)
+
+    data = profile.as_dict()
+    values = data["events"]["values"]
+    expected_bytes = len(frame.encode("utf-8"))
+    assert data["total_events"] == 1
+    assert data["total_bytes"] == expected_bytes
+    assert values["count"] == 1
+    assert values["total_bytes"] == expected_bytes
+    assert values["p95_bytes"] == expected_bytes
+    assert values["total_format_ms"] == 1.5
+
+
 def test_normalize_stream_modes_none():
     from app.gateway.services import normalize_stream_modes
 

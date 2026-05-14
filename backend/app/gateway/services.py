@@ -10,8 +10,11 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import os
 import re
+import time
 from collections.abc import Mapping
+from dataclasses import dataclass, field
 from typing import Any
 
 from fastapi import HTTPException, Request
@@ -36,6 +39,10 @@ from deerflow.runtime import (
 logger = logging.getLogger(__name__)
 
 
+_SSE_PROFILE_ENV = "DEERFLOW_SSE_PROFILE"
+_TRUE_ENV_VALUES = frozenset({"1", "true", "yes", "on"})
+
+
 # ---------------------------------------------------------------------------
 # SSE formatting
 # ---------------------------------------------------------------------------
@@ -55,6 +62,106 @@ def format_sse(event: str, data: Any, *, event_id: str | None = None) -> str:
     parts.append("")
     parts.append("")
     return "\n".join(parts)
+
+
+@dataclass(slots=True)
+class _SseEventStats:
+    count: int = 0
+    total_bytes: int = 0
+    max_bytes: int = 0
+    total_format_ns: int = 0
+    max_format_ns: int = 0
+    byte_samples: list[int] = field(default_factory=list)
+
+    def record(self, frame_bytes: int, format_ns: int) -> None:
+        self.count += 1
+        self.total_bytes += frame_bytes
+        self.max_bytes = max(self.max_bytes, frame_bytes)
+        self.total_format_ns += format_ns
+        self.max_format_ns = max(self.max_format_ns, format_ns)
+        self.byte_samples.append(frame_bytes)
+
+    def as_dict(self) -> dict[str, int | float]:
+        return {
+            "count": self.count,
+            "total_bytes": self.total_bytes,
+            "max_bytes": self.max_bytes,
+            "p95_bytes": _percentile(self.byte_samples, 95),
+            "total_format_ms": round(self.total_format_ns / 1_000_000, 3),
+            "max_format_ms": round(self.max_format_ns / 1_000_000, 3),
+        }
+
+
+@dataclass(slots=True)
+class _SseProfile:
+    run_id: str
+    last_event_id: str | None
+    start_ns: int = field(default_factory=time.perf_counter_ns)
+    rss_start_bytes: int | None = field(default_factory=lambda: _current_rss_bytes())
+    events: dict[str, _SseEventStats] = field(default_factory=dict)
+
+    def record(self, event: str, frame: str, format_ns: int) -> None:
+        stats = self.events.setdefault(event, _SseEventStats())
+        stats.record(len(frame.encode("utf-8")), format_ns)
+
+    def as_dict(self) -> dict[str, Any]:
+        rss_end_bytes = _current_rss_bytes()
+        rss_delta_bytes = None
+        if self.rss_start_bytes is not None and rss_end_bytes is not None:
+            rss_delta_bytes = rss_end_bytes - self.rss_start_bytes
+
+        return {
+            "run_id": sanitize_log_param(self.run_id),
+            "last_event_id": _sanitize_optional_log_param(self.last_event_id),
+            "duration_ms": round((time.perf_counter_ns() - self.start_ns) / 1_000_000, 3),
+            "rss_start_bytes": self.rss_start_bytes,
+            "rss_end_bytes": rss_end_bytes,
+            "rss_delta_bytes": rss_delta_bytes,
+            "total_events": sum(stats.count for stats in self.events.values()),
+            "total_bytes": sum(stats.total_bytes for stats in self.events.values()),
+            "events": {event: stats.as_dict() for event, stats in sorted(self.events.items())},
+        }
+
+
+def _sse_profile_enabled() -> bool:
+    return os.getenv(_SSE_PROFILE_ENV, "").strip().lower() in _TRUE_ENV_VALUES
+
+
+def _format_profiled_sse(
+    profile: _SseProfile | None,
+    event: str,
+    data: Any,
+    *,
+    event_id: str | None = None,
+) -> str:
+    if profile is None:
+        return format_sse(event, data, event_id=event_id)
+
+    started_ns = time.perf_counter_ns()
+    frame = format_sse(event, data, event_id=event_id)
+    profile.record(event, frame, time.perf_counter_ns() - started_ns)
+    return frame
+
+
+def _sanitize_optional_log_param(value: str | None) -> str | None:
+    return sanitize_log_param(value) if value is not None else None
+
+
+def _current_rss_bytes() -> int | None:
+    try:
+        with open("/proc/self/statm", encoding="ascii") as statm:
+            fields = statm.readline().split()
+        return int(fields[1]) * os.sysconf("SC_PAGE_SIZE")
+    except (IndexError, OSError, ValueError):
+        return None
+
+
+def _percentile(values: list[int], percentile: int) -> int:
+    if not values:
+        return 0
+    ordered = sorted(values)
+    index = max(0, min(len(ordered) - 1, (percentile * len(ordered) + 99) // 100 - 1))
+    return ordered[index]
 
 
 # ---------------------------------------------------------------------------
@@ -366,22 +473,32 @@ async def sse_consumer(
     - ``continue``: let the task run; events are discarded.
     """
     last_event_id = request.headers.get("Last-Event-ID")
+    profile = _SseProfile(record.run_id, last_event_id) if _sse_profile_enabled() else None
     try:
         async for entry in bridge.subscribe(record.run_id, last_event_id=last_event_id):
             if await request.is_disconnected():
                 break
 
             if entry is HEARTBEAT_SENTINEL:
-                yield ": heartbeat\n\n"
+                frame = ": heartbeat\n\n"
+                if profile is not None:
+                    profile.record("heartbeat", frame, 0)
+                yield frame
                 continue
 
             if entry is END_SENTINEL:
-                yield format_sse("end", None, event_id=entry.id or None)
+                yield _format_profiled_sse(profile, "end", None, event_id=entry.id or None)
                 return
 
-            yield format_sse(entry.event, entry.data, event_id=entry.id or None)
+            yield _format_profiled_sse(profile, entry.event, entry.data, event_id=entry.id or None)
 
     finally:
+        if profile is not None:
+            logger.info(
+                "SSE profile %s",
+                json.dumps(profile.as_dict(), ensure_ascii=False, sort_keys=True),
+            )
+
         if record.status in (RunStatus.pending, RunStatus.running):
             if record.on_disconnect == DisconnectMode.cancel:
                 await run_mgr.cancel(record.run_id)
