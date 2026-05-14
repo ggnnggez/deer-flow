@@ -3,7 +3,7 @@
 # serve.sh — Unified DeerFlow service launcher
 #
 # Usage:
-#   ./scripts/serve.sh [--dev|--prod] [--daemon] [--stop|--restart]
+#   ./scripts/serve.sh [--dev|--prod] [--daemon] [--stop|--restart] [--sse-profile TASK]
 #
 # Modes:
 #   --dev       Development mode with hot-reload (default)
@@ -14,11 +14,13 @@
 #   --skip-install  Skip dependency installation (faster restart)
 #   --stop      Stop all running services and exit
 #   --restart   Stop all services, then start with the given mode flags
+#   --sse-profile TASK  Enable SSE profiling and write gateway logs to logs/sse-profile-TASK.log
 #
 # Examples:
 #   ./scripts/serve.sh --dev                 # Gateway dev, hot reload
 #   ./scripts/serve.sh --prod                # Gateway prod
 #   ./scripts/serve.sh --dev --daemon        # Gateway dev, background
+#   ./scripts/serve.sh --dev --sse-profile long-task
 #   ./scripts/serve.sh --stop                # Stop all services
 #   ./scripts/serve.sh --restart --dev       # Restart dev services
 #
@@ -43,22 +45,49 @@ DEV_MODE=true
 DAEMON_MODE=false
 SKIP_INSTALL=false
 ACTION="start"   # start | stop | restart
+SSE_PROFILE_TASK_NAME=""
 
-for arg in "$@"; do
-    case "$arg" in
+while [ "$#" -gt 0 ]; do
+    case "$1" in
         --dev)     DEV_MODE=true ;;
         --prod)    DEV_MODE=false ;;
         --daemon)  DAEMON_MODE=true ;;
         --skip-install) SKIP_INSTALL=true ;;
         --stop)    ACTION="stop" ;;
         --restart) ACTION="restart" ;;
+        --sse-profile)
+            export DEERFLOW_SSE_PROFILE=1
+            if [ "$#" -gt 1 ] && [[ "$2" != --* ]]; then
+                SSE_PROFILE_TASK_NAME="$2"
+                shift
+            else
+                SSE_PROFILE_TASK_NAME="manual"
+            fi
+            ;;
         *)
-            echo "Unknown argument: $arg"
-            echo "Usage: $0 [--dev|--prod] [--daemon] [--skip-install] [--stop|--restart]"
+            echo "Unknown argument: $1"
+            echo "Usage: $0 [--dev|--prod] [--daemon] [--skip-install] [--stop|--restart] [--sse-profile TASK]"
             exit 1
             ;;
     esac
+    shift
 done
+
+sanitize_profile_task_name() {
+    local raw="${1:-manual}"
+    local sanitized
+    sanitized="$(printf '%s' "$raw" | tr -cs 'A-Za-z0-9._-' '-' | sed 's/^-*//; s/-*$//')"
+    if [ -z "$sanitized" ]; then
+        sanitized="manual"
+    fi
+    printf '%s' "$sanitized"
+}
+
+GATEWAY_LOG_PATH="$REPO_ROOT/logs/gateway.log"
+if [ -n "$SSE_PROFILE_TASK_NAME" ]; then
+    SSE_PROFILE_TASK_NAME="$(sanitize_profile_task_name "$SSE_PROFILE_TASK_NAME")"
+    GATEWAY_LOG_PATH="$REPO_ROOT/logs/sse-profile-$SSE_PROFILE_TASK_NAME.log"
+fi
 
 # ── Stop helper ──────────────────────────────────────────────────────────────
 
@@ -229,7 +258,7 @@ trap cleanup INT TERM
 # run_service NAME COMMAND PORT TIMEOUT
 # In daemon mode, wraps with nohup. Waits for port to be ready.
 run_service() {
-    local name="$1" cmd="$2" port="$3" timeout="$4"
+    local name="$1" cmd="$2" port="$3" timeout="$4" logfile="${5:-}"
 
     echo "Starting $name..."
     if $DAEMON_MODE; then
@@ -239,7 +268,9 @@ run_service() {
     fi
 
     ./scripts/wait-for-port.sh "$port" "$timeout" "$name" || {
-        local logfile="logs/$(echo "$name" | tr '[:upper:]' '[:lower:]' | tr ' ' '-').log"
+        if [ -z "$logfile" ]; then
+            logfile="logs/$(echo "$name" | tr '[:upper:]' '[:lower:]' | tr ' ' '-').log"
+        fi
         echo "✗ $name failed to start."
         [ -f "$logfile" ] && tail -20 "$logfile"
         cleanup
@@ -254,8 +285,8 @@ mkdir -p temp/client_body_temp temp/proxy_temp temp/fastcgi_temp temp/uwsgi_temp
 
 # 1. Gateway API
 run_service "Gateway" \
-    "cd backend && PYTHONPATH=. uv run uvicorn app.gateway.app:app --host 0.0.0.0 --port 8001 $GATEWAY_EXTRA_FLAGS > ../logs/gateway.log 2>&1" \
-    8001 30
+    "cd backend && PYTHONPATH=. uv run uvicorn app.gateway.app:app --host 0.0.0.0 --port 8001 $GATEWAY_EXTRA_FLAGS > \"$GATEWAY_LOG_PATH\" 2>&1" \
+    8001 30 "$GATEWAY_LOG_PATH"
 
 # 2. Frontend
 run_service "Frontend" \
@@ -281,6 +312,9 @@ echo "  API:     /api/langgraph/*  →  Gateway agent runtime"
 echo "           /api/*              →  Gateway REST API (8001)"
 echo ""
 echo "  📋 Logs: logs/{gateway,frontend,nginx}.log"
+if [ "$GATEWAY_LOG_PATH" != "$REPO_ROOT/logs/gateway.log" ]; then
+    echo "  📋 Gateway log: ${GATEWAY_LOG_PATH#$REPO_ROOT/}"
+fi
 echo ""
 
 if $DAEMON_MODE; then

@@ -1,6 +1,6 @@
 # DeerFlow - Unified Development Environment
 
-.PHONY: help config config-upgrade check install setup doctor dev dev-daemon start start-daemon stop up down clean docker-init docker-start docker-stop docker-logs docker-logs-frontend docker-logs-gateway
+.PHONY: help config config-upgrade check install setup doctor dev sse-profile dev-daemon start start-daemon stop up down clean docker-init docker-start docker-stop docker-logs docker-logs-frontend docker-logs-gateway
 
 BASH ?= bash
 BACKEND_UV_RUN = cd backend && uv run
@@ -16,6 +16,8 @@ else
     RUN_WITH_GIT_BASH =
 endif
 
+SSE_PROFILE_TASK_NAME ?= $(if $(TASK_NAME),$(TASK_NAME),$(if $(task-name),$(task-name),manual))
+
 help:
 	@echo "DeerFlow Development Commands:"
 	@echo "  make setup           - Interactive setup wizard (recommended for new users)"
@@ -26,6 +28,7 @@ help:
 	@echo "  make install         - Install all dependencies (frontend + backend + pre-commit hooks)"
 	@echo "  make setup-sandbox   - Pre-pull sandbox container image (recommended)"
 	@echo "  make dev             - Start all services in development mode (with hot-reloading)"
+	@echo "  make sse-profile     - Start dev services with SSE profiling (TASK_NAME=long-task)"
 	@echo "  make dev-daemon      - Start dev services in background (daemon mode)"
 	@echo "  make start           - Start all services in production mode (optimized, no hot-reloading)"
 	@echo "  make start-daemon    - Start prod services in background (daemon mode)"
@@ -116,6 +119,13 @@ setup-sandbox:
 dev:
 	@$(PYTHON) ./scripts/check.py
 	@$(RUN_WITH_GIT_BASH) ./scripts/serve.sh --dev
+
+# Start dev services with SSE profiling enabled
+sse-profile:
+	@$(PYTHON) ./scripts/check.py
+	@echo "Starting development services with SSE profiling enabled"
+	@echo "SSE profile entries will be written to logs/sse-profile-$(SSE_PROFILE_TASK_NAME).log"
+	@$(RUN_WITH_GIT_BASH) ./scripts/serve.sh --dev --sse-profile "$(SSE_PROFILE_TASK_NAME)"
 
 # Start all services in production mode (with optimizations)
 start:
