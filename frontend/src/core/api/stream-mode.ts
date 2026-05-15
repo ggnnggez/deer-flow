@@ -10,6 +10,14 @@ const SUPPORTED_RUN_STREAM_MODES = new Set([
   "custom",
 ] as const);
 
+export const CHAT_RUN_STREAM_MODES = [
+  "messages-tuple",
+  "updates",
+  "custom",
+] as const;
+
+type ChatRunStreamMode = (typeof CHAT_RUN_STREAM_MODES)[number];
+
 const warnedUnsupportedStreamModes = new Set<string>();
 
 export function warnUnsupportedStreamModes(
@@ -65,4 +73,19 @@ export function sanitizeRunStreamOptions<T>(options: T): T {
     ...options,
     streamMode: Array.isArray(streamMode) ? sanitizedModes : sanitizedModes[0],
   };
+}
+
+export function forceChatRunStreamOptions<T extends object>(
+  options: T,
+): T & { streamMode: ChatRunStreamMode[] };
+export function forceChatRunStreamOptions<T>(options: T): T;
+export function forceChatRunStreamOptions<T>(options: T): T {
+  if (typeof options !== "object" || options === null) {
+    return options;
+  }
+
+  return sanitizeRunStreamOptions({
+    ...options,
+    streamMode: [...CHAT_RUN_STREAM_MODES],
+  }) as T;
 }

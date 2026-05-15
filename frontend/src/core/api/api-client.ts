@@ -5,7 +5,10 @@ import { Client as LangGraphClient } from "@langchain/langgraph-sdk/client";
 import { getLangGraphBaseURL } from "../config";
 
 import { isStateChangingMethod, readCsrfCookie } from "./fetcher";
-import { sanitizeRunStreamOptions } from "./stream-mode";
+import {
+  forceChatRunStreamOptions,
+  sanitizeRunStreamOptions,
+} from "./stream-mode";
 
 /**
  * SDK ``onRequest`` hook that mints the ``X-CSRF-Token`` header from the
@@ -44,7 +47,7 @@ function createCompatibleClient(isMock?: boolean): LangGraphClient {
     originalRunStream(
       threadId,
       assistantId,
-      sanitizeRunStreamOptions(payload),
+      forceChatRunStreamOptions(payload),
     )) as typeof client.runs.stream;
 
   const originalJoinStream = client.runs.joinStream.bind(client.runs);
