@@ -1,0 +1,127 @@
+{
+  "source": "logs/sse-evidence/long-task/raw.sse",
+  "file_bytes": 6560984,
+  "parsed_frame_bytes": 6560984,
+  "unparsed_bytes": 0,
+  "total_events": 898,
+  "events": {
+    "values": {
+      "count": 7,
+      "total_frame_bytes": 4872647,
+      "frame_bytes_share_pct": 74.27,
+      "avg_frame_bytes": 696092.43,
+      "max_frame_bytes": 720048,
+      "p95_frame_bytes": 720048,
+      "total_data_bytes": 4872343,
+      "avg_data_bytes": 696049.0,
+      "max_data_bytes": 720004,
+      "p95_data_bytes": 720004
+    },
+    "messages": {
+      "count": 863,
+      "total_frame_bytes": 962427,
+      "frame_bytes_share_pct": 14.67,
+      "avg_frame_bytes": 1115.21,
+      "max_frame_bytes": 37549,
+      "p95_frame_bytes": 1091,
+      "total_data_bytes": 922821,
+      "avg_data_bytes": 1069.32,
+      "max_data_bytes": 37503,
+      "p95_data_bytes": 1045
+    },
+    "updates": {
+      "count": 21,
+      "total_frame_bytes": 725675,
+      "frame_bytes_share_pct": 11.06,
+      "avg_frame_bytes": 34555.95,
+      "max_frame_bytes": 677793,
+      "p95_frame_bytes": 37072,
+      "total_data_bytes": 724742,
+      "avg_data_bytes": 34511.52,
+      "max_data_bytes": 677750,
+      "p95_data_bytes": 37027
+    },
+    "metadata": {
+      "count": 1,
+      "total_frame_bytes": 147,
+      "frame_bytes_share_pct": 0.0,
+      "avg_frame_bytes": 147.0,
+      "max_frame_bytes": 147,
+      "p95_frame_bytes": 147,
+      "total_data_bytes": 103,
+      "avg_data_bytes": 103.0,
+      "max_data_bytes": 103,
+      "p95_data_bytes": 103
+    },
+    "heartbeat": {
+      "count": 5,
+      "total_frame_bytes": 65,
+      "frame_bytes_share_pct": 0.0,
+      "avg_frame_bytes": 13.0,
+      "max_frame_bytes": 13,
+      "p95_frame_bytes": 13,
+      "total_data_bytes": 0,
+      "avg_data_bytes": 0.0,
+      "max_data_bytes": 0,
+      "p95_data_bytes": 0
+    },
+    "end": {
+      "count": 1,
+      "total_frame_bytes": 23,
+      "frame_bytes_share_pct": 0.0,
+      "avg_frame_bytes": 23.0,
+      "max_frame_bytes": 23,
+      "p95_frame_bytes": 23,
+      "total_data_bytes": 4,
+      "avg_data_bytes": 4.0,
+      "max_data_bytes": 4,
+      "p95_data_bytes": 4
+    }
+  },
+  "values_payload": {
+    "values_event_count": 7,
+    "decoded_values_event_count": 7,
+    "parse_errors": 0,
+    "total_top_level_field_bytes": 4834128,
+    "message_count_min": 137,
+    "message_count_max": 140,
+    "message_count_last": 140,
+    "fields": {
+      "messages": {
+        "count": 7,
+        "total_bytes": 4827569,
+        "share_pct": 99.86,
+        "avg_bytes": 689652.71,
+        "max_bytes": 713541
+      },
+      "thread_data": {
+        "count": 7,
+        "total_bytes": 3647,
+        "share_pct": 0.08,
+        "avg_bytes": 521.0,
+        "max_bytes": 521
+      },
+      "todos": {
+        "count": 7,
+        "total_bytes": 2394,
+        "share_pct": 0.05,
+        "avg_bytes": 342.0,
+        "max_bytes": 342
+      },
+      "artifacts": {
+        "count": 7,
+        "total_bytes": 504,
+        "share_pct": 0.01,
+        "avg_bytes": 72.0,
+        "max_bytes": 72
+      },
+      "viewed_images": {
+        "count": 7,
+        "total_bytes": 14,
+        "share_pct": 0.0,
+        "avg_bytes": 2.0,
+        "max_bytes": 2
+      }
+    }
+  }
+}

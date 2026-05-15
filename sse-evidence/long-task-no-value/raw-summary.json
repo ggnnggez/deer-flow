@@ -1,0 +1,79 @@
+{
+  "source": "logs/sse-evidence/long-task-no-value/raw.sse",
+  "file_bytes": 1642214,
+  "parsed_frame_bytes": 1642214,
+  "unparsed_bytes": 0,
+  "total_events": 813,
+  "events": {
+    "messages": {
+      "count": 776,
+      "total_frame_bytes": 836689,
+      "frame_bytes_share_pct": 50.95,
+      "avg_frame_bytes": 1078.21,
+      "max_frame_bytes": 1726,
+      "p95_frame_bytes": 1221,
+      "total_data_bytes": 801089,
+      "avg_data_bytes": 1032.33,
+      "max_data_bytes": 1680,
+      "p95_data_bytes": 1175
+    },
+    "updates": {
+      "count": 21,
+      "total_frame_bytes": 805173,
+      "frame_bytes_share_pct": 49.03,
+      "avg_frame_bytes": 38341.57,
+      "max_frame_bytes": 793424,
+      "p95_frame_bytes": 3194,
+      "total_data_bytes": 804240,
+      "avg_data_bytes": 38297.14,
+      "max_data_bytes": 793381,
+      "p95_data_bytes": 3149
+    },
+    "heartbeat": {
+      "count": 14,
+      "total_frame_bytes": 182,
+      "frame_bytes_share_pct": 0.01,
+      "avg_frame_bytes": 13.0,
+      "max_frame_bytes": 13,
+      "p95_frame_bytes": 13,
+      "total_data_bytes": 0,
+      "avg_data_bytes": 0.0,
+      "max_data_bytes": 0,
+      "p95_data_bytes": 0
+    },
+    "metadata": {
+      "count": 1,
+      "total_frame_bytes": 147,
+      "frame_bytes_share_pct": 0.01,
+      "avg_frame_bytes": 147.0,
+      "max_frame_bytes": 147,
+      "p95_frame_bytes": 147,
+      "total_data_bytes": 103,
+      "avg_data_bytes": 103.0,
+      "max_data_bytes": 103,
+      "p95_data_bytes": 103
+    },
+    "end": {
+      "count": 1,
+      "total_frame_bytes": 23,
+      "frame_bytes_share_pct": 0.0,
+      "avg_frame_bytes": 23.0,
+      "max_frame_bytes": 23,
+      "p95_frame_bytes": 23,
+      "total_data_bytes": 4,
+      "avg_data_bytes": 4.0,
+      "max_data_bytes": 4,
+      "p95_data_bytes": 4
+    }
+  },
+  "values_payload": {
+    "values_event_count": 0,
+    "decoded_values_event_count": 0,
+    "parse_errors": 0,
+    "total_top_level_field_bytes": 0,
+    "message_count_min": 0,
+    "message_count_max": 0,
+    "message_count_last": 0,
+    "fields": {}
+  }
+}

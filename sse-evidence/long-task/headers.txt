@@ -1,0 +1,9 @@
+HTTP/1.1 200 OK
+Server: nginx/1.24.0 (Ubuntu)
+Date: Fri, 15 May 2026 11:00:28 GMT
+Content-Type: text/event-stream; charset=utf-8
+Transfer-Encoding: chunked
+Connection: keep-alive
+cache-control: no-cache
+content-location: /api/threads/1aa43d59-cfdb-4cd9-a88a-3585086bd6fb/runs/6e225e87-8894-4ca6-96ea-357a1f41de31
+
