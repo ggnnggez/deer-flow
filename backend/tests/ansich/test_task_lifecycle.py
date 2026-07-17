@@ -1,0 +1,373 @@
+from concurrent.futures import ThreadPoolExecutor
+from datetime import UTC, datetime, timedelta
+
+import anyio
+import pytest
+from ansich import AnsichService, ObservationEnvelope, TaskView, new_id
+from ansich.memory import InMemoryAnsichBackend
+
+
+class UnavailableBackend:
+    async def persist_and_project(self, observations: list[ObservationEnvelope]) -> int:
+        raise OSError("database unavailable")
+
+    async def get_task(self, task_id: str) -> TaskView | None:
+        return None
+
+
+class BlockingBackend(UnavailableBackend):
+    async def persist_and_project(self, observations: list[ObservationEnvelope]) -> int:
+        await anyio.sleep_forever()
+        return 0
+
+
+class RecoveringBackend:
+    def __init__(self) -> None:
+        self.inner = InMemoryAnsichBackend()
+        self.fail_next_write = True
+
+    async def persist_and_project(self, observations: list[ObservationEnvelope]) -> int:
+        if self.fail_next_write:
+            self.fail_next_write = False
+            raise OSError("temporary storage outage")
+        return await self.inner.persist_and_project(observations)
+
+    async def get_task(self, task_id: str) -> TaskView | None:
+        return await self.inner.get_task(task_id)
+
+    async def get_task_by_source(self, source_kind: str, source_id: str) -> TaskView | None:
+        return await self.inner.get_task_by_source(source_kind, source_id)
+
+    async def list_tasks(self, **kwargs) -> list[TaskView]:
+        return await self.inner.list_tasks(**kwargs)
+
+    async def list_observations(self, task_id: str) -> list[ObservationEnvelope]:
+        return await self.inner.list_observations(task_id)
+
+
+@pytest.mark.anyio
+async def test_completed_task_is_queryable_with_evidence_backed_control_belief():
+    service = AnsichService.in_memory()
+    await service.start()
+    task_id = new_id()
+    started_at = datetime(2026, 7, 17, 8, 0, tzinfo=UTC)
+
+    try:
+        service.record(
+            ObservationEnvelope.task_lifecycle(
+                kind="task.created",
+                task_id=task_id,
+                source_kind="deerflow_run",
+                source_id="run-123",
+                occurred_at=started_at,
+                source_event_id="run:run-123:task:created",
+            )
+        )
+        service.record(
+            ObservationEnvelope.task_lifecycle(
+                kind="task.started",
+                task_id=task_id,
+                source_kind="deerflow_run",
+                source_id="run-123",
+                occurred_at=started_at + timedelta(seconds=1),
+                source_event_id="run:run-123:task:started",
+            )
+        )
+        completed = service.record(
+            ObservationEnvelope.task_lifecycle(
+                kind="task.completed",
+                task_id=task_id,
+                source_kind="deerflow_run",
+                source_id="run-123",
+                occurred_at=started_at + timedelta(seconds=3),
+                source_event_id="run:run-123:task:completed",
+            )
+        )
+
+        flush = await service.flush_task(task_id)
+        task = await service.get_task(task_id)
+    finally:
+        await service.stop()
+
+    assert completed.accepted is True
+    assert flush.persisted is True
+    assert task is not None
+    assert task.source_kind == "deerflow_run"
+    assert task.source_id == "run-123"
+    assert task.control.value == "completed"
+    assert task.control.as_of == started_at + timedelta(seconds=3)
+    assert task.control.fidelity_class == "hard"
+    assert task.control.source.name == "task-control"
+    assert task.control.source.version == "1"
+    assert task.control.selected_by.name == "control-state"
+    assert task.control.selected_by.version == "1"
+    assert task.control.evidence_obs_ids == (completed.obs_id,)
+
+
+@pytest.mark.anyio
+async def test_terminal_task_does_not_regress_when_started_evidence_arrives_late():
+    service = AnsichService.in_memory()
+    await service.start()
+    task_id = new_id()
+    completed_at = datetime(2026, 7, 17, 10, 0, tzinfo=UTC)
+
+    try:
+        completed = service.record(
+            ObservationEnvelope.task_lifecycle(
+                kind="task.completed",
+                task_id=task_id,
+                source_kind="deerflow_run",
+                source_id="run-terminal",
+                occurred_at=completed_at,
+                source_event_id="run:run-terminal:task:completed",
+            )
+        )
+        service.record(
+            ObservationEnvelope.task_lifecycle(
+                kind="task.started",
+                task_id=task_id,
+                source_kind="deerflow_run",
+                source_id="run-terminal",
+                occurred_at=completed_at + timedelta(seconds=5),
+                source_event_id="run:run-terminal:task:started-late",
+            )
+        )
+        await service.flush_task(task_id)
+        task = await service.get_task(task_id)
+    finally:
+        await service.stop()
+
+    assert task is not None
+    assert task.control.value == "completed"
+    assert task.control.as_of == completed_at
+    assert task.control.evidence_obs_ids == (completed.obs_id,)
+
+
+@pytest.mark.anyio
+async def test_full_queue_is_fail_open_and_visible_as_a_known_lost_range():
+    service = AnsichService.in_memory(queue_capacity=1)
+    await service.start()
+    task_id = new_id()
+    observed_at = datetime(2026, 7, 17, 11, 0, tzinfo=UTC)
+
+    try:
+        accepted = service.record(
+            ObservationEnvelope.task_lifecycle(
+                kind="task.created",
+                task_id=task_id,
+                source_kind="deerflow_run",
+                source_id="run-overflow",
+                occurred_at=observed_at,
+                source_event_id="run:run-overflow:task:created",
+                producer_seq=1,
+            )
+        )
+        dropped = service.record(
+            ObservationEnvelope.task_lifecycle(
+                kind="task.started",
+                task_id=task_id,
+                source_kind="deerflow_run",
+                source_id="run-overflow",
+                occurred_at=observed_at + timedelta(seconds=1),
+                source_event_id="run:run-overflow:task:started",
+                producer_seq=2,
+            )
+        )
+        health = service.get_health()
+    finally:
+        await service.stop()
+
+    assert accepted.accepted is True
+    assert dropped.accepted is False
+    assert dropped.reason == "queue_full"
+    assert health.status == "degraded"
+    assert health.queue_depth == 1
+    assert health.dropped_count == 1
+    assert health.lost_ranges[0].first_sequence == 2
+    assert health.lost_ranges[0].last_sequence == 2
+    assert health.lost_ranges[0].task_id == task_id
+
+
+@pytest.mark.anyio
+async def test_storage_failure_during_flush_is_fail_open_and_marks_task_degraded():
+    service = AnsichService(UnavailableBackend())
+    await service.start()
+    task_id = new_id()
+    observation = ObservationEnvelope.task_lifecycle(
+        kind="task.completed",
+        task_id=task_id,
+        source_kind="deerflow_run",
+        source_id="run-store-down",
+        occurred_at=datetime(2026, 7, 17, 12, 0, tzinfo=UTC),
+        source_event_id="run:run-store-down:task:completed",
+    )
+
+    try:
+        service.record(observation)
+        flush = await service.flush_task(task_id)
+        health = service.get_health()
+    finally:
+        await service.stop()
+
+    assert flush.persisted is False
+    assert flush.processed_count == 0
+    assert flush.reason == "storage_failure"
+    assert health.status == "degraded"
+    assert health.dropped_count == 1
+    assert len(health.lost_ranges) == 1
+    assert health.lost_ranges[0].first_sequence == 1
+    assert health.lost_ranges[0].last_sequence == 1
+    assert health.lost_ranges[0].task_id == task_id
+
+
+@pytest.mark.anyio
+async def test_background_writer_makes_running_task_queryable_without_explicit_flush():
+    service = AnsichService.in_memory(flush_interval_ms=5)
+    await service.start()
+    task_id = new_id()
+    observed_at = datetime(2026, 7, 17, 16, 0, tzinfo=UTC)
+
+    try:
+        for kind in ("task.created", "task.started"):
+            service.record(
+                ObservationEnvelope.task_lifecycle(
+                    kind=kind,
+                    task_id=task_id,
+                    source_kind="deerflow_run",
+                    source_id="run-background-writer",
+                    occurred_at=observed_at,
+                    source_event_id=f"run:run-background-writer:{kind}",
+                )
+            )
+
+        with anyio.fail_after(0.5):
+            while await service.get_task(task_id) is None:
+                await anyio.sleep(0.01)
+        task = await service.get_task(task_id)
+    finally:
+        await service.stop()
+
+    assert task is not None
+    assert task.control.value == "running"
+
+
+@pytest.mark.anyio
+async def test_invalid_record_input_is_rejected_without_raising_into_agent_code():
+    service = AnsichService.in_memory()
+    await service.start()
+
+    try:
+        receipt = service.record(object())  # type: ignore[arg-type]
+    finally:
+        await service.stop()
+
+    assert receipt.accepted is False
+    assert receipt.reason == "validation_failed"
+    assert service.get_health().dropped_count == 1
+
+
+@pytest.mark.anyio
+async def test_terminal_flush_timeout_is_fail_open_and_reports_loss():
+    service = AnsichService(
+        BlockingBackend(),
+        flush_interval_ms=60_000,
+        terminal_flush_timeout_ms=10,
+    )
+    await service.start()
+    task_id = new_id()
+    service.record(
+        ObservationEnvelope.task_lifecycle(
+            kind="task.completed",
+            task_id=task_id,
+            source_kind="deerflow_run",
+            source_id="run-timeout",
+            occurred_at=datetime(2026, 7, 17, 17, 0, tzinfo=UTC),
+            source_event_id="run:run-timeout:task:terminal:completed",
+        )
+    )
+
+    try:
+        result = await service.flush_task(task_id)
+        health = service.get_health()
+    finally:
+        await service.stop()
+
+    assert result.persisted is False
+    assert result.reason == "terminal_flush_timeout"
+    assert health.status == "degraded"
+
+
+@pytest.mark.anyio
+async def test_storage_recovery_persists_observability_degraded_for_known_loss():
+    backend = RecoveringBackend()
+    service = AnsichService(backend, flush_interval_ms=60_000)
+    await service.start()
+    task_id = new_id()
+    observed_at = datetime(2026, 7, 17, 18, 0, tzinfo=UTC)
+
+    try:
+        service.record(
+            ObservationEnvelope.task_lifecycle(
+                kind="task.created",
+                task_id=task_id,
+                source_kind="deerflow_run",
+                source_id="run-recovered",
+                occurred_at=observed_at,
+                source_event_id="run:run-recovered:task:created",
+            )
+        )
+        first_flush = await service.flush_task(task_id)
+        service.record(
+            ObservationEnvelope.task_lifecycle(
+                kind="task.started",
+                task_id=task_id,
+                source_kind="deerflow_run",
+                source_id="run-recovered",
+                occurred_at=observed_at + timedelta(seconds=1),
+                source_event_id="run:run-recovered:task:started",
+                producer_seq=2,
+            )
+        )
+        second_flush = await service.flush_task(task_id)
+        observations = await service.list_observations(task_id)
+    finally:
+        await service.stop()
+
+    assert first_flush.persisted is False
+    assert second_flush.persisted is True
+    assert [observation.kind for observation in observations] == [
+        "task.started",
+        "observability.degraded",
+    ]
+
+
+@pytest.mark.anyio
+async def test_record_is_safe_from_multiple_producer_threads():
+    service = AnsichService.in_memory(queue_capacity=64, flush_interval_ms=60_000)
+    await service.start()
+    task_id = new_id()
+    observed_at = datetime(2026, 7, 17, 19, 0, tzinfo=UTC)
+
+    def record_one(index: int):
+        return service.record(
+            ObservationEnvelope.task_lifecycle(
+                kind="task.created",
+                task_id=task_id,
+                source_kind="deerflow_run",
+                source_id="run-threaded",
+                occurred_at=observed_at,
+                source_event_id=f"run:run-threaded:signal:{index}",
+                producer_seq=index + 1,
+            )
+        )
+
+    try:
+        with ThreadPoolExecutor(max_workers=8) as executor:
+            receipts = list(executor.map(record_one, range(32)))
+        await service.flush_task(task_id)
+        observations = await service.list_observations(task_id)
+    finally:
+        await service.stop()
+
+    assert all(receipt.accepted for receipt in receipts)
+    assert len(observations) == 32

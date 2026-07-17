@@ -5,6 +5,7 @@ description = "LangGraph-based AI agent system with sandbox execution capabiliti
 readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
+    "ansich-core",
     "deerflow-harness",
     "fastapi>=0.115.0",
     "httpx>=0.28.0",
@@ -61,7 +62,8 @@ markers = [
 index-url = "https://pypi.org/simple"
 
 [tool.uv.workspace]
-members = ["packages/harness"]
+members = ["packages/ansich", "packages/harness"]
 
 [tool.uv.sources]
+ansich-core = { workspace = true }
 deerflow-harness = { workspace = true }

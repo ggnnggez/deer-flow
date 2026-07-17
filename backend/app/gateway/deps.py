@@ -281,6 +281,21 @@ async def langgraph_runtime(app: FastAPI, startup_config: AppConfig) -> AsyncGen
             app.state.run_store = MemoryRunStore()
             app.state.feedback_repo = None
 
+        # Embedded Ansich is restart-gated and deliberately fail-open. A
+        # missing SQL session factory yields a failed health surface instead
+        # of aborting Gateway startup or silently switching to volatile data.
+        app.state.ansich_service = None
+        ansich_config = getattr(config, "ansich", None)
+        if ansich_config is not None:
+            try:
+                from deerflow.ansich import create_embedded_ansich_service
+
+                app.state.ansich_service = create_embedded_ansich_service(ansich_config, sf)
+                if app.state.ansich_service is not None:
+                    await app.state.ansich_service.start()
+            except Exception:
+                logger.exception("Ansich startup failed; continuing without collection")
+
         from deerflow.persistence.thread_meta import make_thread_store
 
         app.state.thread_store = make_thread_store(sf, app.state.store)
@@ -340,6 +355,12 @@ async def langgraph_runtime(app: FastAPI, startup_config: AppConfig) -> AsyncGen
             run_manager = getattr(app.state, "run_manager", None)
             if run_manager is not None:
                 await _drain_inflight_runs(run_manager)
+            ansich_service = getattr(app.state, "ansich_service", None)
+            if ansich_service is not None:
+                try:
+                    await ansich_service.stop()
+                except Exception:
+                    logger.exception("Ansich shutdown failed; continuing Gateway shutdown")
             await close_engine()
 
 
@@ -421,6 +442,7 @@ def get_run_context(request: Request) -> RunContext:
         thread_store=get_thread_store(request),
         app_config=get_config(),
         on_run_completed=getattr(request.app.state, "scheduled_task_service", None).handle_run_completion if getattr(request.app.state, "scheduled_task_service", None) is not None else None,
+        ansich_service=getattr(request.app.state, "ansich_service", None),
     )
 
 

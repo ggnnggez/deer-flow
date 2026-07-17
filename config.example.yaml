@@ -15,7 +15,7 @@
 # ============================================================================
 # Bump this number when the config schema changes.
 # Run `make config-upgrade` to merge new fields into your local config.yaml.
-config_version: 25
+config_version: 26
 
 # ============================================================================
 # Logging
@@ -1625,6 +1625,23 @@ skill_evolution:
 database:
   backend: sqlite
   sqlite_dir: .deer-flow/data
+
+# ============================================================================
+# Ansich Embedded Observability
+# ============================================================================
+# Developer/operator observability embedded in the Gateway process. Disabled
+# by default. All fields are restart-required. Collection is fail-open: Ansich
+# storage or projection failures never change the DeerFlow Run result, while
+# DeerFlow's own token/loop/authorization guards remain fail-safe.
+ansich:
+  enabled: false
+  queue_capacity: 10000
+  batch_size: 100
+  flush_interval_ms: 100
+  terminal_flush_timeout_ms: 2000
+  projector_poll_interval_ms: 250
+  projector_lease_seconds: 30
+  projector_max_attempts: 5
 
 # ============================================================================
 # Run Events Configuration

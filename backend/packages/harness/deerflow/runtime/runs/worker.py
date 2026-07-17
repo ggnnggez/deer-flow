@@ -139,6 +139,7 @@ class RunContext:
     thread_store: Any | None = field(default=None)
     app_config: AppConfig | None = field(default=None)
     on_run_completed: Any | None = field(default=None)
+    ansich_service: Any | None = field(default=None)
 
 
 def _install_runtime_context(config: dict, runtime_context: dict[str, Any]) -> None:
@@ -252,6 +253,7 @@ async def run_agent(
     stream_subgraphs: bool = False,
     interrupt_before: list[str] | Literal["*"] | None = None,
     interrupt_after: list[str] | Literal["*"] | None = None,
+    ansich_task: Any | None = None,
 ) -> None:
     """Execute an agent in the background, publishing events to *bridge*."""
 
@@ -283,6 +285,17 @@ async def run_agent(
     # finally is safe even if an exception fires before streaming begins.
     subagent_events: _SubagentEventBuffer | None = None
 
+    if ansich_task is None and ctx.ansich_service is not None:
+        from deerflow.ansich.probes import create_task_control_probe
+
+        ansich_task = create_task_control_probe(
+            ctx.ansich_service,
+            run_id=run_id,
+            thread_id=thread_id,
+            config=config,
+        )
+        ansich_task.created()
+
     # Track whether "events" was requested but skipped
     if "events" in requested_modes:
         logger.info(
@@ -312,6 +325,8 @@ async def run_agent(
 
         # 1. Mark running
         await run_manager.set_status(run_id, RunStatus.running)
+        if ansich_task is not None:
+            ansich_task.started()
 
         if event_store is not None:
             workspace_changes_user_id = get_effective_user_id()
@@ -597,6 +612,9 @@ async def run_agent(
         )
 
     finally:
+        if ansich_task is not None:
+            await ansich_task.terminal(record.status.value)
+
         # Persist any subagent step events still buffered (#3779) — including on
         # abort/exception paths, where the stream loop broke before its own flush.
         if subagent_events is not None:

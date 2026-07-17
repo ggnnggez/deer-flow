@@ -182,6 +182,7 @@ export interface Translations {
     demoChats: string;
     agents: string;
     scheduledTasks: string;
+    ansich: string;
     agentsDisabledTooltip: string;
     channels: string;
   };
@@ -301,6 +302,55 @@ export interface Translations {
       news: { title: string; desc: string };
       issues: { title: string; desc: string };
       weekly: { title: string; desc: string };
+    };
+  };
+
+  // Ansich developer/operator observability
+  ansich: {
+    title: string;
+    description: string;
+    adminOnly: string;
+    autoRefresh: string;
+    task: string;
+    source: string;
+    control: string;
+    asOf: string;
+    evidence: string;
+    currentBelief: string;
+    timeline: string;
+    occurredAt: string;
+    recordedAt: string;
+    producer: string;
+    sourceEvent: string;
+    payload: string;
+    fidelity: string;
+    resolver: string;
+    projection: string;
+    watermark: string;
+    lag: string;
+    failedJobs: string;
+    queue: string;
+    accepted: string;
+    dropped: string;
+    lost: string;
+    noTasks: string;
+    noObservations: string;
+    loadFailed: string;
+    taskNotFound: string;
+    backToOperations: string;
+    status: {
+      unknown: string;
+      created: string;
+      running: string;
+      completed: string;
+      failed: string;
+      interrupted: string;
+    };
+    health: {
+      healthy: string;
+      degraded: string;
+      failed: string;
+      stopped: string;
     };
   };
 

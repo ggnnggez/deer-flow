@@ -14,6 +14,23 @@ its storage implementation lives in ``deerflow.runtime.events.store.db`` and
 there is no matching entity directory.
 """
 
+from deerflow.ansich.persistence.models import (
+    AnsichBeliefAssertionRow,
+    AnsichBeliefEvidenceRow,
+    AnsichCurrentBeliefRow,
+    AnsichEntityRow,
+    AnsichObservationRow,
+    AnsichPayloadRow,
+    AnsichProjectionErrorRow,
+    AnsichProjectionJobRow,
+    AnsichProjectorVersionRow,
+    AnsichRelationEvidenceRow,
+    AnsichRelationRow,
+    AnsichScopeRow,
+    AnsichTaskRow,
+    AnsichTaskSummaryRow,
+    AnsichTransitionRow,
+)
 from deerflow.persistence.channel_connections.model import (
     ChannelConnectionRow,
     ChannelConversationRow,
@@ -29,6 +46,21 @@ from deerflow.persistence.thread_meta.model import ThreadMetaRow
 from deerflow.persistence.user.model import UserRow
 
 __all__ = [
+    "AnsichBeliefAssertionRow",
+    "AnsichBeliefEvidenceRow",
+    "AnsichCurrentBeliefRow",
+    "AnsichEntityRow",
+    "AnsichObservationRow",
+    "AnsichPayloadRow",
+    "AnsichProjectionErrorRow",
+    "AnsichProjectionJobRow",
+    "AnsichProjectorVersionRow",
+    "AnsichRelationEvidenceRow",
+    "AnsichRelationRow",
+    "AnsichScopeRow",
+    "AnsichTaskRow",
+    "AnsichTaskSummaryRow",
+    "AnsichTransitionRow",
     "ChannelConnectionRow",
     "ChannelConversationRow",
     "ChannelCredentialRow",

@@ -13,6 +13,7 @@ from app.gateway.csrf_middleware import CSRFMiddleware, get_configured_cors_orig
 from app.gateway.deps import langgraph_runtime
 from app.gateway.routers import (
     agents,
+    ansich,
     artifacts,
     assistants_compat,
     auth,
@@ -429,6 +430,9 @@ This gateway provides runtime endpoints for agent runs plus custom endpoints for
     app.add_middleware(TraceMiddleware, enabled=_resolve_trace_enabled_for_app_construction())
 
     # Include routers
+    # Embedded Ansich developer/operator observability API.
+    app.include_router(ansich.router)
+
     # Models API is mounted at /api/models
     app.include_router(models.router)
 

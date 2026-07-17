@@ -697,6 +697,22 @@ async def start_run(
 
         stream_modes = normalize_stream_modes(body.stream_mode)
 
+        # Allocate the Ansich Task and record task.created before the worker is
+        # scheduled. This preserves the admission boundary even if task
+        # scheduling or the first worker await fails; observation remains
+        # fail-open and cannot prevent the DeerFlow Run from launching.
+        ansich_task = None
+        if run_ctx.ansich_service is not None:
+            from deerflow.ansich.probes import create_task_control_probe
+
+            ansich_task = create_task_control_probe(
+                run_ctx.ansich_service,
+                run_id=record.run_id,
+                thread_id=thread_id,
+                config=config,
+            )
+            ansich_task.created()
+
         task = asyncio.create_task(
             run_agent(
                 bridge,
@@ -710,6 +726,7 @@ async def start_run(
                 stream_subgraphs=body.stream_subgraphs,
                 interrupt_before=body.interrupt_before,
                 interrupt_after=body.interrupt_after,
+                ansich_task=ansich_task,
             )
         )
         record.task = task
