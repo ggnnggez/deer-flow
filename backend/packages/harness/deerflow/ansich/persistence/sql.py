@@ -7,7 +7,7 @@ from uuid import uuid4
 from ansich import ControlBelief, NamedVersion, ObservationEnvelope, Producer, TaskView, new_id
 from ansich.contracts import ControlValue
 from ansich.control import should_select_control_candidate
-from sqlalchemy import and_, delete, or_, select, update
+from sqlalchemy import and_, case, delete, or_, select, update
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from deerflow.ansich.persistence.models import (
@@ -34,7 +34,16 @@ _CONTROL_BY_KIND = {
     "task.failed": "failed",
     "task.interrupted": "interrupted",
 }
+#: Registration order is execution priority for jobs of one observation:
+#: structural projections must land before belief/control projections, and
+#: future projectors (e.g. Phase 2 steps) run after both. Claim ordering
+#: derives from this tuple — never from projector_name collation.
 _PROJECTORS = (("task-structural", "1"), ("task-control", "1"))
+
+
+def _projector_priority_expression():
+    priority_by_name = {name: index for index, (name, _) in enumerate(_PROJECTORS)}
+    return case(priority_by_name, value=AnsichProjectionJobRow.projector_name, else_=len(priority_by_name))
 
 
 def _as_utc(value: datetime) -> datetime:
@@ -242,7 +251,8 @@ class SqlAnsichBackend:
                     )
                     .order_by(
                         AnsichObservationRow.ingest_seq,
-                        AnsichProjectionJobRow.projector_name.desc(),
+                        _projector_priority_expression(),
+                        AnsichProjectionJobRow.projector_name,
                     )
                     .limit(1)
                     .with_for_update(skip_locked=True)

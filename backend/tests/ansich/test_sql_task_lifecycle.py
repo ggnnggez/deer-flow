@@ -202,3 +202,43 @@ async def test_projection_tables_can_be_rebuilt_from_durable_observations(tmp_pa
     assert before is not None
     assert after == before
     assert len(observations) == 3
+
+
+@pytest.mark.anyio
+async def test_projection_claim_order_follows_registry_priority_not_alphabetical(tmp_path, monkeypatch):
+    """Adding a projector whose name sorts first alphabetically must not jump the queue (F4)."""
+    from deerflow.ansich.persistence import sql as sql_module
+
+    # Simulate a Phase 2-style registry extension: "usage-rollup" sorts after
+    # "task-structural" in the old projector_name.desc() ordering, so an
+    # alphabetical claim would run it before both existing projectors.
+    monkeypatch.setattr(sql_module, "_PROJECTORS", (*sql_module._PROJECTORS, ("usage-rollup", "1")))
+
+    engine = create_async_engine(f"sqlite+aiosqlite:///{tmp_path / 'ansich-priority.db'}")
+    session_factory = async_sessionmaker(engine, expire_on_commit=False)
+    async with engine.begin() as connection:
+        await connection.run_sync(Base.metadata.create_all)
+    backend = SqlAnsichBackend(session_factory)
+
+    try:
+        await backend.persist_and_project(
+            [
+                ObservationEnvelope.task_lifecycle(
+                    kind="task.created",
+                    task_id=new_id(),
+                    source_kind="deerflow_run",
+                    source_id="run-priority",
+                    occurred_at=datetime(2026, 7, 17, 13, 0, tzinfo=UTC),
+                    source_event_id="run:run-priority:task:created",
+                )
+            ]
+        )
+        claimed_names = []
+        for _ in range(3):
+            claim = await backend._claim_projection_job()
+            assert claim is not None
+            claimed_names.append(claim[1])
+    finally:
+        await engine.dispose()
+
+    assert claimed_names == ["task-structural", "task-control", "usage-rollup"]
