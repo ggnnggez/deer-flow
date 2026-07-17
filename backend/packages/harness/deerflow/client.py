@@ -284,7 +284,12 @@ class DeerFlowClient:
             # callbacks at the graph invocation root so a single embedded run
             # produces one trace with correct session_id / user_id propagation.
             # Attaching them again on the model would emit duplicate spans.
-            "model": create_chat_model(name=model_name, thinking_enabled=thinking_enabled, attach_tracing=False),
+            "model": create_chat_model(
+                name=model_name,
+                thinking_enabled=thinking_enabled,
+                attach_tracing=False,
+                ansich_call_class="lead_agent",
+            ),
             "tools": final_tools,
             "middleware": build_middlewares(
                 config,

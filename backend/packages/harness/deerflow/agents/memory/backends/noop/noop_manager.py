@@ -81,6 +81,7 @@ class NoopMemoryManager(MemoryManager):
         agent_name: str | None = None,
         user_id: str | None = None,
         trace_id: str | None = None,
+        observability_context: Any | None = None,
     ) -> None:
         return None
 
@@ -91,6 +92,7 @@ class NoopMemoryManager(MemoryManager):
         *,
         agent_name: str | None = None,
         user_id: str | None = None,
+        observability_context: Any | None = None,
     ) -> None:
         return None
 

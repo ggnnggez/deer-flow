@@ -15,7 +15,10 @@ TaskLifecycleKind = Literal[
     "task.failed",
     "task.interrupted",
 ]
-ObservationKind = TaskLifecycleKind | Literal["observability.degraded"]
+StepObservationKind = Literal["step.started", "step.closed"]
+LlmObservationKind = Literal["llm.requested", "llm.responded", "llm.failed"]
+ContextObservationKind = Literal["content.produced", "context.snapshotted"]
+ObservationKind = TaskLifecycleKind | StepObservationKind | LlmObservationKind | ContextObservationKind | Literal["observability.degraded"]
 ControlValue = Literal["unknown", "created", "running", "completed", "failed", "interrupted"]
 
 _SECRET_FIELD_NAMES = frozenset(
@@ -85,7 +88,8 @@ class ObservationEnvelope(BaseModel):
     occurred_at: datetime
     recorded_at: datetime = Field(default_factory=lambda: datetime.now(UTC))
     task_id: str
-    subject_type: Literal["task"] = "task"
+    step_id: str | None = None
+    subject_type: Literal["task", "step", "llm_attempt", "content_block", "context_snapshot"] = "task"
     subject_id: str
     fidelity_class: Literal["hard"] = "hard"
     producer: Producer
@@ -96,15 +100,25 @@ class ObservationEnvelope(BaseModel):
     payload: dict[str, object] | None = None
     payload_ref_id: str | None = None
 
-    @field_validator("obs_id", "task_id", "subject_id", "causation_obs_id", "payload_ref_id")
+    @field_validator("obs_id", "task_id", "step_id", "subject_id", "causation_obs_id", "payload_ref_id")
     @classmethod
     def _identity_is_uuid4(cls, value: str | None) -> str | None:
         return None if value is None else _validate_uuid4(value)
 
     @model_validator(mode="after")
-    def _validate_task_subject(self) -> Self:
-        if self.subject_id != self.task_id:
-            raise ValueError("task observation subject_id must equal task_id")
+    def _validate_subject(self) -> Self:
+        if self.kind.startswith("task.") or self.kind == "observability.degraded":
+            if self.subject_type != "task" or self.subject_id != self.task_id:
+                raise ValueError("task observation subject must identify task_id")
+        elif self.kind.startswith("step."):
+            if self.step_id is None or self.subject_type != "step" or self.subject_id != self.step_id:
+                raise ValueError("step observation subject must identify step_id")
+        elif self.kind.startswith("llm.") and self.subject_type != "llm_attempt":
+            raise ValueError("LLM observation subject_type must be llm_attempt")
+        elif self.kind == "content.produced" and self.subject_type != "content_block":
+            raise ValueError("content observation subject_type must be content_block")
+        elif self.kind == "context.snapshotted" and self.subject_type != "context_snapshot":
+            raise ValueError("context snapshot observation subject_type must be context_snapshot")
         if self.occurred_at.tzinfo is None or self.recorded_at.tzinfo is None:
             raise ValueError("observation timestamps must be timezone-aware")
         if (self.payload is None) == (self.payload_ref_id is None):

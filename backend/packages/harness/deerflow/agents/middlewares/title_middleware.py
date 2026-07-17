@@ -11,6 +11,7 @@ from langgraph.constants import TAG_NOSTREAM
 from langgraph.runtime import Runtime
 
 from deerflow.agents.middlewares.dynamic_context_middleware import is_dynamic_context_reminder
+from deerflow.ansich.middleware import execution_context_from_runtime, observe_system_model_ainvoke
 from deerflow.config.title_config import get_title_config
 from deerflow.models import create_chat_model
 
@@ -196,7 +197,7 @@ class TitleMiddleware(AgentMiddleware[TitleMiddlewareState]):
         user_msg = self._get_title_user_message(state)
         return {"title": self._fallback_title(user_msg)}
 
-    async def _agenerate_title_result(self, state: TitleMiddlewareState) -> dict | None:
+    async def _agenerate_title_result(self, state: TitleMiddlewareState, runtime: Runtime | None = None) -> dict | None:
         """Generate a configured LLM title asynchronously and fall back locally."""
         if not self._should_generate_title(state):
             return None
@@ -214,11 +215,23 @@ class TitleMiddleware(AgentMiddleware[TitleMiddlewareState]):
             # the graph-level RunnableConfig (set in ``_make_lead_agent``) whose
             # callbacks already carry tracing handlers; binding them again at
             # the model level would emit duplicate spans.
-            model_kwargs = {"thinking_enabled": False, "attach_tracing": False}
+            model_kwargs = {
+                "thinking_enabled": False,
+                "attach_tracing": False,
+                "ansich_call_class": "system_operation",
+                "ansich_operation_kind": "title",
+            }
             if self._app_config is not None:
                 model_kwargs["app_config"] = self._app_config
             model = create_chat_model(name=config.model_name, **model_kwargs)
-            response = await model.ainvoke(prompt, config=self._get_runnable_config())
+            response = await observe_system_model_ainvoke(
+                model,
+                prompt,
+                execution=execution_context_from_runtime(runtime),
+                operation_kind="title",
+                config=self._get_runnable_config(),
+                runtime_context=None if runtime is None else runtime.context,
+            )
             title = self._parse_title(response.content)
             if title:
                 return {"title": title}
@@ -232,4 +245,4 @@ class TitleMiddleware(AgentMiddleware[TitleMiddlewareState]):
 
     @override
     async def aafter_model(self, state: TitleMiddlewareState, runtime: Runtime) -> dict | None:
-        return await self._agenerate_title_result(state)
+        return await self._agenerate_title_result(state, runtime)

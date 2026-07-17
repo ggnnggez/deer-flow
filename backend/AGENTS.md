@@ -321,7 +321,7 @@ CORS is same-origin by default when requests enter through nginx on port 2026. S
 | **Models** (`/api/models`) | `GET /` - list models; `GET /{name}` - model details |
 | **Features** (`/api/features`) | `GET /` - report config-gated feature availability (currently `agents_api.enabled`) for frontend UI gating |
 | **Console** (`/api/console`) | Read-only cross-thread observability for the current user (the data layer for an operations dashboard or external monitoring): `GET /stats` - headline counters (runs/threads/agents/tokens/cost); `GET /runs` - paginated run history joined with thread titles (per-run cost); `GET /usage` - zero-filled daily token series + per-model breakdown with spend. Queries `runs`/`threads_meta` directly as a reporting layer (no new `RunStore` methods); requires a SQL database backend — returns 503 on `database.backend: memory`. Real-cost estimation reads optional `models[*].pricing` (`currency`, `input_per_million`, `output_per_million`, `input_cache_hit_per_million`; `ModelConfig` is `extra="allow"`, so no schema change) and prices each run from its `token_usage_by_model` input/output split. Pricing is **cache-aware**: `RunJournal` accumulates prompt-cache hits from `usage_metadata.input_token_details.cache_read` into a sparse `cache_read_tokens` bucket key (also threaded through `SubagentTokenCollector` → `record_external_llm_usage_records`), and cache-hit input tokens are billed at `input_cache_hit_per_million` (omitted → billed at the miss price, a conservative upper bound). Legacy rows fall back to run-level totals at `model_name`; unpriced models yield `cost: null` and cost fields are null when no pricing is configured |
-| **Ansich** (`/api/ansich`) | Admin-only developer/operator Agent observability, gated by startup-only `ansich.enabled`. `GET /tasks` supports control/time filters and opaque keyset cursors; `GET /tasks/{id}` returns the evidence-backed ControlBelief; `GET /tasks/{id}/timeline` returns lifecycle Observations in ingest order; `GET /health` remains process-local and readable when SQL storage is unavailable. Task queries return 503 with the same projection health summary when storage is unavailable. |
+| **Ansich** (`/api/ansich`) | Admin-only developer/operator Agent observability, gated by startup-only `ansich.enabled`. Task reads include evidence-backed ControlBelief, a cursor-paged lifecycle/Step/system-operation timeline, logical Steps with physical LLM retry attempts, and ordered adapter-visible ContextSnapshot inventory. Raw ContentBlock bodies use a separate logged admin endpoint. `GET /health` remains process-local and readable when SQL storage is unavailable; projection reads return 503 with the same health summary when storage is unavailable. |
 | **MCP** (`/api/mcp`) | `GET /config` - get config; `PUT /config` - update config (saves to extensions_config.json) |
 | **Skills** (`/api/skills`) | `GET /` - list skills; `GET /{name}` - details; `PUT /{name}` - update enabled; `POST /install` - install from .skill archive (accepts standard optional frontmatter like `version`, `author`, `compatibility`) |
 | **Memory** (`/api/memory`) | `GET /` - memory data; `POST /reload` - force reload; `GET /config` - config; `GET /status` - config + data |
@@ -346,6 +346,13 @@ commits Observation plus `task-structural@1`/`task-control@1` jobs, and a
 separate leased projector loop builds Task, Scope, Relation, Transition, Belief,
 and Task-summary projections. Projection failures never roll back the raw
 Observation; they create projection-error rows and degrade Ansich health.
+Phase 2 model probes separate logical decisions from adapter attempts: retry
+adds an attempt under the same Step, while title/summarization/memory/goal and
+other internal calls are system operations and never consume `step_seq`. The
+memory operation context is carried across its debounce worker thread. Context
+inventory preserves message/Tool-schema order but excludes raw bodies; canonical
+JSON above `ansich.inline_payload_max_bytes` is stored in `ansich_payloads` and
+loaded only through the logged admin raw-payload route.
 `database.backend: memory` cannot provide durable Ansich storage and therefore
 surfaces `status=failed` without preventing Agent runs. See
 `ansich/docs/ansich-design-document.md` and `ansich/docs/plans/`.
@@ -678,6 +685,7 @@ This invokes `alembic revision --autogenerate` against the live ORM models. Revi
 - `migrations/versions/0001_baseline.py` — chain root, matches the schema `create_all` produces from `Base.metadata`
 - `migrations/versions/0002_runs_token_usage.py` — fixes issue #3682
 - `migrations/versions/0006_ansich_task_core.py` — Ansich Observation/job zone and rebuildable Phase 1 Task/Scope/Belief projections
+- `migrations/versions/0007_ansich_steps_and_context.py` — Ansich logical Steps, physical LLM attempts, and ordered request-context snapshots
 - `persistence/bootstrap.py` — `bootstrap_schema(engine, backend=...)`, the three-branch decision + locking
 - Tests: `tests/test_persistence_bootstrap.py` (branches), `tests/test_persistence_bootstrap_concurrency.py` (concurrency), `tests/test_persistence_bootstrap_regression.py` (issue #3682), `tests/test_persistence_migrations_env.py` (filter), `tests/blocking_io/test_persistence_bootstrap.py` (asyncio.to_thread anchor)
 

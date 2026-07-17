@@ -15,9 +15,12 @@ import {
   CardTitle,
 } from "@/components/ui/card";
 import { Skeleton } from "@/components/ui/skeleton";
+import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import {
+  AnsichContextPanel,
   AnsichObservationTimeline,
   AnsichProjectionHealth,
+  AnsichStepsPanel,
   AnsichStatusBadge,
 } from "@/components/workspace/ansich";
 import {
@@ -93,70 +96,84 @@ export default function AnsichTaskDetailPage() {
 
               {health && <AnsichProjectionHealth health={health} />}
 
-              <Card>
-                <CardHeader>
-                  <CardTitle>{t.ansich.currentBelief}</CardTitle>
-                  <CardDescription>
-                    {t.ansich.asOf}:{" "}
-                    {formatAnsichTimestamp(task.control.as_of, locale)}
-                  </CardDescription>
-                </CardHeader>
-                <CardContent className="grid gap-5 text-sm sm:grid-cols-2">
-                  <BeliefField
-                    label={t.ansich.control}
-                    value={t.ansich.status[task.control.value]}
-                  />
-                  <BeliefField
-                    label={t.ansich.fidelity}
-                    value={task.control.fidelity_class}
-                    mono
-                  />
-                  <BeliefField
-                    label={t.ansich.source}
-                    value={`${task.control.source.name}@${task.control.source.version}`}
-                    mono
-                  />
-                  <BeliefField
-                    label={t.ansich.resolver}
-                    value={`${task.control.selected_by.name}@${task.control.selected_by.version}`}
-                    mono
-                  />
-                  <div className="sm:col-span-2">
-                    <div className="text-muted-foreground mb-2 text-xs">
-                      {t.ansich.evidence}
-                    </div>
-                    <div className="flex flex-wrap gap-2">
-                      {task.control.evidence_obs_ids.map((obsId) => (
-                        <code
-                          key={obsId}
-                          className="bg-muted rounded px-2 py-1 text-xs"
-                        >
-                          {obsId}
-                        </code>
-                      ))}
-                    </div>
-                  </div>
-                </CardContent>
-              </Card>
+              <Tabs defaultValue="overview" className="space-y-4">
+                <TabsList className="h-auto flex-wrap">
+                  <TabsTrigger value="overview">
+                    {t.ansich.overview}
+                  </TabsTrigger>
+                  <TabsTrigger value="timeline">
+                    {t.ansich.timeline}
+                  </TabsTrigger>
+                  <TabsTrigger value="steps">{t.ansich.steps}</TabsTrigger>
+                  <TabsTrigger value="context">{t.ansich.context}</TabsTrigger>
+                </TabsList>
 
-              <section
-                aria-labelledby="ansich-timeline-title"
-                className="space-y-3"
-              >
-                <h2
-                  id="ansich-timeline-title"
-                  className="text-lg font-semibold"
-                >
-                  {t.ansich.timeline}
-                </h2>
-                {timelineQuery.isPending ? (
-                  <Skeleton className="h-48 w-full" />
-                ) : (
-                  <AnsichObservationTimeline
-                    observations={timelineQuery.data?.items ?? []}
-                  />
-                )}
-              </section>
+                <TabsContent value="overview">
+                  <Card>
+                    <CardHeader>
+                      <CardTitle>{t.ansich.currentBelief}</CardTitle>
+                      <CardDescription>
+                        {t.ansich.asOf}:{" "}
+                        {formatAnsichTimestamp(task.control.as_of, locale)}
+                      </CardDescription>
+                    </CardHeader>
+                    <CardContent className="grid gap-5 text-sm sm:grid-cols-2">
+                      <BeliefField
+                        label={t.ansich.control}
+                        value={t.ansich.status[task.control.value]}
+                      />
+                      <BeliefField
+                        label={t.ansich.fidelity}
+                        value={task.control.fidelity_class}
+                        mono
+                      />
+                      <BeliefField
+                        label={t.ansich.source}
+                        value={`${task.control.source.name}@${task.control.source.version}`}
+                        mono
+                      />
+                      <BeliefField
+                        label={t.ansich.resolver}
+                        value={`${task.control.selected_by.name}@${task.control.selected_by.version}`}
+                        mono
+                      />
+                      <div className="sm:col-span-2">
+                        <div className="text-muted-foreground mb-2 text-xs">
+                          {t.ansich.evidence}
+                        </div>
+                        <div className="flex flex-wrap gap-2">
+                          {task.control.evidence_obs_ids.map((obsId) => (
+                            <code
+                              key={obsId}
+                              className="bg-muted rounded px-2 py-1 text-xs"
+                            >
+                              {obsId}
+                            </code>
+                          ))}
+                        </div>
+                      </div>
+                    </CardContent>
+                  </Card>
+                </TabsContent>
+
+                <TabsContent value="timeline" className="space-y-3">
+                  {timelineQuery.isPending ? (
+                    <Skeleton className="h-48 w-full" />
+                  ) : (
+                    <AnsichObservationTimeline
+                      observations={timelineQuery.data?.items ?? []}
+                    />
+                  )}
+                </TabsContent>
+
+                <TabsContent value="steps">
+                  <AnsichStepsPanel taskId={taskId} />
+                </TabsContent>
+
+                <TabsContent value="context">
+                  <AnsichContextPanel taskId={taskId} />
+                </TabsContent>
+              </Tabs>
             </>
           )}
         </div>

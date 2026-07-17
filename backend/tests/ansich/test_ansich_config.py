@@ -18,6 +18,7 @@ def test_ansich_is_disabled_by_default_with_bounded_runtime_settings():
     assert config.projector_poll_interval_ms == 250
     assert config.projector_lease_seconds == 30
     assert config.projector_max_attempts == 5
+    assert config.inline_payload_max_bytes == 65_536
 
 
 @pytest.mark.anyio

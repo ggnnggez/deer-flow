@@ -785,6 +785,7 @@ class MemoryUpdater:
         reinforcement_detected: bool = False,
         user_id: str | None = None,
         trace_id: str | None = None,
+        observability_context: Any | None = None,
     ) -> bool:
         """Update memory asynchronously by delegating to the sync path.
 
@@ -803,6 +804,7 @@ class MemoryUpdater:
             reinforcement_detected=reinforcement_detected,
             user_id=user_id,
             trace_id=trace_id,
+            observability_context=observability_context,
         )
 
     def _do_update_memory_sync(
@@ -814,6 +816,7 @@ class MemoryUpdater:
         reinforcement_detected: bool = False,
         user_id: str | None = None,
         trace_id: str | None = None,
+        observability_context: Any | None = None,
     ) -> bool:
         """Pure-sync memory update; bind ``trace_id`` into the request-trace
         ContextVar for the worker thread, then delegate to the impl.
@@ -837,6 +840,7 @@ class MemoryUpdater:
                     reinforcement_detected=reinforcement_detected,
                     user_id=user_id,
                     trace_id=trace_id,
+                    observability_context=observability_context,
                 )
         return self._do_update_memory_sync_impl(
             messages=messages,
@@ -846,6 +850,7 @@ class MemoryUpdater:
             reinforcement_detected=reinforcement_detected,
             user_id=user_id,
             trace_id=trace_id,
+            observability_context=observability_context,
         )
 
     def _do_update_memory_sync_impl(
@@ -857,6 +862,7 @@ class MemoryUpdater:
         reinforcement_detected: bool = False,
         user_id: str | None = None,
         trace_id: str | None = None,
+        observability_context: Any | None = None,
     ) -> bool:
         """Pure-sync memory update using ``model.invoke()``.
 
@@ -895,7 +901,15 @@ class MemoryUpdater:
                     model_name=model_name,
                 )
             logger.info("Invoking memory-update LLM (thread=%s trace_id=%s)", thread_id, trace_id)
-            response = model.invoke(prompt, config=invoke_config)
+            if self._config.model_invoke_callback is not None:
+                response = self._config.model_invoke_callback(
+                    model,
+                    prompt,
+                    config=invoke_config,
+                    observability_context=observability_context,
+                )
+            else:
+                response = model.invoke(prompt, config=invoke_config)
             return self._finalize_update(
                 current_memory=current_memory,
                 response_content=response.content,
@@ -919,6 +933,7 @@ class MemoryUpdater:
         reinforcement_detected: bool = False,
         user_id: str | None = None,
         trace_id: str | None = None,
+        observability_context: Any | None = None,
     ) -> bool:
         """Synchronously update memory using the sync LLM path.
 
@@ -958,6 +973,7 @@ class MemoryUpdater:
                     reinforcement_detected=reinforcement_detected,
                     user_id=user_id,
                     trace_id=trace_id,
+                    observability_context=observability_context,
                 )
                 return future.result()
             except Exception:
@@ -972,6 +988,7 @@ class MemoryUpdater:
             reinforcement_detected=reinforcement_detected,
             user_id=user_id,
             trace_id=trace_id,
+            observability_context=observability_context,
         )
 
     def _apply_updates(

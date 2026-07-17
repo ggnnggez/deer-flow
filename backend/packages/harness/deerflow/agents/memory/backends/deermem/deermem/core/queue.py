@@ -27,6 +27,7 @@ class ConversationContext:
     agent_name: str | None = None
     user_id: str | None = None
     trace_id: str | None = None
+    observability_context: Any | None = None
     correction_detected: bool = False
     reinforcement_detected: bool = False
 
@@ -70,6 +71,7 @@ class MemoryUpdateQueue:
         agent_name: str | None = None,
         user_id: str | None = None,
         trace_id: str | None = None,
+        observability_context: Any | None = None,
         correction_detected: bool = False,
         reinforcement_detected: bool = False,
     ) -> None:
@@ -94,6 +96,7 @@ class MemoryUpdateQueue:
                 agent_name=agent_name,
                 user_id=user_id,
                 trace_id=trace_id,
+                observability_context=observability_context,
                 correction_detected=correction_detected,
                 reinforcement_detected=reinforcement_detected,
             )
@@ -108,6 +111,7 @@ class MemoryUpdateQueue:
         agent_name: str | None = None,
         user_id: str | None = None,
         trace_id: str | None = None,
+        observability_context: Any | None = None,
         correction_detected: bool = False,
         reinforcement_detected: bool = False,
     ) -> None:
@@ -119,6 +123,7 @@ class MemoryUpdateQueue:
                 agent_name=agent_name,
                 user_id=user_id,
                 trace_id=trace_id,
+                observability_context=observability_context,
                 correction_detected=correction_detected,
                 reinforcement_detected=reinforcement_detected,
             )
@@ -134,6 +139,7 @@ class MemoryUpdateQueue:
         agent_name: str | None,
         user_id: str | None,
         trace_id: str | None,
+        observability_context: Any | None,
         correction_detected: bool,
         reinforcement_detected: bool,
     ) -> None:
@@ -150,6 +156,7 @@ class MemoryUpdateQueue:
             agent_name=agent_name,
             user_id=user_id,
             trace_id=trace_id,
+            observability_context=observability_context,
             correction_detected=merged_correction_detected,
             reinforcement_detected=merged_reinforcement_detected,
         )
@@ -213,14 +220,19 @@ class MemoryUpdateQueue:
             for context in contexts_to_process:
                 try:
                     logger.info("Updating memory for thread %s (trace_id=%s)", context.thread_id, context.trace_id)
+                    update_kwargs = {
+                        "messages": context.messages,
+                        "thread_id": context.thread_id,
+                        "agent_name": context.agent_name,
+                        "correction_detected": context.correction_detected,
+                        "reinforcement_detected": context.reinforcement_detected,
+                        "user_id": context.user_id,
+                        "trace_id": context.trace_id,
+                    }
+                    if context.observability_context is not None:
+                        update_kwargs["observability_context"] = context.observability_context
                     success = self._updater.update_memory(
-                        messages=context.messages,
-                        thread_id=context.thread_id,
-                        agent_name=context.agent_name,
-                        correction_detected=context.correction_detected,
-                        reinforcement_detected=context.reinforcement_detected,
-                        user_id=context.user_id,
-                        trace_id=context.trace_id,
+                        **update_kwargs,
                     )
                     if success:
                         succeeded += 1

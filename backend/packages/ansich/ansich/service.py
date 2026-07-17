@@ -8,6 +8,7 @@ from threading import Lock
 from ansich.backend import AnsichBackend
 from ansich.contracts import AnsichHealth, ControlValue, FlushResult, LostRange, ObservationEnvelope, Producer, RecordReceipt, TaskView
 from ansich.memory import InMemoryAnsichBackend
+from ansich.step import ContentBlockPayloadView, ContextSnapshotView, LlmAttemptView, StepView
 
 
 class AnsichService:
@@ -198,6 +199,36 @@ class AnsichService:
 
     async def list_observations(self, task_id: str) -> list[ObservationEnvelope]:
         return await self._backend.list_observations(task_id)
+
+    async def list_timeline(
+        self,
+        task_id: str,
+        *,
+        limit: int,
+        cursor: tuple[datetime, int] | None = None,
+    ) -> list[tuple[int, ObservationEnvelope]]:
+        return await self._backend.list_timeline(task_id, limit=limit, cursor=cursor)
+
+    async def get_max_step_seq(self, task_id: str) -> int:
+        get_max = getattr(self._backend, "get_max_step_seq", None)
+        if not callable(get_max):
+            return 0
+        return max(0, int(await get_max(task_id)))
+
+    async def list_steps(self, task_id: str) -> list[StepView]:
+        return await self._backend.list_steps(task_id)
+
+    async def list_system_operations(self, task_id: str) -> list[LlmAttemptView]:
+        return await self._backend.list_system_operations(task_id)
+
+    async def get_step(self, step_id: str) -> StepView | None:
+        return await self._backend.get_step(step_id)
+
+    async def get_step_context(self, step_id: str) -> ContextSnapshotView | None:
+        return await self._backend.get_step_context(step_id)
+
+    async def get_content_block_payload(self, block_id: str) -> ContentBlockPayloadView | None:
+        return await self._backend.get_content_block_payload(block_id)
 
     async def rebuild_projections(self) -> int:
         rebuild = getattr(self._backend, "rebuild_projections", None)

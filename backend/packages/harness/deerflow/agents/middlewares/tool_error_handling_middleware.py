@@ -156,6 +156,7 @@ def _build_runtime_middlewares(
     app_config: AppConfig,
     include_uploads: bool,
     include_dangling_tool_call_patch: bool,
+    ansich_actor_kind: str,
     lazy_init: bool = True,
 ) -> list[AgentMiddleware]:
     """Build shared base middlewares for agent execution."""
@@ -197,6 +198,10 @@ def _build_runtime_middlewares(
         from deerflow.agents.middlewares.dangling_tool_call_middleware import DanglingToolCallMiddleware
 
         tail.append(DanglingToolCallMiddleware())
+    if app_config.ansich.enabled:
+        from deerflow.ansich.middleware import AnsichDecisionMiddleware
+
+        tail.append(AnsichDecisionMiddleware(actor_kind=ansich_actor_kind))
     tail.append(LLMErrorHandlingMiddleware(app_config=app_config))
 
     # Guardrail middleware (if configured)
@@ -270,6 +275,7 @@ def build_lead_runtime_middlewares(*, app_config: AppConfig, lazy_init: bool = T
         app_config=app_config,
         include_uploads=True,
         include_dangling_tool_call_patch=True,
+        ansich_actor_kind="lead_agent",
         lazy_init=lazy_init,
     )
 
@@ -293,6 +299,7 @@ def build_subagent_runtime_middlewares(
         app_config=app_config,
         include_uploads=False,
         include_dangling_tool_call_patch=True,
+        ansich_actor_kind="subagent",
         lazy_init=lazy_init,
     )
 
@@ -451,5 +458,10 @@ def build_subagent_runtime_middlewares(
     from deerflow.agents.middlewares.system_message_coalescing_middleware import SystemMessageCoalescingMiddleware
 
     middlewares.append(SystemMessageCoalescingMiddleware())
+
+    if app_config.ansich.enabled:
+        from deerflow.ansich.middleware import AnsichAttemptMiddleware
+
+        middlewares.append(AnsichAttemptMiddleware())
 
     return middlewares

@@ -413,6 +413,7 @@ class SubagentExecutor:
         is_internal: bool = False,
         authz_attributes: Mapping[str, Any] | None = None,
         deerflow_trace_id: str | None = None,
+        ansich_execution_context: Any | None = None,
     ):
         """Initialize the executor.
 
@@ -437,6 +438,8 @@ class SubagentExecutor:
                 the same run as the lead agent.
             deerflow_trace_id: DeerFlow request-level correlation id propagated
                 from the parent run for Langfuse metadata correlation.
+            ansich_execution_context: Parent Task-scoped allocator/collector;
+                subagent decisions share its monotonic Step sequence.
         """
         self.config = config
         self.app_config = app_config
@@ -469,6 +472,7 @@ class SubagentExecutor:
         self.is_internal = is_internal
         self.authz_attributes = normalize_authz_attributes(authz_attributes)
         self.deerflow_trace_id = deerflow_trace_id
+        self.ansich_execution_context = ansich_execution_context
 
         self._base_tools = _filter_tools(
             tools,
@@ -497,7 +501,13 @@ class SubagentExecutor:
         app_config = self.app_config or get_app_config()
         if self.model_name is None:
             self.model_name = resolve_subagent_model_name(self.config, self.parent_model, app_config=app_config)
-        model = create_chat_model(name=self.model_name, thinking_enabled=False, app_config=app_config, attach_tracing=False)
+        model = create_chat_model(
+            name=self.model_name,
+            thinking_enabled=False,
+            app_config=app_config,
+            attach_tracing=False,
+            ansich_call_class="subagent",
+        )
 
         from deerflow.agents.middlewares.tool_error_handling_middleware import build_subagent_runtime_middlewares
 
@@ -800,6 +810,10 @@ class SubagentExecutor:
             if self.deerflow_trace_id:
                 context[DEERFLOW_TRACE_METADATA_KEY] = self.deerflow_trace_id
             context["is_subagent"] = True
+            if self.ansich_execution_context is not None:
+                from deerflow.ansich.execution import ANSICH_EXECUTION_CONTEXT_KEY
+
+                context[ANSICH_EXECUTION_CONTEXT_KEY] = self.ansich_execution_context
 
             logger.info(f"[trace={self.trace_id}] Subagent {self.config.name} starting async execution with max_turns={self.config.max_turns}")
 

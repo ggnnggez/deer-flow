@@ -16,6 +16,7 @@ from langgraph.graph.message import REMOVE_ALL_MESSAGES
 from langgraph.runtime import Runtime
 
 from deerflow.agents.middlewares.dynamic_context_middleware import is_dynamic_context_reminder
+from deerflow.ansich.middleware import execution_context_from_runtime, observe_system_model_ainvoke, observe_system_model_invoke
 from deerflow.config.app_config import get_app_config
 from deerflow.models import create_chat_model
 
@@ -107,7 +108,13 @@ class DeerFlowSummarizationMiddleware(SummarizationMiddleware):
     async def _acreate_summary(self, messages_to_summarize: list[AnyMessage]) -> str | None:
         return await self._asummarize_with(messages_to_summarize)
 
-    def _summarize_with(self, messages_to_summarize: list[AnyMessage], previous_summary: str | None = None) -> str | None:
+    def _summarize_with(
+        self,
+        messages_to_summarize: list[AnyMessage],
+        previous_summary: str | None = None,
+        *,
+        runtime: Runtime | None = None,
+    ) -> str | None:
         """Mirror the parent ``_create_summary`` but invoke the nostream-tagged model.
 
         We do not swap ``self.model`` at the instance level: the agent/middleware is
@@ -121,16 +128,26 @@ class DeerFlowSummarizationMiddleware(SummarizationMiddleware):
         if prompt is None:
             return "Previous conversation was too long to summarize."
         try:
-            response = self._summary_model.invoke(
+            response = observe_system_model_invoke(
+                self._summary_model,
                 prompt,
+                execution=execution_context_from_runtime(runtime),
+                operation_kind="summarization",
                 config={"metadata": {"lc_source": "summarization"}},
+                runtime_context=None if runtime is None else runtime.context,
             )
             return response.text.strip()
         except Exception:
             logger.exception("Summary generation failed; skipping compaction this turn")
             return None
 
-    async def _asummarize_with(self, messages_to_summarize: list[AnyMessage], previous_summary: str | None = None) -> str | None:
+    async def _asummarize_with(
+        self,
+        messages_to_summarize: list[AnyMessage],
+        previous_summary: str | None = None,
+        *,
+        runtime: Runtime | None = None,
+    ) -> str | None:
         """Async counterpart of :meth:`_summarize_with` using the nostream model."""
         if not messages_to_summarize:
             return "No previous conversation history."
@@ -138,9 +155,13 @@ class DeerFlowSummarizationMiddleware(SummarizationMiddleware):
         if prompt is None:
             return "Previous conversation was too long to summarize."
         try:
-            response = await self._summary_model.ainvoke(
+            response = await observe_system_model_ainvoke(
+                self._summary_model,
                 prompt,
+                execution=execution_context_from_runtime(runtime),
+                operation_kind="summarization",
                 config={"metadata": {"lc_source": "summarization"}},
+                runtime_context=None if runtime is None else runtime.context,
             )
             return response.text.strip()
         except Exception:
@@ -309,7 +330,7 @@ class DeerFlowSummarizationMiddleware(SummarizationMiddleware):
             return None
         messages_to_summarize, preserved_messages, previous_summary, total_tokens = prepared
         self._fire_hooks(messages_to_summarize, preserved_messages, runtime)
-        summary = self._summarize_with(messages_to_summarize, previous_summary=previous_summary)
+        summary = self._summarize_with(messages_to_summarize, previous_summary=previous_summary, runtime=runtime)
         if summary is None:
             return None
         return ContextCompactionResult(
@@ -331,7 +352,7 @@ class DeerFlowSummarizationMiddleware(SummarizationMiddleware):
             return None
         messages_to_summarize, preserved_messages, previous_summary, total_tokens = prepared
         self._fire_hooks(messages_to_summarize, preserved_messages, runtime)
-        summary = await self._asummarize_with(messages_to_summarize, previous_summary=previous_summary)
+        summary = await self._asummarize_with(messages_to_summarize, previous_summary=previous_summary, runtime=runtime)
         if summary is None:
             return None
         return ContextCompactionResult(
@@ -483,12 +504,16 @@ def create_summarization_middleware(
             thinking_enabled=False,
             app_config=resolved_app_config,
             attach_tracing=False,
+            ansich_call_class="system_operation",
+            ansich_operation_kind="summarization",
         )
     else:
         model = create_chat_model(
             thinking_enabled=False,
             app_config=resolved_app_config,
             attach_tracing=False,
+            ansich_call_class="system_operation",
+            ansich_operation_kind="summarization",
         )
     model = model.with_config(tags=["middleware:summarize"])
 

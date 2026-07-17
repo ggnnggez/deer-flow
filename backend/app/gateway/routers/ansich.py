@@ -1,6 +1,7 @@
 import base64
 import binascii
 import json
+import logging
 from datetime import datetime
 
 from ansich.contracts import ControlValue
@@ -10,6 +11,7 @@ from app.gateway.deps import require_admin_user
 
 router = APIRouter(prefix="/api/ansich", tags=["ansich"])
 _ADMIN_REQUIRED = "Ansich developer/operator observability requires an admin account."
+logger = logging.getLogger(__name__)
 
 
 def _service_or_503(request: Request):
@@ -54,6 +56,27 @@ def _decode_cursor(value: str | None) -> tuple[datetime, str] | None:
         return as_of, decoded[1]
     except (binascii.Error, ValueError, UnicodeDecodeError, json.JSONDecodeError) as exc:
         raise HTTPException(status_code=422, detail="Invalid Ansich task cursor") from exc
+
+
+def _encode_timeline_cursor(occurred_at: datetime, ingest_seq: int) -> str:
+    payload = json.dumps([occurred_at.isoformat(), ingest_seq], separators=(",", ":")).encode()
+    return base64.urlsafe_b64encode(payload).decode().rstrip("=")
+
+
+def _decode_timeline_cursor(value: str | None) -> tuple[datetime, int] | None:
+    if value is None:
+        return None
+    try:
+        padded = value + "=" * (-len(value) % 4)
+        decoded = json.loads(base64.urlsafe_b64decode(padded).decode())
+        if not isinstance(decoded, list) or len(decoded) != 2 or not isinstance(decoded[0], str) or not isinstance(decoded[1], int) or decoded[1] < 1:
+            raise ValueError
+        occurred_at = datetime.fromisoformat(decoded[0])
+        if occurred_at.tzinfo is None:
+            raise ValueError
+        return occurred_at, decoded[1]
+    except (binascii.Error, ValueError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise HTTPException(status_code=422, detail="Invalid Ansich timeline cursor") from exc
 
 
 @router.get("/tasks")
@@ -121,7 +144,12 @@ async def get_task(task_id: str, request: Request) -> dict:
 
 
 @router.get("/tasks/{task_id}/timeline")
-async def get_task_timeline(task_id: str, request: Request) -> dict:
+async def get_task_timeline(
+    task_id: str,
+    request: Request,
+    limit: int = Query(default=200, ge=1, le=500),
+    cursor: str | None = Query(default=None),
+) -> dict:
     await require_admin_user(request, detail=_ADMIN_REQUIRED)
     service = _service_or_503(request)
     _ensure_queryable(service)
@@ -135,16 +163,115 @@ async def get_task_timeline(task_id: str, request: Request) -> dict:
     if task is None:
         raise HTTPException(status_code=404, detail="Ansich Task not found")
     try:
-        observations = await service.list_observations(task_id)
+        observations = await service.list_timeline(
+            task_id,
+            limit=limit + 1,
+            cursor=_decode_timeline_cursor(cursor),
+        )
     except Exception as exc:
         raise HTTPException(
             status_code=503,
             detail={"message": "Ansich timeline query failed", "projection_status": _projection_status(service)},
         ) from exc
+    page = observations[:limit]
+    next_cursor = None
+    if len(observations) > limit and page:
+        last_seq, last_observation = page[-1]
+        next_cursor = _encode_timeline_cursor(last_observation.occurred_at, last_seq)
     return {
-        "items": [observation.model_dump(mode="json") for observation in observations],
+        "items": [{"ingest_seq": ingest_seq, **observation.model_dump(mode="json")} for ingest_seq, observation in page],
+        "next_cursor": next_cursor,
         "projection_status": _projection_status(service),
     }
+
+
+@router.get("/tasks/{task_id}/steps")
+async def list_task_steps(task_id: str, request: Request) -> dict:
+    await require_admin_user(request, detail=_ADMIN_REQUIRED)
+    service = _service_or_503(request)
+    _ensure_queryable(service)
+    try:
+        task = await service.get_task(task_id)
+        if task is None:
+            raise HTTPException(status_code=404, detail="Ansich Task not found")
+        steps = await service.list_steps(task_id)
+        system_operations = await service.list_system_operations(task_id)
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise HTTPException(
+            status_code=503,
+            detail={"message": "Ansich Step query failed", "projection_status": _projection_status(service)},
+        ) from exc
+    return {
+        "items": [step.model_dump(mode="json") for step in steps],
+        "system_operations": [operation.model_dump(mode="json") for operation in system_operations],
+        "projection_status": _projection_status(service),
+    }
+
+
+@router.get("/steps/{step_id}")
+async def get_step(step_id: str, request: Request) -> dict:
+    await require_admin_user(request, detail=_ADMIN_REQUIRED)
+    service = _service_or_503(request)
+    _ensure_queryable(service)
+    try:
+        step = await service.get_step(step_id)
+    except Exception as exc:
+        raise HTTPException(
+            status_code=503,
+            detail={"message": "Ansich Step query failed", "projection_status": _projection_status(service)},
+        ) from exc
+    if step is None:
+        raise HTTPException(status_code=404, detail="Ansich Step not found")
+    return {"step": step.model_dump(mode="json"), "projection_status": _projection_status(service)}
+
+
+@router.get("/steps/{step_id}/context")
+async def get_step_context(step_id: str, request: Request) -> dict:
+    await require_admin_user(request, detail=_ADMIN_REQUIRED)
+    service = _service_or_503(request)
+    _ensure_queryable(service)
+    try:
+        step = await service.get_step(step_id)
+        if step is None:
+            raise HTTPException(status_code=404, detail="Ansich Step not found")
+        context = await service.get_step_context(step_id)
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise HTTPException(
+            status_code=503,
+            detail={"message": "Ansich Context query failed", "projection_status": _projection_status(service)},
+        ) from exc
+    if context is None:
+        raise HTTPException(status_code=404, detail="Ansich effective ContextSnapshot not found")
+    return {"context": context.model_dump(mode="json"), "projection_status": _projection_status(service)}
+
+
+@router.get("/content-blocks/{block_id}/payload")
+async def get_content_block_payload(block_id: str, request: Request) -> dict:
+    await require_admin_user(request, detail=_ADMIN_REQUIRED)
+    service = _service_or_503(request)
+    _ensure_queryable(service)
+    try:
+        payload = await service.get_content_block_payload(block_id)
+    except Exception as exc:
+        raise HTTPException(
+            status_code=503,
+            detail={"message": "Ansich raw payload query failed", "projection_status": _projection_status(service)},
+        ) from exc
+    if payload is None:
+        raise HTTPException(status_code=404, detail="Ansich ContentBlock payload not found")
+    user = getattr(request.state, "user", None)
+    logger.info(
+        "Ansich raw content payload accessed",
+        extra={
+            "ansich_block_id": block_id,
+            "ansich_actor_id": str(getattr(user, "id", "unknown")),
+        },
+    )
+    return {"payload": payload.model_dump(mode="json")}
 
 
 @router.get("/health")

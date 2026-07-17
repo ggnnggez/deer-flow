@@ -413,6 +413,14 @@ def build_middlewares(
     if safety_config.enabled:
         middlewares.append(SafetyFinishReasonMiddleware.from_config(safety_config))
 
+    # Ansich's physical-attempt probe is the innermost model-call wrapper. It
+    # observes the final request after every request-transform middleware and
+    # is re-entered by both provider retries and terminal-response retries.
+    if resolved_app_config.ansich.enabled:
+        from deerflow.ansich.middleware import AnsichAttemptMiddleware
+
+        middlewares.append(AnsichAttemptMiddleware())
+
     # ClarificationMiddleware should always be last
     middlewares.append(ClarificationMiddleware())
     return middlewares
@@ -567,7 +575,13 @@ def _make_lead_agent(config: RunnableConfig, *, app_config: AppConfig):
         if should_use_memory_tools(resolved_app_config.memory):
             _append_memory_tools_without_name_conflicts(final_tools)
         return create_agent(
-            model=create_chat_model(name=model_name, thinking_enabled=thinking_enabled, app_config=resolved_app_config, attach_tracing=False),
+            model=create_chat_model(
+                name=model_name,
+                thinking_enabled=thinking_enabled,
+                app_config=resolved_app_config,
+                attach_tracing=False,
+                ansich_call_class="lead_agent",
+            ),
             tools=final_tools,
             middleware=build_middlewares(
                 config,
@@ -634,7 +648,14 @@ def _make_lead_agent(config: RunnableConfig, *, app_config: AppConfig):
     if should_use_memory_tools(resolved_app_config.memory):
         _append_memory_tools_without_name_conflicts(final_tools)
     return create_agent(
-        model=create_chat_model(name=model_name, thinking_enabled=thinking_enabled, reasoning_effort=reasoning_effort, app_config=resolved_app_config, attach_tracing=False),
+        model=create_chat_model(
+            name=model_name,
+            thinking_enabled=thinking_enabled,
+            reasoning_effort=reasoning_effort,
+            app_config=resolved_app_config,
+            attach_tracing=False,
+            ansich_call_class="lead_agent",
+        ),
         tools=final_tools,
         middleware=build_middlewares(
             config,

@@ -1,27 +1,48 @@
 from __future__ import annotations
 
+import hashlib
+import json
 from datetime import UTC, datetime, timedelta
 from typing import cast
 from uuid import uuid4
 
-from ansich import ControlBelief, NamedVersion, ObservationEnvelope, Producer, TaskView, new_id
+from ansich import (
+    ContentBlockPayloadView,
+    ContextSnapshotItemView,
+    ContextSnapshotView,
+    ControlBelief,
+    LlmAttemptView,
+    NamedVersion,
+    ObservationEnvelope,
+    Producer,
+    StepView,
+    TaskView,
+    new_id,
+)
 from ansich.contracts import ControlValue
 from ansich.control import should_select_control_candidate
-from sqlalchemy import and_, case, delete, or_, select, update
+from sqlalchemy import and_, case, delete, func, or_, select, update
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from deerflow.ansich.persistence.models import (
     AnsichBeliefAssertionRow,
     AnsichBeliefEvidenceRow,
+    AnsichContentBlockRow,
+    AnsichContextSnapshotItemRow,
+    AnsichContextSnapshotRow,
+    AnsichContextWindowRow,
     AnsichCurrentBeliefRow,
     AnsichEntityRow,
+    AnsichLlmAttemptRow,
     AnsichObservationRow,
+    AnsichPayloadRow,
     AnsichProjectionErrorRow,
     AnsichProjectionJobRow,
     AnsichProjectorVersionRow,
     AnsichRelationEvidenceRow,
     AnsichRelationRow,
     AnsichScopeRow,
+    AnsichStepRow,
     AnsichTaskRow,
     AnsichTaskSummaryRow,
     AnsichTransitionRow,
@@ -38,7 +59,7 @@ _CONTROL_BY_KIND = {
 #: structural projections must land before belief/control projections, and
 #: future projectors (e.g. Phase 2 steps) run after both. Claim ordering
 #: derives from this tuple — never from projector_name collation.
-_PROJECTORS = (("task-structural", "1"), ("task-control", "1"))
+_PROJECTORS = (("task-structural", "1"), ("task-control", "1"), ("task-step", "1"))
 
 
 def _projector_priority_expression():
@@ -59,10 +80,12 @@ class SqlAnsichBackend:
         *,
         projector_lease_seconds: int = 30,
         projector_max_attempts: int = 5,
+        inline_payload_max_bytes: int = 65_536,
     ) -> None:
         self._session_factory = session_factory
         self._projector_lease_seconds = projector_lease_seconds
         self._projector_max_attempts = projector_max_attempts
+        self._inline_payload_max_bytes = inline_payload_max_bytes
         self._lease_owner = str(uuid4())
         self._watermark: int | None = None
         self._failed_jobs = 0
@@ -87,6 +110,29 @@ class SqlAnsichBackend:
                 )
                 if existing_obs is not None:
                     continue
+                payload_json = observation.payload
+                payload_ref_id = observation.payload_ref_id
+                if payload_json is not None:
+                    encoded_payload = json.dumps(
+                        payload_json,
+                        ensure_ascii=False,
+                        separators=(",", ":"),
+                        sort_keys=True,
+                    ).encode("utf-8")
+                    if len(encoded_payload) > self._inline_payload_max_bytes:
+                        payload_ref_id = new_id()
+                        session.add(
+                            AnsichPayloadRow(
+                                payload_id=payload_ref_id,
+                                content_type="application/json",
+                                encoding="utf-8",
+                                compression="none",
+                                byte_size=len(encoded_payload),
+                                sha256=hashlib.sha256(encoded_payload).hexdigest(),
+                                body=encoded_payload,
+                            )
+                        )
+                        payload_json = None
                 session.add(
                     AnsichObservationRow(
                         obs_id=observation.obs_id,
@@ -95,6 +141,7 @@ class SqlAnsichBackend:
                         occurred_at=observation.occurred_at,
                         recorded_at=observation.recorded_at,
                         task_id=observation.task_id,
+                        step_id=observation.step_id,
                         subject_type=observation.subject_type,
                         subject_id=observation.subject_id,
                         fidelity_class=observation.fidelity_class,
@@ -105,8 +152,8 @@ class SqlAnsichBackend:
                         source_event_id=observation.source_event_id,
                         correlation_id=observation.correlation_id,
                         causation_obs_id=observation.causation_obs_id,
-                        payload_json=observation.payload,
-                        payload_ref_id=observation.payload_ref_id,
+                        payload_json=payload_json,
+                        payload_ref_id=payload_ref_id,
                     )
                 )
                 await session.flush()
@@ -147,6 +194,8 @@ class SqlAnsichBackend:
                         await self._project_structural(session, observation)
                     elif projector_name == "task-control":
                         await self._project_control(session, observation, ingest_seq=ingest_seq)
+                    elif projector_name == "task-step":
+                        await self._project_step(session, observation)
                     else:
                         raise ValueError(f"unknown Ansich projector: {projector_name}")
                     job = await session.get(AnsichProjectionJobRow, job_id)
@@ -200,6 +249,12 @@ class SqlAnsichBackend:
 
         async with self._session_factory() as session, session.begin():
             for model in (
+                AnsichContextSnapshotItemRow,
+                AnsichContextSnapshotRow,
+                AnsichContextWindowRow,
+                AnsichContentBlockRow,
+                AnsichLlmAttemptRow,
+                AnsichStepRow,
                 AnsichTaskSummaryRow,
                 AnsichCurrentBeliefRow,
                 AnsichBeliefEvidenceRow,
@@ -266,6 +321,14 @@ class SqlAnsichBackend:
             job.lease_owner = self._lease_owner
             job.lease_expires_at = now + timedelta(seconds=self._projector_lease_seconds)
             observation = self._observation_from_row(observation_row)
+            if observation.payload is None and observation.payload_ref_id is not None:
+                payload = await session.get(AnsichPayloadRow, observation.payload_ref_id)
+                if payload is None:
+                    raise RuntimeError(f"Ansich payload disappeared: {observation.payload_ref_id}")
+                decoded = json.loads(payload.body.decode(payload.encoding))
+                if not isinstance(decoded, dict):
+                    raise ValueError("Ansich projection payload must decode to an object")
+                observation = observation.model_copy(update={"payload": decoded, "payload_ref_id": None})
             return job.job_id, job.projector_name, observation, observation_row.ingest_seq, job.attempts
 
     async def _record_projection_error(self, job_id: str, attempt: int, exc: Exception) -> None:
@@ -395,6 +458,195 @@ class SqlAnsichBackend:
             rows = list((await session.execute(select(AnsichObservationRow).where(AnsichObservationRow.task_id == task_id).order_by(AnsichObservationRow.ingest_seq))).scalars())
         return [self._observation_from_row(row) for row in rows]
 
+    async def list_timeline(
+        self,
+        task_id: str,
+        *,
+        limit: int,
+        cursor: tuple[datetime, int] | None = None,
+    ) -> list[tuple[int, ObservationEnvelope]]:
+        statement = select(AnsichObservationRow).where(AnsichObservationRow.task_id == task_id)
+        if cursor is not None:
+            occurred_at, ingest_seq = cursor
+            statement = statement.where(
+                or_(
+                    AnsichObservationRow.occurred_at > occurred_at,
+                    and_(
+                        AnsichObservationRow.occurred_at == occurred_at,
+                        AnsichObservationRow.ingest_seq > ingest_seq,
+                    ),
+                )
+            )
+        async with self._session_factory() as session:
+            rows = list(
+                (
+                    await session.execute(
+                        statement.order_by(
+                            AnsichObservationRow.occurred_at,
+                            AnsichObservationRow.ingest_seq,
+                        ).limit(limit)
+                    )
+                ).scalars()
+            )
+        return [(row.ingest_seq, self._observation_from_row(row)) for row in rows]
+
+    async def get_max_step_seq(self, task_id: str) -> int:
+        async with self._session_factory() as session:
+            value = await session.scalar(select(func.max(AnsichStepRow.step_seq)).where(AnsichStepRow.task_id == task_id))
+        return int(value or 0)
+
+    async def list_steps(self, task_id: str) -> list[StepView]:
+        async with self._session_factory() as session:
+            rows = list((await session.execute(select(AnsichStepRow).where(AnsichStepRow.task_id == task_id).order_by(AnsichStepRow.step_seq))).scalars())
+            return [await self._step_view(session, row) for row in rows]
+
+    async def list_system_operations(self, task_id: str) -> list[LlmAttemptView]:
+        async with self._session_factory() as session:
+            rows = list(
+                (
+                    await session.execute(
+                        select(AnsichLlmAttemptRow)
+                        .where(
+                            AnsichLlmAttemptRow.task_id == task_id,
+                            AnsichLlmAttemptRow.step_id.is_(None),
+                        )
+                        .order_by(AnsichLlmAttemptRow.request_obs_id, AnsichLlmAttemptRow.attempt_no)
+                    )
+                ).scalars()
+            )
+            return [self._attempt_view(row) for row in rows]
+
+    async def get_step(self, step_id: str) -> StepView | None:
+        async with self._session_factory() as session:
+            row = await session.get(AnsichStepRow, step_id)
+            return None if row is None else await self._step_view(session, row)
+
+    async def get_step_context(self, step_id: str) -> ContextSnapshotView | None:
+        async with self._session_factory() as session:
+            step = await session.get(AnsichStepRow, step_id)
+            if step is None or step.effective_context_snapshot_id is None:
+                return None
+            snapshot = await session.get(AnsichContextSnapshotRow, step.effective_context_snapshot_id)
+            if snapshot is None:
+                return None
+            item_rows = list(
+                (
+                    await session.execute(
+                        select(AnsichContextSnapshotItemRow, AnsichContentBlockRow)
+                        .join(
+                            AnsichContentBlockRow,
+                            AnsichContentBlockRow.entity_id == AnsichContextSnapshotItemRow.content_block_id,
+                        )
+                        .where(AnsichContextSnapshotItemRow.snapshot_id == snapshot.entity_id)
+                        .order_by(AnsichContextSnapshotItemRow.ordinal)
+                    )
+                ).all()
+            )
+            items = tuple(
+                ContextSnapshotItemView(
+                    ordinal=item.ordinal,
+                    channel=item.channel,
+                    role=item.role,
+                    name=item.name,
+                    block_id=block.entity_id,
+                    kind=block.kind,
+                    content_hash=block.content_hash,
+                    visible_bytes=item.visible_bytes,
+                    estimated_tokens=item.estimated_tokens,
+                    metadata=item.metadata_json,
+                    sensitivity_flags=tuple(block.sensitivity_flags_json),
+                    payload_available=True,
+                )
+                for item, block in item_rows
+            )
+            return ContextSnapshotView(
+                snapshot_id=snapshot.entity_id,
+                task_id=snapshot.task_id,
+                step_id=snapshot.step_id,
+                operation_id=snapshot.operation_id,
+                attempt_no=snapshot.attempt_no,
+                request_obs_id=snapshot.request_obs_id,
+                message_count=snapshot.message_count,
+                tool_schema_count=snapshot.tool_schema_count,
+                visible_bytes=snapshot.visible_bytes,
+                estimated_tokens=snapshot.estimated_tokens,
+                estimator_name=snapshot.estimator_name,
+                estimator_version=snapshot.estimator_version,
+                adapter_name=snapshot.adapter_name,
+                adapter_version=snapshot.adapter_version,
+                configured_model=snapshot.configured_model,
+                response_format=snapshot.response_format_json,
+                generation_settings=snapshot.generation_settings_json,
+                redactions=tuple(snapshot.redactions_json),
+                warnings=tuple(snapshot.warnings_json),
+                items=items,
+            )
+
+    async def get_content_block_payload(self, block_id: str) -> ContentBlockPayloadView | None:
+        async with self._session_factory() as session:
+            block = await session.get(AnsichContentBlockRow, block_id)
+            if block is None:
+                return None
+            observation = await session.scalar(select(AnsichObservationRow).where(AnsichObservationRow.obs_id == block.payload_obs_id))
+            if observation is None or observation.payload_json is None or "body" not in observation.payload_json:
+                if observation is None or observation.payload_ref_id is None:
+                    return None
+                payload = await session.get(AnsichPayloadRow, observation.payload_ref_id)
+                if payload is None:
+                    return None
+                decoded = json.loads(payload.body.decode(payload.encoding))
+                if not isinstance(decoded, dict) or "body" not in decoded:
+                    return None
+                return ContentBlockPayloadView(block_id=block_id, body=decoded["body"])
+            return ContentBlockPayloadView(block_id=block_id, body=observation.payload_json["body"])
+
+    @staticmethod
+    async def _step_view(session: AsyncSession, step: AnsichStepRow) -> StepView:
+        attempt_rows = list((await session.execute(select(AnsichLlmAttemptRow).where(AnsichLlmAttemptRow.step_id == step.entity_id).order_by(AnsichLlmAttemptRow.attempt_no))).scalars())
+        attempts = tuple(
+            SqlAnsichBackend._attempt_view(
+                attempt,
+                effective=attempt.attempt_no == step.effective_attempt_no and attempt.status == "success",
+            )
+            for attempt in attempt_rows
+        )
+        return StepView(
+            step_id=step.entity_id,
+            task_id=step.task_id,
+            step_seq=step.step_seq,
+            actor_kind=step.actor_kind,
+            status=step.status,
+            result=step.result,
+            started_obs_id=step.started_obs_id,
+            closed_obs_id=step.closed_obs_id,
+            effective_attempt_no=step.effective_attempt_no,
+            effective_context_snapshot_id=step.effective_context_snapshot_id,
+            issued_tools=tuple(step.issued_tools_json),
+            attempts=attempts,
+        )
+
+    @staticmethod
+    def _attempt_view(attempt: AnsichLlmAttemptRow, *, effective: bool = False) -> LlmAttemptView:
+        return LlmAttemptView(
+            attempt_id=attempt.attempt_id,
+            task_id=attempt.task_id,
+            step_id=attempt.step_id,
+            actor_kind=attempt.actor_kind,
+            operation_id=attempt.operation_id,
+            operation_kind=attempt.operation_kind,
+            attempt_no=attempt.attempt_no,
+            status=attempt.status,
+            request_obs_id=attempt.request_obs_id,
+            response_obs_id=attempt.response_obs_id,
+            failure_obs_id=attempt.failure_obs_id,
+            provider_model=attempt.provider_model,
+            usage=dict((attempt.usage_json or {}).get("usage", {})),
+            response_metadata=dict((attempt.usage_json or {}).get("response_metadata", {})),
+            latency_ms=attempt.latency_ms,
+            context_snapshot_id=attempt.context_snapshot_id,
+            effective=effective,
+        )
+
     @staticmethod
     def _observation_from_row(row: AnsichObservationRow) -> ObservationEnvelope:
         return ObservationEnvelope(
@@ -404,6 +656,7 @@ class SqlAnsichBackend:
             occurred_at=_as_utc(row.occurred_at),
             recorded_at=_as_utc(row.recorded_at),
             task_id=row.task_id,
+            step_id=row.step_id,
             subject_type=row.subject_type,
             subject_id=row.subject_id,
             fidelity_class=row.fidelity_class,
@@ -542,6 +795,242 @@ class SqlAnsichBackend:
             summary.assertion_id = assertion.assertion_id
             summary.projection_watermark = ingest_seq
             summary.updated_at = observation.recorded_at
+
+    async def _project_step(self, session: AsyncSession, observation: ObservationEnvelope) -> None:
+        """Project logical decisions, physical LLM attempts, and request context.
+
+        The projector is deliberately event-specific. Task lifecycle events are
+        harmless no-ops, which lets every durable observation receive the same
+        versioned job set and keeps rebuild behavior uniform.
+        """
+
+        if observation.kind not in {
+            "step.started",
+            "step.closed",
+            "llm.requested",
+            "llm.responded",
+            "llm.failed",
+            "content.produced",
+            "context.snapshotted",
+        }:
+            return
+        if observation.payload is None:
+            raise ValueError(f"{observation.kind} requires inline projection payload")
+        if await session.get(AnsichTaskRow, observation.task_id) is None:
+            raise ValueError(f"Ansich task is not projected: {observation.task_id}")
+
+        payload = observation.payload
+        if observation.kind == "step.started":
+            if observation.step_id is None:
+                raise ValueError("step.started is missing step_id")
+            if await session.get(AnsichEntityRow, observation.step_id) is None:
+                session.add(
+                    AnsichEntityRow(
+                        entity_id=observation.step_id,
+                        entity_type="step",
+                        discovered_obs_id=observation.obs_id,
+                    )
+                )
+            if await session.get(AnsichStepRow, observation.step_id) is None:
+                session.add(
+                    AnsichStepRow(
+                        entity_id=observation.step_id,
+                        task_id=observation.task_id,
+                        step_seq=int(payload["step_seq"]),
+                        actor_kind=str(payload["actor_kind"]),
+                        status="deciding",
+                        started_obs_id=observation.obs_id,
+                        issued_tools_json=[],
+                    )
+                )
+            return
+
+        if observation.kind == "step.closed":
+            if observation.step_id is None:
+                raise ValueError("step.closed is missing step_id")
+            step = await session.get(AnsichStepRow, observation.step_id)
+            if step is None:
+                raise ValueError(f"step.started has not been projected: {observation.step_id}")
+            result = str(payload["result"])
+            step.result = result
+            step.status = "model_failed" if result == "model_failed" else "acting" if result == "acting" else "closed"
+            step.closed_obs_id = observation.obs_id
+            step.issued_tools_json = list(payload.get("issued_tools", []))
+            raw_effective_attempt_no = payload.get("effective_attempt_no")
+            if isinstance(raw_effective_attempt_no, int):
+                attempt = await session.scalar(
+                    select(AnsichLlmAttemptRow).where(
+                        AnsichLlmAttemptRow.step_id == step.entity_id,
+                        AnsichLlmAttemptRow.attempt_no == raw_effective_attempt_no,
+                        AnsichLlmAttemptRow.status == "success",
+                    )
+                )
+                if attempt is not None:
+                    step.effective_attempt_no = attempt.attempt_no
+                    step.effective_context_snapshot_id = attempt.context_snapshot_id
+            return
+
+        if observation.kind == "content.produced":
+            if await session.get(AnsichEntityRow, observation.subject_id) is None:
+                session.add(
+                    AnsichEntityRow(
+                        entity_id=observation.subject_id,
+                        entity_type="content_block",
+                        discovered_obs_id=observation.obs_id,
+                    )
+                )
+            if await session.get(AnsichContentBlockRow, observation.subject_id) is None:
+                session.add(
+                    AnsichContentBlockRow(
+                        entity_id=observation.subject_id,
+                        kind=str(payload["kind"]),
+                        content_hash=str(payload["content_hash"]),
+                        payload_obs_id=observation.obs_id,
+                        producer_obs_id=observation.obs_id,
+                        byte_size=int(payload["visible_bytes"]),
+                        token_estimate=int(payload["estimated_tokens"]),
+                        sensitivity_flags_json=list(payload.get("sensitivity_flags", [])),
+                    )
+                )
+            return
+
+        if observation.kind == "context.snapshotted":
+            await self._project_context_snapshot(session, observation)
+            return
+
+        attempt = await session.get(AnsichLlmAttemptRow, observation.subject_id)
+        if attempt is None:
+            actor_kind = "system_operation"
+            if observation.step_id is not None:
+                step = await session.get(AnsichStepRow, observation.step_id)
+                if step is None:
+                    raise ValueError(f"step.started has not been projected: {observation.step_id}")
+                actor_kind = step.actor_kind
+            attempt = AnsichLlmAttemptRow(
+                attempt_id=observation.subject_id,
+                task_id=observation.task_id,
+                step_id=observation.step_id,
+                actor_kind=str(payload.get("actor_kind", actor_kind)),
+                operation_id=payload.get("operation_id") if isinstance(payload.get("operation_id"), str) else None,
+                operation_kind=payload.get("operation_kind") if isinstance(payload.get("operation_kind"), str) else None,
+                attempt_no=int(payload["attempt_no"]),
+                status="incomplete",
+            )
+            session.add(attempt)
+
+        if observation.kind == "llm.requested":
+            attempt.request_obs_id = observation.obs_id
+            attempt.actor_kind = str(payload.get("actor_kind", attempt.actor_kind))
+            if isinstance(payload.get("operation_id"), str):
+                attempt.operation_id = str(payload["operation_id"])
+            if isinstance(payload.get("operation_kind"), str):
+                attempt.operation_kind = str(payload["operation_kind"])
+            attempt.provider_model = payload.get("configured_model") if isinstance(payload.get("configured_model"), str) else None
+            if attempt.status == "incomplete":
+                attempt.status = "requested"
+        elif observation.kind == "llm.responded":
+            attempt.response_obs_id = observation.obs_id
+            attempt.status = "success"
+            attempt.latency_ms = int(payload["latency_ms"])
+            attempt.usage_json = {
+                "usage": dict(payload.get("usage", {})),
+                "response_metadata": dict(payload.get("response_metadata", {})),
+            }
+        elif observation.kind == "llm.failed":
+            attempt.failure_obs_id = observation.obs_id
+            attempt.status = "failed"
+            attempt.latency_ms = int(payload["latency_ms"])
+
+    async def _project_context_snapshot(
+        self,
+        session: AsyncSession,
+        observation: ObservationEnvelope,
+    ) -> None:
+        if observation.payload is None:
+            raise ValueError("context.snapshotted is missing payload")
+        payload = observation.payload
+        attempt_id = str(payload["attempt_id"])
+        attempt = await session.get(AnsichLlmAttemptRow, attempt_id)
+        if attempt is None:
+            raise ValueError(f"llm.requested has not been projected: {attempt_id}")
+
+        window = await session.scalar(select(AnsichContextWindowRow).where(AnsichContextWindowRow.task_id == observation.task_id))
+        if window is None:
+            window_id = new_id()
+            session.add(
+                AnsichEntityRow(
+                    entity_id=window_id,
+                    entity_type="context_window",
+                    discovered_obs_id=observation.obs_id,
+                )
+            )
+            window = AnsichContextWindowRow(
+                entity_id=window_id,
+                task_id=observation.task_id,
+                capacity_tokens=None,
+                estimator_name=str(payload["estimator_name"]),
+                estimator_version=str(payload["estimator_version"]),
+            )
+            session.add(window)
+
+        if await session.get(AnsichEntityRow, observation.subject_id) is None:
+            session.add(
+                AnsichEntityRow(
+                    entity_id=observation.subject_id,
+                    entity_type="context_snapshot",
+                    discovered_obs_id=observation.obs_id,
+                )
+            )
+        snapshot = await session.get(AnsichContextSnapshotRow, observation.subject_id)
+        if snapshot is None:
+            if observation.causation_obs_id is None:
+                raise ValueError("context.snapshotted is missing request causation")
+            snapshot = AnsichContextSnapshotRow(
+                entity_id=observation.subject_id,
+                task_id=observation.task_id,
+                step_id=observation.step_id,
+                operation_id=payload.get("operation_id") if isinstance(payload.get("operation_id"), str) else None,
+                attempt_no=int(payload["attempt_no"]),
+                request_obs_id=observation.causation_obs_id,
+                message_count=int(payload["message_count"]),
+                tool_schema_count=int(payload["tool_schema_count"]),
+                visible_bytes=int(payload["visible_bytes"]),
+                estimated_tokens=int(payload["estimated_tokens"]),
+                estimator_name=str(payload["estimator_name"]),
+                estimator_version=str(payload["estimator_version"]),
+                adapter_name=str(payload["adapter_name"]),
+                adapter_version=str(payload["adapter_version"]),
+                configured_model=payload.get("configured_model") if isinstance(payload.get("configured_model"), str) else None,
+                response_format_json=payload.get("response_format"),
+                generation_settings_json=dict(payload.get("generation_settings", {})),
+                redactions_json=list(payload.get("redactions", [])),
+                warnings_json=list(payload.get("warnings", [])),
+            )
+            session.add(snapshot)
+            await session.flush()
+
+        for raw_item in payload.get("items", []):
+            if not isinstance(raw_item, dict):
+                continue
+            block_id = str(raw_item["block_id"])
+            if await session.get(AnsichContentBlockRow, block_id) is None:
+                raise ValueError(f"content.produced has not been projected: {block_id}")
+            ordinal = int(raw_item["ordinal"])
+            if await session.get(AnsichContextSnapshotItemRow, (snapshot.entity_id, ordinal)) is None:
+                session.add(
+                    AnsichContextSnapshotItemRow(
+                        snapshot_id=snapshot.entity_id,
+                        ordinal=ordinal,
+                        channel=str(raw_item["channel"]),
+                        role=raw_item.get("role") if isinstance(raw_item.get("role"), str) else None,
+                        name=raw_item.get("name") if isinstance(raw_item.get("name"), str) else None,
+                        content_block_id=block_id,
+                        visible_bytes=int(raw_item["visible_bytes"]),
+                        estimated_tokens=int(raw_item["estimated_tokens"]),
+                        metadata_json=dict(raw_item.get("metadata", {})),
+                    )
+                )
+        attempt.context_snapshot_id = snapshot.entity_id
 
     async def _project_scopes(self, session: AsyncSession, observation: ObservationEnvelope) -> None:
         if observation.payload is None:

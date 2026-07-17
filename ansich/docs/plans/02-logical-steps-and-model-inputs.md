@@ -8,6 +8,12 @@
 
 ## 2. 前置条件与非目标
 
+### 当前实施状态（2026-07-17）
+
+Phase 2 的本地纵向切片已经实现：Task-scoped Step allocator、Decision/Attempt 双层探针、显式模型调用分类、有序 ContextSnapshot 序列化与脱敏、超阈值 payload 外置、Step/Attempt/Content/Context SQL 投影与迁移、稳定 timeline cursor、管理员 raw payload 端点，以及 Operations 页面中的 Timeline/Steps/Context 浏览器均已接通。lead/subagent 决策产生 Step；title、summarization、memory extraction、goal evaluation 通过 system operation 记录且不消耗 `step_seq`，其中 memory 的观测上下文会跨 debounce Timer 线程传播。
+
+SQLite 迁移、投影重放、重试/乱序/失败注入、同步/异步/stream middleware 边界、后端相关回归、前端类型检查与全量单测、真实浏览器 Ansich E2E 已验证。按照本目录的阶段合并规则，本阶段尚不标记最终完成：PostgreSQL 空库/已有库矩阵、关闭 Ansich 的性能基准和生产环境 paper drill 仍待执行。
+
 依赖 Phase 1 的 Collector、Observation store、projection job、Task ID 和管理员 API。本阶段只建立 ToolCall 的 issued 占位信息，Tool 的执行责任链在 Phase 3 完成；完整压缩谱系在 Phase 4 完成。
 
 实施前提（已满足，2026-07-17，commit `66b426ed`）：[Phase 1 评审跟进项 F4](phase-1-review-followups.md) 已修复——projection job 按 `_PROJECTORS` 注册顺序认领，新增 Step projector 时把它追加到注册表即可获得确定的 structural → control → step 执行顺序。

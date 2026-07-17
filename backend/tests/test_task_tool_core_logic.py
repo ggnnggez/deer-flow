@@ -266,6 +266,10 @@ def test_task_tool_forwards_channel_user_id_to_executor(monkeypatch):
     oauth attribution)."""
     runtime = _make_runtime()
     runtime.context["channel_user_id"] = "ou_group_sender_1"
+    from deerflow.ansich.execution import ANSICH_EXECUTION_CONTEXT_KEY, AnsichExecutionContext
+
+    ansich_execution = AnsichExecutionContext(task_id="00000000-0000-4000-8000-000000000001")
+    runtime.context[ANSICH_EXECUTION_CONTEXT_KEY] = ansich_execution
     captured = {}
 
     class DummyExecutor:
@@ -298,6 +302,7 @@ def test_task_tool_forwards_channel_user_id_to_executor(monkeypatch):
     message = _task_tool_message(output)
     assert message.content == "Task Succeeded. Result: done"
     assert captured["executor_kwargs"]["channel_user_id"] == "ou_group_sender_1"
+    assert captured["executor_kwargs"]["ansich_execution_context"] is ansich_execution
 
 
 def test_task_tool_forwards_is_internal_true_to_executor(monkeypatch):

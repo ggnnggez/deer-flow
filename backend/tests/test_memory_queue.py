@@ -71,6 +71,24 @@ def test_process_queue_forwards_reinforcement_flag_to_updater() -> None:
     )
 
 
+def test_process_queue_forwards_observability_context_to_updater() -> None:
+    mock_updater = MagicMock()
+    mock_updater.update_memory.return_value = True
+    operation_context = object()
+    queue = _queue(mock_updater)
+    queue._queue = [
+        ConversationContext(
+            thread_id="thread-1",
+            messages=["conversation"],
+            observability_context=operation_context,
+        )
+    ]
+
+    queue._process_queue()
+
+    assert mock_updater.update_memory.call_args.kwargs["observability_context"] is operation_context
+
+
 def test_flush_nowait_cancels_existing_timer_and_starts_immediate_timer() -> None:
     queue = _queue()
     existing_timer = MagicMock()

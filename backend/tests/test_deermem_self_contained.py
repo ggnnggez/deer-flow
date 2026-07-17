@@ -105,6 +105,33 @@ def test_tracing_callback_optional_no_langfuse(deermem_data_dir):
     dm._queue.flush()  # no callback, no error, update completes
 
 
+def test_memory_model_invoke_callback_receives_observability_context(deermem_data_dir):
+    operation_context = object()
+    calls = []
+
+    def invoke_model(model, prompt, *, config, observability_context):
+        calls.append((model, prompt, config, observability_context))
+        return model.invoke(prompt, config=config)
+
+    dm = _deermem_with_fake_llm(
+        {
+            "model_invoke_callback": invoke_model,
+            "model": {"provider": "openai", "model": "gpt-x", "api_key": "k"},
+        }
+    )
+    dm.add(
+        thread_id="t-observed",
+        messages=[HumanMessage(content="hi"), AIMessage(content="hello")],
+        user_id="u-observed",
+        observability_context=operation_context,
+    )
+
+    dm._queue.flush()
+
+    assert len(calls) == 1
+    assert calls[0][3] is operation_context
+
+
 def test_hide_from_ui_default_skip_hook_keeps():
     hidden = HumanMessage(content="secret", additional_kwargs={"hide_from_ui": True})
     normal = HumanMessage(content="hi")

@@ -2,6 +2,10 @@ import { fetch } from "@/core/api/fetcher";
 import { getBackendBaseURL } from "@/core/config";
 
 import type {
+  AnsichContentPayloadResponse,
+  AnsichContextResponse,
+  AnsichStepResponse,
+  AnsichStepsResponse,
   AnsichTaskListResponse,
   AnsichTaskResponse,
   AnsichTimelineResponse,
@@ -88,6 +92,66 @@ export async function fetchAnsichTaskTimeline(
     await throwAnsichApiError(
       response,
       `Failed to load Ansich task timeline: ${response.statusText}`,
+    );
+  }
+  return response.json();
+}
+
+export async function fetchAnsichTaskSteps(
+  taskId: string,
+): Promise<AnsichStepsResponse> {
+  const response = await fetch(
+    ansichUrl(`/tasks/${encodeURIComponent(taskId)}/steps`),
+  );
+  if (!response.ok) {
+    await throwAnsichApiError(
+      response,
+      `Failed to load Ansich steps: ${response.statusText}`,
+    );
+  }
+  return response.json();
+}
+
+export async function fetchAnsichStep(
+  stepId: string,
+): Promise<AnsichStepResponse> {
+  const response = await fetch(
+    ansichUrl(`/steps/${encodeURIComponent(stepId)}`),
+  );
+  if (!response.ok) {
+    await throwAnsichApiError(
+      response,
+      `Failed to load Ansich step: ${response.statusText}`,
+    );
+  }
+  return response.json();
+}
+
+export async function fetchAnsichStepContext(
+  stepId: string,
+): Promise<AnsichContextResponse> {
+  const response = await fetch(
+    ansichUrl(`/steps/${encodeURIComponent(stepId)}/context`),
+  );
+  if (!response.ok) {
+    await throwAnsichApiError(
+      response,
+      `Failed to load Ansich context: ${response.statusText}`,
+    );
+  }
+  return response.json();
+}
+
+export async function fetchAnsichContentPayload(
+  blockId: string,
+): Promise<AnsichContentPayloadResponse> {
+  const response = await fetch(
+    ansichUrl(`/content-blocks/${encodeURIComponent(blockId)}/payload`),
+  );
+  if (!response.ok) {
+    await throwAnsichApiError(
+      response,
+      `Failed to load Ansich raw payload: ${response.statusText}`,
     );
   }
   return response.json();

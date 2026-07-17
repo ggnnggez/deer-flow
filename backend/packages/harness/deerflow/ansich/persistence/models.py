@@ -47,6 +47,7 @@ class AnsichObservationRow(Base):
     occurred_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
     recorded_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
     task_id: Mapped[str] = mapped_column(String(36), nullable=False)
+    step_id: Mapped[str | None] = mapped_column(String(36))
     subject_type: Mapped[str] = mapped_column(String(32), nullable=False)
     subject_id: Mapped[str] = mapped_column(String(36), nullable=False)
     fidelity_class: Mapped[str] = mapped_column(String(16), nullable=False)
@@ -134,6 +135,121 @@ class AnsichTaskRow(Base):
     trigger_obs_id: Mapped[str] = mapped_column(String(36), ForeignKey("ansich_observations.obs_id"), nullable=False)
 
     __table_args__ = (UniqueConstraint("source_kind", "source_id", name="uq_ansich_task_source"),)
+
+
+class AnsichStepRow(Base):
+    __tablename__ = "ansich_steps"
+
+    entity_id: Mapped[str] = mapped_column(String(36), ForeignKey("ansich_entities.entity_id", ondelete="CASCADE"), primary_key=True)
+    task_id: Mapped[str] = mapped_column(String(36), ForeignKey("ansich_tasks.entity_id", ondelete="CASCADE"), nullable=False)
+    step_seq: Mapped[int] = mapped_column(Integer, nullable=False)
+    actor_kind: Mapped[str] = mapped_column(String(32), nullable=False)
+    status: Mapped[str] = mapped_column(String(32), nullable=False, default="deciding")
+    result: Mapped[str | None] = mapped_column(String(32))
+    started_obs_id: Mapped[str] = mapped_column(String(36), ForeignKey("ansich_observations.obs_id"), nullable=False)
+    closed_obs_id: Mapped[str | None] = mapped_column(String(36), ForeignKey("ansich_observations.obs_id"))
+    effective_attempt_no: Mapped[int | None] = mapped_column(Integer)
+    effective_context_snapshot_id: Mapped[str | None] = mapped_column(String(36))
+    issued_tools_json: Mapped[list] = mapped_column(JSON, nullable=False, default=list)
+
+    __table_args__ = (
+        UniqueConstraint("task_id", "step_seq", name="uq_ansich_step_task_seq"),
+        Index("ix_ansich_steps_task_seq", "task_id", "step_seq"),
+    )
+
+
+class AnsichLlmAttemptRow(Base):
+    __tablename__ = "ansich_llm_attempts"
+
+    attempt_id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    step_id: Mapped[str | None] = mapped_column(String(36), ForeignKey("ansich_steps.entity_id", ondelete="CASCADE"))
+    task_id: Mapped[str] = mapped_column(String(36), ForeignKey("ansich_tasks.entity_id", ondelete="CASCADE"), nullable=False)
+    actor_kind: Mapped[str] = mapped_column(String(32), nullable=False)
+    operation_id: Mapped[str | None] = mapped_column(String(36))
+    operation_kind: Mapped[str | None] = mapped_column(String(32))
+    attempt_no: Mapped[int] = mapped_column(Integer, nullable=False)
+    status: Mapped[str] = mapped_column(String(16), nullable=False, default="requested")
+    request_obs_id: Mapped[str | None] = mapped_column(String(36), ForeignKey("ansich_observations.obs_id"), unique=True)
+    response_obs_id: Mapped[str | None] = mapped_column(String(36), ForeignKey("ansich_observations.obs_id"), unique=True)
+    failure_obs_id: Mapped[str | None] = mapped_column(String(36), ForeignKey("ansich_observations.obs_id"), unique=True)
+    provider_model: Mapped[str | None] = mapped_column(String(256))
+    usage_json: Mapped[dict | None] = mapped_column(JSON)
+    latency_ms: Mapped[int | None] = mapped_column(BigInteger)
+    context_snapshot_id: Mapped[str | None] = mapped_column(String(36))
+
+    __table_args__ = (
+        UniqueConstraint("step_id", "attempt_no", name="uq_ansich_llm_attempt_step_no"),
+        UniqueConstraint("task_id", "operation_id", "attempt_no", name="uq_ansich_llm_attempt_operation_no"),
+        Index("ix_ansich_llm_attempts_step_no", "step_id", "attempt_no"),
+        Index("ix_ansich_llm_attempts_task_request", "task_id", "request_obs_id"),
+    )
+
+
+class AnsichContentBlockRow(Base):
+    __tablename__ = "ansich_content_blocks"
+
+    entity_id: Mapped[str] = mapped_column(String(36), ForeignKey("ansich_entities.entity_id", ondelete="CASCADE"), primary_key=True)
+    kind: Mapped[str] = mapped_column(String(32), nullable=False)
+    content_hash: Mapped[str] = mapped_column(String(64), nullable=False)
+    payload_obs_id: Mapped[str] = mapped_column(String(36), ForeignKey("ansich_observations.obs_id"), nullable=False)
+    producer_obs_id: Mapped[str] = mapped_column(String(36), ForeignKey("ansich_observations.obs_id"), nullable=False, unique=True)
+    byte_size: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    token_estimate: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    sensitivity_flags_json: Mapped[list] = mapped_column(JSON, nullable=False, default=list)
+
+    __table_args__ = (Index("ix_ansich_content_blocks_hash", "content_hash"),)
+
+
+class AnsichContextWindowRow(Base):
+    __tablename__ = "ansich_context_windows"
+
+    entity_id: Mapped[str] = mapped_column(String(36), ForeignKey("ansich_entities.entity_id", ondelete="CASCADE"), primary_key=True)
+    task_id: Mapped[str] = mapped_column(String(36), ForeignKey("ansich_tasks.entity_id", ondelete="CASCADE"), nullable=False, unique=True)
+    capacity_tokens: Mapped[int | None] = mapped_column(BigInteger)
+    estimator_name: Mapped[str] = mapped_column(String(64), nullable=False)
+    estimator_version: Mapped[str] = mapped_column(String(32), nullable=False)
+
+
+class AnsichContextSnapshotRow(Base):
+    __tablename__ = "ansich_context_snapshots"
+
+    entity_id: Mapped[str] = mapped_column(String(36), ForeignKey("ansich_entities.entity_id", ondelete="CASCADE"), primary_key=True)
+    task_id: Mapped[str] = mapped_column(String(36), ForeignKey("ansich_tasks.entity_id", ondelete="CASCADE"), nullable=False)
+    step_id: Mapped[str | None] = mapped_column(String(36), ForeignKey("ansich_steps.entity_id", ondelete="CASCADE"))
+    operation_id: Mapped[str | None] = mapped_column(String(36))
+    attempt_no: Mapped[int] = mapped_column(Integer, nullable=False)
+    request_obs_id: Mapped[str] = mapped_column(String(36), ForeignKey("ansich_observations.obs_id"), nullable=False, unique=True)
+    message_count: Mapped[int] = mapped_column(Integer, nullable=False)
+    tool_schema_count: Mapped[int] = mapped_column(Integer, nullable=False)
+    visible_bytes: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    estimated_tokens: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    estimator_name: Mapped[str] = mapped_column(String(64), nullable=False)
+    estimator_version: Mapped[str] = mapped_column(String(32), nullable=False)
+    adapter_name: Mapped[str] = mapped_column(String(256), nullable=False)
+    adapter_version: Mapped[str] = mapped_column(String(64), nullable=False)
+    configured_model: Mapped[str | None] = mapped_column(String(256))
+    response_format_json: Mapped[object | None] = mapped_column(JSON)
+    generation_settings_json: Mapped[dict] = mapped_column(JSON, nullable=False, default=dict)
+    redactions_json: Mapped[list] = mapped_column(JSON, nullable=False, default=list)
+    warnings_json: Mapped[list] = mapped_column(JSON, nullable=False, default=list)
+
+    __table_args__ = (Index("ix_ansich_context_snapshots_task_request", "task_id", "request_obs_id"),)
+
+
+class AnsichContextSnapshotItemRow(Base):
+    __tablename__ = "ansich_context_snapshot_items"
+
+    snapshot_id: Mapped[str] = mapped_column(String(36), ForeignKey("ansich_context_snapshots.entity_id", ondelete="CASCADE"), primary_key=True)
+    ordinal: Mapped[int] = mapped_column(Integer, primary_key=True)
+    channel: Mapped[str] = mapped_column(String(32), nullable=False)
+    role: Mapped[str | None] = mapped_column(String(16))
+    name: Mapped[str | None] = mapped_column(String(256))
+    content_block_id: Mapped[str] = mapped_column(String(36), ForeignKey("ansich_content_blocks.entity_id", ondelete="RESTRICT"), nullable=False)
+    visible_bytes: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    estimated_tokens: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    metadata_json: Mapped[dict] = mapped_column(JSON, nullable=False, default=dict)
+
+    __table_args__ = (Index("ix_ansich_context_snapshot_items_block", "content_block_id"),)
 
 
 class AnsichScopeRow(Base):

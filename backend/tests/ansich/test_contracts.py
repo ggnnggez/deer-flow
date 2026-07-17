@@ -59,3 +59,25 @@ def test_ansich_core_has_no_deerflow_or_web_framework_imports() -> None:
                     violations.append(f"{path.relative_to(package_root)} imports {module}")
 
     assert violations == []
+
+
+def test_phase_two_observation_accepts_step_subject_with_explicit_parent() -> None:
+    task_id = new_id()
+    step_id = new_id()
+
+    observation = ObservationEnvelope(
+        kind="step.started",
+        occurred_at=datetime.now(UTC),
+        task_id=task_id,
+        step_id=step_id,
+        subject_type="step",
+        subject_id=step_id,
+        producer=Producer(name="decision-probe", version="1", instance_id="worker-1"),
+        producer_seq=1,
+        source_event_id=f"step:{step_id}:started",
+        correlation_id=task_id,
+        payload={"step_seq": 1, "actor_kind": "lead_agent"},
+    )
+
+    assert observation.step_id == step_id
+    assert observation.subject_id == step_id

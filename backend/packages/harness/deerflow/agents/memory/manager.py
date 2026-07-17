@@ -82,6 +82,7 @@ class MemoryManager(ABC):
         agent_name: str | None = None,
         user_id: str | None = None,
         trace_id: str | None = None,
+        observability_context: Any | None = None,
     ) -> None:
         """Queue a conversation for memory update (debounced, asynchronous).
 
@@ -92,6 +93,8 @@ class MemoryManager(ABC):
             agent_name: Per-agent bucket; ``None`` = global memory.
             user_id: Per-user bucket.
             trace_id: Request trace id captured for memory-LLM tracing.
+            observability_context: Opaque host context carried across the
+                debounce worker boundary for model-call observation.
         """
 
     @abstractmethod
@@ -102,6 +105,7 @@ class MemoryManager(ABC):
         *,
         agent_name: str | None = None,
         user_id: str | None = None,
+        observability_context: Any | None = None,
     ) -> None:
         """Queue a conversation for *immediate* memory update (emergency flush).
 
@@ -368,6 +372,28 @@ def _host_default_should_keep_hidden_message(additional_kwargs: Any) -> bool:
     return read_human_input_response(additional_kwargs) is not None
 
 
+def _host_default_memory_model_invoke(
+    model: Any,
+    prompt: Any,
+    *,
+    config: Any,
+    observability_context: Any | None,
+) -> Any:
+    """Invoke DeerMem's LLM through the host's Ansich system-operation seam."""
+
+    from deerflow.ansich.execution import AnsichExecutionContext
+    from deerflow.ansich.middleware import observe_system_model_invoke
+
+    execution = observability_context if isinstance(observability_context, AnsichExecutionContext) else None
+    return observe_system_model_invoke(
+        model,
+        prompt,
+        execution=execution,
+        operation_kind="memory",
+        config=config,
+    )
+
+
 def _host_default_llm() -> Any:
     """deer-flow default for DeerMem's ``host_llm`` slot (zero-config extraction).
 
@@ -381,7 +407,11 @@ def _host_default_llm() -> Any:
     try:
         from deerflow.models import create_chat_model
 
-        return create_chat_model(name=None)
+        return create_chat_model(
+            name=None,
+            ansich_call_class="system_operation",
+            ansich_operation_kind="memory",
+        )
     except Exception:  # noqa: BLE001 - no default model is a config state, not a crash
         logger.warning("Could not build host default model for DeerMem memory extraction; memory extraction will be disabled", exc_info=True)
         return None
@@ -453,6 +483,8 @@ def get_memory_manager() -> MemoryManager:
             backend_config["tracing_callback"] = _host_default_tracing_callback
         if "should_keep_hidden_message" not in backend_config:
             backend_config["should_keep_hidden_message"] = _host_default_should_keep_hidden_message
+        if "model_invoke_callback" not in backend_config:
+            backend_config["model_invoke_callback"] = _host_default_memory_model_invoke
         # Zero-config LLM: when no memory model is configured, inject the host's
         # default chat model so memory extraction works out of the box (mirrors
         # pre-abstraction `model_name: null` -> app default). DeerMem prefers

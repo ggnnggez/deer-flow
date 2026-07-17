@@ -1,13 +1,20 @@
 from datetime import UTC, datetime
 
 import pytest
-from ansich import AnsichService, ObservationEnvelope, new_id
+from ansich import AnsichService, ObservationEnvelope, Producer, new_id
+from langchain.agents import create_agent
+from langchain_core.language_models import BaseChatModel
+from langchain_core.messages import AIMessage, HumanMessage
+from langchain_core.outputs import ChatGeneration, ChatResult
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
 from deerflow.ansich import create_sql_ansich_service
+from deerflow.ansich.execution import ANSICH_EXECUTION_CONTEXT_KEY, AnsichExecutionContext
+from deerflow.ansich.middleware import AnsichAttemptMiddleware, AnsichDecisionMiddleware
 from deerflow.ansich.persistence.models import (
     AnsichObservationRow,
+    AnsichPayloadRow,
     AnsichProjectionErrorRow,
     AnsichProjectionJobRow,
     AnsichRelationRow,
@@ -15,6 +22,28 @@ from deerflow.ansich.persistence.models import (
 )
 from deerflow.ansich.persistence.sql import SqlAnsichBackend
 from deerflow.persistence.base import Base
+
+
+class _ObservedFinalModel(BaseChatModel):
+    @property
+    def _llm_type(self) -> str:
+        return "ansich-sql-observed"
+
+    def _generate(self, messages, stop=None, run_manager=None, **kwargs):
+        return ChatResult(
+            generations=[
+                ChatGeneration(
+                    message=AIMessage(
+                        content="done",
+                        usage_metadata={"input_tokens": 4, "output_tokens": 2, "total_tokens": 6},
+                        response_metadata={"finish_reason": "stop", "model_name": "observed-model"},
+                    )
+                )
+            ]
+        )
+
+    async def _agenerate(self, messages, stop=None, run_manager=None, **kwargs):
+        return self._generate(messages, stop=stop, run_manager=run_manager, **kwargs)
 
 
 @pytest.mark.anyio
@@ -103,7 +132,7 @@ async def test_writer_deduplicates_observation_and_projects_owner_and_thread_sco
         await engine.dispose()
 
     assert observation_count == 1
-    assert job_count == 2
+    assert job_count == 3
     assert scope_count == 2
     assert relation_count == 2
     assert stored is not None
@@ -151,7 +180,7 @@ async def test_projection_failure_keeps_raw_observation_and_records_retry_eviden
     assert flush.persisted is True
     assert observation_count == 1
     assert error_count == 1
-    assert sorted(statuses) == ["completed", "failed"]
+    assert sorted(statuses) == ["completed", "completed", "failed"]
     assert task is not None
     assert task.control.value == "unknown"
     assert task.control.evidence_obs_ids == ()
@@ -234,11 +263,209 @@ async def test_projection_claim_order_follows_registry_priority_not_alphabetical
             ]
         )
         claimed_names = []
-        for _ in range(3):
+        for _ in range(4):
             claim = await backend._claim_projection_job()
             assert claim is not None
             claimed_names.append(claim[1])
     finally:
         await engine.dispose()
 
-    assert claimed_names == ["task-structural", "task-control", "usage-rollup"]
+    assert claimed_names == ["task-structural", "task-control", "task-step", "usage-rollup"]
+
+
+@pytest.mark.anyio
+async def test_step_attempt_and_context_are_queryable_after_projection(tmp_path):
+    engine = create_async_engine(f"sqlite+aiosqlite:///{tmp_path / 'ansich-step.db'}")
+    session_factory = async_sessionmaker(engine, expire_on_commit=False)
+    async with engine.begin() as connection:
+        await connection.run_sync(Base.metadata.create_all)
+    service = create_sql_ansich_service(session_factory)
+    await service.start()
+    task_id = new_id()
+    service.record(
+        ObservationEnvelope.task_lifecycle(
+            kind="task.created",
+            task_id=task_id,
+            source_kind="deerflow_run",
+            source_id="run-step",
+            occurred_at=datetime.now(UTC),
+            source_event_id="run:run-step:task:created",
+        )
+    )
+    await service.flush_task(task_id)
+    execution = AnsichExecutionContext(task_id=task_id, service=service)
+    agent = create_agent(
+        model=_ObservedFinalModel(),
+        tools=[],
+        middleware=[AnsichDecisionMiddleware(), AnsichAttemptMiddleware()],
+    )
+
+    try:
+        await agent.ainvoke(
+            {"messages": [HumanMessage(id="human-step", content="hello")]},
+            context={ANSICH_EXECUTION_CONTEXT_KEY: execution},
+        )
+        await service.flush_task(task_id)
+        steps = await service.list_steps(task_id)
+        context = await service.get_step_context(steps[0].step_id)
+        assert await service.rebuild_projections() > 0
+        rebuilt_steps = await service.list_steps(task_id)
+        rebuilt_context = await service.get_step_context(steps[0].step_id)
+    finally:
+        await service.stop()
+        await engine.dispose()
+
+    assert len(steps) == 1
+    assert steps[0].step_seq == 1
+    assert steps[0].result == "final_answer"
+    assert steps[0].effective_attempt_no == 1
+    assert len(steps[0].attempts) == 1
+    assert steps[0].attempts[0].status == "success"
+    assert steps[0].attempts[0].effective is True
+    assert steps[0].attempts[0].usage == {"input_tokens": 4, "output_tokens": 2, "total_tokens": 6}
+    assert steps[0].attempts[0].response_metadata == {
+        "finish_reason": "stop",
+        "model_name": "observed-model",
+    }
+    assert context is not None
+    assert [(item.ordinal, item.role, item.kind) for item in context.items] == [(0, "user", "user_input")]
+    assert context.items[0].payload_available is True
+    assert context.items[0].body is None
+    assert rebuilt_steps == steps
+    assert rebuilt_context == context
+
+
+@pytest.mark.anyio
+async def test_large_content_payload_is_externalized_but_remains_lazy_queryable(tmp_path):
+    engine = create_async_engine(f"sqlite+aiosqlite:///{tmp_path / 'ansich-large-payload.db'}")
+    session_factory = async_sessionmaker(engine, expire_on_commit=False)
+    async with engine.begin() as connection:
+        await connection.run_sync(Base.metadata.create_all)
+    service = create_sql_ansich_service(session_factory, inline_payload_max_bytes=128)
+    await service.start()
+    task_id = new_id()
+    service.record(
+        ObservationEnvelope.task_lifecycle(
+            kind="task.created",
+            task_id=task_id,
+            source_kind="deerflow_run",
+            source_id="run-large-payload",
+            occurred_at=datetime.now(UTC),
+            source_event_id="run:run-large-payload:task:created",
+        )
+    )
+    await service.flush_task(task_id)
+    execution = AnsichExecutionContext(task_id=task_id, service=service)
+    agent = create_agent(
+        model=_ObservedFinalModel(),
+        tools=[],
+        middleware=[AnsichDecisionMiddleware(), AnsichAttemptMiddleware()],
+    )
+    visible_body = "x" * 500
+
+    try:
+        await agent.ainvoke(
+            {"messages": [HumanMessage(id="human-large", content=visible_body)]},
+            context={ANSICH_EXECUTION_CONTEXT_KEY: execution},
+        )
+        await service.flush_task(task_id)
+        step = (await service.list_steps(task_id))[0]
+        context = await service.get_step_context(step.step_id)
+        assert context is not None
+        raw = await service.get_content_block_payload(context.items[0].block_id)
+        async with session_factory() as session:
+            content_observation = await session.scalar(select(AnsichObservationRow).where(AnsichObservationRow.kind == "content.produced"))
+            payload = await session.get(AnsichPayloadRow, content_observation.payload_ref_id)
+    finally:
+        await service.stop()
+        await engine.dispose()
+
+    assert content_observation is not None
+    assert content_observation.payload_json is None
+    assert content_observation.payload_ref_id is not None
+    assert payload is not None
+    assert payload.byte_size > 128
+    assert raw is not None
+    assert raw.body == visible_body
+
+
+@pytest.mark.anyio
+async def test_late_system_request_completes_an_existing_successful_attempt(tmp_path):
+    engine = create_async_engine(f"sqlite+aiosqlite:///{tmp_path / 'ansich-late-request.db'}")
+    session_factory = async_sessionmaker(engine, expire_on_commit=False)
+    async with engine.begin() as connection:
+        await connection.run_sync(Base.metadata.create_all)
+    service = create_sql_ansich_service(session_factory)
+    await service.start()
+    task_id = new_id()
+    attempt_id = new_id()
+    operation_id = new_id()
+    producer = Producer(name="late-test", version="1", instance_id="late-instance")
+    observed_at = datetime.now(UTC)
+    service.record(
+        ObservationEnvelope.task_lifecycle(
+            kind="task.created",
+            task_id=task_id,
+            source_kind="deerflow_run",
+            source_id="run-late-request",
+            occurred_at=observed_at,
+            source_event_id="run:run-late-request:created",
+        )
+    )
+    await service.flush_task(task_id)
+    service.record(
+        ObservationEnvelope(
+            kind="llm.responded",
+            occurred_at=observed_at,
+            task_id=task_id,
+            subject_type="llm_attempt",
+            subject_id=attempt_id,
+            producer=producer,
+            producer_seq=1,
+            source_event_id="late:responded",
+            correlation_id=task_id,
+            payload={
+                "attempt_no": 1,
+                "latency_ms": 7,
+                "usage": {"total_tokens": 3},
+                "response_metadata": {"finish_reason": "stop"},
+            },
+        )
+    )
+    service.record(
+        ObservationEnvelope(
+            kind="llm.requested",
+            occurred_at=observed_at,
+            task_id=task_id,
+            subject_type="llm_attempt",
+            subject_id=attempt_id,
+            producer=producer,
+            producer_seq=2,
+            source_event_id="late:requested",
+            correlation_id=task_id,
+            payload={
+                "attempt_no": 1,
+                "snapshot_id": new_id(),
+                "actor_kind": "system_operation",
+                "operation_id": operation_id,
+                "operation_kind": "memory",
+                "adapter_name": "test.Adapter",
+                "adapter_version": "1",
+                "configured_model": "test-model",
+            },
+        )
+    )
+
+    try:
+        await service.flush_task(task_id)
+        operations = await service.list_system_operations(task_id)
+    finally:
+        await service.stop()
+        await engine.dispose()
+
+    assert len(operations) == 1
+    assert operations[0].status == "success"
+    assert operations[0].request_obs_id is not None
+    assert operations[0].operation_id == operation_id
+    assert operations[0].operation_kind == "memory"
+    assert operations[0].usage == {"total_tokens": 3}

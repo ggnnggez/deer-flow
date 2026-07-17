@@ -12,3 +12,8 @@ class AnsichConfig(BaseModel):
     projector_poll_interval_ms: int = Field(default=250, ge=1, description="Polling interval for pending projection jobs.")
     projector_lease_seconds: int = Field(default=30, ge=1, description="Lease duration for a claimed projection job.")
     projector_max_attempts: int = Field(default=5, ge=1, description="Maximum projection attempts before a job is marked failed.")
+    inline_payload_max_bytes: int = Field(
+        default=65_536,
+        ge=1,
+        description="Largest canonical JSON Observation payload stored inline before using ansich_payloads.",
+    )

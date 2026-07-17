@@ -9,6 +9,7 @@ from langgraph.config import get_config
 from langgraph.runtime import Runtime
 
 from deerflow.agents.memory import get_memory_manager
+from deerflow.ansich.middleware import execution_context_from_runtime
 from deerflow.config.memory_config import get_memory_config
 from deerflow.runtime.user_context import get_effective_user_id
 from deerflow.trace_context import DEERFLOW_TRACE_METADATA_KEY, get_current_trace_id, normalize_trace_id
@@ -103,6 +104,7 @@ class MemoryMiddleware(AgentMiddleware[MemoryMiddlewareState]):
             agent_name=self._agent_name,
             user_id=user_id,
             trace_id=trace_id,
+            observability_context=execution_context_from_runtime(runtime),
         )
 
         return None

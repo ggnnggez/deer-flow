@@ -72,6 +72,7 @@ class DeerMem(MemoryManager):
         agent_name: str | None = None,
         user_id: str | None = None,
         trace_id: str | None = None,
+        observability_context: Any | None = None,
     ) -> None:
         """Filter, validate, detect signals, then enqueue (debounced).
 
@@ -89,6 +90,7 @@ class DeerMem(MemoryManager):
             agent_name=agent_name,
             user_id=user_id,
             trace_id=trace_id,
+            observability_context=observability_context,
             correction_detected=correction_detected,
             reinforcement_detected=reinforcement_detected,
         )
@@ -100,6 +102,7 @@ class DeerMem(MemoryManager):
         *,
         agent_name: str | None = None,
         user_id: str | None = None,
+        observability_context: Any | None = None,
     ) -> None:
         """Filter, validate, detect signals, then enqueue for immediate flush.
 
@@ -117,6 +120,7 @@ class DeerMem(MemoryManager):
             user_id=user_id,
             correction_detected=correction_detected,
             reinforcement_detected=reinforcement_detected,
+            observability_context=observability_context,
         )
 
     def _prepare_update(

@@ -91,6 +91,7 @@ def test_make_goal_continuation_message_is_hidden_from_ui():
 
 
 def test_evaluate_goal_completion_uses_non_thinking_model(monkeypatch):
+    monkeypatch.setattr(goal, "inject_langfuse_metadata", lambda *_args, **_kwargs: None)
     fake_model = MagicMock()
     fake_model.ainvoke = AsyncMock(return_value=SimpleNamespace(content='{"satisfied": true, "reason": "Done", "evidence_summary": "Done"}'))
     captured = {}

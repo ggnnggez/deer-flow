@@ -6,7 +6,8 @@
 
 - Phase 1 已形成可运行纵向切片：嵌入式启动、Run→Task 生命周期、严格 Observation 契约、有界 fail-open Collector、Observation/job 原子写入、独立 leased projector、Task/Scope/Belief 投影、重放、管理员 API，以及 dev/op 工作区列表和详情页均已实现。
 - SQLite、Gateway、Run worker、API、前端类型/lint、前端全量单测，以及管理员列表→Task 详情和 503 的真实浏览器 E2E 已经验证；Phase 1 尚未标记最终完成，因为 PostgreSQL 集成矩阵、关闭 Ansich 的基准对比和生产环境 paper drill 仍待执行。
-- Phase 2–12 尚未开始实现；页面不得提前显示 Step、ToolCall、进度百分比、预算或语义判断的占位数据。
+- Phase 2 已形成可运行的本地纵向切片：逻辑 Step 与 adapter attempt 分层、内部 LLM system operation、有序模型输入快照、payload 分层、SQL 投影/API，以及 Operations 的 Timeline/Steps/Context 页面均已实现。SQLite、相关后端回归、前端全量单测和真实浏览器 E2E 已验证；PostgreSQL 迁移矩阵、关闭 Ansich 的性能基准和生产 paper drill 完成前不标记最终完成。
+- Phase 3–12 尚未开始实现；页面不得提前显示 ToolCall 责任链、进度百分比、预算或语义判断的占位数据。
 - Phase 1 代码评审的跟进项登记在 [phase-1-review-followups.md](phase-1-review-followups.md)，各项带有修复状态、归属阶段与对应 commit；Phase 2 的实施前提 F4（projector 显式优先级）已修复。
 
 ## 固定实现边界

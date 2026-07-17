@@ -260,6 +260,8 @@ def create_goal_evaluator_model(
         thinking_enabled=False,
         app_config=app_config,
         attach_tracing=True,
+        ansich_call_class="system_operation",
+        ansich_operation_kind="goal",
     )
 
 
@@ -277,6 +279,7 @@ async def evaluate_goal_completion(
     thread_id: str | None = None,
     user_id: str | None = None,
     deerflow_trace_id: str | None = None,
+    ansich_execution_context: Any | None = None,
 ) -> GoalEvaluation:
     """Ask a small non-thinking model whether the active goal is satisfied.
 
@@ -320,10 +323,19 @@ async def evaluate_goal_completion(
         environment=_resolve_environment(),
         deerflow_trace_id=deerflow_trace_id,
     )
-    response = await model.ainvoke(
-        [SystemMessage(content=system_instruction), HumanMessage(content=user_content)],
-        config=invoke_config,
-    )
+    invoke_input = [SystemMessage(content=system_instruction), HumanMessage(content=user_content)]
+    if ansich_execution_context is None:
+        response = await model.ainvoke(invoke_input, config=invoke_config)
+    else:
+        from deerflow.ansich.middleware import observe_system_model_ainvoke
+
+        response = await observe_system_model_ainvoke(
+            model,
+            invoke_input,
+            execution=ansich_execution_context,
+            operation_kind="goal",
+            config=invoke_config,
+        )
     return parse_goal_evaluation_response(_extract_response_text(response.content))
 
 

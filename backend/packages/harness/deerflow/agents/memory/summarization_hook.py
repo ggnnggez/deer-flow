@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from deerflow.agents.memory import get_memory_manager
 from deerflow.agents.middlewares.summarization_middleware import SummarizationEvent
+from deerflow.ansich.middleware import execution_context_from_runtime
 from deerflow.config.memory_config import get_memory_config
 from deerflow.runtime.user_context import resolve_runtime_user_id
 
@@ -25,4 +26,5 @@ def memory_flush_hook(event: SummarizationEvent) -> None:
         list(event.messages_to_summarize),
         agent_name=event.agent_name,
         user_id=user_id,
+        observability_context=execution_context_from_runtime(event.runtime),
     )

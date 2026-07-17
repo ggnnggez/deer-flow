@@ -339,6 +339,11 @@ async def task_tool(
     oauth_provider = parent_context.get("oauth_provider")
     oauth_id = parent_context.get("oauth_id")
     run_id = parent_context.get("run_id")
+    from deerflow.ansich.execution import ANSICH_EXECUTION_CONTEXT_KEY, AnsichExecutionContext
+
+    ansich_execution_context = parent_context.get(ANSICH_EXECUTION_CONTEXT_KEY)
+    if not isinstance(ansich_execution_context, AnsichExecutionContext):
+        ansich_execution_context = None
     # IM-channel sender identity: group chats share one thread across senders,
     # so delegated bash commands need the dispatching turn's channel_user_id.
     channel_user_id = parent_context.get("channel_user_id")
@@ -391,6 +396,7 @@ async def task_tool(
         "oauth_provider": oauth_provider,
         "oauth_id": oauth_id,
         "run_id": run_id,
+        "ansich_execution_context": ansich_execution_context,
         "channel_user_id": channel_user_id,
         "is_internal": is_internal,
         "authz_attributes": authz_attributes,

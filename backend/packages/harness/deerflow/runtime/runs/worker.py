@@ -376,6 +376,18 @@ async def run_agent(
         # manually here because we drive the graph through ``agent.astream(config=...)``
         # without passing the official ``context=`` parameter.
         runtime_ctx = _build_runtime_context(thread_id, run_id, config.get("context"), ctx.app_config)
+        if ansich_task is not None and ctx.ansich_service is not None:
+            try:
+                from deerflow.ansich.execution import ANSICH_EXECUTION_CONTEXT_KEY, AnsichExecutionContext
+
+                max_step_seq = await ctx.ansich_service.get_max_step_seq(ansich_task.task_id)
+                runtime_ctx[ANSICH_EXECUTION_CONTEXT_KEY] = AnsichExecutionContext(
+                    task_id=ansich_task.task_id,
+                    service=ctx.ansich_service,
+                    next_step_seq=max_step_seq + 1,
+                )
+            except Exception:
+                logger.warning("Run %s: could not initialize Ansich execution context", run_id, exc_info=True)
         runtime_ctx[CURRENT_RUN_PRE_EXISTING_MESSAGE_IDS_KEY] = frozenset(pre_existing_message_ids)
         incoming_metadata = config.get("metadata") if isinstance(config.get("metadata"), dict) else {}
         deerflow_trace_id = normalize_trace_id(incoming_metadata.get(DEERFLOW_TRACE_METADATA_KEY)) or get_current_trace_id()
@@ -551,6 +563,7 @@ async def run_agent(
                 abort_event=record.abort_event,
                 user_id=resolve_runtime_user_id(runtime),
                 deerflow_trace_id=deerflow_trace_id,
+                ansich_execution_context=(runtime.context.get("__ansich_execution_context") if isinstance(runtime.context, dict) else None),
             )
             if continuation_input is None or record.abort_event.is_set():
                 break
@@ -885,6 +898,7 @@ async def _prepare_goal_continuation_input(
     abort_event: asyncio.Event | None = None,
     user_id: str | None = None,
     deerflow_trace_id: str | None = None,
+    ansich_execution_context: Any | None = None,
 ) -> dict[str, Any] | None:
     """Evaluate the active goal and return a hidden continuation input if needed.
 
@@ -965,6 +979,7 @@ async def _prepare_goal_continuation_input(
             thread_id=thread_id,
             user_id=user_id,
             deerflow_trace_id=deerflow_trace_id,
+            ansich_execution_context=ansich_execution_context,
         )
         if abort_event is not None and abort_event.is_set():
             return None

@@ -6,7 +6,11 @@ rs.mock("@/core/api/fetcher", () => ({
 
 import {
   AnsichApiError,
+  fetchAnsichContentPayload,
+  fetchAnsichStep,
+  fetchAnsichStepContext,
   fetchAnsichTask,
+  fetchAnsichTaskSteps,
   fetchAnsichTaskTimeline,
   fetchAnsichTasks,
 } from "@/core/ansich/api";
@@ -71,6 +75,24 @@ describe("Ansich API", () => {
     await expect(fetchAnsichTasks()).rejects.toThrow(
       "Administrator access required",
     );
+  });
+
+  it("uses distinct encoded endpoints for steps, context inventory, and raw payload", async () => {
+    mockedFetch.mockResolvedValue(jsonResponse({}));
+    const identifier = "id/with spaces";
+
+    await fetchAnsichTaskSteps(identifier);
+    await fetchAnsichStep(identifier);
+    await fetchAnsichStepContext(identifier);
+    await fetchAnsichContentPayload(identifier);
+
+    const encoded = encodeURIComponent(identifier);
+    expect(mockedFetch.mock.calls.map((call) => call[0])).toEqual([
+      expect.stringContaining(`/api/ansich/tasks/${encoded}/steps`),
+      expect.stringContaining(`/api/ansich/steps/${encoded}`),
+      expect.stringContaining(`/api/ansich/steps/${encoded}/context`),
+      expect.stringContaining(`/api/ansich/content-blocks/${encoded}/payload`),
+    ]);
   });
 
   it("preserves projection health from a storage-unavailable response", async () => {

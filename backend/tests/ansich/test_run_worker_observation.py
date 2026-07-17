@@ -7,6 +7,7 @@ import pytest
 from ansich import AnsichService
 from ansich.memory import InMemoryAnsichBackend
 
+from deerflow.ansich.execution import ANSICH_EXECUTION_CONTEXT_KEY, AnsichExecutionContext
 from deerflow.runtime.runs.manager import RunRecord
 from deerflow.runtime.runs.schemas import DisconnectMode, RunStatus
 from deerflow.runtime.runs.worker import RunContext, run_agent
@@ -33,6 +34,16 @@ class FailingAgent(SuccessfulAgent):
 class InterruptedAgent(SuccessfulAgent):
     async def astream(self, graph_input, *, config, stream_mode, **kwargs):
         raise asyncio.CancelledError
+        yield
+
+
+class CapturingExecutionAgent(SuccessfulAgent):
+    execution: AnsichExecutionContext | None = None
+
+    async def astream(self, graph_input, *, config, stream_mode, **kwargs):
+        runtime = config["configurable"]["__pregel_runtime"]
+        self.execution = runtime.context.get(ANSICH_EXECUTION_CONTEXT_KEY)
+        return
         yield
 
 
@@ -180,3 +191,38 @@ async def test_ansich_storage_unavailability_does_not_change_successful_run_resu
     assert task is None
     assert health.status == "failed"
     assert health.dropped_count == 3
+
+
+@pytest.mark.asyncio
+async def test_worker_injects_task_scoped_ansich_execution_context_into_graph_runtime():
+    service = AnsichService.in_memory()
+    await service.start()
+    record = RunRecord(
+        run_id="run-ansich-execution",
+        thread_id="thread-ansich-execution",
+        assistant_id="lead-agent",
+        status=RunStatus.pending,
+        on_disconnect=DisconnectMode.cancel,
+    )
+    record.abort_event = asyncio.Event()
+    agent = CapturingExecutionAgent()
+
+    try:
+        await run_agent(
+            RecordingBridge(),
+            RecordingRunManager(record),
+            record,
+            ctx=RunContext(checkpointer=None, ansich_service=service),
+            agent_factory=lambda config: agent,
+            graph_input={"messages": []},
+            config={"configurable": {"thread_id": record.thread_id}},
+        )
+        task = await service.get_task_by_source("deerflow_run", record.run_id)
+    finally:
+        await service.stop()
+
+    assert task is not None
+    assert agent.execution is not None
+    assert agent.execution.task_id == task.task_id
+    assert agent.execution.service is service
+    assert agent.execution.next_step_seq == 1

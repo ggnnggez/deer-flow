@@ -76,6 +76,11 @@ admin authorization remains authoritative. The operations list and Task detail
 poll their REST read models every 5 seconds and always render full Belief
 provenance plus projection health (`watermark`, lag, failed jobs, and lost
 ranges). They must not derive end-user progress percentages or fake Step counts.
+Task detail has Overview, Timeline, Steps, and Context tabs. Logical Steps fold
+provider retries into attempts and render internal system operations separately;
+Context initially renders only ordered hashes/size/token inventory. Raw
+ContentBlock bodies are fetched lazily after an explicit admin click and must
+never be placed in the polling response or TanStack query cache pre-emptively.
 
 `/goal` and `/compact` are built-in composer commands, not skill activations. `src/components/workspace/input-box.tsx` intercepts `/goal`, `/goal clear`, and `/goal <condition>` before normal chat submission, calling Gateway `GET/PUT/DELETE /api/threads/{thread_id}/goal`. Setting `/goal <condition>` also submits the condition text as the next user task so the agent starts running immediately; status and clear do not start a run. Goal and compact requests are tied to the current `threadId` with an `AbortController`, so switching threads or unmounting the composer aborts in-flight requests and stale responses cannot update the new thread's composer state. The chat pages render `GoalStatus` above the composer from `AgentThreadState.goal`, with local optimistic state until the next stream `values` update arrives. `/compact` calls `POST /api/threads/{thread_id}/compact` to summarize older active context while leaving the full visible chat history intact; it is skipped on new/empty threads and blocked server-side while a run is in flight.
 

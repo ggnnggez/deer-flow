@@ -201,6 +201,15 @@ class DeerMemConfig(BaseModel):
             "(callables cannot come from YAML)."
         ),
     )
+    model_invoke_callback: Any = Field(
+        default=None,
+        description=(
+            "Optional host hook used instead of calling ``model.invoke`` "
+            "directly: ``callback(model, prompt, *, config, "
+            "observability_context)``. The opaque context is supplied by the "
+            "host at enqueue time and carried across the debounce worker."
+        ),
+    )
     should_keep_hidden_message: Any = Field(
         default=None,
         description=("Optional ``hook(additional_kwargs) -> bool``; when set, ``hide_from_ui`` messages are kept if it returns True. None = skip all ``hide_from_ui`` (host-agnostic safe default). Set programmatically."),

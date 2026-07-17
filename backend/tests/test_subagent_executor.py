@@ -325,6 +325,7 @@ class TestAgentConstruction:
             # this the subagent would emit both a model-level trace and a
             # graph-level trace per call.
             "attach_tracing": False,
+            "ansich_call_class": "subagent",
         }
         assert captured["middlewares"] == {
             "app_config": app_config,
