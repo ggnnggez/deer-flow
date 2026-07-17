@@ -35,7 +35,7 @@ from deerflow.ansich.middleware import AnsichAttemptMiddleware, AnsichDecisionMi
 from deerflow.ansich.tool_middleware import (
     AnsichRawToolMiddleware,
     AnsichVisibleToolMiddleware,
-    _transform_kind,
+    _classify_transform,
     reconcile_open_tool_calls,
 )
 from deerflow.config.ansich_config import AnsichConfig
@@ -159,7 +159,7 @@ def test_visible_tool_transform_classification(
         path="test.visible",
     )
 
-    assert _transform_kind(invocation, visible) == expected
+    assert _classify_transform(invocation, visible, ())[0] == expected
 
 
 def test_identical_raw_and_visible_hash_is_classified_unchanged() -> None:
@@ -183,7 +183,7 @@ def test_identical_raw_and_visible_hash_is_classified_unchanged() -> None:
         raw_terminal_kind="tool.returned_raw",
     )
 
-    assert _transform_kind(invocation, visible) == "unchanged"
+    assert _classify_transform(invocation, visible, ()) == ("unchanged", "content_hash")
 
 
 def test_sync_raw_probe_classifies_timeout_without_changing_the_exception(

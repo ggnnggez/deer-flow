@@ -5,21 +5,25 @@ import hashlib
 import time
 from collections.abc import Awaitable, Callable, Mapping
 from datetime import UTC, datetime
+from typing import get_args
 from uuid import uuid4
 
 from ansich import ObservationEnvelope, Producer, new_id
 from ansich.serialization import ObservedContentCapture, serialize_observed_content
+from ansich.tool import ToolTransformKind
 from langchain.agents.middleware import AgentMiddleware
 from langchain_core.messages import ToolMessage
 from langgraph.errors import GraphBubbleUp
 from langgraph.prebuilt.tool_node import ToolCallRequest
 from langgraph.types import Command
 
+from deerflow.agents.middlewares.tool_transform_meta import read_tool_transforms
 from deerflow.ansich.execution import AnsichExecutionContext, ToolInvocation
 from deerflow.ansich.middleware import execution_context_from_runtime
 from deerflow.runtime.secret_context import extract_request_secrets, read_active_secrets
 
 _PRODUCER_INSTANCE_ID = str(uuid4())
+_TRANSFORM_KINDS = frozenset(get_args(ToolTransformKind))
 
 
 def _producer() -> Producer:
@@ -220,11 +224,31 @@ def _record_raw_result(
         execution.mark_tool_terminal(registration.tool_call_id)
 
 
-def _transform_kind(invocation: ToolInvocation, visible: ObservedContentCapture) -> str:
+def _classify_transform(
+    invocation: ToolInvocation,
+    visible: ObservedContentCapture,
+    transforms: tuple[Mapping[str, object], ...],
+) -> tuple[str, str]:
+    """Return ``(transform_kind, classified_by)`` for the raw→visible edge.
+
+    Declared trail entries from the transforming middlewares are the
+    authoritative facts; wording heuristics survive only as a labeled fallback
+    for transformers that do not stamp metadata yet.
+    """
+
     if invocation.raw_content_hash == visible.block.content_hash:
-        return "unchanged"
+        return "unchanged", "content_hash"
     if invocation.raw_terminal_kind in {"tool.failed", "tool.timed_out", "tool.cancelled"}:
-        return "error_normalized"
+        return "error_normalized", "raw_terminal"
+    declared = [str(entry["kind"]) for entry in transforms if entry.get("kind") in _TRANSFORM_KINDS]
+    if declared:
+        # The last applied transform produced the final visible bytes; the
+        # full ordered trail rides in the observation payload.
+        return declared[-1], "declared"
+    return _wording_heuristic(visible), "heuristic"
+
+
+def _wording_heuristic(visible: ObservedContentCapture) -> str:
     body_text = str(visible.block.body).lower()
     if "chars omitted" in body_text:
         return "truncated"
@@ -241,6 +265,8 @@ def _record_visible_result(
     execution: AnsichExecutionContext,
     invocation: ToolInvocation,
     capture: ObservedContentCapture,
+    *,
+    transforms: tuple[Mapping[str, object], ...] = (),
 ) -> None:
     registration = invocation.registration
     observations: list[ObservationEnvelope] = []
@@ -267,6 +293,10 @@ def _record_visible_result(
         invocation.raw_terminal_obs_id = denied.obs_id
     block_id = new_id()
     source_block_id = invocation.raw_block_id if invocation.raw_recorded else None
+    if source_block_id is not None:
+        transform_kind, classified_by = _classify_transform(invocation, capture, transforms)
+    else:
+        transform_kind, classified_by = "unknown", "no_raw_result"
     causation_obs_id = invocation.raw_terminal_obs_id if invocation.raw_recorded or not invocation.started else invocation.started_obs_id or registration.issued_obs_id
     content_observation = ObservationEnvelope(
         kind="content.produced",
@@ -304,8 +334,10 @@ def _record_visible_result(
             "call_seq": registration.call_seq,
             "result_block_id": block_id,
             "source_block_id": source_block_id,
-            "transform_kind": (_transform_kind(invocation, capture) if source_block_id is not None else "unknown"),
+            "transform_kind": transform_kind,
             "transform_version": "1",
+            "classified_by": classified_by,
+            "transforms": [dict(entry) for entry in transforms],
         },
     )
     observations.append(visible_observation)
@@ -343,6 +375,7 @@ class AnsichVisibleToolMiddleware(AgentMiddleware):
                         execution,
                         invocation,
                         _capture_result(result, request, kind="tool_result_visible"),
+                        transforms=read_tool_transforms(_tool_message(result, request)),
                     )
             except Exception:
                 pass
@@ -371,6 +404,7 @@ class AnsichVisibleToolMiddleware(AgentMiddleware):
                         execution,
                         invocation,
                         _capture_result(result, request, kind="tool_result_visible"),
+                        transforms=read_tool_transforms(_tool_message(result, request)),
                     )
             except Exception:
                 pass
