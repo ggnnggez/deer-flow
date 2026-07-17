@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import base64
 import hashlib
 import importlib.metadata
 import json
@@ -15,6 +16,7 @@ ContentKind = Literal[
     "user_input",
     "assistant_output",
     "tool_request",
+    "tool_result_raw",
     "tool_result_visible",
     "system_prompt",
     "tool_schema",
@@ -82,6 +84,43 @@ class SerializedContentBlock(BaseModel):
     sensitivity_flags: tuple[str, ...] = ()
 
 
+class ObservedContentCapture(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    block: SerializedContentBlock
+    redactions: tuple[RedactionManifestEntry, ...] = ()
+    warnings: tuple[str, ...] = ()
+
+
+def serialize_observed_content(
+    *,
+    kind: ContentKind,
+    body: object,
+    path: str,
+    known_secrets: Sequence[str] = (),
+) -> ObservedContentCapture:
+    """Safely serialize one observed content occurrence without using repr."""
+
+    redactions: list[RedactionManifestEntry] = []
+    warnings: list[str] = []
+    safe_body = _safe_json(
+        body,
+        path,
+        frozenset(value for value in known_secrets if value),
+        redactions,
+        warnings,
+    )
+    return ObservedContentCapture(
+        block=_block(kind, safe_body),
+        redactions=tuple(redactions),
+        warnings=tuple(warnings),
+    )
+
+
+def canonical_content_hash(value: object) -> str:
+    return hashlib.sha256(_canonical_bytes(value)).hexdigest()
+
+
 class ContextSnapshotItemCapture(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True)
 
@@ -136,10 +175,15 @@ def serialize_model_request(
     secret_values = frozenset(value for value in known_secrets if value)
     items: list[ContextSnapshotItemCapture] = []
     ordered_messages = ([system_message] if system_message is not None else []) + list(messages)
+    message_occurrence_counts: dict[str, int] = {}
 
     for message_index, message in enumerate(ordered_messages):
         role = _message_role(message)
         message_id = _string_attribute(message, "id")
+        message_occurrence_seq = 1
+        if message_id is not None:
+            message_occurrence_seq = message_occurrence_counts.get(message_id, 0) + 1
+            message_occurrence_counts[message_id] = message_occurrence_seq
         name = _string_attribute(message, "name")
         content = getattr(message, "content", None)
         parts = content if isinstance(content, list | tuple) else [content]
@@ -155,7 +199,11 @@ def serialize_model_request(
                     message_id=message_id,
                     name=name,
                     block=_block(kind, body),
-                    metadata={"message_ordinal": message_index, "part_ordinal": part_index},
+                    metadata={
+                        "message_ordinal": message_index,
+                        "message_occurrence_seq": message_occurrence_seq,
+                        "part_ordinal": part_index,
+                    },
                 )
             )
         for tool_index, tool_call in enumerate(_message_tool_calls(message)):
@@ -174,7 +222,11 @@ def serialize_model_request(
                     message_id=message_id,
                     name=name,
                     block=_block("tool_request", body),
-                    metadata={"message_ordinal": message_index, "tool_call_ordinal": tool_index},
+                    metadata={
+                        "message_ordinal": message_index,
+                        "message_occurrence_seq": message_occurrence_seq,
+                        "tool_call_ordinal": tool_index,
+                    },
                 )
             )
 
@@ -356,10 +408,28 @@ def _safe_json(
     if value is None or isinstance(value, bool | int | float):
         return value
     if isinstance(value, str):
-        if value in secret_values:
+        safe_value = value
+        for secret in sorted(secret_values, key=len, reverse=True):
+            safe_value = safe_value.replace(secret, _REDACTED)
+        if safe_value != value:
             redactions.append(RedactionManifestEntry(path=path, reason="known_secret_value"))
-            return _REDACTED
-        return value
+        return safe_value
+    if isinstance(value, bytes | bytearray | memoryview):
+        raw = bytes(value)
+        if any(secret.encode("utf-8") in raw for secret in secret_values):
+            redactions.append(RedactionManifestEntry(path=path, reason="known_secret_value"))
+            return {
+                "type": "binary",
+                "encoding": "redacted",
+                "byte_length": len(raw),
+                "data": _REDACTED,
+            }
+        return {
+            "type": "binary",
+            "encoding": "base64",
+            "byte_length": len(raw),
+            "data": base64.b64encode(raw).decode("ascii"),
+        }
     if isinstance(value, Mapping):
         result: dict[str, object] = {}
         for raw_key, child in value.items():

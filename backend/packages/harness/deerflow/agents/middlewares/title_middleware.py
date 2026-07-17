@@ -218,8 +218,6 @@ class TitleMiddleware(AgentMiddleware[TitleMiddlewareState]):
             model_kwargs = {
                 "thinking_enabled": False,
                 "attach_tracing": False,
-                "ansich_call_class": "system_operation",
-                "ansich_operation_kind": "title",
             }
             if self._app_config is not None:
                 model_kwargs["app_config"] = self._app_config

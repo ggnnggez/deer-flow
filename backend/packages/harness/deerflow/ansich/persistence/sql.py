@@ -8,8 +8,13 @@ from uuid import uuid4
 
 from ansich import (
     ContentBlockPayloadView,
+    ContentDerivationView,
+    ContentOccurrenceView,
     ContextSnapshotItemView,
     ContextSnapshotView,
+    ContextStateDelta,
+    ContextStateItem,
+    ContextStateView,
     ControlBelief,
     LlmAttemptView,
     NamedVersion,
@@ -17,21 +22,33 @@ from ansich import (
     Producer,
     StepView,
     TaskView,
+    ToolBelief,
+    ToolCallView,
+    ToolResultView,
     new_id,
 )
+from ansich.context_state import context_state_hash, materialize_context_state
 from ansich.contracts import ControlValue
 from ansich.control import should_select_control_candidate
 from sqlalchemy import and_, case, delete, func, or_, select, update
+from sqlalchemy.dialects.postgresql import insert as postgresql_insert
+from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from deerflow.ansich.persistence.models import (
     AnsichBeliefAssertionRow,
     AnsichBeliefEvidenceRow,
     AnsichContentBlobRow,
+    AnsichContentBlockDerivationRow,
     AnsichContentBlockRow,
+    AnsichContentOccurrenceRow,
     AnsichContextSnapshotItemRow,
     AnsichContextSnapshotMissingItemRow,
     AnsichContextSnapshotRow,
+    AnsichContextStateCheckpointItemRow,
+    AnsichContextStateDeltaRow,
+    AnsichContextStateMissingBlockRow,
+    AnsichContextStateRow,
     AnsichContextWindowRow,
     AnsichCurrentBeliefRow,
     AnsichEntityRow,
@@ -47,6 +64,8 @@ from deerflow.ansich.persistence.models import (
     AnsichStepRow,
     AnsichTaskRow,
     AnsichTaskSummaryRow,
+    AnsichToolCallResultRow,
+    AnsichToolCallRow,
     AnsichTransitionRow,
 )
 
@@ -65,7 +84,17 @@ _STEP_PROJECTION_KINDS = frozenset(
         "llm.responded",
         "llm.failed",
         "content.produced",
+        "context.state_recorded",
         "context.snapshotted",
+        "tool.issued",
+        "tool.started",
+        "tool.returned_raw",
+        "tool.result_visible",
+        "tool.denied",
+        "tool.timed_out",
+        "tool.cancelled",
+        "tool.failed",
+        "tool.unknown_terminal",
     }
 )
 #: Registration order is execution priority for jobs of one observation:
@@ -79,6 +108,14 @@ _PROJECTOR_KINDS = {
     "task-step": _STEP_PROJECTION_KINDS,
 }
 _CONTENT_CANONICALIZATION_VERSION = "1"
+_TOOL_TERMINAL_PRECEDENCE = {
+    "unknown_terminal": 0,
+    "denied": 1,
+    "cancelled": 2,
+    "timed_out": 3,
+    "failed": 4,
+    "returned": 5,
+}
 
 
 def _projectors_for_kind(kind: str) -> tuple[tuple[str, str], ...]:
@@ -168,38 +205,13 @@ class SqlAnsichBackend:
                     if payload_json.get("content_hash") != content_hash:
                         raise ValueError("content.produced hash does not match canonical body")
                     blob_key = _content_blob_key(content_type, content_bytes)
-                    blob = await session.get(AnsichContentBlobRow, blob_key)
-                    if blob is None:
-                        blob_payload_ref_id = None
-                        inline_body = content_bytes
-                        if len(content_bytes) > self._inline_payload_max_bytes:
-                            blob_payload_ref_id = new_id()
-                            inline_body = None
-                            session.add(
-                                AnsichPayloadRow(
-                                    payload_id=blob_payload_ref_id,
-                                    content_type=content_type,
-                                    encoding="utf-8",
-                                    compression="none",
-                                    byte_size=len(content_bytes),
-                                    sha256=content_hash,
-                                    body=content_bytes,
-                                )
-                            )
-                        blob = AnsichContentBlobRow(
-                            blob_key=blob_key,
-                            content_hash=content_hash,
-                            byte_size=len(content_bytes),
-                            content_type=content_type,
-                            canonicalization_version=_CONTENT_CANONICALIZATION_VERSION,
-                            inline_body=inline_body,
-                            payload_ref_id=blob_payload_ref_id,
-                        )
-                        session.add(blob)
-                    else:
-                        existing_bytes = await self._content_blob_bytes(session, blob)
-                        if existing_bytes != content_bytes:
-                            raise ValueError("Ansich ContentBlob key collision")
+                    await self._ensure_content_blob(
+                        session,
+                        blob_key=blob_key,
+                        content_hash=content_hash,
+                        content_type=content_type,
+                        content_bytes=content_bytes,
+                    )
                     payload_json = dict(payload_json)
                     payload_json.pop("body", None)
                     payload_json["blob_key"] = blob_key
@@ -274,6 +286,63 @@ class SqlAnsichBackend:
                 self._latest_recorded_at = latest
         return processed
 
+    async def _ensure_content_blob(
+        self,
+        session: AsyncSession,
+        *,
+        blob_key: str,
+        content_hash: str,
+        content_type: str,
+        content_bytes: bytes,
+    ) -> None:
+        blob = await session.get(AnsichContentBlobRow, blob_key)
+        if blob is None:
+            blob_payload_ref_id = None
+            inline_body = content_bytes
+            if len(content_bytes) > self._inline_payload_max_bytes:
+                blob_payload_ref_id = new_id()
+                inline_body = None
+                session.add(
+                    AnsichPayloadRow(
+                        payload_id=blob_payload_ref_id,
+                        content_type=content_type,
+                        encoding="utf-8",
+                        compression="none",
+                        byte_size=len(content_bytes),
+                        sha256=content_hash,
+                        body=content_bytes,
+                    )
+                )
+                await session.flush()
+            values = {
+                "blob_key": blob_key,
+                "content_hash": content_hash,
+                "byte_size": len(content_bytes),
+                "content_type": content_type,
+                "canonicalization_version": _CONTENT_CANONICALIZATION_VERSION,
+                "payload_status": "available",
+                "inline_body": inline_body,
+                "payload_ref_id": blob_payload_ref_id,
+            }
+            dialect_name = session.bind.dialect.name if session.bind is not None else ""
+            if dialect_name == "postgresql":
+                statement = postgresql_insert(AnsichContentBlobRow).values(**values)
+            elif dialect_name == "sqlite":
+                statement = sqlite_insert(AnsichContentBlobRow).values(**values)
+            else:
+                raise ValueError(f"unsupported Ansich SQL dialect: {dialect_name}")
+            inserted_key = (await session.execute(statement.on_conflict_do_nothing(index_elements=["blob_key"]).returning(AnsichContentBlobRow.blob_key))).scalar_one_or_none()
+            if inserted_key is None and blob_payload_ref_id is not None:
+                losing_payload = await session.get(AnsichPayloadRow, blob_payload_ref_id)
+                if losing_payload is not None:
+                    await session.delete(losing_payload)
+            blob = await session.get(AnsichContentBlobRow, blob_key)
+            if blob is None:
+                raise RuntimeError("Ansich ContentBlob upsert did not produce a row")
+        existing_bytes = await self._content_blob_bytes(session, blob)
+        if existing_bytes != content_bytes:
+            raise ValueError("Ansich ContentBlob key collision")
+
     async def project_pending(self, *, limit: int = 200) -> int:
         processed = 0
         for _ in range(limit):
@@ -330,17 +399,20 @@ class SqlAnsichBackend:
             snapshot_visible_bytes = await session.scalar(select(func.coalesce(func.sum(AnsichContextSnapshotRow.visible_bytes), 0)))
             complete_items = await session.scalar(select(func.count()).select_from(AnsichContextSnapshotItemRow))
             missing_items = await session.scalar(select(func.count()).select_from(AnsichContextSnapshotMissingItemRow))
+            state_items = await session.scalar(
+                select(func.coalesce(func.sum(AnsichContextStateRow.item_count), 0)).select_from(AnsichContextSnapshotRow).join(AnsichContextStateRow, AnsichContextStateRow.state_id == AnsichContextSnapshotRow.state_id)
+            )
+            state_missing_blocks = await session.scalar(select(func.count()).select_from(AnsichContextStateMissingBlockRow))
             incomplete_snapshots = await session.scalar(select(func.count()).select_from(AnsichContextSnapshotRow).where(AnsichContextSnapshotRow.status == "incomplete"))
         self._context_metrics = {
             "snapshot_count": int(snapshot_count or 0),
-            "snapshot_item_count": int(complete_items or 0) + int(missing_items or 0),
+            "snapshot_item_count": int(complete_items or 0) + int(missing_items or 0) + int(state_items or 0),
             "snapshot_visible_bytes": int(snapshot_visible_bytes or 0),
             "incomplete_snapshot_count": int(incomplete_snapshots or 0),
-            "missing_content_block_count": int(missing_items or 0),
+            "missing_content_block_count": int(missing_items or 0) + int(state_missing_blocks or 0),
         }
 
     async def has_pending_for_task(self, task_id: str) -> bool:
-        now = datetime.now(UTC)
         async with self._session_factory() as session:
             pending = await session.scalar(
                 select(AnsichProjectionJobRow.job_id)
@@ -349,7 +421,7 @@ class SqlAnsichBackend:
                     AnsichObservationRow.task_id == task_id,
                     or_(
                         AnsichProjectionJobRow.status == "pending",
-                        (AnsichProjectionJobRow.status == "processing") & (AnsichProjectionJobRow.lease_expires_at <= now),
+                        AnsichProjectionJobRow.status == "processing",
                     ),
                 )
                 .limit(1)
@@ -365,6 +437,14 @@ class SqlAnsichBackend:
                 AnsichContextSnapshotItemRow,
                 AnsichContextSnapshotRow,
                 AnsichContextWindowRow,
+                AnsichContextStateMissingBlockRow,
+                AnsichContextStateDeltaRow,
+                AnsichContextStateCheckpointItemRow,
+                AnsichContextStateRow,
+                AnsichContentBlockDerivationRow,
+                AnsichToolCallResultRow,
+                AnsichToolCallRow,
+                AnsichContentOccurrenceRow,
                 AnsichContentBlockRow,
                 AnsichLlmAttemptRow,
                 AnsichStepRow,
@@ -473,6 +553,12 @@ class SqlAnsichBackend:
             task = await session.get(AnsichTaskRow, task_id)
             if task is None:
                 return None
+            summary = await session.get(AnsichTaskSummaryRow, task_id)
+            usage = {
+                "observability_status": ("healthy" if summary is None else summary.observability_status),
+                "tool_calls_issued": 0 if summary is None else summary.tool_calls_issued,
+                "tool_calls_executed": 0 if summary is None else summary.tool_calls_executed,
+            }
             current = await session.get(AnsichCurrentBeliefRow, (task_id, "control"))
             if current is None:
                 trigger = await session.scalar(select(AnsichObservationRow).where(AnsichObservationRow.obs_id == task.trigger_obs_id))
@@ -490,6 +576,7 @@ class SqlAnsichBackend:
                         selected_by=NamedVersion(name="control-state", version="1"),
                         evidence_obs_ids=(),
                     ),
+                    **usage,
                 )
             assertion = await session.get(AnsichBeliefAssertionRow, current.assertion_id)
             if assertion is None:
@@ -508,6 +595,7 @@ class SqlAnsichBackend:
                     selected_by=NamedVersion(name=current.resolver_name, version=current.resolver_version),
                     evidence_obs_ids=tuple(row.obs_id for row in evidence_rows),
                 ),
+                **usage,
             )
 
     async def get_task_by_source(self, source_kind: str, source_id: str) -> TaskView | None:
@@ -609,6 +697,50 @@ class SqlAnsichBackend:
             value = await session.scalar(select(func.max(AnsichStepRow.step_seq)).where(AnsichStepRow.task_id == task_id))
         return int(value or 0)
 
+    async def list_content_occurrences(self, task_id: str) -> list[ContentOccurrenceView]:
+        async with self._session_factory() as session:
+            rows = list(
+                (
+                    await session.execute(
+                        select(AnsichContentOccurrenceRow)
+                        .where(AnsichContentOccurrenceRow.task_id == task_id)
+                        .order_by(
+                            AnsichContentOccurrenceRow.source_identity,
+                            AnsichContentOccurrenceRow.content_hash,
+                            AnsichContentOccurrenceRow.kind,
+                        )
+                    )
+                ).scalars()
+            )
+        return [
+            ContentOccurrenceView(
+                task_id=row.task_id,
+                source_identity=row.source_identity,
+                content_hash=row.content_hash,
+                kind=row.kind,
+                block_id=row.block_id,
+                producer_obs_id=row.producer_obs_id,
+            )
+            for row in rows
+        ]
+
+    async def get_latest_context_state(self, task_id: str) -> ContextStateView | None:
+        async with self._session_factory() as session:
+            state = await session.scalar(
+                select(AnsichContextStateRow)
+                .join(
+                    AnsichObservationRow,
+                    AnsichObservationRow.obs_id == AnsichContextStateRow.created_obs_id,
+                )
+                .where(
+                    AnsichContextStateRow.task_id == task_id,
+                    AnsichContextStateRow.created_obs_id.is_not(None),
+                )
+                .order_by(AnsichObservationRow.ingest_seq.desc())
+                .limit(1)
+            )
+            return None if state is None else await self._context_state_view(session, state)
+
     async def list_steps(self, task_id: str) -> list[StepView]:
         async with self._session_factory() as session:
             rows = list((await session.execute(select(AnsichStepRow).where(AnsichStepRow.task_id == task_id).order_by(AnsichStepRow.step_seq))).scalars())
@@ -620,11 +752,15 @@ class SqlAnsichBackend:
                 (
                     await session.execute(
                         select(AnsichLlmAttemptRow)
+                        .join(
+                            AnsichObservationRow,
+                            AnsichObservationRow.obs_id == AnsichLlmAttemptRow.request_obs_id,
+                        )
                         .where(
                             AnsichLlmAttemptRow.task_id == task_id,
                             AnsichLlmAttemptRow.step_id.is_(None),
                         )
-                        .order_by(AnsichLlmAttemptRow.request_obs_id, AnsichLlmAttemptRow.attempt_no)
+                        .order_by(AnsichObservationRow.ingest_seq, AnsichLlmAttemptRow.attempt_no)
                     )
                 ).scalars()
             )
@@ -635,6 +771,11 @@ class SqlAnsichBackend:
             row = await session.get(AnsichStepRow, step_id)
             return None if row is None else await self._step_view(session, row)
 
+    async def get_tool_call(self, tool_call_id: str) -> ToolCallView | None:
+        async with self._session_factory() as session:
+            row = await session.get(AnsichToolCallRow, tool_call_id)
+            return None if row is None else await self._tool_call_view(session, row)
+
     async def get_step_context(self, step_id: str) -> ContextSnapshotView | None:
         async with self._session_factory() as session:
             step = await session.get(AnsichStepRow, step_id)
@@ -643,57 +784,72 @@ class SqlAnsichBackend:
             snapshot = await session.get(AnsichContextSnapshotRow, step.effective_context_snapshot_id)
             if snapshot is None:
                 return None
-            item_rows = list(
-                (
-                    await session.execute(
-                        select(AnsichContextSnapshotItemRow, AnsichContentBlockRow)
-                        .join(
-                            AnsichContentBlockRow,
-                            AnsichContentBlockRow.entity_id == AnsichContextSnapshotItemRow.content_block_id,
+            status = snapshot.status
+            if snapshot.state_id is not None:
+                state = await session.get(AnsichContextStateRow, snapshot.state_id)
+                state_view = None if state is None else await self._context_state_view(session, state)
+                if state_view is None:
+                    items: list[ContextSnapshotItemView] = []
+                    status = "incomplete"
+                else:
+                    items = await self._context_snapshot_items_for_state(session, state_view)
+                    status = "complete" if state_view.status == "complete" else "incomplete"
+            else:
+                item_rows = list(
+                    (
+                        await session.execute(
+                            select(AnsichContextSnapshotItemRow, AnsichContentBlockRow)
+                            .join(
+                                AnsichContentBlockRow,
+                                AnsichContentBlockRow.entity_id == AnsichContextSnapshotItemRow.content_block_id,
+                            )
+                            .where(AnsichContextSnapshotItemRow.snapshot_id == snapshot.entity_id)
+                            .order_by(AnsichContextSnapshotItemRow.ordinal)
                         )
-                        .where(AnsichContextSnapshotItemRow.snapshot_id == snapshot.entity_id)
-                        .order_by(AnsichContextSnapshotItemRow.ordinal)
+                    ).all()
+                )
+                missing_rows = list(
+                    (await session.execute(select(AnsichContextSnapshotMissingItemRow).where(AnsichContextSnapshotMissingItemRow.snapshot_id == snapshot.entity_id).order_by(AnsichContextSnapshotMissingItemRow.ordinal))).scalars()
+                )
+                items = [
+                    ContextSnapshotItemView(
+                        ordinal=item.ordinal,
+                        channel=item.channel,
+                        role=item.role,
+                        name=item.name,
+                        message_id=item.message_id,
+                        source_identity=item.source_identity,
+                        block_id=block.entity_id,
+                        kind=block.kind,
+                        content_hash=block.content_hash,
+                        visible_bytes=item.visible_bytes,
+                        estimated_tokens=item.estimated_tokens,
+                        metadata=item.metadata_json,
+                        sensitivity_flags=tuple(block.sensitivity_flags_json),
+                        payload_available=True,
                     )
-                ).all()
-            )
-            missing_rows = list(
-                (await session.execute(select(AnsichContextSnapshotMissingItemRow).where(AnsichContextSnapshotMissingItemRow.snapshot_id == snapshot.entity_id).order_by(AnsichContextSnapshotMissingItemRow.ordinal))).scalars()
-            )
-            items = [
-                ContextSnapshotItemView(
-                    ordinal=item.ordinal,
-                    channel=item.channel,
-                    role=item.role,
-                    name=item.name,
-                    block_id=block.entity_id,
-                    kind=block.kind,
-                    content_hash=block.content_hash,
-                    visible_bytes=item.visible_bytes,
-                    estimated_tokens=item.estimated_tokens,
-                    metadata=item.metadata_json,
-                    sensitivity_flags=tuple(block.sensitivity_flags_json),
-                    payload_available=True,
+                    for item, block in item_rows
+                ]
+                items.extend(
+                    ContextSnapshotItemView(
+                        ordinal=item.ordinal,
+                        channel=cast(Literal["message", "tool_schema"], item.channel),
+                        role=cast(Literal["system", "user", "assistant", "tool"] | None, item.role),
+                        name=item.name,
+                        message_id=item.message_id,
+                        source_identity=item.source_identity,
+                        block_id=item.expected_content_block_id,
+                        kind=None,
+                        content_hash=None,
+                        visible_bytes=item.visible_bytes,
+                        estimated_tokens=item.estimated_tokens,
+                        metadata=item.metadata_json,
+                        payload_available=False,
+                        resolution_status="missing",
+                    )
+                    for item in missing_rows
                 )
-                for item, block in item_rows
-            ]
-            items.extend(
-                ContextSnapshotItemView(
-                    ordinal=item.ordinal,
-                    channel=cast(Literal["message", "tool_schema"], item.channel),
-                    role=cast(Literal["system", "user", "assistant", "tool"] | None, item.role),
-                    name=item.name,
-                    block_id=item.expected_content_block_id,
-                    kind=None,
-                    content_hash=None,
-                    visible_bytes=item.visible_bytes,
-                    estimated_tokens=item.estimated_tokens,
-                    metadata=item.metadata_json,
-                    payload_available=False,
-                    resolution_status="missing",
-                )
-                for item in missing_rows
-            )
-            items.sort(key=lambda item: item.ordinal)
+                items.sort(key=lambda item: item.ordinal)
             return ContextSnapshotView(
                 snapshot_id=snapshot.entity_id,
                 task_id=snapshot.task_id,
@@ -715,8 +871,117 @@ class SqlAnsichBackend:
                 redactions=tuple(snapshot.redactions_json),
                 warnings=tuple(snapshot.warnings_json),
                 items=tuple(items),
-                status=cast(Literal["complete", "incomplete"], snapshot.status),
+                status=cast(Literal["complete", "incomplete"], status),
             )
+
+    async def _context_state_view(
+        self,
+        session: AsyncSession,
+        state: AnsichContextStateRow,
+    ) -> ContextStateView:
+        try:
+            items = await self._materialize_context_state(session, state.state_id, frozenset())
+        except ValueError:
+            items = ()
+        return ContextStateView(
+            state_id=state.state_id,
+            task_id=state.task_id,
+            state_hash=state.state_hash or "",
+            parent_state_id=state.parent_state_id,
+            chain_depth=state.chain_depth,
+            is_checkpoint=state.is_checkpoint,
+            status=cast(Literal["complete", "incomplete", "missing"], state.status),
+            items=items,
+        )
+
+    async def _materialize_context_state(
+        self,
+        session: AsyncSession,
+        state_id: str,
+        visited: frozenset[str],
+    ) -> tuple[ContextStateItem, ...]:
+        if state_id in visited:
+            raise ValueError("ContextState parent cycle detected")
+        state = await session.get(AnsichContextStateRow, state_id)
+        if state is None or state.status == "missing":
+            raise ValueError(f"ContextState is missing: {state_id}")
+        if state.is_checkpoint:
+            rows = list((await session.execute(select(AnsichContextStateCheckpointItemRow).where(AnsichContextStateCheckpointItemRow.state_id == state_id).order_by(AnsichContextStateCheckpointItemRow.ordinal))).scalars())
+            return tuple(
+                ContextStateItem(
+                    ordinal=row.ordinal,
+                    channel=cast(Literal["message", "tool_schema"], row.channel),
+                    role=cast(Literal["system", "user", "assistant", "tool"] | None, row.role),
+                    message_id=row.message_id,
+                    source_identity=row.source_identity,
+                    name=row.name,
+                    block_id=row.block_id,
+                    visible_bytes=row.visible_bytes,
+                    estimated_tokens=row.estimated_tokens,
+                    metadata=row.metadata_json,
+                )
+                for row in rows
+            )
+        if state.parent_state_id is None:
+            raise ValueError(f"delta ContextState has no parent: {state_id}")
+        parent = await self._materialize_context_state(session, state.parent_state_id, visited | {state_id})
+        rows = list((await session.execute(select(AnsichContextStateDeltaRow).where(AnsichContextStateDeltaRow.state_id == state_id).order_by(AnsichContextStateDeltaRow.operation_ordinal))).scalars())
+        operations = tuple(self._context_state_delta_from_row(row) for row in rows)
+        return materialize_context_state(parent, operations, item_count=state.item_count)
+
+    @staticmethod
+    def _context_state_delta_from_row(row: AnsichContextStateDeltaRow) -> ContextStateDelta:
+        item = None
+        if row.block_id is not None:
+            item = ContextStateItem(
+                ordinal=int(row.target_ordinal or 0),
+                channel=cast(Literal["message", "tool_schema"], row.channel),
+                role=cast(Literal["system", "user", "assistant", "tool"] | None, row.role),
+                message_id=row.message_id,
+                source_identity=row.source_identity,
+                name=row.name,
+                block_id=row.block_id,
+                visible_bytes=int(row.visible_bytes or 0),
+                estimated_tokens=int(row.estimated_tokens or 0),
+                metadata=dict(row.metadata_json or {}),
+            )
+        return ContextStateDelta(
+            op=cast(Literal["append", "remove", "replace", "reorder"], row.operation),
+            source_ordinal=row.source_ordinal,
+            target_ordinal=row.target_ordinal,
+            item=item,
+        )
+
+    async def _context_snapshot_items_for_state(
+        self,
+        session: AsyncSession,
+        state: ContextStateView,
+    ) -> list[ContextSnapshotItemView]:
+        block_ids = [item.block_id for item in state.items]
+        blocks: dict[str, AnsichContentBlockRow] = {}
+        if block_ids:
+            rows = list((await session.execute(select(AnsichContentBlockRow).where(AnsichContentBlockRow.entity_id.in_(block_ids)))).scalars())
+            blocks = {row.entity_id: row for row in rows}
+        return [
+            ContextSnapshotItemView(
+                ordinal=item.ordinal,
+                channel=item.channel,
+                role=item.role,
+                name=item.name,
+                message_id=item.message_id,
+                source_identity=item.source_identity,
+                block_id=item.block_id,
+                kind=blocks[item.block_id].kind if item.block_id in blocks else None,
+                content_hash=blocks[item.block_id].content_hash if item.block_id in blocks else None,
+                visible_bytes=item.visible_bytes,
+                estimated_tokens=item.estimated_tokens,
+                metadata=item.metadata,
+                sensitivity_flags=tuple(blocks[item.block_id].sensitivity_flags_json) if item.block_id in blocks else (),
+                payload_available=item.block_id in blocks,
+                resolution_status="available" if item.block_id in blocks else "missing",
+            )
+            for item in state.items
+        ]
 
     async def get_content_block_payload(self, block_id: str) -> ContentBlockPayloadView | None:
         async with self._session_factory() as session:
@@ -725,7 +990,7 @@ class SqlAnsichBackend:
                 return None
             if block.blob_key is not None:
                 blob = await session.get(AnsichContentBlobRow, block.blob_key)
-                if blob is None:
+                if blob is None or blob.payload_status != "available":
                     return None
                 body_bytes = await self._content_blob_bytes(session, blob)
                 body = body_bytes.decode("utf-8") if blob.content_type.startswith("text/plain") else json.loads(body_bytes.decode("utf-8"))
@@ -764,6 +1029,8 @@ class SqlAnsichBackend:
             )
             for attempt in attempt_rows
         )
+        tool_rows = list((await session.execute(select(AnsichToolCallRow).where(AnsichToolCallRow.step_id == step.entity_id).order_by(AnsichToolCallRow.call_seq))).scalars())
+        tool_calls = tuple([await SqlAnsichBackend._tool_call_view(session, row) for row in tool_rows])
         return StepView(
             step_id=step.entity_id,
             task_id=step.task_id,
@@ -777,6 +1044,146 @@ class SqlAnsichBackend:
             effective_context_snapshot_id=step.effective_context_snapshot_id,
             issued_tools=tuple(step.issued_tools_json),
             attempts=attempts,
+            tool_calls=tool_calls,
+        )
+
+    @staticmethod
+    async def _tool_call_view(
+        session: AsyncSession,
+        tool_call: AnsichToolCallRow,
+    ) -> ToolCallView:
+        step = await session.get(AnsichStepRow, tool_call.step_id)
+        if step is None:
+            raise ValueError(f"Ansich ToolCall step disappeared: {tool_call.step_id}")
+        observation_ids = tuple(
+            observation_id
+            for observation_id in (
+                tool_call.issued_obs_id,
+                tool_call.started_obs_id,
+                tool_call.raw_terminal_obs_id,
+                tool_call.visible_result_obs_id,
+            )
+            if observation_id is not None
+        )
+        observations: dict[str, AnsichObservationRow] = {}
+        if observation_ids:
+            rows = list((await session.execute(select(AnsichObservationRow).where(AnsichObservationRow.obs_id.in_(observation_ids)))).scalars())
+            observations = {row.obs_id: row for row in rows}
+
+        result_rows = list(
+            (
+                await session.execute(
+                    select(AnsichToolCallResultRow)
+                    .where(AnsichToolCallResultRow.tool_call_id == tool_call.entity_id)
+                    .order_by(
+                        AnsichToolCallResultRow.result_role,
+                        AnsichToolCallResultRow.source_obs_id,
+                    )
+                )
+            ).scalars()
+        )
+        block_ids = tuple({row.content_block_id for row in result_rows})
+        blocks: dict[str, AnsichContentBlockRow] = {}
+        if block_ids:
+            block_rows = list((await session.execute(select(AnsichContentBlockRow).where(AnsichContentBlockRow.entity_id.in_(block_ids)))).scalars())
+            blocks = {row.entity_id: row for row in block_rows}
+        results = tuple(
+            ToolResultView(
+                result_role=cast(Literal["raw", "visible"], result.result_role),
+                content_block_id=result.content_block_id,
+                source_obs_id=result.source_obs_id,
+                content_hash=(blocks[result.content_block_id].content_hash if result.content_block_id in blocks else None),
+                byte_size=(blocks[result.content_block_id].byte_size if result.content_block_id in blocks else None),
+                payload_available=result.content_block_id in blocks,
+                metadata=dict(result.metadata_json),
+            )
+            for result in result_rows
+        )
+        visible_block_ids = tuple(result.content_block_id for result in result_rows if result.result_role == "visible")
+        derivation_rows: list[AnsichContentBlockDerivationRow] = []
+        if visible_block_ids:
+            derivation_rows = list(
+                (
+                    await session.execute(
+                        select(AnsichContentBlockDerivationRow)
+                        .where(AnsichContentBlockDerivationRow.derived_block_id.in_(visible_block_ids))
+                        .order_by(
+                            AnsichContentBlockDerivationRow.derived_block_id,
+                            AnsichContentBlockDerivationRow.source_block_id,
+                        )
+                    )
+                ).scalars()
+            )
+
+        issued = observations.get(tool_call.issued_obs_id or "")
+        started = observations.get(tool_call.started_obs_id or "")
+        terminal = observations.get(tool_call.raw_terminal_obs_id or "")
+        visible = observations.get(tool_call.visible_result_obs_id or "")
+        fallback = issued or started or terminal or visible
+        asserted_at = _as_utc(fallback.recorded_at) if fallback is not None else datetime.now(UTC)
+
+        def belief(
+            value: str,
+            evidence: AnsichObservationRow | None,
+            *,
+            resolver: str,
+        ) -> ToolBelief:
+            return ToolBelief(
+                value=value,
+                as_of=None if evidence is None else _as_utc(evidence.occurred_at),
+                asserted_at=(asserted_at if evidence is None else _as_utc(evidence.recorded_at)),
+                source=NamedVersion(
+                    name="tool-accountability" if evidence is None else evidence.producer_name,
+                    version="1" if evidence is None else evidence.producer_version,
+                ),
+                selected_by=NamedVersion(name=resolver, version="1"),
+                evidence_obs_ids=() if evidence is None else (evidence.obs_id,),
+            )
+
+        authorization_evidence = terminal if tool_call.execution_status == "denied" else None
+        return ToolCallView(
+            tool_call_id=tool_call.entity_id,
+            task_id=tool_call.task_id,
+            step_id=tool_call.step_id,
+            step_seq=step.step_seq,
+            call_seq=tool_call.call_seq,
+            provider_call_id=tool_call.provider_call_id,
+            tool_name=tool_call.tool_name,
+            args_hash=tool_call.args_hash,
+            args_preview={} if tool_call.args_preview_json is None else tool_call.args_preview_json,
+            tool_schema_block_id=tool_call.tool_schema_block_id,
+            issued_obs_id=tool_call.issued_obs_id,
+            started_obs_id=tool_call.started_obs_id,
+            raw_terminal_obs_id=tool_call.raw_terminal_obs_id,
+            visible_result_obs_id=tool_call.visible_result_obs_id,
+            duration_ms=tool_call.duration_ms,
+            authorization=belief(
+                "denied" if authorization_evidence is not None else "unknown",
+                authorization_evidence,
+                resolver="tool-authorization-state",
+            ),
+            execution=belief(
+                tool_call.execution_status,
+                terminal or started or issued,
+                resolver=("tool-terminal-precedence" if terminal is not None else "tool-execution-state"),
+            ),
+            visible_result=belief(
+                tool_call.visible_result_status,
+                visible,
+                resolver="tool-visible-result-state",
+            ),
+            raw_results=tuple(result for result in results if result.result_role == "raw"),
+            visible_results=tuple(result for result in results if result.result_role == "visible"),
+            derivations=tuple(
+                ContentDerivationView(
+                    derived_block_id=row.derived_block_id,
+                    source_block_id=row.source_block_id,
+                    transform_kind=row.transform_kind,
+                    transform_version=row.transform_version,
+                    established_obs_id=row.established_obs_id,
+                )
+                for row in derivation_rows
+            ),
         )
 
     @staticmethod
@@ -794,8 +1201,8 @@ class SqlAnsichBackend:
             response_obs_id=attempt.response_obs_id,
             failure_obs_id=attempt.failure_obs_id,
             provider_model=attempt.provider_model,
-            usage=dict((attempt.usage_json or {}).get("usage", {})),
-            response_metadata=dict((attempt.usage_json or {}).get("response_metadata", {})),
+            usage=dict(attempt.usage_json or {}),
+            response_metadata=dict(attempt.response_metadata_json or {}),
             latency_ms=attempt.latency_ms,
             context_snapshot_id=attempt.context_snapshot_id,
             effective=effective,
@@ -949,24 +1356,25 @@ class SqlAnsichBackend:
             summary.assertion_id = assertion.assertion_id
             summary.projection_watermark = ingest_seq
             summary.updated_at = observation.recorded_at
+        if observation.kind in {
+            "task.completed",
+            "task.failed",
+            "task.interrupted",
+        }:
+            await self._close_settled_acting_steps(
+                session,
+                task_id=observation.task_id,
+                followup_observed=True,
+            )
 
     async def _project_step(self, session: AsyncSession, observation: ObservationEnvelope) -> bool:
         """Project logical decisions, physical LLM attempts, and request context.
 
-        The projector is deliberately event-specific. Task lifecycle events are
-        harmless no-ops, which lets every durable observation receive the same
-        versioned job set and keeps rebuild behavior uniform.
+        Projector routing creates jobs only for the event kinds consumed here;
+        this guard remains a replay compatibility boundary for unknown kinds.
         """
 
-        if observation.kind not in {
-            "step.started",
-            "step.closed",
-            "llm.requested",
-            "llm.responded",
-            "llm.failed",
-            "content.produced",
-            "context.snapshotted",
-        }:
+        if observation.kind not in _STEP_PROJECTION_KINDS:
             return False
         if observation.payload is None:
             raise ValueError(f"{observation.kind} requires inline projection payload")
@@ -997,6 +1405,12 @@ class SqlAnsichBackend:
                         issued_tools_json=[],
                     )
                 )
+            await self._close_settled_acting_steps(
+                session,
+                task_id=observation.task_id,
+                before_step_seq=int(payload["step_seq"]),
+                followup_observed=True,
+            )
             return False
 
         if observation.kind == "step.closed":
@@ -1048,6 +1462,25 @@ class SqlAnsichBackend:
                     )
                 )
                 await session.flush()
+            source_identity = payload.get("source_identity")
+            if isinstance(source_identity, str) and source_identity:
+                occurrence_key = (
+                    observation.task_id,
+                    source_identity,
+                    str(payload["content_hash"]),
+                    str(payload["kind"]),
+                )
+                if await session.get(AnsichContentOccurrenceRow, occurrence_key) is None:
+                    session.add(
+                        AnsichContentOccurrenceRow(
+                            task_id=observation.task_id,
+                            source_identity=source_identity,
+                            content_hash=str(payload["content_hash"]),
+                            kind=str(payload["kind"]),
+                            block_id=observation.subject_id,
+                            producer_obs_id=observation.obs_id,
+                        )
+                    )
             missing_items = list((await session.execute(select(AnsichContextSnapshotMissingItemRow).where(AnsichContextSnapshotMissingItemRow.expected_content_block_id == observation.subject_id))).scalars())
             affected_snapshot_ids: set[str] = set()
             for missing in missing_items:
@@ -1060,6 +1493,8 @@ class SqlAnsichBackend:
                             channel=missing.channel,
                             role=missing.role,
                             name=missing.name,
+                            message_id=missing.message_id,
+                            source_identity=missing.source_identity,
                             content_block_id=observation.subject_id,
                             visible_bytes=missing.visible_bytes,
                             estimated_tokens=missing.estimated_tokens,
@@ -1075,11 +1510,28 @@ class SqlAnsichBackend:
                         repaired_snapshot = await session.get(AnsichContextSnapshotRow, snapshot_id)
                         if repaired_snapshot is not None:
                             repaired_snapshot.status = "complete"
-            return bool(affected_snapshot_ids)
+            state_ids = list((await session.execute(select(AnsichContextStateMissingBlockRow.state_id).where(AnsichContextStateMissingBlockRow.block_id == observation.subject_id))).scalars())
+            for state_id in state_ids:
+                missing = await session.get(
+                    AnsichContextStateMissingBlockRow,
+                    (state_id, observation.subject_id),
+                )
+                if missing is not None:
+                    await session.delete(missing)
+                await self._refresh_context_state_and_descendants(session, state_id)
+            return bool(affected_snapshot_ids or state_ids)
+
+        if observation.kind == "context.state_recorded":
+            await self._project_context_state(session, observation)
+            return True
 
         if observation.kind == "context.snapshotted":
             await self._project_context_snapshot(session, observation)
             return True
+
+        if observation.kind.startswith("tool."):
+            await self._project_tool_call(session, observation)
+            return False
 
         attempt = await session.get(AnsichLlmAttemptRow, observation.subject_id)
         if attempt is None:
@@ -1115,15 +1567,423 @@ class SqlAnsichBackend:
             attempt.response_obs_id = observation.obs_id
             attempt.status = "success"
             attempt.latency_ms = int(payload["latency_ms"])
-            attempt.usage_json = {
-                "usage": dict(payload.get("usage", {})),
-                "response_metadata": dict(payload.get("response_metadata", {})),
-            }
+            attempt.usage_json = dict(payload.get("usage", {}))
+            attempt.response_metadata_json = dict(payload.get("response_metadata", {}))
         elif observation.kind == "llm.failed":
             attempt.failure_obs_id = observation.obs_id
             attempt.status = "failed"
             attempt.latency_ms = int(payload["latency_ms"])
         return False
+
+    async def _project_tool_call(
+        self,
+        session: AsyncSession,
+        observation: ObservationEnvelope,
+    ) -> None:
+        if observation.step_id is None or observation.payload is None:
+            raise ValueError(f"{observation.kind} requires step_id and payload")
+        step = await session.get(AnsichStepRow, observation.step_id)
+        if step is None:
+            raise ValueError(f"step.started has not been projected: {observation.step_id}")
+        payload = observation.payload
+        tool_call = await session.get(AnsichToolCallRow, observation.subject_id)
+        if tool_call is None:
+            if await session.get(AnsichEntityRow, observation.subject_id) is None:
+                session.add(
+                    AnsichEntityRow(
+                        entity_id=observation.subject_id,
+                        entity_type="tool_call",
+                        discovered_obs_id=observation.obs_id,
+                    )
+                )
+            tool_call = AnsichToolCallRow(
+                entity_id=observation.subject_id,
+                task_id=observation.task_id,
+                step_id=observation.step_id,
+                call_seq=int(payload.get("call_seq", 0)),
+                tool_name="unknown",
+                args_hash="",
+                execution_status="unknown",
+                visible_result_status="unknown",
+            )
+            session.add(tool_call)
+            await session.flush()
+
+        if observation.kind == "tool.issued":
+            first_issued_evidence = tool_call.issued_obs_id is None
+            tool_call.call_seq = int(payload["call_seq"])
+            tool_call.provider_call_id = payload.get("provider_call_id") if isinstance(payload.get("provider_call_id"), str) else None
+            tool_call.tool_name = str(payload["tool_name"])
+            tool_call.args_hash = str(payload["args_hash"])
+            tool_call.args_preview_json = payload.get("args_preview")
+            tool_call.tool_schema_block_id = payload.get("tool_schema_block_id") if isinstance(payload.get("tool_schema_block_id"), str) else None
+            tool_call.issued_obs_id = observation.obs_id
+            if tool_call.execution_status == "unknown":
+                tool_call.execution_status = "issued"
+            if first_issued_evidence:
+                await self._increment_tool_usage(
+                    session,
+                    observation.task_id,
+                    issued=1,
+                )
+            return
+        if observation.kind == "tool.started":
+            first_execution_evidence = tool_call.execution_status in {"unknown", "issued"}
+            tool_call.started_obs_id = observation.obs_id
+            if tool_call.raw_terminal_obs_id is None:
+                tool_call.execution_status = "acting"
+            if first_execution_evidence:
+                await self._increment_tool_usage(
+                    session,
+                    observation.task_id,
+                    executed=1,
+                )
+            return
+        if observation.kind == "tool.result_visible":
+            tool_call.visible_result_obs_id = observation.obs_id
+            tool_call.visible_result_status = "available"
+            result_block_id = payload.get("result_block_id")
+            if isinstance(result_block_id, str):
+                result_key = (tool_call.entity_id, "visible", observation.obs_id)
+                if await session.get(AnsichToolCallResultRow, result_key) is None:
+                    session.add(
+                        AnsichToolCallResultRow(
+                            tool_call_id=tool_call.entity_id,
+                            result_role="visible",
+                            source_obs_id=observation.obs_id,
+                            content_block_id=result_block_id,
+                            metadata_json={"transform_kind": payload.get("transform_kind", "unknown")},
+                        )
+                    )
+            source_block_id = payload.get("source_block_id")
+            if isinstance(result_block_id, str) and isinstance(source_block_id, str):
+                transform_kind = str(payload.get("transform_kind", "unknown"))
+                derivation_key = (result_block_id, source_block_id, transform_kind)
+                if await session.get(AnsichContentBlockDerivationRow, derivation_key) is None:
+                    session.add(
+                        AnsichContentBlockDerivationRow(
+                            derived_block_id=result_block_id,
+                            source_block_id=source_block_id,
+                            transform_kind=transform_kind,
+                            transform_version=str(payload.get("transform_version", "1")),
+                            established_obs_id=observation.obs_id,
+                        )
+                    )
+            return
+
+        terminal_status = {
+            "tool.returned_raw": "returned",
+            "tool.denied": "denied",
+            "tool.timed_out": "timed_out",
+            "tool.cancelled": "cancelled",
+            "tool.failed": "failed",
+            "tool.unknown_terminal": "unknown_terminal",
+        }.get(observation.kind)
+        if terminal_status is None:
+            return
+        previous_terminal_status = tool_call.execution_status if tool_call.raw_terminal_obs_id is not None else None
+        assertion = AnsichBeliefAssertionRow(
+            assertion_id=new_id(),
+            subject_id=tool_call.entity_id,
+            field_name="execution",
+            value_json={"value": terminal_status},
+            as_of=observation.occurred_at,
+            asserted_at=observation.recorded_at,
+            source_name=observation.producer.name,
+            source_version=observation.producer.version,
+            fidelity_class="hard",
+        )
+        session.add(assertion)
+        session.add(
+            AnsichBeliefEvidenceRow(
+                assertion_id=assertion.assertion_id,
+                obs_id=observation.obs_id,
+                evidence_role="supporting",
+                ordinal=0,
+            )
+        )
+        current_execution = await session.get(
+            AnsichCurrentBeliefRow,
+            (tool_call.entity_id, "execution"),
+        )
+        if current_execution is None:
+            session.add(
+                AnsichCurrentBeliefRow(
+                    subject_id=tool_call.entity_id,
+                    field_name="execution",
+                    assertion_id=assertion.assertion_id,
+                    resolver_name="tool-terminal-precedence",
+                    resolver_version="1",
+                )
+            )
+        candidate_selected = previous_terminal_status is None or _TOOL_TERMINAL_PRECEDENCE[terminal_status] >= _TOOL_TERMINAL_PRECEDENCE[previous_terminal_status]
+        if current_execution is not None and candidate_selected:
+            current_execution.assertion_id = assertion.assertion_id
+        if previous_terminal_status is not None and previous_terminal_status != terminal_status:
+            summary = await session.get(AnsichTaskSummaryRow, observation.task_id)
+            if summary is not None:
+                summary.observability_status = "degraded"
+        first_execution_evidence = terminal_status not in {"denied", "unknown_terminal"} and tool_call.execution_status in {"unknown", "issued", "denied", "unknown_terminal"}
+        if candidate_selected:
+            tool_call.raw_terminal_obs_id = observation.obs_id
+            tool_call.execution_status = terminal_status
+        if first_execution_evidence:
+            await self._increment_tool_usage(
+                session,
+                observation.task_id,
+                executed=1,
+            )
+        if candidate_selected and isinstance(payload.get("duration_ms"), int):
+            tool_call.duration_ms = int(payload["duration_ms"])
+        result_block_id = payload.get("result_block_id")
+        if isinstance(result_block_id, str):
+            result_key = (tool_call.entity_id, "raw", observation.obs_id)
+            if await session.get(AnsichToolCallResultRow, result_key) is None:
+                session.add(
+                    AnsichToolCallResultRow(
+                        tool_call_id=tool_call.entity_id,
+                        result_role="raw",
+                        source_obs_id=observation.obs_id,
+                        content_block_id=result_block_id,
+                        metadata_json={key: value for key, value in payload.items() if key not in {"result_block_id", "call_seq"}},
+                    )
+                )
+        later_step_exists = (
+            await session.scalar(
+                select(AnsichStepRow.entity_id)
+                .where(
+                    AnsichStepRow.task_id == observation.task_id,
+                    AnsichStepRow.step_seq > step.step_seq,
+                )
+                .limit(1)
+            )
+            is not None
+        )
+        summary = await session.get(AnsichTaskSummaryRow, observation.task_id)
+        task_is_terminal = summary is not None and summary.control_value in {"completed", "failed", "interrupted"}
+        if later_step_exists or task_is_terminal:
+            await self._close_settled_acting_steps(
+                session,
+                task_id=observation.task_id,
+                step_id=step.entity_id,
+                followup_observed=True,
+            )
+
+    @staticmethod
+    async def _close_settled_acting_steps(
+        session: AsyncSession,
+        *,
+        task_id: str,
+        step_id: str | None = None,
+        before_step_seq: int | None = None,
+        followup_observed: bool,
+    ) -> None:
+        if not followup_observed:
+            return
+        statement = select(AnsichStepRow).where(
+            AnsichStepRow.task_id == task_id,
+            AnsichStepRow.status == "acting",
+        )
+        if step_id is not None:
+            statement = statement.where(AnsichStepRow.entity_id == step_id)
+        if before_step_seq is not None:
+            statement = statement.where(AnsichStepRow.step_seq < before_step_seq)
+        steps = list((await session.execute(statement)).scalars())
+        for acting_step in steps:
+            issued_count = await session.scalar(select(func.count()).select_from(AnsichToolCallRow).where(AnsichToolCallRow.step_id == acting_step.entity_id))
+            unsettled_count = await session.scalar(
+                select(func.count())
+                .select_from(AnsichToolCallRow)
+                .where(
+                    AnsichToolCallRow.step_id == acting_step.entity_id,
+                    AnsichToolCallRow.raw_terminal_obs_id.is_(None),
+                )
+            )
+            if int(issued_count or 0) > 0 and int(unsettled_count or 0) == 0:
+                acting_step.status = "closed"
+
+    @staticmethod
+    async def _increment_tool_usage(
+        session: AsyncSession,
+        task_id: str,
+        *,
+        issued: int = 0,
+        executed: int = 0,
+    ) -> None:
+        await session.execute(
+            update(AnsichTaskSummaryRow)
+            .where(AnsichTaskSummaryRow.task_id == task_id)
+            .values(
+                tool_calls_issued=AnsichTaskSummaryRow.tool_calls_issued + issued,
+                tool_calls_executed=AnsichTaskSummaryRow.tool_calls_executed + executed,
+            )
+        )
+
+    async def _ensure_context_state_placeholder(
+        self,
+        session: AsyncSession,
+        *,
+        state_id: str,
+        task_id: str,
+        discovered_obs_id: str,
+    ) -> AnsichContextStateRow:
+        if await session.get(AnsichEntityRow, state_id) is None:
+            session.add(
+                AnsichEntityRow(
+                    entity_id=state_id,
+                    entity_type="context_state",
+                    discovered_obs_id=discovered_obs_id,
+                )
+            )
+        state = await session.get(AnsichContextStateRow, state_id)
+        if state is None:
+            state = AnsichContextStateRow(
+                state_id=state_id,
+                task_id=task_id,
+                state_hash=None,
+                parent_state_id=None,
+                created_obs_id=None,
+                chain_depth=0,
+                item_count=0,
+                is_checkpoint=False,
+                status="missing",
+            )
+            session.add(state)
+            await session.flush()
+        elif state.task_id != task_id:
+            raise ValueError("ContextState placeholder belongs to a different task")
+        return state
+
+    async def _project_context_state(
+        self,
+        session: AsyncSession,
+        observation: ObservationEnvelope,
+    ) -> None:
+        if observation.payload is None:
+            raise ValueError("context.state_recorded is missing payload")
+        payload = observation.payload
+        parent_state_id = payload.get("parent_state_id") if isinstance(payload.get("parent_state_id"), str) else None
+        if parent_state_id == observation.subject_id:
+            raise ValueError("ContextState cannot parent itself")
+        if parent_state_id is not None:
+            await self._ensure_context_state_placeholder(
+                session,
+                state_id=parent_state_id,
+                task_id=observation.task_id,
+                discovered_obs_id=observation.obs_id,
+            )
+        state = await self._ensure_context_state_placeholder(
+            session,
+            state_id=observation.subject_id,
+            task_id=observation.task_id,
+            discovered_obs_id=observation.obs_id,
+        )
+        state_hash = str(payload["state_hash"])
+        if state.created_obs_id is not None:
+            if state.state_hash != state_hash:
+                raise ValueError("ContextState ID collision")
+            return
+        is_checkpoint = bool(payload["is_checkpoint"])
+        if is_checkpoint != (parent_state_id is None):
+            raise ValueError("ContextState checkpoint/parent shape is inconsistent")
+        state.state_hash = state_hash
+        state.parent_state_id = parent_state_id
+        state.created_obs_id = observation.obs_id
+        state.chain_depth = int(payload["chain_depth"])
+        state.item_count = int(payload["item_count"])
+        state.is_checkpoint = is_checkpoint
+        state.status = "incomplete"
+        state.created_at = observation.recorded_at
+
+        if is_checkpoint:
+            items = tuple(ContextStateItem.model_validate(item) for item in payload.get("checkpoint_items", []))
+            if len(items) != state.item_count:
+                raise ValueError("ContextState checkpoint item_count mismatch")
+            for item in items:
+                session.add(
+                    AnsichContextStateCheckpointItemRow(
+                        state_id=state.state_id,
+                        ordinal=item.ordinal,
+                        channel=item.channel,
+                        role=item.role,
+                        message_id=item.message_id,
+                        source_identity=item.source_identity,
+                        name=item.name,
+                        block_id=item.block_id,
+                        visible_bytes=item.visible_bytes,
+                        estimated_tokens=item.estimated_tokens,
+                        metadata_json=item.metadata,
+                    )
+                )
+        else:
+            operations = tuple(ContextStateDelta.model_validate(item) for item in payload.get("delta", []))
+            for operation_ordinal, operation in enumerate(operations):
+                item = operation.item
+                session.add(
+                    AnsichContextStateDeltaRow(
+                        state_id=state.state_id,
+                        operation_ordinal=operation_ordinal,
+                        operation=operation.op,
+                        source_ordinal=operation.source_ordinal,
+                        target_ordinal=operation.target_ordinal,
+                        channel=None if item is None else item.channel,
+                        role=None if item is None else item.role,
+                        message_id=None if item is None else item.message_id,
+                        source_identity=None if item is None else item.source_identity,
+                        name=None if item is None else item.name,
+                        block_id=None if item is None else item.block_id,
+                        visible_bytes=None if item is None else item.visible_bytes,
+                        estimated_tokens=None if item is None else item.estimated_tokens,
+                        metadata_json=None if item is None else item.metadata,
+                    )
+                )
+        await session.flush()
+        await self._refresh_context_state_and_descendants(session, state.state_id)
+
+    async def _refresh_context_state_and_descendants(
+        self,
+        session: AsyncSession,
+        root_state_id: str,
+    ) -> None:
+        pending = [root_state_id]
+        visited: set[str] = set()
+        while pending:
+            state_id = pending.pop(0)
+            if state_id in visited:
+                continue
+            visited.add(state_id)
+            state = await session.get(AnsichContextStateRow, state_id)
+            if state is None or state.created_obs_id is None or state.state_hash is None:
+                continue
+            state.status = "incomplete"
+            await session.flush()
+            try:
+                items = await self._materialize_context_state(session, state_id, frozenset())
+            except ValueError:
+                items = ()
+            if items:
+                if len(items) != state.item_count or context_state_hash(items) != state.state_hash:
+                    raise ValueError("ContextState materialization does not match its declared hash")
+            elif state.item_count != 0:
+                children = list((await session.execute(select(AnsichContextStateRow.state_id).where(AnsichContextStateRow.parent_state_id == state_id))).scalars())
+                pending.extend(children)
+                continue
+            await session.execute(delete(AnsichContextStateMissingBlockRow).where(AnsichContextStateMissingBlockRow.state_id == state_id))
+            block_ids = {item.block_id for item in items}
+            available: set[str] = set()
+            if block_ids:
+                available = set((await session.execute(select(AnsichContentBlockRow.entity_id).where(AnsichContentBlockRow.entity_id.in_(block_ids)))).scalars())
+            for block_id in sorted(block_ids - available):
+                session.add(
+                    AnsichContextStateMissingBlockRow(
+                        state_id=state_id,
+                        block_id=block_id,
+                    )
+                )
+            state.status = "complete" if block_ids == available else "incomplete"
+            await session.execute(update(AnsichContextSnapshotRow).where(AnsichContextSnapshotRow.state_id == state_id).values(status="complete" if state.status == "complete" else "incomplete"))
+            children = list((await session.execute(select(AnsichContextStateRow.state_id).where(AnsichContextStateRow.parent_state_id == state_id))).scalars())
+            pending.extend(children)
 
     async def _project_context_snapshot(
         self,
@@ -1137,6 +1997,15 @@ class SqlAnsichBackend:
         attempt = await session.get(AnsichLlmAttemptRow, attempt_id)
         if attempt is None:
             raise ValueError(f"llm.requested has not been projected: {attempt_id}")
+        state_id = payload.get("state_id") if isinstance(payload.get("state_id"), str) else None
+        state = None
+        if state_id is not None:
+            state = await self._ensure_context_state_placeholder(
+                session,
+                state_id=state_id,
+                task_id=observation.task_id,
+                discovered_obs_id=observation.obs_id,
+            )
 
         window = await session.scalar(select(AnsichContextWindowRow).where(AnsichContextWindowRow.task_id == observation.task_id))
         if window is None:
@@ -1174,6 +2043,7 @@ class SqlAnsichBackend:
                 task_id=observation.task_id,
                 step_id=observation.step_id,
                 operation_id=payload.get("operation_id") if isinstance(payload.get("operation_id"), str) else None,
+                state_id=state_id,
                 attempt_no=int(payload["attempt_no"]),
                 request_obs_id=observation.causation_obs_id,
                 message_count=int(payload["message_count"]),
@@ -1189,10 +2059,14 @@ class SqlAnsichBackend:
                 generation_settings_json=dict(payload.get("generation_settings", {})),
                 redactions_json=list(payload.get("redactions", [])),
                 warnings_json=list(payload.get("warnings", [])),
-                status="complete",
+                status="complete" if state is None or state.status == "complete" else "incomplete",
             )
             session.add(snapshot)
             await session.flush()
+
+        if state_id is not None:
+            attempt.context_snapshot_id = snapshot.entity_id
+            return
 
         for raw_item in payload.get("items", []):
             if not isinstance(raw_item, dict):
@@ -1210,6 +2084,7 @@ class SqlAnsichBackend:
                             role=raw_item.get("role") if isinstance(raw_item.get("role"), str) else None,
                             name=raw_item.get("name") if isinstance(raw_item.get("name"), str) else None,
                             message_id=raw_item.get("message_id") if isinstance(raw_item.get("message_id"), str) else None,
+                            source_identity=raw_item.get("source_identity") if isinstance(raw_item.get("source_identity"), str) else None,
                             visible_bytes=int(raw_item["visible_bytes"]),
                             estimated_tokens=int(raw_item["estimated_tokens"]),
                             metadata_json=dict(raw_item.get("metadata", {})),
@@ -1226,6 +2101,8 @@ class SqlAnsichBackend:
                         channel=str(raw_item["channel"]),
                         role=raw_item.get("role") if isinstance(raw_item.get("role"), str) else None,
                         name=raw_item.get("name") if isinstance(raw_item.get("name"), str) else None,
+                        message_id=raw_item.get("message_id") if isinstance(raw_item.get("message_id"), str) else None,
+                        source_identity=raw_item.get("source_identity") if isinstance(raw_item.get("source_identity"), str) else None,
                         content_block_id=block_id,
                         visible_bytes=int(raw_item["visible_bytes"]),
                         estimated_tokens=int(raw_item["estimated_tokens"]),

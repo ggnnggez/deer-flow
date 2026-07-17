@@ -580,7 +580,6 @@ def _make_lead_agent(config: RunnableConfig, *, app_config: AppConfig):
                 thinking_enabled=thinking_enabled,
                 app_config=resolved_app_config,
                 attach_tracing=False,
-                ansich_call_class="lead_agent",
             ),
             tools=final_tools,
             middleware=build_middlewares(
@@ -654,7 +653,6 @@ def _make_lead_agent(config: RunnableConfig, *, app_config: AppConfig):
             reasoning_effort=reasoning_effort,
             app_config=resolved_app_config,
             attach_tracing=False,
-            ansich_call_class="lead_agent",
         ),
         tools=final_tools,
         middleware=build_middlewares(

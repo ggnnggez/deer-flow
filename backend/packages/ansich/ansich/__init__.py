@@ -1,3 +1,4 @@
+from ansich.context_state import ContextStateDelta, ContextStateItem, ContextStateView
 from ansich.contracts import (
     AnsichHealth,
     ControlBelief,
@@ -11,13 +12,19 @@ from ansich.contracts import (
 )
 from ansich.ids import new_id
 from ansich.service import AnsichService
-from ansich.step import ContentBlockPayloadView, ContextSnapshotItemView, ContextSnapshotView, LlmAttemptView, StepView
+from ansich.step import ContentBlockPayloadView, ContentOccurrenceView, ContextSnapshotItemView, ContextSnapshotView, LlmAttemptView, StepView
+from ansich.tool import ContentDerivationView, ToolBelief, ToolCallView, ToolResultView
 
 __all__ = [
     "AnsichHealth",
     "AnsichService",
     "ContentBlockPayloadView",
+    "ContentOccurrenceView",
+    "ContentDerivationView",
     "ControlBelief",
+    "ContextStateDelta",
+    "ContextStateItem",
+    "ContextStateView",
     "ContextSnapshotItemView",
     "ContextSnapshotView",
     "FlushResult",
@@ -28,6 +35,9 @@ __all__ = [
     "Producer",
     "RecordReceipt",
     "TaskView",
+    "ToolBelief",
+    "ToolCallView",
+    "ToolResultView",
     "StepView",
     "new_id",
 ]

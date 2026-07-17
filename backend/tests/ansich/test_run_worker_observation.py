@@ -4,7 +4,7 @@ import asyncio
 from datetime import UTC, datetime
 
 import pytest
-from ansich import AnsichService
+from ansich import AnsichService, ObservationEnvelope, Producer, new_id
 from ansich.memory import InMemoryAnsichBackend
 
 from deerflow.ansich.execution import ANSICH_EXECUTION_CONTEXT_KEY, AnsichExecutionContext
@@ -43,6 +43,53 @@ class CapturingExecutionAgent(SuccessfulAgent):
     async def astream(self, graph_input, *, config, stream_mode, **kwargs):
         runtime = config["configurable"]["__pregel_runtime"]
         self.execution = runtime.context.get(ANSICH_EXECUTION_CONTEXT_KEY)
+        return
+        yield
+
+
+class LeavesIssuedToolOpenAgent(CapturingExecutionAgent):
+    tool_call_id: str | None = None
+
+    async def astream(self, graph_input, *, config, stream_mode, **kwargs):
+        runtime = config["configurable"]["__pregel_runtime"]
+        self.execution = runtime.context.get(ANSICH_EXECUTION_CONTEXT_KEY)
+        assert self.execution is not None
+        step_id = new_id()
+        self.tool_call_id = new_id()
+        issued = ObservationEnvelope(
+            kind="tool.issued",
+            occurred_at=datetime.now(UTC),
+            task_id=self.execution.task_id,
+            step_id=step_id,
+            subject_type="tool_call",
+            subject_id=self.tool_call_id,
+            producer=Producer(
+                name="worker-reconciliation-test",
+                version="1",
+                instance_id="test",
+            ),
+            source_event_id=f"tool:{self.tool_call_id}:issued",
+            correlation_id=self.execution.task_id,
+            payload={
+                "call_seq": 1,
+                "provider_call_id": "worker-open-tool",
+                "tool_name": "open_tool",
+                "args_hash": "d" * 64,
+                "args_preview": {},
+                "tool_schema_block_id": None,
+            },
+        )
+        self.execution.service.record(issued)
+        self.execution.register_tool_call(
+            tool_call_id=self.tool_call_id,
+            step_id=step_id,
+            step_seq=1,
+            call_seq=1,
+            provider_call_id="worker-open-tool",
+            tool_name="open_tool",
+            args_hash="d" * 64,
+            issued_obs_id=issued.obs_id,
+        )
         return
         yield
 
@@ -226,3 +273,42 @@ async def test_worker_injects_task_scoped_ansich_execution_context_into_graph_ru
     assert agent.execution.task_id == task.task_id
     assert agent.execution.service is service
     assert agent.execution.next_step_seq == 1
+
+
+@pytest.mark.asyncio
+async def test_worker_reconciles_open_tool_before_recording_task_terminal():
+    service = AnsichService.in_memory()
+    await service.start()
+    record = RunRecord(
+        run_id="run-ansich-open-tool",
+        thread_id="thread-ansich-open-tool",
+        assistant_id="lead-agent",
+        status=RunStatus.pending,
+        on_disconnect=DisconnectMode.cancel,
+    )
+    record.abort_event = asyncio.Event()
+    agent = LeavesIssuedToolOpenAgent()
+
+    try:
+        await run_agent(
+            RecordingBridge(),
+            RecordingRunManager(record),
+            record,
+            ctx=RunContext(checkpointer=None, ansich_service=service),
+            agent_factory=lambda config: agent,
+            graph_input={"messages": []},
+            config={"configurable": {"thread_id": record.thread_id}},
+        )
+        task = await service.get_task_by_source("deerflow_run", record.run_id)
+        assert task is not None
+        observations = await service.list_observations(task.task_id)
+        tool_call = await service.get_tool_call(agent.tool_call_id or "")
+    finally:
+        await service.stop()
+
+    assert tool_call is not None
+    assert tool_call.execution.value == "unknown_terminal"
+    assert task.tool_calls_issued == 1
+    assert task.tool_calls_executed == 0
+    kinds = [item.kind for item in observations]
+    assert kinds.index("tool.unknown_terminal") < kinds.index("task.completed")

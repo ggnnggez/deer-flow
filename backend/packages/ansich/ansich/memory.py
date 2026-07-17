@@ -3,9 +3,11 @@ from __future__ import annotations
 from datetime import UTC, datetime
 from typing import cast
 
+from ansich.context_state import ContextStateDelta, ContextStateItem, ContextStateView, materialize_context_state
 from ansich.contracts import ControlBelief, ControlValue, NamedVersion, ObservationEnvelope, TaskView
 from ansich.control import should_select_control_candidate
-from ansich.step import ContentBlockPayloadView, ContextSnapshotItemView, ContextSnapshotView, LlmAttemptView, StepView
+from ansich.step import ContentBlockPayloadView, ContentOccurrenceView, ContextSnapshotItemView, ContextSnapshotView, LlmAttemptView, StepView
+from ansich.tool import ContentDerivationView, ToolBelief, ToolCallView, ToolResultView
 
 _CONTROL_BY_KIND = {
     "task.created": "created",
@@ -13,6 +15,14 @@ _CONTROL_BY_KIND = {
     "task.completed": "completed",
     "task.failed": "failed",
     "task.interrupted": "interrupted",
+}
+_TOOL_TERMINAL_PRECEDENCE = {
+    "tool.unknown_terminal": 0,
+    "tool.denied": 1,
+    "tool.cancelled": 2,
+    "tool.timed_out": 3,
+    "tool.failed": 4,
+    "tool.returned_raw": 5,
 }
 
 
@@ -39,13 +49,55 @@ class InMemoryAnsichBackend:
         return processed
 
     async def get_task(self, task_id: str) -> TaskView | None:
-        return self._tasks.get(task_id)
+        task = self._tasks.get(task_id)
+        if task is None:
+            return None
+        issued_ids = {observation.subject_id for observation in self._observations if observation.task_id == task_id and observation.kind == "tool.issued"}
+        executed_ids = {
+            observation.subject_id
+            for observation in self._observations
+            if observation.task_id == task_id
+            and observation.kind
+            in {
+                "tool.started",
+                "tool.returned_raw",
+                "tool.timed_out",
+                "tool.cancelled",
+                "tool.failed",
+            }
+        }
+        terminal_kinds_by_call = {
+            tool_call_id: {
+                observation.kind
+                for observation in self._observations
+                if observation.task_id == task_id
+                and observation.subject_id == tool_call_id
+                and observation.kind
+                in {
+                    "tool.returned_raw",
+                    "tool.denied",
+                    "tool.timed_out",
+                    "tool.cancelled",
+                    "tool.failed",
+                    "tool.unknown_terminal",
+                }
+            }
+            for tool_call_id in issued_ids
+        }
+        return task.model_copy(
+            update={
+                "observability_status": ("degraded" if any(len(terminal_kinds) > 1 for terminal_kinds in terminal_kinds_by_call.values()) else "healthy"),
+                "tool_calls_issued": len(issued_ids),
+                "tool_calls_executed": len(executed_ids),
+            }
+        )
 
     async def get_task_by_source(self, source_kind: str, source_id: str) -> TaskView | None:
-        return next(
+        task = next(
             (task for task in self._tasks.values() if task.source_kind == source_kind and task.source_id == source_id),
             None,
         )
+        return None if task is None else await self.get_task(task.task_id)
 
     async def list_tasks(
         self,
@@ -56,7 +108,7 @@ class InMemoryAnsichBackend:
         to_time: datetime | None = None,
         cursor: tuple[datetime, str] | None = None,
     ) -> list[TaskView]:
-        tasks = list(self._tasks.values())
+        tasks = [task for task_id in self._tasks if (task := await self.get_task(task_id)) is not None]
         if control is not None:
             tasks = [task for task in tasks if task.control.value == control]
         if from_time is not None:
@@ -98,6 +150,37 @@ class InMemoryAnsichBackend:
             ),
             default=0,
         )
+
+    async def list_content_occurrences(self, task_id: str) -> list[ContentOccurrenceView]:
+        occurrences: dict[tuple[str, str, str], ContentOccurrenceView] = {}
+        for observation in self._observations:
+            if observation.task_id != task_id or observation.kind != "content.produced" or observation.payload is None:
+                continue
+            source_identity = observation.payload.get("source_identity")
+            content_hash = observation.payload.get("content_hash")
+            kind = observation.payload.get("kind")
+            if not all(isinstance(value, str) and value for value in (source_identity, content_hash, kind)):
+                continue
+            key = (source_identity, content_hash, kind)
+            occurrences.setdefault(
+                key,
+                ContentOccurrenceView(
+                    task_id=task_id,
+                    source_identity=source_identity,
+                    content_hash=content_hash,
+                    kind=kind,
+                    block_id=observation.subject_id,
+                    producer_obs_id=observation.obs_id,
+                ),
+            )
+        return list(occurrences.values())
+
+    async def get_latest_context_state(self, task_id: str) -> ContextStateView | None:
+        observation = next(
+            (observation for observation in reversed(self._observations) if observation.task_id == task_id and observation.kind == "context.state_recorded"),
+            None,
+        )
+        return None if observation is None else self._context_state_view(observation.subject_id)
 
     async def list_steps(self, task_id: str) -> list[StepView]:
         started = [observation for observation in self._observations if observation.task_id == task_id and observation.kind == "step.started"]
@@ -147,6 +230,13 @@ class InMemoryAnsichBackend:
         )
         return None if started is None else self._step_view(started)
 
+    async def get_tool_call(self, tool_call_id: str) -> ToolCallView | None:
+        issued = next(
+            (observation for observation in self._observations if observation.kind == "tool.issued" and observation.subject_id == tool_call_id),
+            None,
+        )
+        return None if issued is None else self._tool_call_view(issued)
+
     async def get_step_context(self, step_id: str) -> ContextSnapshotView | None:
         step = await self.get_step(step_id)
         if step is None or step.effective_context_snapshot_id is None:
@@ -159,28 +249,35 @@ class InMemoryAnsichBackend:
             return None
         payload = snapshot.payload
         blocks = {observation.subject_id: observation.payload for observation in self._observations if observation.kind == "content.produced" and observation.payload is not None}
+        state_id = payload.get("state_id")
+        state = self._context_state_view(state_id) if isinstance(state_id, str) else None
+        if state is not None:
+            raw_items = [item.model_dump(mode="json") for item in state.items]
+        else:
+            raw_items = payload.get("items", [])
         items: list[ContextSnapshotItemView] = []
-        for item in payload.get("items", []):
+        for item in raw_items:
             if not isinstance(item, dict):
                 continue
             block_id = str(item["block_id"])
             block = blocks.get(block_id)
-            if block is None:
-                continue
             items.append(
                 ContextSnapshotItemView(
                     ordinal=int(item["ordinal"]),
                     channel=str(item["channel"]),
                     role=item.get("role") if isinstance(item.get("role"), str) else None,
                     name=item.get("name") if isinstance(item.get("name"), str) else None,
+                    message_id=item.get("message_id") if isinstance(item.get("message_id"), str) else None,
+                    source_identity=item.get("source_identity") if isinstance(item.get("source_identity"), str) else None,
                     block_id=block_id,
-                    kind=str(block["kind"]),
-                    content_hash=str(block["content_hash"]),
+                    kind=str(block["kind"]) if block is not None else None,
+                    content_hash=str(block["content_hash"]) if block is not None else None,
                     visible_bytes=int(item["visible_bytes"]),
                     estimated_tokens=int(item["estimated_tokens"]),
                     metadata=dict(item.get("metadata", {})),
-                    sensitivity_flags=tuple(block.get("sensitivity_flags", [])),
-                    payload_available="body" in block,
+                    sensitivity_flags=tuple(block.get("sensitivity_flags", [])) if block is not None else (),
+                    payload_available=block is not None and "body" in block,
+                    resolution_status="available" if block is not None else "missing",
                 )
             )
         return ContextSnapshotView(
@@ -204,6 +301,48 @@ class InMemoryAnsichBackend:
             redactions=tuple(payload.get("redactions", [])),
             warnings=tuple(payload.get("warnings", [])),
             items=tuple(sorted(items, key=lambda item: item.ordinal)),
+            status=("complete" if not isinstance(state_id, str) or (state is not None and state.status == "complete") else "incomplete"),
+        )
+
+    def _context_state_view(
+        self,
+        state_id: str,
+        visited: frozenset[str] = frozenset(),
+    ) -> ContextStateView | None:
+        if state_id in visited:
+            raise ValueError("ContextState parent cycle detected")
+        observation = next(
+            (observation for observation in self._observations if observation.kind == "context.state_recorded" and observation.subject_id == state_id),
+            None,
+        )
+        if observation is None or observation.payload is None:
+            return None
+        payload = observation.payload
+        is_checkpoint = bool(payload["is_checkpoint"])
+        parent_state_id = payload.get("parent_state_id") if isinstance(payload.get("parent_state_id"), str) else None
+        if is_checkpoint:
+            items = tuple(ContextStateItem.model_validate(item) for item in payload.get("checkpoint_items", []))
+            parent_complete = True
+        else:
+            parent = self._context_state_view(parent_state_id, visited | {state_id}) if parent_state_id is not None else None
+            if parent is None:
+                items = ()
+                parent_complete = False
+            else:
+                delta = tuple(ContextStateDelta.model_validate(operation) for operation in payload.get("delta", []))
+                items = materialize_context_state(parent.items, delta, item_count=int(payload["item_count"]))
+                parent_complete = parent.status == "complete"
+        available_blocks = {item.subject_id for item in self._observations if item.kind == "content.produced" and item.task_id == observation.task_id}
+        status = "complete" if parent_complete and all(item.block_id in available_blocks for item in items) else "incomplete"
+        return ContextStateView(
+            state_id=state_id,
+            task_id=observation.task_id,
+            state_hash=str(payload["state_hash"]),
+            parent_state_id=parent_state_id,
+            chain_depth=int(payload["chain_depth"]),
+            is_checkpoint=is_checkpoint,
+            status=status,
+            items=items,
         )
 
     async def get_content_block_payload(self, block_id: str) -> ContentBlockPayloadView | None:
@@ -262,13 +401,31 @@ class InMemoryAnsichBackend:
             )
         attempts.sort(key=lambda attempt: attempt.attempt_no)
         effective_attempt = next((attempt for attempt in attempts if attempt.effective), None)
+        tool_calls = tuple(self._tool_call_view(observation) for observation in self._observations if observation.kind == "tool.issued" and observation.step_id == started.step_id)
         result = closed_payload.get("result") if isinstance(closed_payload.get("result"), str) else None
+        status = "deciding" if closed is None else "model_failed" if result == "model_failed" else "acting" if result == "acting" else "closed"
+        if status == "acting" and tool_calls:
+            terminal_values = {
+                "returned",
+                "denied",
+                "timed_out",
+                "cancelled",
+                "failed",
+                "unknown_terminal",
+            }
+            all_terminal = all(tool_call.execution.value in terminal_values for tool_call in tool_calls)
+            current_step_seq = int(started.payload["step_seq"])
+            followup_observed = any(
+                observation.kind == "step.started" and observation.task_id == started.task_id and observation.payload is not None and int(observation.payload["step_seq"]) > current_step_seq for observation in self._observations
+            ) or any(observation.task_id == started.task_id and observation.kind in {"task.completed", "task.failed", "task.interrupted"} for observation in self._observations)
+            if all_terminal and followup_observed:
+                status = "closed"
         return StepView(
             step_id=started.step_id,
             task_id=started.task_id,
             step_seq=int(started.payload["step_seq"]),
             actor_kind=str(started.payload["actor_kind"]),
-            status=("deciding" if closed is None else "model_failed" if result == "model_failed" else "acting" if result == "acting" else "closed"),
+            status=status,
             result=result,
             started_obs_id=started.obs_id,
             closed_obs_id=None if closed is None else closed.obs_id,
@@ -276,6 +433,133 @@ class InMemoryAnsichBackend:
             effective_context_snapshot_id=None if effective_attempt is None else effective_attempt.context_snapshot_id,
             issued_tools=tuple(closed_payload.get("issued_tools", [])),
             attempts=tuple(attempts),
+            tool_calls=tuple(sorted(tool_calls, key=lambda item: item.call_seq)),
+        )
+
+    def _tool_call_view(self, issued: ObservationEnvelope) -> ToolCallView:
+        if issued.payload is None or issued.step_id is None:
+            raise ValueError("invalid in-memory tool.issued observation")
+        related = [observation for observation in self._observations if observation.subject_id == issued.subject_id and observation.kind.startswith("tool.")]
+        started = next(
+            (observation for observation in related if observation.kind == "tool.started"),
+            None,
+        )
+        terminals = [observation for observation in related if observation.kind in _TOOL_TERMINAL_PRECEDENCE]
+        terminal = (
+            None
+            if not terminals
+            else max(
+                terminals,
+                key=lambda observation: _TOOL_TERMINAL_PRECEDENCE[observation.kind],
+            )
+        )
+        visible = next(
+            (observation for observation in reversed(related) if observation.kind == "tool.result_visible"),
+            None,
+        )
+        blocks = {observation.subject_id: observation.payload for observation in self._observations if observation.kind == "content.produced" and observation.payload is not None}
+
+        def result_view(
+            observation: ObservationEnvelope | None,
+            role: str,
+        ) -> ToolResultView | None:
+            payload = None if observation is None else observation.payload
+            block_id = None if payload is None else payload.get("result_block_id")
+            if observation is None or not isinstance(block_id, str):
+                return None
+            block = blocks.get(block_id)
+            metadata = {key: value for key, value in payload.items() if key not in {"result_block_id", "call_seq", "source_block_id"}}
+            return ToolResultView(
+                result_role=cast(str, role),
+                content_block_id=block_id,
+                source_obs_id=observation.obs_id,
+                content_hash=(str(block["content_hash"]) if block is not None and "content_hash" in block else None),
+                byte_size=(int(block["visible_bytes"]) if block is not None and isinstance(block.get("visible_bytes"), int) else None),
+                payload_available=block is not None and "body" in block,
+                metadata=metadata,
+            )
+
+        raw_result = result_view(terminal, "raw")
+        visible_result = result_view(visible, "visible")
+        execution_status = {
+            "tool.returned_raw": "returned",
+            "tool.denied": "denied",
+            "tool.timed_out": "timed_out",
+            "tool.cancelled": "cancelled",
+            "tool.failed": "failed",
+            "tool.unknown_terminal": "unknown_terminal",
+        }.get(None if terminal is None else terminal.kind)
+        if execution_status is None:
+            execution_status = "acting" if started is not None else "issued"
+
+        def belief(
+            value: str,
+            evidence: ObservationEnvelope | None,
+            resolver: str,
+        ) -> ToolBelief:
+            return ToolBelief(
+                value=value,
+                as_of=None if evidence is None else evidence.occurred_at,
+                asserted_at=(issued.recorded_at if evidence is None else evidence.recorded_at),
+                source=NamedVersion(
+                    name=("tool-accountability" if evidence is None else evidence.producer.name),
+                    version=("1" if evidence is None else evidence.producer.version),
+                ),
+                selected_by=NamedVersion(name=resolver, version="1"),
+                evidence_obs_ids=() if evidence is None else (evidence.obs_id,),
+            )
+
+        derivations: tuple[ContentDerivationView, ...] = ()
+        if visible is not None and visible.payload is not None:
+            derived_block_id = visible.payload.get("result_block_id")
+            source_block_id = visible.payload.get("source_block_id")
+            if isinstance(derived_block_id, str) and isinstance(source_block_id, str):
+                derivations = (
+                    ContentDerivationView(
+                        derived_block_id=derived_block_id,
+                        source_block_id=source_block_id,
+                        transform_kind=str(visible.payload.get("transform_kind", "unknown")),
+                        transform_version=str(visible.payload.get("transform_version", "1")),
+                        established_obs_id=visible.obs_id,
+                    ),
+                )
+        return ToolCallView(
+            tool_call_id=issued.subject_id,
+            task_id=issued.task_id,
+            step_id=issued.step_id,
+            step_seq=next(
+                (int(observation.payload["step_seq"]) for observation in self._observations if observation.kind == "step.started" and observation.step_id == issued.step_id and observation.payload is not None),
+                0,
+            ),
+            call_seq=int(issued.payload["call_seq"]),
+            provider_call_id=(issued.payload.get("provider_call_id") if isinstance(issued.payload.get("provider_call_id"), str) else None),
+            tool_name=str(issued.payload["tool_name"]),
+            args_hash=str(issued.payload["args_hash"]),
+            args_preview=issued.payload.get("args_preview", {}),
+            tool_schema_block_id=(issued.payload.get("tool_schema_block_id") if isinstance(issued.payload.get("tool_schema_block_id"), str) else None),
+            issued_obs_id=issued.obs_id,
+            started_obs_id=None if started is None else started.obs_id,
+            raw_terminal_obs_id=None if terminal is None else terminal.obs_id,
+            visible_result_obs_id=None if visible is None else visible.obs_id,
+            duration_ms=(int(terminal.payload["duration_ms"]) if terminal is not None and terminal.payload is not None and isinstance(terminal.payload.get("duration_ms"), int) else None),
+            authorization=belief(
+                "denied" if terminal is not None and terminal.kind == "tool.denied" else "unknown",
+                terminal if terminal is not None and terminal.kind == "tool.denied" else None,
+                "tool-authorization-state",
+            ),
+            execution=belief(
+                execution_status,
+                terminal or started or issued,
+                ("tool-terminal-precedence" if terminal is not None else "tool-execution-state"),
+            ),
+            visible_result=belief(
+                "available" if visible is not None else "unknown",
+                visible,
+                "tool-visible-result-state",
+            ),
+            raw_results=() if raw_result is None else (raw_result,),
+            visible_results=() if visible_result is None else (visible_result,),
+            derivations=derivations,
         )
 
     def _project(self, observation: ObservationEnvelope) -> None:

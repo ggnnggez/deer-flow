@@ -3,8 +3,10 @@ from __future__ import annotations
 from datetime import datetime
 from typing import Protocol
 
+from ansich.context_state import ContextStateView
 from ansich.contracts import ControlValue, ObservationEnvelope, TaskView
-from ansich.step import ContentBlockPayloadView, ContextSnapshotView, LlmAttemptView, StepView
+from ansich.step import ContentBlockPayloadView, ContentOccurrenceView, ContextSnapshotView, LlmAttemptView, StepView
+from ansich.tool import ToolCallView
 
 
 class AnsichBackend(Protocol):
@@ -36,11 +38,17 @@ class AnsichBackend(Protocol):
 
     async def get_max_step_seq(self, task_id: str) -> int: ...
 
+    async def list_content_occurrences(self, task_id: str) -> list[ContentOccurrenceView]: ...
+
+    async def get_latest_context_state(self, task_id: str) -> ContextStateView | None: ...
+
     async def list_steps(self, task_id: str) -> list[StepView]: ...
 
     async def list_system_operations(self, task_id: str) -> list[LlmAttemptView]: ...
 
     async def get_step(self, step_id: str) -> StepView | None: ...
+
+    async def get_tool_call(self, tool_call_id: str) -> ToolCallView | None: ...
 
     async def get_step_context(self, step_id: str) -> ContextSnapshotView | None: ...
 

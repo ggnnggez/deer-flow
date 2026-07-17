@@ -506,7 +506,6 @@ class SubagentExecutor:
             thinking_enabled=False,
             app_config=app_config,
             attach_tracing=False,
-            ansich_call_class="subagent",
         )
 
         from deerflow.agents.middlewares.tool_error_handling_middleware import build_subagent_runtime_middlewares

@@ -60,11 +60,7 @@ def _store_observation_payload(row: sa.Row, payload: dict, observations: sa.Tabl
         op.get_bind().execute(sa.update(observations).where(observations.c.obs_id == row.obs_id).values(payload_json=payload))
         return
     encoded = json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")
-    op.get_bind().execute(
-        sa.update(payloads)
-        .where(payloads.c.payload_id == row.payload_ref_id)
-        .values(byte_size=len(encoded), sha256=hashlib.sha256(encoded).hexdigest(), body=encoded)
-    )
+    op.get_bind().execute(sa.update(payloads).where(payloads.c.payload_id == row.payload_ref_id).values(byte_size=len(encoded), sha256=hashlib.sha256(encoded).hexdigest(), body=encoded))
 
 
 def _backfill_blobs() -> None:
@@ -133,6 +129,49 @@ def _backfill_blobs() -> None:
         _store_observation_payload(row, payload, observations, payloads)
 
 
+def _restore_observation_bodies() -> set[str]:
+    bind = op.get_bind()
+    inspector = sa.inspect(bind)
+    if not inspector.has_table("ansich_content_blobs") or not inspector.has_table("ansich_content_blocks"):
+        return set()
+    metadata = sa.MetaData()
+    observations = sa.Table("ansich_observations", metadata, autoload_with=bind)
+    payloads = sa.Table("ansich_payloads", metadata, autoload_with=bind)
+    blocks = sa.Table("ansich_content_blocks", metadata, autoload_with=bind)
+    blobs = sa.Table("ansich_content_blobs", metadata, autoload_with=bind)
+    rows = bind.execute(
+        sa.select(
+            blocks.c.payload_obs_id,
+            observations.c.obs_id,
+            observations.c.payload_json,
+            observations.c.payload_ref_id,
+            blobs.c.content_type,
+            blobs.c.inline_body,
+            blobs.c.payload_ref_id.label("blob_payload_ref_id"),
+        )
+        .join(observations, observations.c.obs_id == blocks.c.payload_obs_id)
+        .join(blobs, blobs.c.blob_key == blocks.c.blob_key)
+    ).all()
+    blob_payload_ids: set[str] = set()
+    for row in rows:
+        if row.inline_body is not None:
+            body_bytes = bytes(row.inline_body)
+        elif row.blob_payload_ref_id is not None:
+            blob_payload_ids.add(row.blob_payload_ref_id)
+            body_bytes = bind.execute(sa.select(payloads.c.body).where(payloads.c.payload_id == row.blob_payload_ref_id)).scalar_one()
+            body_bytes = bytes(body_bytes)
+        else:
+            continue
+        body = body_bytes.decode("utf-8") if row.content_type.startswith("text/plain") else json.loads(body_bytes.decode("utf-8"))
+        payload = _decode_observation_payload(row, payloads) or {}
+        payload["body"] = body
+        payload.pop("blob_key", None)
+        payload.pop("content_type", None)
+        payload.pop("canonicalization_version", None)
+        _store_observation_payload(row, payload, observations, payloads)
+    return blob_payload_ids
+
+
 def upgrade() -> None:
     inspector = sa.inspect(op.get_bind())
     if not inspector.has_table("ansich_content_blobs"):
@@ -176,6 +215,7 @@ def upgrade() -> None:
 
 
 def downgrade() -> None:
+    blob_payload_ids = _restore_observation_bodies()
     inspector = sa.inspect(op.get_bind())
     if inspector.has_table("ansich_content_blocks"):
         indexes = {index["name"] for index in inspector.get_indexes("ansich_content_blocks")}
@@ -184,3 +224,6 @@ def downgrade() -> None:
     safe_drop_column("ansich_content_blocks", "blob_key")
     if sa.inspect(op.get_bind()).has_table("ansich_content_blobs"):
         op.drop_table("ansich_content_blobs")
+    if blob_payload_ids and sa.inspect(op.get_bind()).has_table("ansich_payloads"):
+        payloads = sa.Table("ansich_payloads", sa.MetaData(), autoload_with=op.get_bind())
+        op.get_bind().execute(sa.delete(payloads).where(payloads.c.payload_id.in_(blob_payload_ids)))

@@ -12,6 +12,8 @@ from collections.abc import Sequence
 import sqlalchemy as sa
 from alembic import op
 
+from deerflow.persistence.migrations._helpers import safe_add_column, safe_drop_column
+
 revision: str = "0007_ansich_steps_and_context"
 down_revision: str | Sequence[str] | None = "0006_ansich_task_core"
 branch_labels: str | Sequence[str] | None = None
@@ -30,14 +32,8 @@ def _create_index(name: str, table_name: str, columns: list[str], *, unique: boo
         op.create_index(name, table_name, columns, unique=unique)
 
 
-def _add_column(table_name: str, column: sa.Column) -> None:
-    columns = {item["name"] for item in sa.inspect(op.get_bind()).get_columns(table_name)}
-    if column.name not in columns:
-        op.add_column(table_name, column)
-
-
 def upgrade() -> None:
-    _add_column("ansich_observations", sa.Column("step_id", sa.String(length=36), nullable=True))
+    safe_add_column("ansich_observations", sa.Column("step_id", sa.String(length=36), nullable=True))
 
     _create_table(
         "ansich_steps",
@@ -193,4 +189,4 @@ def downgrade() -> None:
     op.drop_table("ansich_llm_attempts")
     op.drop_index("ix_ansich_steps_task_seq", table_name="ansich_steps")
     op.drop_table("ansich_steps")
-    op.drop_column("ansich_observations", "step_id")
+    safe_drop_column("ansich_observations", "step_id")

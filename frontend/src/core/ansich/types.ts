@@ -18,7 +18,17 @@ export type AnsichObservationKind =
   | "llm.responded"
   | "llm.failed"
   | "content.produced"
+  | "context.state_recorded"
   | "context.snapshotted"
+  | "tool.issued"
+  | "tool.started"
+  | "tool.returned_raw"
+  | "tool.result_visible"
+  | "tool.denied"
+  | "tool.timed_out"
+  | "tool.cancelled"
+  | "tool.failed"
+  | "tool.unknown_terminal"
   | "observability.degraded";
 
 export interface AnsichNamedVersion {
@@ -45,6 +55,9 @@ export interface AnsichTask {
   source_kind: string;
   source_id: string;
   control: AnsichControlBelief;
+  observability_status: "healthy" | "degraded";
+  tool_calls_issued: number;
+  tool_calls_executed: number;
 }
 
 export interface AnsichObservation {
@@ -60,7 +73,9 @@ export interface AnsichObservation {
     | "task"
     | "step"
     | "llm_attempt"
+    | "tool_call"
     | "content_block"
+    | "context_state"
     | "context_snapshot";
   subject_id: string;
   fidelity_class: "hard";
@@ -94,6 +109,15 @@ export interface AnsichHealth {
   loss_detected: boolean;
   range_known: boolean;
   storage_available: boolean;
+  queue_high_watermark: number;
+  snapshot_request_count: number;
+  snapshot_observations_accepted: number;
+  snapshot_observations_dropped: number;
+  snapshot_count: number;
+  snapshot_item_count: number;
+  snapshot_visible_bytes: number;
+  incomplete_snapshot_count: number;
+  missing_content_block_count: number;
 }
 
 export interface AnsichTaskListResponse {
@@ -152,6 +176,67 @@ export interface AnsichStep {
   effective_context_snapshot_id: string | null;
   issued_tools: Array<Record<string, unknown>>;
   attempts: AnsichLlmAttempt[];
+  tool_calls: AnsichToolCall[];
+}
+
+export interface AnsichToolBelief {
+  value: string;
+  as_of: string | null;
+  asserted_at: string;
+  source: AnsichNamedVersion;
+  fidelity_class: "hard";
+  selected_by: AnsichNamedVersion;
+  evidence_obs_ids: string[];
+}
+
+export interface AnsichToolResult {
+  result_role: "raw" | "visible";
+  content_block_id: string;
+  source_obs_id: string;
+  content_hash: string | null;
+  byte_size: number | null;
+  payload_available: boolean;
+  metadata: Record<string, unknown>;
+}
+
+export interface AnsichContentDerivation {
+  derived_block_id: string;
+  source_block_id: string;
+  transform_kind:
+    | "unchanged"
+    | "error_normalized"
+    | "sanitized"
+    | "truncated"
+    | "externalized"
+    | "coalesced"
+    | "clarification_card"
+    | "unknown";
+  transform_version: string;
+  established_obs_id: string;
+}
+
+export interface AnsichToolCall {
+  tool_call_id: string;
+  task_id: string;
+  step_id: string;
+  step_seq: number;
+  call_seq: number;
+  provider_call_id: string | null;
+  tool_name: string;
+  args_hash: string;
+  args_preview: unknown;
+  tool_schema_block_id: string | null;
+  issued_obs_id: string | null;
+  started_obs_id: string | null;
+  raw_terminal_obs_id: string | null;
+  visible_result_obs_id: string | null;
+  duration_ms: number | null;
+  authorization: AnsichToolBelief;
+  execution: AnsichToolBelief;
+  visible_result: AnsichToolBelief;
+  raw_results: AnsichToolResult[];
+  visible_results: AnsichToolResult[];
+  derivations: AnsichContentDerivation[];
 }
 
 export interface AnsichContextItem {
@@ -159,14 +244,17 @@ export interface AnsichContextItem {
   channel: "message" | "tool_schema";
   role: "system" | "user" | "assistant" | "tool" | null;
   name: string | null;
+  message_id: string | null;
+  source_identity: string | null;
   block_id: string;
-  kind: string;
-  content_hash: string;
+  kind: string | null;
+  content_hash: string | null;
   visible_bytes: number;
   estimated_tokens: number;
   metadata: Record<string, unknown>;
   sensitivity_flags: string[];
   payload_available: boolean;
+  resolution_status: "available" | "missing";
   body: null;
 }
 
@@ -191,6 +279,7 @@ export interface AnsichContextSnapshot {
   redactions: Array<Record<string, unknown>>;
   warnings: string[];
   items: AnsichContextItem[];
+  status: "complete" | "incomplete";
 }
 
 export interface AnsichStepsResponse {
@@ -215,4 +304,16 @@ export interface AnsichContentPayloadResponse {
     content_type: string;
     body: unknown;
   };
+}
+
+export interface AnsichToolCallResponse {
+  tool_call: AnsichToolCall;
+  projection_status: AnsichHealth;
+}
+
+export interface AnsichToolResultPayloadResponse {
+  raw_result?: AnsichToolResult;
+  visible_result?: AnsichToolResult;
+  raw_payload?: AnsichContentPayloadResponse["payload"];
+  visible_payload?: AnsichContentPayloadResponse["payload"];
 }

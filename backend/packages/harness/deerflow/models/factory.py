@@ -1,5 +1,4 @@
 import logging
-from typing import Literal
 
 from langchain.chat_models import BaseChatModel
 from langchain_openai.chat_models.base import BaseChatOpenAI
@@ -10,9 +9,6 @@ from deerflow.reflection import resolve_class
 from deerflow.tracing import build_tracing_callbacks
 
 logger = logging.getLogger(__name__)
-
-AnsichCallClass = Literal["lead_agent", "subagent", "system_operation"]
-AnsichOperationKind = Literal["title", "summarization", "memory", "goal", "other"]
 
 
 def _deep_merge_dicts(base: dict | None, override: dict) -> dict:
@@ -181,8 +177,6 @@ def create_chat_model(
     *,
     app_config: AppConfig | None = None,
     attach_tracing: bool = True,
-    ansich_call_class: AnsichCallClass = "system_operation",
-    ansich_operation_kind: AnsichOperationKind | None = None,
     **kwargs,
 ) -> BaseChatModel:
     """Create a chat model instance from the config.
@@ -202,12 +196,6 @@ def create_chat_model(
             the model) and ``session_id`` / ``user_id`` metadata never reach the trace
             because the model becomes a nested observation whose ``langfuse_*`` keys
             get stripped.
-        ansich_call_class: Explicit observability classification. Unknown or
-            standalone callers default to ``system_operation`` so they can
-            never inflate logical Agent Step counts.
-        ansich_operation_kind: Internal-operation subtype; defaults to
-            ``other`` for system operations and is ignored for Agent calls.
-
     Returns:
         A chat model instance.
     """
@@ -312,16 +300,6 @@ def create_chat_model(
     _warn_unknown_model_settings(model_class, name, model_settings_from_config)
 
     model_instance = model_class(**kwargs, **model_settings_from_config)
-
-    # BaseChatModel implementations are Pydantic models and commonly reject
-    # undeclared setattr. These two inert private attributes are metadata for
-    # the DeerFlow/Ansich adapter only and must never become provider kwargs.
-    object.__setattr__(model_instance, "_ansich_call_class", ansich_call_class)
-    object.__setattr__(
-        model_instance,
-        "_ansich_operation_kind",
-        (ansich_operation_kind or "other") if ansich_call_class == "system_operation" else None,
-    )
 
     if attach_tracing:
         callbacks = build_tracing_callbacks()

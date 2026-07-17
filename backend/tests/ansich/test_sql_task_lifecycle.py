@@ -1,12 +1,16 @@
+import asyncio
 import hashlib
+import json
 from datetime import UTC, datetime
 
 import pytest
-from ansich import AnsichService, ObservationEnvelope, Producer, new_id
+from ansich import AnsichService, ContextStateItem, ObservationEnvelope, Producer, new_id
+from ansich.context_state import build_context_state_delta, context_state_hash
 from langchain.agents import create_agent
 from langchain_core.language_models import BaseChatModel
 from langchain_core.messages import AIMessage, HumanMessage
 from langchain_core.outputs import ChatGeneration, ChatResult
+from langchain_core.tools import tool
 from sqlalchemy import func, select, text
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
@@ -14,6 +18,13 @@ from deerflow.ansich import create_sql_ansich_service
 from deerflow.ansich.execution import ANSICH_EXECUTION_CONTEXT_KEY, AnsichExecutionContext
 from deerflow.ansich.middleware import AnsichAttemptMiddleware, AnsichDecisionMiddleware
 from deerflow.ansich.persistence.models import (
+    AnsichBeliefAssertionRow,
+    AnsichContentOccurrenceRow,
+    AnsichContextSnapshotItemRow,
+    AnsichContextStateCheckpointItemRow,
+    AnsichContextStateDeltaRow,
+    AnsichContextStateRow,
+    AnsichLlmAttemptRow,
     AnsichObservationRow,
     AnsichPayloadRow,
     AnsichProjectionErrorRow,
@@ -22,6 +33,7 @@ from deerflow.ansich.persistence.models import (
     AnsichScopeRow,
 )
 from deerflow.ansich.persistence.sql import SqlAnsichBackend
+from deerflow.ansich.tool_middleware import AnsichRawToolMiddleware, AnsichVisibleToolMiddleware
 from deerflow.persistence.base import Base
 
 
@@ -45,6 +57,459 @@ class _ObservedFinalModel(BaseChatModel):
 
     async def _agenerate(self, messages, stop=None, run_manager=None, **kwargs):
         return self._generate(messages, stop=stop, run_manager=run_manager, **kwargs)
+
+
+@tool
+def _sql_observed_tool(value: str) -> str:
+    """Return a value for SQL ToolCall projection tests."""
+    return value
+
+
+class _SqlToolThenFinalModel(_ObservedFinalModel):
+    call_count: int = 0
+
+    def bind_tools(self, tools, **kwargs):
+        return self
+
+    def _generate(self, messages, stop=None, run_manager=None, **kwargs):
+        self.call_count += 1
+        if self.call_count == 1:
+            return ChatResult(
+                generations=[
+                    ChatGeneration(
+                        message=AIMessage(
+                            content="",
+                            tool_calls=[
+                                {
+                                    "id": "provider-reused-id",
+                                    "name": "_sql_observed_tool",
+                                    "args": {"value": "sql-result"},
+                                }
+                            ],
+                        )
+                    )
+                ]
+            )
+        return super()._generate(
+            messages,
+            stop=stop,
+            run_manager=run_manager,
+            **kwargs,
+        )
+
+
+@pytest.mark.anyio
+async def test_tool_call_projection_survives_restart_and_rebuild_without_usage_duplication(
+    tmp_path,
+):
+    engine = create_async_engine(f"sqlite+aiosqlite:///{tmp_path / 'ansich-tool.db'}")
+    session_factory = async_sessionmaker(engine, expire_on_commit=False)
+    async with engine.begin() as connection:
+        await connection.run_sync(Base.metadata.create_all)
+    task_id = new_id()
+    service = create_sql_ansich_service(session_factory)
+    await service.start()
+    service.record(
+        ObservationEnvelope.task_lifecycle(
+            kind="task.created",
+            task_id=task_id,
+            source_kind="deerflow_run",
+            source_id="run-tool-projection",
+            occurred_at=datetime.now(UTC),
+            source_event_id="run:tool-projection:created",
+        )
+    )
+    await service.flush_task(task_id)
+    execution = AnsichExecutionContext(task_id=task_id, service=service)
+    agent = create_agent(
+        model=_SqlToolThenFinalModel(),
+        tools=[_sql_observed_tool],
+        middleware=[
+            AnsichDecisionMiddleware(),
+            AnsichVisibleToolMiddleware(),
+            AnsichRawToolMiddleware(),
+            AnsichAttemptMiddleware(),
+        ],
+    )
+
+    await agent.ainvoke(
+        {"messages": [HumanMessage(content="use SQL tool")]},
+        context={ANSICH_EXECUTION_CONTEXT_KEY: execution},
+    )
+    await service.flush_task(task_id)
+    before_task = await service.get_task(task_id)
+    before_step = (await service.list_steps(task_id))[0]
+    tool_call_id = before_step.tool_calls[0].tool_call_id
+    before_tool_call = await service.get_tool_call(tool_call_id)
+    await service.stop()
+
+    restarted = create_sql_ansich_service(session_factory)
+    await restarted.start()
+    try:
+        restarted_tool_call = await restarted.get_tool_call(tool_call_id)
+        assert await restarted.rebuild_projections() > 0
+        rebuilt_task = await restarted.get_task(task_id)
+        rebuilt_tool_call = await restarted.get_tool_call(tool_call_id)
+    finally:
+        await restarted.stop()
+        await engine.dispose()
+
+    assert before_task is not None
+    assert before_task.tool_calls_issued == 1
+    assert before_task.tool_calls_executed == 1
+    assert before_tool_call is not None
+    assert before_tool_call.execution.value == "returned"
+    assert before_tool_call.visible_result.value == "available"
+    assert restarted_tool_call == before_tool_call
+    assert rebuilt_tool_call == before_tool_call
+    assert rebuilt_task is not None
+    assert rebuilt_task.tool_calls_issued == 1
+    assert rebuilt_task.tool_calls_executed == 1
+
+
+@pytest.mark.anyio
+async def test_tool_projection_repairs_raw_and_visible_observations_that_arrive_before_issued(
+    tmp_path,
+):
+    engine = create_async_engine(f"sqlite+aiosqlite:///{tmp_path / 'ansich-tool-out-of-order.db'}")
+    session_factory = async_sessionmaker(engine, expire_on_commit=False)
+    async with engine.begin() as connection:
+        await connection.run_sync(Base.metadata.create_all)
+    service = create_sql_ansich_service(session_factory)
+    await service.start()
+    task_id = new_id()
+    step_id = new_id()
+    raw_tool_id = new_id()
+    visible_tool_id = new_id()
+    raw_block_id = new_id()
+    visible_block_id = new_id()
+    producer = Producer(name="out-of-order-tool", version="1", instance_id="test")
+    observed_at = datetime.now(UTC)
+    service.record(
+        ObservationEnvelope.task_lifecycle(
+            kind="task.created",
+            task_id=task_id,
+            source_kind="deerflow_run",
+            source_id="run-tool-out-of-order",
+            occurred_at=observed_at,
+            source_event_id="run:tool-out-of-order:created",
+        )
+    )
+    await service.flush_task(task_id)
+    observations = [
+        ObservationEnvelope(
+            kind="step.started",
+            occurred_at=observed_at,
+            task_id=task_id,
+            step_id=step_id,
+            subject_type="step",
+            subject_id=step_id,
+            producer=producer,
+            producer_seq=1,
+            source_event_id="tool-out-of-order:step",
+            correlation_id=task_id,
+            payload={"step_seq": 1, "actor_kind": "lead_agent"},
+        ),
+        _tool_content_observation(
+            task_id=task_id,
+            step_id=step_id,
+            block_id=raw_block_id,
+            producer=producer,
+            producer_seq=2,
+            source_event_id="tool-out-of-order:raw-content",
+            kind="tool_result_raw",
+            body={"content": "raw first"},
+        ),
+        ObservationEnvelope(
+            kind="tool.returned_raw",
+            occurred_at=observed_at,
+            task_id=task_id,
+            step_id=step_id,
+            subject_type="tool_call",
+            subject_id=raw_tool_id,
+            producer=producer,
+            producer_seq=3,
+            source_event_id="tool-out-of-order:raw-terminal",
+            correlation_id=task_id,
+            payload={
+                "call_seq": 1,
+                "result_block_id": raw_block_id,
+                "duration_ms": 7,
+            },
+        ),
+        ObservationEnvelope(
+            kind="tool.issued",
+            occurred_at=observed_at,
+            task_id=task_id,
+            step_id=step_id,
+            subject_type="tool_call",
+            subject_id=raw_tool_id,
+            producer=producer,
+            producer_seq=4,
+            source_event_id="tool-out-of-order:raw-issued",
+            correlation_id=task_id,
+            payload={
+                "call_seq": 1,
+                "provider_call_id": "provider-raw-first",
+                "tool_name": "raw_first",
+                "args_hash": "a" * 64,
+                "args_preview": {"value": "safe"},
+                "tool_schema_block_id": None,
+            },
+        ),
+        ObservationEnvelope(
+            kind="tool.started",
+            occurred_at=observed_at,
+            task_id=task_id,
+            step_id=step_id,
+            subject_type="tool_call",
+            subject_id=raw_tool_id,
+            producer=producer,
+            producer_seq=5,
+            source_event_id="tool-out-of-order:raw-started-late",
+            correlation_id=task_id,
+            payload={"call_seq": 1},
+        ),
+        _tool_content_observation(
+            task_id=task_id,
+            step_id=step_id,
+            block_id=visible_block_id,
+            producer=producer,
+            producer_seq=6,
+            source_event_id="tool-out-of-order:visible-content",
+            kind="tool_result_visible",
+            body={"content": "visible first"},
+        ),
+        ObservationEnvelope(
+            kind="tool.result_visible",
+            occurred_at=observed_at,
+            task_id=task_id,
+            step_id=step_id,
+            subject_type="tool_call",
+            subject_id=visible_tool_id,
+            producer=producer,
+            producer_seq=7,
+            source_event_id="tool-out-of-order:visible-result",
+            correlation_id=task_id,
+            payload={
+                "call_seq": 2,
+                "result_block_id": visible_block_id,
+                "source_block_id": None,
+                "transform_kind": "unknown",
+                "transform_version": "1",
+            },
+        ),
+        ObservationEnvelope(
+            kind="tool.issued",
+            occurred_at=observed_at,
+            task_id=task_id,
+            step_id=step_id,
+            subject_type="tool_call",
+            subject_id=visible_tool_id,
+            producer=producer,
+            producer_seq=8,
+            source_event_id="tool-out-of-order:visible-issued",
+            correlation_id=task_id,
+            payload={
+                "call_seq": 2,
+                "provider_call_id": "provider-visible-first",
+                "tool_name": "visible_first",
+                "args_hash": "b" * 64,
+                "args_preview": {},
+                "tool_schema_block_id": None,
+            },
+        ),
+    ]
+    for observation in observations:
+        service.record(observation)
+
+    try:
+        await service.flush_task(task_id)
+        step = await service.get_step(step_id)
+        task = await service.get_task(task_id)
+        assert await service.rebuild_projections() > 0
+        rebuilt_step = await service.get_step(step_id)
+        rebuilt_task = await service.get_task(task_id)
+    finally:
+        await service.stop()
+        await engine.dispose()
+
+    assert step is not None
+    assert [item.tool_name for item in step.tool_calls] == [
+        "raw_first",
+        "visible_first",
+    ]
+    assert step.tool_calls[0].execution.value == "returned"
+    assert step.tool_calls[0].raw_results[0].content_block_id == raw_block_id
+    assert step.tool_calls[1].execution.value == "issued"
+    assert step.tool_calls[1].visible_result.value == "available"
+    assert step.tool_calls[1].visible_results[0].content_block_id == visible_block_id
+    assert task is not None
+    assert (task.tool_calls_issued, task.tool_calls_executed) == (2, 1)
+    assert rebuilt_step == step
+    assert rebuilt_task == task
+
+
+def _tool_content_observation(
+    *,
+    task_id: str,
+    step_id: str,
+    block_id: str,
+    producer: Producer,
+    producer_seq: int,
+    source_event_id: str,
+    kind: str,
+    body: object,
+) -> ObservationEnvelope:
+    encoded = json.dumps(body, sort_keys=True, separators=(",", ":")).encode()
+    return ObservationEnvelope(
+        kind="content.produced",
+        occurred_at=datetime.now(UTC),
+        task_id=task_id,
+        step_id=step_id,
+        subject_type="content_block",
+        subject_id=block_id,
+        producer=producer,
+        producer_seq=producer_seq,
+        source_event_id=source_event_id,
+        correlation_id=task_id,
+        payload={
+            "kind": kind,
+            "content_hash": hashlib.sha256(encoded).hexdigest(),
+            "body": body,
+            "visible_bytes": len(encoded),
+            "estimated_tokens": 1,
+            "sensitivity_flags": [],
+        },
+    )
+
+
+@pytest.mark.anyio
+async def test_conflicting_tool_terminal_evidence_is_preserved_and_degrades_task_health(
+    tmp_path,
+):
+    engine = create_async_engine(f"sqlite+aiosqlite:///{tmp_path / 'ansich-tool-conflict.db'}")
+    session_factory = async_sessionmaker(engine, expire_on_commit=False)
+    async with engine.begin() as connection:
+        await connection.run_sync(Base.metadata.create_all)
+    service = create_sql_ansich_service(session_factory)
+    await service.start()
+    task_id = new_id()
+    step_id = new_id()
+    tool_call_id = new_id()
+    producer = Producer(name="tool-conflict", version="1", instance_id="test")
+    observed_at = datetime.now(UTC)
+    service.record(
+        ObservationEnvelope.task_lifecycle(
+            kind="task.created",
+            task_id=task_id,
+            source_kind="deerflow_run",
+            source_id="run-tool-conflict",
+            occurred_at=observed_at,
+            source_event_id="run:tool-conflict:created",
+        )
+    )
+    await service.flush_task(task_id)
+    observations = [
+        ObservationEnvelope(
+            kind="step.started",
+            occurred_at=observed_at,
+            task_id=task_id,
+            step_id=step_id,
+            subject_type="step",
+            subject_id=step_id,
+            producer=producer,
+            producer_seq=1,
+            source_event_id="tool-conflict:step-started",
+            correlation_id=task_id,
+            payload={"step_seq": 1, "actor_kind": "lead_agent"},
+        ),
+        ObservationEnvelope(
+            kind="tool.issued",
+            occurred_at=observed_at,
+            task_id=task_id,
+            step_id=step_id,
+            subject_type="tool_call",
+            subject_id=tool_call_id,
+            producer=producer,
+            producer_seq=2,
+            source_event_id="tool-conflict:issued",
+            correlation_id=task_id,
+            payload={
+                "call_seq": 1,
+                "provider_call_id": "provider-conflict",
+                "tool_name": "conflicting_tool",
+                "args_hash": "c" * 64,
+                "args_preview": {},
+                "tool_schema_block_id": None,
+            },
+        ),
+        ObservationEnvelope(
+            kind="tool.failed",
+            occurred_at=observed_at,
+            task_id=task_id,
+            step_id=step_id,
+            subject_type="tool_call",
+            subject_id=tool_call_id,
+            producer=producer,
+            producer_seq=3,
+            source_event_id="tool-conflict:failed",
+            correlation_id=task_id,
+            payload={"call_seq": 1, "error_type": "RuntimeError"},
+        ),
+        ObservationEnvelope(
+            kind="tool.returned_raw",
+            occurred_at=observed_at,
+            task_id=task_id,
+            step_id=step_id,
+            subject_type="tool_call",
+            subject_id=tool_call_id,
+            producer=producer,
+            producer_seq=4,
+            source_event_id="tool-conflict:returned",
+            correlation_id=task_id,
+            payload={"call_seq": 1, "duration_ms": 4},
+        ),
+    ]
+    for observation in observations:
+        service.record(observation)
+
+    try:
+        await service.flush_task(task_id)
+        task = await service.get_task(task_id)
+        tool_call = await service.get_tool_call(tool_call_id)
+        durable = await service.list_observations(task_id)
+        async with session_factory() as session:
+            assertions = list(
+                (
+                    await session.execute(
+                        select(AnsichBeliefAssertionRow).where(
+                            AnsichBeliefAssertionRow.subject_id == tool_call_id,
+                            AnsichBeliefAssertionRow.field_name == "execution",
+                        )
+                    )
+                ).scalars()
+            )
+        assert await service.rebuild_projections() > 0
+        rebuilt_task = await service.get_task(task_id)
+        rebuilt_tool_call = await service.get_tool_call(tool_call_id)
+    finally:
+        await service.stop()
+        await engine.dispose()
+
+    assert task is not None
+    assert task.observability_status == "degraded"
+    assert (task.tool_calls_issued, task.tool_calls_executed) == (1, 1)
+    assert tool_call is not None
+    assert tool_call.execution.value == "returned"
+    assert tool_call.execution.selected_by.name == "tool-terminal-precedence"
+    assert {assertion.value_json["value"] for assertion in assertions} == {
+        "failed",
+        "returned",
+    }
+    assert {item.kind for item in durable} >= {"tool.failed", "tool.returned_raw"}
+    assert rebuilt_task == task
+    assert rebuilt_tool_call == tool_call
 
 
 @pytest.mark.anyio
@@ -463,6 +928,218 @@ async def test_equal_content_from_distinct_occurrences_shares_one_blob(tmp_path)
     assert all(payload is not None and "body" not in payload for payload in stored_payloads)
 
 
+@pytest.mark.anyio
+async def test_content_blob_upsert_is_concurrent_and_hash_collision_safe(tmp_path, monkeypatch):
+    engine = create_async_engine(f"sqlite+aiosqlite:///{tmp_path / 'ansich-content-blob-race.db'}")
+    session_factory = async_sessionmaker(engine, expire_on_commit=False)
+    async with engine.begin() as connection:
+        await connection.run_sync(Base.metadata.create_all)
+    task_id = new_id()
+    bootstrap = create_sql_ansich_service(session_factory)
+    await bootstrap.start()
+    bootstrap.record(
+        ObservationEnvelope.task_lifecycle(
+            kind="task.created",
+            task_id=task_id,
+            source_kind="deerflow_run",
+            source_id="run-content-blob-race",
+            occurred_at=datetime.now(UTC),
+            source_event_id="run:run-content-blob-race:created",
+        )
+    )
+    await bootstrap.flush_task(task_id)
+    await bootstrap.stop()
+    producer = Producer(name="blob-race", version="1", instance_id="blob-race")
+
+    def content_observation(index: int, body: str) -> ObservationEnvelope:
+        return ObservationEnvelope(
+            kind="content.produced",
+            occurred_at=datetime.now(UTC),
+            task_id=task_id,
+            subject_type="content_block",
+            subject_id=new_id(),
+            producer=producer,
+            producer_seq=index,
+            source_event_id=f"blob-race:{index}",
+            correlation_id=task_id,
+            payload={
+                "kind": "user_input",
+                "content_hash": hashlib.sha256(body.encode()).hexdigest(),
+                "body": body,
+                "visible_bytes": len(body.encode()),
+                "estimated_tokens": 1,
+                "sensitivity_flags": [],
+            },
+        )
+
+    first_backend = SqlAnsichBackend(session_factory)
+    second_backend = SqlAnsichBackend(session_factory)
+    same_body = "concurrent value"
+    await asyncio.gather(
+        first_backend.persist_and_project([content_observation(1, same_body)]),
+        second_backend.persist_and_project([content_observation(2, same_body)]),
+    )
+    async with session_factory() as session:
+        assert await session.scalar(text("SELECT count(*) FROM ansich_content_blobs")) == 1
+        assert await session.scalar(text("SELECT count(*) FROM ansich_observations WHERE kind='content.produced'")) == 2
+
+    monkeypatch.setattr("deerflow.ansich.persistence.sql._content_blob_key", lambda *_args: "f" * 64)
+    collision_backend = SqlAnsichBackend(session_factory)
+    await collision_backend.persist_and_project([content_observation(3, "first collision value")])
+    with pytest.raises(ValueError, match="ContentBlob key collision"):
+        await collision_backend.persist_and_project([content_observation(4, "second collision value")])
+
+    await engine.dispose()
+
+
+@pytest.mark.anyio
+async def test_content_occurrence_registry_survives_service_restart_and_reuses_block(tmp_path):
+    engine = create_async_engine(f"sqlite+aiosqlite:///{tmp_path / 'ansich-occurrence-recovery.db'}")
+    session_factory = async_sessionmaker(engine, expire_on_commit=False)
+    async with engine.begin() as connection:
+        await connection.run_sync(Base.metadata.create_all)
+    task_id = new_id()
+    first_service = create_sql_ansich_service(session_factory)
+    await first_service.start()
+    first_service.record(
+        ObservationEnvelope.task_lifecycle(
+            kind="task.created",
+            task_id=task_id,
+            source_kind="deerflow_run",
+            source_id="run-occurrence-recovery",
+            occurred_at=datetime.now(UTC),
+            source_event_id="run:run-occurrence-recovery:created",
+        )
+    )
+    await first_service.flush_task(task_id)
+    first_execution = AnsichExecutionContext(task_id=task_id, service=first_service)
+    first_agent = create_agent(
+        model=_ObservedFinalModel(),
+        tools=[],
+        middleware=[AnsichDecisionMiddleware(), AnsichAttemptMiddleware()],
+    )
+    await first_agent.ainvoke(
+        {"messages": [HumanMessage(id="durable-user", content="same occurrence")]},
+        context={ANSICH_EXECUTION_CONTEXT_KEY: first_execution},
+    )
+    await first_service.flush_task(task_id)
+    await first_service.stop()
+
+    restarted_service = create_sql_ansich_service(session_factory)
+    await restarted_service.start()
+    try:
+        occurrences = await restarted_service.list_content_occurrences(task_id)
+        context_state = await restarted_service.get_latest_context_state(task_id)
+        next_step_seq = await restarted_service.get_max_step_seq(task_id) + 1
+        recovered_execution = AnsichExecutionContext(
+            task_id=task_id,
+            service=restarted_service,
+            next_step_seq=next_step_seq,
+            content_occurrences=occurrences,
+            context_state=context_state,
+        )
+        restarted_agent = create_agent(
+            model=_ObservedFinalModel(),
+            tools=[],
+            middleware=[AnsichDecisionMiddleware(), AnsichAttemptMiddleware()],
+        )
+        await restarted_agent.ainvoke(
+            {"messages": [HumanMessage(id="durable-user", content="same occurrence")]},
+            context={ANSICH_EXECUTION_CONTEXT_KEY: recovered_execution},
+        )
+        await restarted_service.flush_task(task_id)
+        steps = await restarted_service.list_steps(task_id)
+        contexts = [await restarted_service.get_step_context(step.step_id) for step in steps]
+        async with session_factory() as session:
+            occurrence_count = await session.scalar(select(func.count()).select_from(AnsichContentOccurrenceRow))
+            content_observation_count = await session.scalar(select(func.count()).select_from(AnsichObservationRow).where(AnsichObservationRow.kind == "content.produced"))
+            snapshot_items = list((await session.execute(select(AnsichContextSnapshotItemRow))).scalars())
+            state_items = list((await session.execute(select(AnsichContextStateCheckpointItemRow))).scalars())
+            state_count = await session.scalar(select(func.count()).select_from(AnsichContextStateRow))
+            state_observation_count = await session.scalar(select(func.count()).select_from(AnsichObservationRow).where(AnsichObservationRow.kind == "context.state_recorded"))
+    finally:
+        await restarted_service.stop()
+        await engine.dispose()
+
+    assert len(occurrences) == 1
+    assert occurrences[0].source_identity == "message:durable-user:occurrence:1:content:0"
+    assert occurrence_count == 1
+    assert content_observation_count == 1
+    assert len(contexts) == 2
+    assert all(context is not None for context in contexts)
+    assert len({context.items[0].block_id for context in contexts if context is not None}) == 1
+    assert all(context.items[0].message_id == "durable-user" for context in contexts if context is not None)
+    assert all(context.items[0].source_identity == occurrences[0].source_identity for context in contexts if context is not None)
+    assert snapshot_items == []
+    assert {item.source_identity for item in state_items} == {occurrences[0].source_identity}
+    assert state_count == 1
+    assert state_observation_count == 1
+
+
+@pytest.mark.anyio
+async def test_append_only_context_persists_one_state_delta_instead_of_full_snapshot_membership(tmp_path):
+    engine = create_async_engine(f"sqlite+aiosqlite:///{tmp_path / 'ansich-context-delta.db'}")
+    session_factory = async_sessionmaker(engine, expire_on_commit=False)
+    async with engine.begin() as connection:
+        await connection.run_sync(Base.metadata.create_all)
+    service = create_sql_ansich_service(session_factory)
+    await service.start()
+    task_id = new_id()
+    service.record(
+        ObservationEnvelope.task_lifecycle(
+            kind="task.created",
+            task_id=task_id,
+            source_kind="deerflow_run",
+            source_id="run-context-delta",
+            occurred_at=datetime.now(UTC),
+            source_event_id="run:run-context-delta:created",
+        )
+    )
+    await service.flush_task(task_id)
+    execution = AnsichExecutionContext(task_id=task_id, service=service)
+
+    try:
+        for messages in (
+            [HumanMessage(id="message-a", content="a")],
+            [
+                HumanMessage(id="message-a", content="a"),
+                HumanMessage(id="message-b", content="b"),
+            ],
+        ):
+            agent = create_agent(
+                model=_ObservedFinalModel(),
+                tools=[],
+                middleware=[AnsichDecisionMiddleware(), AnsichAttemptMiddleware()],
+            )
+            await agent.ainvoke(
+                {"messages": messages},
+                context={ANSICH_EXECUTION_CONTEXT_KEY: execution},
+            )
+            await service.flush_task(task_id)
+        steps = await service.list_steps(task_id)
+        contexts = [await service.get_step_context(step.step_id) for step in steps]
+        assert await service.rebuild_projections() > 0
+        rebuilt_contexts = [await service.get_step_context(step.step_id) for step in await service.list_steps(task_id)]
+        async with session_factory() as session:
+            states = list((await session.execute(select(AnsichContextStateRow).order_by(AnsichContextStateRow.chain_depth))).scalars())
+            checkpoint_items = list((await session.execute(select(AnsichContextStateCheckpointItemRow))).scalars())
+            deltas = list((await session.execute(select(AnsichContextStateDeltaRow))).scalars())
+            snapshot_item_count = await session.scalar(select(func.count()).select_from(AnsichContextSnapshotItemRow))
+    finally:
+        await service.stop()
+        await engine.dispose()
+
+    assert [(state.chain_depth, state.is_checkpoint, state.item_count) for state in states] == [
+        (0, True, 1),
+        (1, False, 2),
+    ]
+    assert len(checkpoint_items) == 1
+    assert [(delta.operation, delta.source_ordinal, delta.target_ordinal, delta.block_id) for delta in deltas] == [("append", None, 1, contexts[1].items[1].block_id)]
+    assert snapshot_item_count == 0
+    assert [len(context.items) for context in contexts if context is not None] == [1, 2]
+    assert rebuilt_contexts == contexts
+
+
 async def _record_incomplete_context(service: AnsichService, *, source_suffix: str) -> tuple[str, str, str, Producer]:
     task_id = new_id()
     step_id = new_id()
@@ -676,6 +1353,314 @@ async def test_late_content_repairs_an_incomplete_snapshot(tmp_path):
 
 
 @pytest.mark.anyio
+async def test_late_parent_state_repairs_delta_snapshot_without_projection_poison(tmp_path):
+    engine = create_async_engine(f"sqlite+aiosqlite:///{tmp_path / 'ansich-late-parent-state.db'}")
+    session_factory = async_sessionmaker(engine, expire_on_commit=False)
+    async with engine.begin() as connection:
+        await connection.run_sync(Base.metadata.create_all)
+    service = create_sql_ansich_service(session_factory)
+    await service.start()
+    task_id = new_id()
+    step_id = new_id()
+    attempt_id = new_id()
+    snapshot_id = new_id()
+    parent_state_id = new_id()
+    child_state_id = new_id()
+    first_block_id = new_id()
+    second_block_id = new_id()
+    producer = Producer(name="state-gap-test", version="1", instance_id="state-gap")
+    observed_at = datetime.now(UTC)
+    parent_items = (
+        ContextStateItem(
+            ordinal=0,
+            channel="message",
+            role="user",
+            message_id="message-a",
+            source_identity="message:message-a:occurrence:1:content:0",
+            block_id=first_block_id,
+            visible_bytes=1,
+            estimated_tokens=1,
+            metadata={"message_ordinal": 0, "part_ordinal": 0},
+        ),
+    )
+    child_items = (
+        *parent_items,
+        ContextStateItem(
+            ordinal=1,
+            channel="message",
+            role="user",
+            message_id="message-b",
+            source_identity="message:message-b:occurrence:1:content:0",
+            block_id=second_block_id,
+            visible_bytes=1,
+            estimated_tokens=1,
+            metadata={"message_ordinal": 1, "part_ordinal": 0},
+        ),
+    )
+    service.record(
+        ObservationEnvelope.task_lifecycle(
+            kind="task.created",
+            task_id=task_id,
+            source_kind="deerflow_run",
+            source_id="run-state-gap",
+            occurred_at=observed_at,
+            source_event_id="run:run-state-gap:created",
+        )
+    )
+    await service.flush_task(task_id)
+    started = ObservationEnvelope(
+        kind="step.started",
+        occurred_at=observed_at,
+        task_id=task_id,
+        step_id=step_id,
+        subject_type="step",
+        subject_id=step_id,
+        producer=producer,
+        producer_seq=1,
+        source_event_id="state-gap:step",
+        correlation_id=task_id,
+        payload={"step_seq": 1, "actor_kind": "lead_agent"},
+    )
+    requested = ObservationEnvelope(
+        kind="llm.requested",
+        occurred_at=observed_at,
+        task_id=task_id,
+        step_id=step_id,
+        subject_type="llm_attempt",
+        subject_id=attempt_id,
+        producer=producer,
+        producer_seq=2,
+        source_event_id="state-gap:request",
+        correlation_id=task_id,
+        causation_obs_id=started.obs_id,
+        payload={
+            "attempt_no": 1,
+            "snapshot_id": snapshot_id,
+            "actor_kind": "lead_agent",
+            "adapter_name": "test.Adapter",
+            "adapter_version": "1",
+            "configured_model": "test-model",
+        },
+    )
+    content_observations = [
+        ObservationEnvelope(
+            kind="content.produced",
+            occurred_at=observed_at,
+            task_id=task_id,
+            step_id=step_id,
+            subject_type="content_block",
+            subject_id=block_id,
+            producer=producer,
+            producer_seq=3 + index,
+            source_event_id=f"state-gap:content:{index}",
+            correlation_id=task_id,
+            causation_obs_id=requested.obs_id,
+            payload={
+                "kind": "user_input",
+                "content_hash": hashlib.sha256(body.encode()).hexdigest(),
+                "body": body,
+                "visible_bytes": 1,
+                "estimated_tokens": 1,
+                "sensitivity_flags": [],
+            },
+        )
+        for index, (block_id, body) in enumerate(((first_block_id, "a"), (second_block_id, "b")))
+    ]
+    child_state = ObservationEnvelope(
+        kind="context.state_recorded",
+        occurred_at=observed_at,
+        task_id=task_id,
+        step_id=step_id,
+        subject_type="context_state",
+        subject_id=child_state_id,
+        producer=producer,
+        producer_seq=5,
+        source_event_id="state-gap:child-state",
+        correlation_id=task_id,
+        causation_obs_id=requested.obs_id,
+        payload={
+            "state_hash": context_state_hash(child_items),
+            "parent_state_id": parent_state_id,
+            "chain_depth": 1,
+            "is_checkpoint": False,
+            "item_count": 2,
+            "checkpoint_items": [],
+            "delta": [operation.model_dump(mode="json") for operation in build_context_state_delta(parent_items, child_items)],
+        },
+    )
+    snapshotted = ObservationEnvelope(
+        kind="context.snapshotted",
+        occurred_at=observed_at,
+        task_id=task_id,
+        step_id=step_id,
+        subject_type="context_snapshot",
+        subject_id=snapshot_id,
+        producer=producer,
+        producer_seq=6,
+        source_event_id="state-gap:snapshot",
+        correlation_id=task_id,
+        causation_obs_id=requested.obs_id,
+        payload={
+            "attempt_id": attempt_id,
+            "attempt_no": 1,
+            "message_count": 2,
+            "tool_schema_count": 0,
+            "visible_bytes": 2,
+            "estimated_tokens": 2,
+            "estimator_name": "chars",
+            "estimator_version": "1",
+            "adapter_name": "test.Adapter",
+            "adapter_version": "1",
+            "configured_model": "test-model",
+            "state_id": child_state_id,
+            "generation_settings": {},
+            "redactions": [],
+            "warnings": [],
+        },
+    )
+    responded = ObservationEnvelope(
+        kind="llm.responded",
+        occurred_at=observed_at,
+        task_id=task_id,
+        step_id=step_id,
+        subject_type="llm_attempt",
+        subject_id=attempt_id,
+        producer=producer,
+        producer_seq=7,
+        source_event_id="state-gap:response",
+        correlation_id=task_id,
+        causation_obs_id=requested.obs_id,
+        payload={"attempt_no": 1, "latency_ms": 1, "usage": {}, "response_metadata": {}},
+    )
+    closed = ObservationEnvelope(
+        kind="step.closed",
+        occurred_at=observed_at,
+        task_id=task_id,
+        step_id=step_id,
+        subject_type="step",
+        subject_id=step_id,
+        producer=producer,
+        producer_seq=8,
+        source_event_id="state-gap:closed",
+        correlation_id=task_id,
+        causation_obs_id=responded.obs_id,
+        payload={"result": "final_answer", "effective_attempt_no": 1, "issued_tools": []},
+    )
+    for observation in (started, requested, content_observations[0], child_state, snapshotted, responded, closed):
+        service.record(observation)
+
+    try:
+        await service.flush_task(task_id)
+        incomplete = await service.get_step_context(step_id)
+        parent_state = ObservationEnvelope(
+            kind="context.state_recorded",
+            occurred_at=datetime.now(UTC),
+            task_id=task_id,
+            step_id=step_id,
+            subject_type="context_state",
+            subject_id=parent_state_id,
+            producer=producer,
+            producer_seq=9,
+            source_event_id="state-gap:parent-state",
+            correlation_id=task_id,
+            causation_obs_id=requested.obs_id,
+            payload={
+                "state_hash": context_state_hash(parent_items),
+                "parent_state_id": None,
+                "chain_depth": 0,
+                "is_checkpoint": True,
+                "item_count": 1,
+                "checkpoint_items": [item.model_dump(mode="json") for item in parent_items],
+                "delta": [],
+            },
+        )
+        service.record(parent_state)
+        await service.flush_task(task_id)
+        parent_repaired = await service.get_step_context(step_id)
+        service.record(content_observations[1])
+        await service.flush_task(task_id)
+        repaired = await service.get_step_context(step_id)
+        health = service.get_health()
+    finally:
+        await service.stop()
+        await engine.dispose()
+
+    assert incomplete is not None
+    assert incomplete.status == "incomplete"
+    assert incomplete.items == ()
+    assert parent_repaired is not None
+    assert parent_repaired.status == "incomplete"
+    assert [item.resolution_status for item in parent_repaired.items] == ["available", "missing"]
+    assert repaired is not None
+    assert repaired.status == "complete"
+    assert [item.block_id for item in repaired.items] == [first_block_id, second_block_id]
+    assert health.failed_jobs == 0
+
+
+@pytest.mark.anyio
+async def test_system_operations_follow_observation_ingest_order_not_request_uuid(tmp_path):
+    engine = create_async_engine(f"sqlite+aiosqlite:///{tmp_path / 'ansich-operation-order.db'}")
+    session_factory = async_sessionmaker(engine, expire_on_commit=False)
+    async with engine.begin() as connection:
+        await connection.run_sync(Base.metadata.create_all)
+    service = create_sql_ansich_service(session_factory)
+    await service.start()
+    task_id = new_id()
+    producer = Producer(name="operation-order-test", version="1", instance_id="operation-order")
+    observed_at = datetime.now(UTC)
+    service.record(
+        ObservationEnvelope.task_lifecycle(
+            kind="task.created",
+            task_id=task_id,
+            source_kind="deerflow_run",
+            source_id="run-operation-order",
+            occurred_at=observed_at,
+            source_event_id="run:run-operation-order:created",
+        )
+    )
+    await service.flush_task(task_id)
+    operation_ids = [new_id(), new_id()]
+    request_obs_ids = [
+        "ffffffff-ffff-4fff-bfff-ffffffffffff",
+        "00000000-0000-4000-8000-000000000001",
+    ]
+    for index, (operation_id, obs_id) in enumerate(zip(operation_ids, request_obs_ids, strict=True), start=1):
+        service.record(
+            ObservationEnvelope(
+                obs_id=obs_id,
+                kind="llm.requested",
+                occurred_at=observed_at,
+                task_id=task_id,
+                subject_type="llm_attempt",
+                subject_id=new_id(),
+                producer=producer,
+                producer_seq=index,
+                source_event_id=f"operation-order:requested:{index}",
+                correlation_id=task_id,
+                payload={
+                    "attempt_no": 1,
+                    "snapshot_id": new_id(),
+                    "actor_kind": "system_operation",
+                    "operation_id": operation_id,
+                    "operation_kind": "other",
+                    "adapter_name": "test.Adapter",
+                    "adapter_version": "1",
+                    "configured_model": "test-model",
+                },
+            )
+        )
+
+    try:
+        await service.flush_task(task_id)
+        operations = await service.list_system_operations(task_id)
+    finally:
+        await service.stop()
+        await engine.dispose()
+
+    assert [operation.operation_id for operation in operations] == operation_ids
+
+
+@pytest.mark.anyio
 async def test_late_system_request_completes_an_existing_successful_attempt(tmp_path):
     engine = create_async_engine(f"sqlite+aiosqlite:///{tmp_path / 'ansich-late-request.db'}")
     session_factory = async_sessionmaker(engine, expire_on_commit=False)
@@ -745,6 +1730,8 @@ async def test_late_system_request_completes_an_existing_successful_attempt(tmp_
     try:
         await service.flush_task(task_id)
         operations = await service.list_system_operations(task_id)
+        async with session_factory() as session:
+            stored_attempt = await session.get(AnsichLlmAttemptRow, attempt_id)
     finally:
         await service.stop()
         await engine.dispose()
@@ -755,3 +1742,6 @@ async def test_late_system_request_completes_an_existing_successful_attempt(tmp_
     assert operations[0].operation_id == operation_id
     assert operations[0].operation_kind == "memory"
     assert operations[0].usage == {"total_tokens": 3}
+    assert stored_attempt is not None
+    assert stored_attempt.usage_json == {"total_tokens": 3}
+    assert stored_attempt.response_metadata_json == {"finish_reason": "stop"}

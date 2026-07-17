@@ -2,13 +2,17 @@ from __future__ import annotations
 
 import asyncio
 from collections import deque
+from collections.abc import Callable
 from datetime import UTC, datetime
 from threading import Lock
+from weakref import ReferenceType, WeakMethod, ref
 
 from ansich.backend import AnsichBackend
+from ansich.context_state import ContextStateView
 from ansich.contracts import AnsichHealth, ControlValue, FlushResult, LostRange, ObservationEnvelope, Producer, RecordReceipt, TaskView
 from ansich.memory import InMemoryAnsichBackend
-from ansich.step import ContentBlockPayloadView, ContextSnapshotView, LlmAttemptView, StepView
+from ansich.step import ContentBlockPayloadView, ContentOccurrenceView, ContextSnapshotView, LlmAttemptView, StepView
+from ansich.tool import ToolCallView
 
 
 class AnsichService:
@@ -61,6 +65,7 @@ class AnsichService:
         self._projection_lock: asyncio.Lock | None = None
         self._writer_task: asyncio.Task[None] | None = None
         self._projector_task: asyncio.Task[None] | None = None
+        self._persistence_listeners: dict[str, list[ReferenceType[object]]] = {}
 
     @classmethod
     def in_memory(
@@ -192,6 +197,18 @@ class AnsichService:
                 missing_content_block_count=int(metrics.get("missing_content_block_count", 0)),
             )
 
+    def register_persistence_listener(
+        self,
+        task_id: str,
+        listener: Callable[[tuple[str, ...]], None],
+    ) -> None:
+        try:
+            listener_ref: ReferenceType[object] = WeakMethod(listener)  # type: ignore[arg-type]
+        except TypeError:
+            listener_ref = ref(listener)
+        with self._lock:
+            self._persistence_listeners.setdefault(task_id, []).append(listener_ref)
+
     async def flush_task(self, task_id: str) -> FlushResult:
         persist_lock = self._persist_lock
         if persist_lock is None:
@@ -258,10 +275,27 @@ class AnsichService:
         return await self._backend.list_timeline(task_id, limit=limit, cursor=cursor)
 
     async def get_max_step_seq(self, task_id: str) -> int:
+        """Return the projected maximum after callers have flushed the task.
+
+        This is used for Step sequence allocation, so reading while task-step
+        projection lags durable observations can allocate a duplicate value.
+        """
         get_max = getattr(self._backend, "get_max_step_seq", None)
         if not callable(get_max):
             return 0
         return max(0, int(await get_max(task_id)))
+
+    async def list_content_occurrences(self, task_id: str) -> list[ContentOccurrenceView]:
+        list_occurrences = getattr(self._backend, "list_content_occurrences", None)
+        if not callable(list_occurrences):
+            return []
+        return list(await list_occurrences(task_id))
+
+    async def get_latest_context_state(self, task_id: str) -> ContextStateView | None:
+        get_latest = getattr(self._backend, "get_latest_context_state", None)
+        if not callable(get_latest):
+            return None
+        return await get_latest(task_id)
 
     async def list_steps(self, task_id: str) -> list[StepView]:
         return await self._backend.list_steps(task_id)
@@ -271,6 +305,9 @@ class AnsichService:
 
     async def get_step(self, step_id: str) -> StepView | None:
         return await self._backend.get_step(step_id)
+
+    async def get_tool_call(self, tool_call_id: str) -> ToolCallView | None:
+        return await self._backend.get_tool_call(tool_call_id)
 
     async def get_step_context(self, step_id: str) -> ContextSnapshotView | None:
         return await self._backend.get_step_context(step_id)
@@ -413,10 +450,35 @@ class AnsichService:
                 for _, observation in selected:
                     self._record_observation_loss(observation)
             return FlushResult(persisted=False, processed_count=0, reason="storage_failure")
+        self._notify_persisted(selected)
         if self._projector_wake_event is not None:
             self._projector_wake_event.set()
         await self._report_degradation_if_storage_recovered()
         return FlushResult(persisted=True, processed_count=processed)
+
+    def _notify_persisted(self, selected: list[tuple[int, ObservationEnvelope]]) -> None:
+        observation_ids_by_task: dict[str, list[str]] = {}
+        for _, observation in selected:
+            observation_ids_by_task.setdefault(observation.task_id, []).append(observation.obs_id)
+        callbacks: list[tuple[Callable[[tuple[str, ...]], None], tuple[str, ...]]] = []
+        with self._lock:
+            for task_id, observation_ids in observation_ids_by_task.items():
+                retained: list[ReferenceType[object]] = []
+                for listener_ref in self._persistence_listeners.get(task_id, []):
+                    listener = listener_ref()
+                    if listener is None:
+                        continue
+                    retained.append(listener_ref)
+                    callbacks.append((listener, tuple(observation_ids)))  # type: ignore[arg-type]
+                if retained:
+                    self._persistence_listeners[task_id] = retained
+                else:
+                    self._persistence_listeners.pop(task_id, None)
+        for listener, observation_ids in callbacks:
+            try:
+                listener(observation_ids)
+            except Exception:
+                continue
 
     async def _report_degradation_if_storage_recovered(self) -> None:
         with self._lock:

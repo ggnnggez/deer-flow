@@ -1,8 +1,9 @@
 from __future__ import annotations
 
+import base64
 from types import SimpleNamespace
 
-from ansich.serialization import serialize_model_request
+from ansich.serialization import serialize_model_request, serialize_observed_content
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage, ToolMessage
 from langchain_core.tools import tool
 from pydantic import BaseModel
@@ -58,6 +59,22 @@ def test_snapshot_preserves_message_and_content_part_occurrence_order() -> None:
     assert capture.generation_settings == {"temperature": 0.2}
 
 
+def test_duplicate_message_ids_receive_stable_in_snapshot_occurrence_sequences() -> None:
+    capture = serialize_model_request(
+        system_message=None,
+        messages=[
+            HumanMessage(id="copied-message", content="first"),
+            HumanMessage(id="copied-message", content="copy"),
+        ],
+        tools=[],
+        response_format=None,
+        model_settings={},
+        model=None,
+    )
+
+    assert [item.metadata["message_occurrence_seq"] for item in capture.items] == [1, 2]
+
+
 def test_snapshot_structurally_excludes_secret_fields_and_redacts_known_values() -> None:
     secret = "request-secret-value"
     capture = serialize_model_request(
@@ -101,6 +118,55 @@ def test_snapshot_structurally_excludes_secret_fields_and_redacts_known_values()
         "secret_field",
         "known_secret_value",
     ]
+
+
+def test_observed_content_redacts_known_secret_embedded_in_error_text() -> None:
+    secret = "embedded-tool-secret"
+    capture = serialize_observed_content(
+        kind="tool_result_raw",
+        body={"message": f"request failed with token={secret}; retry denied"},
+        path="tool.raw_exception",
+        known_secrets=[secret],
+    )
+
+    assert secret not in str(capture.model_dump(mode="json"))
+    assert capture.block.body == {"message": "request failed with token=<redacted>; retry denied"}
+    assert [entry.reason for entry in capture.redactions] == ["known_secret_value"]
+
+
+def test_observed_binary_content_is_json_safe_and_preserves_exact_bytes() -> None:
+    raw = b"\x00\xfftool-result"
+
+    capture = serialize_observed_content(
+        kind="tool_result_raw",
+        body={"content": raw},
+        path="tool.raw_result",
+    )
+
+    assert capture.block.body == {
+        "content": {
+            "type": "binary",
+            "encoding": "base64",
+            "byte_length": len(raw),
+            "data": base64.b64encode(raw).decode("ascii"),
+        }
+    }
+    assert capture.warnings == ()
+
+    secret = "binary-secret"
+    redacted = serialize_observed_content(
+        kind="tool_result_raw",
+        body=b"prefix:" + secret.encode(),
+        path="tool.raw_result",
+        known_secrets=[secret],
+    )
+    assert redacted.block.body == {
+        "type": "binary",
+        "encoding": "redacted",
+        "byte_length": 20,
+        "data": "<redacted>",
+    }
+    assert [entry.reason for entry in redacted.redactions] == ["known_secret_value"]
 
 
 def test_snapshot_keeps_unsupported_values_without_calling_repr() -> None:

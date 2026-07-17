@@ -5,13 +5,25 @@ from collections.abc import Awaitable, Callable, Mapping
 from datetime import UTC, datetime
 from uuid import uuid4
 
-from ansich import ObservationEnvelope, Producer, new_id
-from ansich.serialization import ContextSnapshotCapture, ContextSnapshotItemCapture, serialize_model_request
+from ansich import ContextStateItem, ObservationEnvelope, Producer, new_id
+from ansich.serialization import (
+    ContextSnapshotCapture,
+    ContextSnapshotItemCapture,
+    serialize_model_request,
+    serialize_observed_content,
+)
 from langchain.agents.middleware import AgentMiddleware
 from langchain.agents.middleware.types import ExtendedModelResponse, ModelCallResult, ModelRequest, ModelResponse
 from langchain_core.messages import AIMessage, HumanMessage
 
-from deerflow.ansich.execution import ANSICH_EXECUTION_CONTEXT_KEY, ActorKind, AnsichExecutionContext, ExecutionCall, OperationKind
+from deerflow.ansich.execution import (
+    ANSICH_EXECUTION_CONTEXT_KEY,
+    ActorKind,
+    AnsichExecutionContext,
+    ContentOccurrenceResolution,
+    ExecutionCall,
+    OperationKind,
+)
 from deerflow.runtime.secret_context import extract_request_secrets, read_active_secrets
 
 _PRODUCER_INSTANCE_ID = str(uuid4())
@@ -53,7 +65,13 @@ class AnsichDecisionMiddleware(AgentMiddleware):
                 pass
             raise
         try:
-            _record_step_closed(execution, call, result=_decision_result(result), response=result)
+            _record_step_closed(
+                execution,
+                call,
+                result=_decision_result(result),
+                response=result,
+                runtime_context=getattr(request.runtime, "context", None),
+            )
         except Exception:
             pass
         return result
@@ -81,7 +99,13 @@ class AnsichDecisionMiddleware(AgentMiddleware):
                 pass
             raise
         try:
-            _record_step_closed(execution, call, result=_decision_result(result), response=result)
+            _record_step_closed(
+                execution,
+                call,
+                result=_decision_result(result),
+                response=result,
+                runtime_context=getattr(request.runtime, "context", None),
+            )
         except Exception:
             pass
         return result
@@ -373,25 +397,25 @@ def _record_captured_request(
         },
     )
     observations = [request_observation]
-    resolved_items: list[tuple[ContextSnapshotItemCapture, str | None, bool]] = []
+    resolved_items: list[tuple[ContextSnapshotItemCapture, str | None]] = []
     for item in capture.items:
         source_identity = _content_source_identity(item)
-        is_new_occurrence = True
+        resolution: ContentOccurrenceResolution | None = None
         if source_identity is not None:
-            block_id, is_new_occurrence = execution.resolve_content_occurrence(
+            resolution = execution.resolve_content_occurrence(
                 source_identity=source_identity,
                 content_hash=item.block.content_hash,
                 kind=item.block.kind,
-                proposed_block_id=item.block.block_id,
             )
-            if block_id != item.block.block_id:
-                item = item.model_copy(update={"block": item.block.model_copy(update={"block_id": block_id})})
-        resolved_items.append((item, source_identity, is_new_occurrence))
-        if not is_new_occurrence:
+            if resolution.block_id != item.block.block_id:
+                item = item.model_copy(update={"block": item.block.model_copy(update={"block_id": resolution.block_id})})
+        resolved_items.append((item, source_identity))
+        if resolution is not None and not resolution.should_emit:
             continue
         block = item.block
         observations.append(
             ObservationEnvelope(
+                obs_id=resolution.producer_obs_id if resolution is not None else new_id(),
                 kind="content.produced",
                 occurred_at=datetime.now(UTC),
                 task_id=execution.task_id,
@@ -400,7 +424,7 @@ def _record_captured_request(
                 subject_id=block.block_id,
                 producer=_producer(),
                 producer_seq=execution.next_producer_seq(),
-                source_event_id=f"attempt:{attempt_id}:content:{item.ordinal}",
+                source_event_id=resolution.source_event_id if resolution is not None else f"attempt:{attempt_id}:content:{item.ordinal}",
                 correlation_id=execution.task_id,
                 causation_obs_id=request_observation.obs_id,
                 payload={
@@ -408,6 +432,49 @@ def _record_captured_request(
                     "occurrence_ordinal": item.ordinal,
                     "source_identity": source_identity,
                     **block.model_dump(mode="json"),
+                },
+            )
+        )
+    context_state = execution.resolve_context_state(
+        tuple(
+            ContextStateItem(
+                ordinal=item.ordinal,
+                channel=item.channel,
+                role=item.role,
+                message_id=item.message_id,
+                source_identity=source_identity,
+                name=item.name,
+                block_id=item.block.block_id,
+                visible_bytes=item.block.visible_bytes,
+                estimated_tokens=item.block.estimated_tokens,
+                metadata=item.metadata,
+            )
+            for item, source_identity in resolved_items
+        )
+    )
+    if context_state.should_emit:
+        observations.append(
+            ObservationEnvelope(
+                obs_id=context_state.producer_obs_id,
+                kind="context.state_recorded",
+                occurred_at=datetime.now(UTC),
+                task_id=execution.task_id,
+                step_id=call.step_id,
+                subject_type="context_state",
+                subject_id=context_state.state_id,
+                producer=_producer(),
+                producer_seq=execution.next_producer_seq(),
+                source_event_id=context_state.source_event_id,
+                correlation_id=execution.task_id,
+                causation_obs_id=request_observation.obs_id,
+                payload={
+                    "state_hash": context_state.state_hash,
+                    "parent_state_id": context_state.parent_state_id,
+                    "chain_depth": context_state.chain_depth,
+                    "is_checkpoint": context_state.is_checkpoint,
+                    "item_count": context_state.item_count,
+                    "checkpoint_items": [item.model_dump(mode="json") for item in context_state.checkpoint_items],
+                    "delta": [operation.model_dump(mode="json") for operation in context_state.delta],
                 },
             )
         )
@@ -437,25 +504,11 @@ def _record_captured_request(
                 "adapter_name": capture.adapter_name,
                 "adapter_version": capture.adapter_version,
                 "configured_model": capture.configured_model,
+                "state_id": context_state.state_id,
                 "response_format": capture.response_format,
                 "generation_settings": capture.generation_settings,
                 "redactions": [entry.model_dump(mode="json") for entry in capture.redactions],
                 "warnings": list(capture.warnings),
-                "items": [
-                    {
-                        "ordinal": item.ordinal,
-                        "channel": item.channel,
-                        "role": item.role,
-                        "message_id": item.message_id,
-                        "name": item.name,
-                        "block_id": item.block.block_id,
-                        "source_identity": source_identity,
-                        "visible_bytes": item.block.visible_bytes,
-                        "estimated_tokens": item.block.estimated_tokens,
-                        "metadata": item.metadata,
-                    }
-                    for item, source_identity, _ in resolved_items
-                ],
             },
         )
     )
@@ -465,12 +518,15 @@ def _record_captured_request(
 
 def _content_source_identity(item: ContextSnapshotItemCapture) -> str | None:
     if item.channel == "message" and item.message_id:
+        occurrence_seq = item.metadata.get("message_occurrence_seq", 1)
+        if not isinstance(occurrence_seq, int):
+            return None
         part_ordinal = item.metadata.get("part_ordinal")
         if isinstance(part_ordinal, int):
-            return f"message:{item.message_id}:content:{part_ordinal}"
+            return f"message:{item.message_id}:occurrence:{occurrence_seq}:content:{part_ordinal}"
         tool_call_ordinal = item.metadata.get("tool_call_ordinal")
         if isinstance(tool_call_ordinal, int):
-            return f"message:{item.message_id}:tool-call:{tool_call_ordinal}"
+            return f"message:{item.message_id}:occurrence:{occurrence_seq}:tool-call:{tool_call_ordinal}"
     if item.channel == "tool_schema" and item.name:
         return f"tool-schema:{item.name}"
     return None
@@ -549,13 +605,74 @@ def _record_step_closed(
     *,
     result: str,
     response: ModelCallResult | None,
+    runtime_context: object | None = None,
 ) -> None:
     if call.step_id is None:
         return
     message = _ai_message(response)
-    tools = [] if message is None else [{"provider_call_id": item.get("id"), "name": item.get("name")} for item in message.tool_calls]
-    _record(
-        execution,
+    observations: list[ObservationEnvelope] = []
+    tools: list[dict[str, object]] = []
+    known_secrets = [
+        *extract_request_secrets(runtime_context).values(),
+        *read_active_secrets(runtime_context).values(),
+    ]
+    for call_seq, item in enumerate(() if message is None else message.tool_calls, start=1):
+        provider_call_id = item.get("id") if isinstance(item.get("id"), str) else None
+        tool_name = str(item.get("name") or "unknown_tool")
+        args_capture = serialize_observed_content(
+            kind="tool_request",
+            body=item.get("args", {}),
+            path=f"tool_calls[{call_seq - 1}].args",
+            known_secrets=known_secrets,
+        )
+        tool_call_id = new_id()
+        issued_obs_id = new_id()
+        execution.register_tool_call(
+            tool_call_id=tool_call_id,
+            step_id=call.step_id,
+            step_seq=call.step_seq or 0,
+            call_seq=call_seq,
+            provider_call_id=provider_call_id,
+            tool_name=tool_name,
+            args_hash=args_capture.block.content_hash,
+            issued_obs_id=issued_obs_id,
+        )
+        tool_schema_block_id = execution.tool_schema_block_id(tool_name)
+        tools.append(
+            {
+                "tool_call_id": tool_call_id,
+                "provider_call_id": provider_call_id,
+                "name": tool_name,
+                "call_seq": call_seq,
+            }
+        )
+        observations.append(
+            ObservationEnvelope(
+                obs_id=issued_obs_id,
+                kind="tool.issued",
+                occurred_at=datetime.now(UTC),
+                task_id=execution.task_id,
+                step_id=call.step_id,
+                subject_type="tool_call",
+                subject_id=tool_call_id,
+                producer=_producer(),
+                producer_seq=execution.next_producer_seq(),
+                source_event_id=f"tool:{tool_call_id}:issued",
+                correlation_id=execution.task_id,
+                causation_obs_id=call.last_response_obs_id or call.started_obs_id,
+                payload={
+                    "call_seq": call_seq,
+                    "provider_call_id": provider_call_id,
+                    "tool_name": tool_name,
+                    "args_hash": args_capture.block.content_hash,
+                    "args_preview": args_capture.block.body,
+                    "tool_schema_block_id": tool_schema_block_id,
+                    "redactions": [entry.model_dump(mode="json") for entry in args_capture.redactions],
+                    "warnings": list(args_capture.warnings),
+                },
+            )
+        )
+    observations.append(
         ObservationEnvelope(
             kind="step.closed",
             occurred_at=datetime.now(UTC),
@@ -574,12 +691,18 @@ def _record_step_closed(
                 "issued_tool_count": len(tools),
                 "issued_tools": tools,
             },
-        ),
+        )
     )
+    if len(observations) == 1:
+        _record(execution, observations[0])
+    else:
+        _record_batch(execution, observations, batch_kind="tool_intent")
 
 
 def _decision_result(result: ModelCallResult) -> str:
     message = _ai_message(result)
+    if message is not None and message.additional_kwargs.get("deerflow_error_fallback") is True:
+        return "model_failed"
     return "acting" if message is not None and message.tool_calls else "final_answer"
 
 

@@ -22,7 +22,10 @@ table-level backfill works.
 from __future__ import annotations
 
 import asyncio
+import json
+import sqlite3
 from pathlib import Path
+from uuid import uuid4
 
 import pytest
 import sqlalchemy as sa
@@ -48,7 +51,7 @@ from deerflow.persistence.migrations._helpers import _normalize_default
 asyncio_test = pytest.mark.asyncio
 
 
-HEAD = "0009_ansich_content_blobs"
+HEAD = "0013_ansich_tool_accountability"
 BASELINE = "0001_baseline"
 
 
@@ -430,6 +433,193 @@ async def test_versioned_phase1_ansich_revision_upgrades_to_head(tmp_path: Path)
         assert "ansich_steps" in tables
     finally:
         await engine.dispose()
+
+
+@asyncio_test
+async def test_occurrence_migration_backfills_registry_and_snapshot_identity(tmp_path: Path) -> None:
+    db_path = tmp_path / "occurrence-backfill.db"
+    engine = create_async_engine(f"sqlite+aiosqlite:///{db_path.as_posix()}")
+    task_id = str(uuid4())
+    block_id = str(uuid4())
+    content_obs_id = str(uuid4())
+    snapshot_id = str(uuid4())
+    snapshot_obs_id = str(uuid4())
+    try:
+        cfg = _get_alembic_config(engine)
+        await asyncio.to_thread(_upgrade, cfg, "0009_ansich_content_blobs")
+        await engine.dispose()
+
+        content_payload = {
+            "kind": "user_input",
+            "content_hash": "a" * 64,
+            "visible_bytes": 5,
+            "estimated_tokens": 2,
+            "sensitivity_flags": [],
+        }
+        snapshot_payload = {
+            "items": [
+                {
+                    "ordinal": 0,
+                    "channel": "message",
+                    "role": "user",
+                    "message_id": "legacy-message",
+                    "name": None,
+                    "block_id": block_id,
+                    "visible_bytes": 5,
+                    "estimated_tokens": 2,
+                    "metadata": {"message_ordinal": 0, "part_ordinal": 0},
+                }
+            ]
+        }
+        with sqlite3.connect(db_path) as raw:
+            raw.execute("PRAGMA foreign_keys=OFF")
+            observation_sql = (
+                "INSERT INTO ansich_observations "
+                "(obs_id, schema_version, kind, occurred_at, recorded_at, task_id, step_id, "
+                "subject_type, subject_id, fidelity_class, producer_name, producer_version, "
+                "producer_instance_id, producer_seq, source_event_id, correlation_id, "
+                "causation_obs_id, payload_json, payload_ref_id) "
+                "VALUES (?, 1, ?, ?, ?, ?, NULL, ?, ?, 'hard', 'migration-test', '1', "
+                "'migration-test', ?, ?, ?, NULL, ?, NULL)"
+            )
+            timestamp = "2026-07-17 10:00:00+00:00"
+            raw.execute(
+                observation_sql,
+                (
+                    content_obs_id,
+                    "content.produced",
+                    timestamp,
+                    timestamp,
+                    task_id,
+                    "content_block",
+                    block_id,
+                    1,
+                    "legacy:content",
+                    task_id,
+                    json.dumps(content_payload),
+                ),
+            )
+            raw.execute(
+                observation_sql,
+                (
+                    snapshot_obs_id,
+                    "context.snapshotted",
+                    timestamp,
+                    timestamp,
+                    task_id,
+                    "context_snapshot",
+                    snapshot_id,
+                    2,
+                    "legacy:snapshot",
+                    task_id,
+                    json.dumps(snapshot_payload),
+                ),
+            )
+            raw.execute(
+                "INSERT INTO ansich_content_blocks (entity_id, kind, content_hash, payload_obs_id, producer_obs_id, blob_key, byte_size, token_estimate, sensitivity_flags_json) VALUES (?, 'user_input', ?, ?, ?, NULL, 5, 2, '[]')",
+                (block_id, "a" * 64, content_obs_id, content_obs_id),
+            )
+            raw.execute(
+                "INSERT INTO ansich_context_snapshot_items (snapshot_id, ordinal, channel, role, name, content_block_id, visible_bytes, estimated_tokens, metadata_json) VALUES (?, 0, 'message', 'user', NULL, ?, 5, 2, ?)",
+                (snapshot_id, block_id, json.dumps({"message_ordinal": 0, "part_ordinal": 0})),
+            )
+            raw.execute(
+                "INSERT INTO ansich_context_snapshots "
+                "(entity_id, task_id, step_id, operation_id, attempt_no, request_obs_id, "
+                "message_count, tool_schema_count, visible_bytes, estimated_tokens, "
+                "estimator_name, estimator_version, adapter_name, adapter_version, "
+                "configured_model, response_format_json, generation_settings_json, "
+                "redactions_json, warnings_json, status) "
+                "VALUES (?, ?, NULL, NULL, 1, ?, 1, 0, 5, 2, 'chars', '1', "
+                "'test.Adapter', '1', 'test-model', NULL, '{}', '[]', '[]', 'complete')",
+                (snapshot_id, task_id, snapshot_obs_id),
+            )
+            raw.commit()
+
+        engine = create_async_engine(f"sqlite+aiosqlite:///{db_path.as_posix()}")
+        cfg = _get_alembic_config(engine)
+        await asyncio.to_thread(_upgrade, cfg, "head")
+        async with engine.connect() as conn:
+            occurrence = (await conn.execute(sa.text("SELECT task_id, source_identity, content_hash, kind, block_id, producer_obs_id FROM ansich_content_occurrences"))).one()
+            item = (
+                await conn.execute(
+                    sa.text("SELECT message_id, source_identity FROM ansich_context_snapshot_items WHERE snapshot_id = :snapshot_id AND ordinal = 0"),
+                    {"snapshot_id": snapshot_id},
+                )
+            ).one()
+            state = (
+                await conn.execute(
+                    sa.text(
+                        "SELECT s.state_id, s.state_hash, s.is_checkpoint, s.item_count, s.status, "
+                        "i.block_id, cs.state_id "
+                        "FROM ansich_context_states s "
+                        "JOIN ansich_context_state_checkpoint_items i ON i.state_id = s.state_id "
+                        "JOIN ansich_context_snapshots cs ON cs.state_id = s.state_id"
+                    )
+                )
+            ).one()
+    finally:
+        await engine.dispose()
+
+    expected_source = "message:legacy-message:occurrence:1:content:0"
+    assert tuple(occurrence) == (task_id, expected_source, "a" * 64, "user_input", block_id, content_obs_id)
+    assert tuple(item) == ("legacy-message", expected_source)
+    assert state.is_checkpoint == 1
+    assert state.item_count == 1
+    assert state.status == "complete"
+    assert state.block_id == block_id
+    assert state.state_id == state[6]
+
+
+@asyncio_test
+async def test_attempt_metadata_migration_splits_existing_usage_wrapper(tmp_path: Path) -> None:
+    db_path = tmp_path / "attempt-metadata-backfill.db"
+    engine = create_async_engine(f"sqlite+aiosqlite:///{db_path.as_posix()}")
+    attempt_id = str(uuid4())
+    try:
+        cfg = _get_alembic_config(engine)
+        await asyncio.to_thread(_upgrade, cfg, "0011_ansich_context_states")
+        await engine.dispose()
+
+        with sqlite3.connect(db_path) as raw:
+            raw.execute("PRAGMA foreign_keys=OFF")
+            raw.execute(
+                "INSERT INTO ansich_llm_attempts "
+                "(attempt_id, step_id, task_id, actor_kind, operation_id, operation_kind, "
+                "attempt_no, status, request_obs_id, response_obs_id, failure_obs_id, "
+                "provider_model, usage_json, latency_ms, context_snapshot_id) "
+                "VALUES (?, NULL, ?, 'system_operation', NULL, 'other', 1, 'success', "
+                "NULL, NULL, NULL, 'test-model', ?, 5, NULL)",
+                (
+                    attempt_id,
+                    str(uuid4()),
+                    json.dumps(
+                        {
+                            "usage": {"total_tokens": 7},
+                            "response_metadata": {"finish_reason": "stop"},
+                        }
+                    ),
+                ),
+            )
+            raw.commit()
+
+        engine = create_async_engine(f"sqlite+aiosqlite:///{db_path.as_posix()}")
+        cfg = _get_alembic_config(engine)
+        await asyncio.to_thread(_upgrade, cfg, "head")
+        async with engine.connect() as conn:
+            row = (
+                await conn.execute(
+                    sa.text("SELECT usage_json, response_metadata_json FROM ansich_llm_attempts WHERE attempt_id = :attempt_id"),
+                    {"attempt_id": attempt_id},
+                )
+            ).one()
+    finally:
+        await engine.dispose()
+
+    usage = json.loads(row.usage_json) if isinstance(row.usage_json, str) else row.usage_json
+    metadata = json.loads(row.response_metadata_json) if isinstance(row.response_metadata_json, str) else row.response_metadata_json
+    assert usage == {"total_tokens": 7}
+    assert metadata == {"finish_reason": "stop"}
 
 
 # ---------------------------------------------------------------------------

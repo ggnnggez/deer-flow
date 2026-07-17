@@ -1,5 +1,11 @@
 import type { AnsichLostRange } from "./types";
 
+export function countMissingContextItems(
+  items: Array<{ resolution_status: "available" | "missing" }>,
+): number {
+  return items.filter((item) => item.resolution_status === "missing").length;
+}
+
 export function countLostObservations(ranges: AnsichLostRange[]): number {
   return ranges.reduce(
     (total, range) =>

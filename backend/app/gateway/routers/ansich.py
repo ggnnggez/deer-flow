@@ -5,7 +5,7 @@ import logging
 from datetime import datetime
 
 from ansich.contracts import ControlValue
-from fastapi import APIRouter, HTTPException, Query, Request
+from fastapi import APIRouter, HTTPException, Query, Request, Response
 
 from app.gateway.deps import require_admin_user
 
@@ -259,8 +259,115 @@ async def get_step_context(step_id: str, request: Request) -> dict:
     return {"context": context.model_dump(mode="json"), "projection_status": _projection_status(service)}
 
 
+async def _tool_call_or_404(service, tool_call_id: str):
+    try:
+        tool_call = await service.get_tool_call(tool_call_id)
+    except Exception as exc:
+        raise HTTPException(
+            status_code=503,
+            detail={
+                "message": "Ansich ToolCall query failed",
+                "projection_status": _projection_status(service),
+            },
+        ) from exc
+    if tool_call is None:
+        raise HTTPException(status_code=404, detail="Ansich ToolCall not found")
+    return tool_call
+
+
+@router.get("/tool-calls/{tool_call_id}")
+async def get_tool_call(tool_call_id: str, request: Request) -> dict:
+    await require_admin_user(request, detail=_ADMIN_REQUIRED)
+    service = _service_or_503(request)
+    _ensure_queryable(service)
+    tool_call = await _tool_call_or_404(service, tool_call_id)
+    return {
+        "tool_call": tool_call.model_dump(mode="json"),
+        "projection_status": _projection_status(service),
+    }
+
+
+async def _get_tool_result_payload(
+    *,
+    tool_call_id: str,
+    role: str,
+    request: Request,
+    response: Response,
+) -> dict:
+    await require_admin_user(request, detail=_ADMIN_REQUIRED)
+    service = _service_or_503(request)
+    _ensure_queryable(service)
+    tool_call = await _tool_call_or_404(service, tool_call_id)
+    results = tool_call.raw_results if role == "raw" else tool_call.visible_results
+    if not results:
+        raise HTTPException(
+            status_code=404,
+            detail=f"Ansich ToolCall {role} result not found",
+        )
+    result = results[-1]
+    try:
+        payload = await service.get_content_block_payload(result.content_block_id)
+    except Exception as exc:
+        raise HTTPException(
+            status_code=503,
+            detail={
+                "message": f"Ansich {role} tool result query failed",
+                "projection_status": _projection_status(service),
+            },
+        ) from exc
+    if payload is None:
+        raise HTTPException(
+            status_code=404,
+            detail=f"Ansich ToolCall {role} payload not found",
+        )
+    user = getattr(request.state, "user", None)
+    logger.info(
+        "Ansich %s tool result accessed",
+        role,
+        extra={
+            "ansich_tool_call_id": tool_call_id,
+            "ansich_block_id": result.content_block_id,
+            "ansich_result_role": role,
+            "ansich_actor_id": str(getattr(user, "id", "unknown")),
+        },
+    )
+    response.headers["Cache-Control"] = "no-store"
+    return {
+        f"{role}_result": result.model_dump(mode="json"),
+        f"{role}_payload": payload.model_dump(mode="json"),
+    }
+
+
+@router.get("/tool-calls/{tool_call_id}/raw-result")
+async def get_tool_raw_result(
+    tool_call_id: str,
+    request: Request,
+    response: Response,
+) -> dict:
+    return await _get_tool_result_payload(
+        tool_call_id=tool_call_id,
+        role="raw",
+        request=request,
+        response=response,
+    )
+
+
+@router.get("/tool-calls/{tool_call_id}/visible-result")
+async def get_tool_visible_result(
+    tool_call_id: str,
+    request: Request,
+    response: Response,
+) -> dict:
+    return await _get_tool_result_payload(
+        tool_call_id=tool_call_id,
+        role="visible",
+        request=request,
+        response=response,
+    )
+
+
 @router.get("/content-blocks/{block_id}/payload")
-async def get_content_block_payload(block_id: str, request: Request) -> dict:
+async def get_content_block_payload(block_id: str, request: Request, response: Response) -> dict:
     await require_admin_user(request, detail=_ADMIN_REQUIRED)
     service = _service_or_503(request)
     _ensure_queryable(service)
@@ -281,6 +388,7 @@ async def get_content_block_payload(block_id: str, request: Request) -> dict:
             "ansich_actor_id": str(getattr(user, "id", "unknown")),
         },
     )
+    response.headers["Cache-Control"] = "no-store"
     return {"payload": payload.model_dump(mode="json")}
 
 

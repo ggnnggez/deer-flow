@@ -4,6 +4,8 @@ from typing import Literal
 
 from pydantic import BaseModel, ConfigDict
 
+from ansich.tool import ToolCallView
+
 
 class LlmAttemptView(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True)
@@ -42,6 +44,18 @@ class StepView(BaseModel):
     effective_context_snapshot_id: str | None
     issued_tools: tuple[dict[str, object], ...] = ()
     attempts: tuple[LlmAttemptView, ...] = ()
+    tool_calls: tuple[ToolCallView, ...] = ()
+
+
+class ContentOccurrenceView(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    task_id: str
+    source_identity: str
+    content_hash: str
+    kind: str
+    block_id: str
+    producer_obs_id: str
 
 
 class ContextSnapshotItemView(BaseModel):
@@ -51,6 +65,8 @@ class ContextSnapshotItemView(BaseModel):
     channel: Literal["message", "tool_schema"]
     role: Literal["system", "user", "assistant", "tool"] | None
     name: str | None
+    message_id: str | None = None
+    source_identity: str | None = None
     block_id: str
     kind: str | None
     content_hash: str | None

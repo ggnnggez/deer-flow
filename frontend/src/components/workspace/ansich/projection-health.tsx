@@ -30,6 +30,10 @@ export function AnsichProjectionHealth({ health }: { health: AnsichHealth }) {
           value={`${health.queue_depth}/${health.queue_capacity}`}
         />
         <HealthMetric
+          label={t.ansich.queueHighWatermark}
+          value={String(health.queue_high_watermark)}
+        />
+        <HealthMetric
           label={t.ansich.watermark}
           value={health.watermark === null ? "—" : String(health.watermark)}
         />
@@ -47,6 +51,22 @@ export function AnsichProjectionHealth({ health }: { health: AnsichHealth }) {
           value={String(health.dropped_count)}
         />
         <HealthMetric label={t.ansich.lost} value={String(lostCount)} />
+        <HealthMetric
+          label={t.ansich.snapshotRequests}
+          value={`${health.snapshot_request_count} (${health.snapshot_observations_accepted}/${health.snapshot_observations_dropped})`}
+        />
+        <HealthMetric
+          label={t.ansich.snapshotItems}
+          value={String(health.snapshot_item_count)}
+        />
+        <HealthMetric
+          label={t.ansich.incompleteSnapshots}
+          value={String(health.incomplete_snapshot_count)}
+        />
+        <HealthMetric
+          label={t.ansich.missingBlocks}
+          value={String(health.missing_content_block_count)}
+        />
       </CardContent>
     </Card>
   );

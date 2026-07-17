@@ -9,12 +9,14 @@ from langchain.agents import create_agent
 from langchain_core.language_models import BaseChatModel
 from langchain_core.messages import AIMessage, HumanMessage
 from langchain_core.outputs import ChatGeneration, ChatResult
+from langchain_core.tools import tool
 
 from app.gateway.auth.models import User
 from app.gateway.routers import ansich as ansich_router
 from deerflow.ansich import create_embedded_ansich_service
 from deerflow.ansich.execution import ANSICH_EXECUTION_CONTEXT_KEY, AnsichExecutionContext
 from deerflow.ansich.middleware import AnsichAttemptMiddleware, AnsichDecisionMiddleware
+from deerflow.ansich.tool_middleware import AnsichRawToolMiddleware, AnsichVisibleToolMiddleware
 from deerflow.config.ansich_config import AnsichConfig
 
 
@@ -46,6 +48,45 @@ class _ApiObservedModel(BaseChatModel):
 
     async def _agenerate(self, messages, stop=None, run_manager=None, **kwargs):
         return self._generate(messages, stop=stop, run_manager=run_manager, **kwargs)
+
+
+@tool
+def _api_observed_tool(value: str) -> str:
+    """Return a value for the Ansich ToolCall API test."""
+    return value
+
+
+class _ApiToolThenFinalModel(_ApiObservedModel):
+    call_count: int = 0
+
+    def bind_tools(self, tools, **kwargs):
+        return self
+
+    def _generate(self, messages, stop=None, run_manager=None, **kwargs):
+        self.call_count += 1
+        if self.call_count == 1:
+            return ChatResult(
+                generations=[
+                    ChatGeneration(
+                        message=AIMessage(
+                            content="",
+                            tool_calls=[
+                                {
+                                    "id": "api-tool-provider-id",
+                                    "name": "_api_observed_tool",
+                                    "args": {"value": "api-tool-result"},
+                                }
+                            ],
+                        )
+                    )
+                ]
+            )
+        return super()._generate(
+            messages,
+            stop=stop,
+            run_manager=run_manager,
+            **kwargs,
+        )
 
 
 async def _record_observed_call(
@@ -243,7 +284,69 @@ async def test_step_context_inventory_and_raw_payload_are_separate(caplog):
     assert step_response.json()["step"]["attempts"][0]["effective"] is True
     assert context_item["body"] is None
     assert payload_response.json()["payload"]["body"] == "inspect me"
+    assert payload_response.headers["cache-control"] == "no-store"
     assert "Ansich raw content payload accessed" in caplog.text
+
+
+@pytest.mark.anyio
+async def test_tool_call_inventory_and_raw_visible_payloads_use_separate_endpoints(
+    caplog,
+):
+    caplog.set_level("INFO", logger=ansich_router.__name__)
+    service = AnsichService.in_memory()
+    await service.start()
+    task_id = new_id()
+    service.record(
+        ObservationEnvelope.task_lifecycle(
+            kind="task.created",
+            task_id=task_id,
+            source_kind="deerflow_run",
+            source_id="run-tool-api",
+            occurred_at=datetime.now(UTC),
+            source_event_id="run:run-tool-api:created",
+        )
+    )
+    await service.flush_task(task_id)
+    execution = AnsichExecutionContext(task_id=task_id, service=service)
+    agent = create_agent(
+        model=_ApiToolThenFinalModel(),
+        tools=[_api_observed_tool],
+        middleware=[
+            AnsichDecisionMiddleware(),
+            AnsichVisibleToolMiddleware(),
+            AnsichRawToolMiddleware(),
+            AnsichAttemptMiddleware(),
+        ],
+    )
+    await agent.ainvoke(
+        {"messages": [HumanMessage(content="inspect tool accountability")]},
+        context={ANSICH_EXECUTION_CONTEXT_KEY: execution},
+    )
+    await service.flush_task(task_id)
+    tool_call_id = (await service.list_steps(task_id))[0].tool_calls[0].tool_call_id
+    app = make_authed_test_app(user_factory=admin_user)
+    app.state.ansich_service = service
+    app.include_router(ansich_router.router)
+
+    try:
+        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+            inventory = await client.get(f"/api/ansich/tool-calls/{tool_call_id}")
+            raw = await client.get(f"/api/ansich/tool-calls/{tool_call_id}/raw-result")
+            visible = await client.get(f"/api/ansich/tool-calls/{tool_call_id}/visible-result")
+    finally:
+        await service.stop()
+
+    assert inventory.status_code == 200
+    assert inventory.json()["tool_call"]["execution"]["value"] == "returned"
+    assert "body" not in inventory.text
+    assert raw.status_code == 200
+    assert raw.json()["raw_payload"]["body"]["content"] == "api-tool-result"
+    assert raw.headers["cache-control"] == "no-store"
+    assert visible.status_code == 200
+    assert visible.json()["visible_payload"]["body"]["content"] == "api-tool-result"
+    assert visible.headers["cache-control"] == "no-store"
+    assert "Ansich raw tool result accessed" in caplog.text
+    assert "Ansich visible tool result accessed" in caplog.text
 
 
 @pytest.mark.anyio
@@ -292,9 +395,15 @@ async def test_regular_user_is_forbidden_from_ansich_operations():
     async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
         response = await client.get("/api/ansich/tasks")
         raw_response = await client.get(f"/api/ansich/content-blocks/{new_id()}/payload")
+        tool_response = await client.get(f"/api/ansich/tool-calls/{new_id()}")
+        tool_raw_response = await client.get(f"/api/ansich/tool-calls/{new_id()}/raw-result")
+        tool_visible_response = await client.get(f"/api/ansich/tool-calls/{new_id()}/visible-result")
 
     assert response.status_code == 403
     assert raw_response.status_code == 403
+    assert tool_response.status_code == 403
+    assert tool_raw_response.status_code == 403
+    assert tool_visible_response.status_code == 403
 
 
 @pytest.mark.anyio

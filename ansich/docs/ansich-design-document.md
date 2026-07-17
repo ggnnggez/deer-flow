@@ -312,6 +312,7 @@ event committed late.
 | Step | step_id + unique(task_id, step_seq) | atomic Agent accountability unit | D1, D2, D4 |
 | ToolCall | Ansich ID + unique(step_id, call_seq) | Step sub-action | D1, D2, D4 |
 | ContextWindow | task_id | capacity-bearing Task resource | D1, D2 |
+| ContextState | task_id + state_hash | reusable immutable ordered context inventory | D2-D4 |
 | ContextSnapshot | snapshot_id; Step + attempt number | actual structured decision input inventory | D2-D4 |
 | ContentBlock | block_id; content hash is non-identity | immutable lineage unit | D2-D4 |
 | TaskBudget | task_id + dimension + aggregation scope | effective resource constraint | D1 |
@@ -418,11 +419,20 @@ Raw and visible Tool results are distinct. Sanitization, truncation,
 externalization, coalescing, and compression create new blocks with explicit
 `derived_from` edges.
 
-### 4.7 ContextWindow and ContextSnapshot
+### 4.7 ContextWindow, ContextState, and ContextSnapshot
 
 ContextWindow is the Task-level capacity-bearing resource. Each real Agent LLM
-attempt captures a ContextSnapshot immediately before the LangChain model
-adapter receives the final structured request.
+attempt captures an attempt-specific ContextSnapshot immediately before the
+LangChain model adapter receives the final structured request. The snapshot
+references an immutable, reusable ContextState: identical retries may share the
+same state while remaining distinct attempts and snapshot facts.
+
+ContextState is stored as either a full ordered checkpoint or
+`parent_state_id + ordered delta`. Deltas express append/remove/replace/reorder;
+the storage chain is capped and periodically checkpointed so reads never require
+unbounded traversal. This is a physical optimization only: query APIs always
+materialize the complete strict-order inventory without requiring a live
+process-local registry.
 
 The v1 lossless boundary includes:
 
@@ -436,7 +446,12 @@ It does not include raw provider HTTP wire bytes or authorization headers.
 
 Each snapshot item stores ordinal, channel, role, ContentBlock ID, visible bytes,
 and estimated tokens. If origin cannot be resolved, the full visible block is
-recorded with kind `unknown`.
+recorded with kind `unknown`. If a referenced parent state or ContentBlock has
+not arrived, the ordinal remains present as a typed `missing` item and the
+snapshot is `incomplete`; late evidence repairs it to `complete` without
+poisoning replay. Compression lineage remains explicit: Phase 4 must record its
+source/preserved/removed inventories and summary `derived_from` edges rather
+than inferring them from text diffs.
 
 ### 4.8 Budget and usage
 
@@ -666,7 +681,8 @@ llm.requested | llm.responded | llm.failed
 tool.issued | tool.started | tool.returned_raw | tool.result_visible |
 tool.denied | tool.timed_out | tool.cancelled | tool.failed
 
-content.produced | context.snapshotted | context.compressed
+content.produced | context.state_recorded | context.snapshotted |
+context.compressed
 
 budget.configured | budget.consumed
 
@@ -741,9 +757,13 @@ ansich_agent_releases(entity_id FK, namespace, agent_name, release_hash, ...)
 ansich_tasks(entity_id FK, source_kind, source_id, trigger_obs_id, ...)
 ansich_steps(entity_id FK, task_id, step_seq, actor_kind, ...)
 ansich_tool_calls(entity_id FK, step_id, call_seq, provider_call_id?, ...)
+ansich_tool_call_results(tool_call_id FK, result_role, source_obs_id, content_block_id FK, ...)
 ansich_context_windows(entity_id FK, task_id, capacity, ...)
-ansich_content_blocks(entity_id FK, kind, content_hash, payload_obs_id, ...)
-ansich_context_snapshots(entity_id FK, step_id, attempt_no, ...)
+ansich_content_blobs(blob_key, content_hash, byte_size, content_type, payload_status, ...)
+ansich_content_blocks(entity_id FK, kind, content_hash, blob_key FK, ...)
+ansich_content_occurrences(task_id, source_identity, content_hash, kind, block_id FK, ...)
+ansich_context_states(state_id FK, task_id, parent_state_id, state_hash, chain_depth, ...)
+ansich_context_snapshots(entity_id FK, step_id, attempt_no, state_id FK, ...)
 ansich_task_budgets(entity_id FK, task_id, dimension, aggregation_scope, ...)
 ansich_scopes(entity_id FK, scope_kind, parent_scope_id?, ...)
 ansich_alerts(entity_id FK, alert_key, episode, alert_type, ...)
@@ -773,6 +793,10 @@ Assertions are append-only; current rows are materialized resolver output.
 
 ```text
 ansich_context_snapshot_items
+ansich_context_snapshot_missing_items
+ansich_context_state_checkpoint_items
+ansich_context_state_deltas
+ansich_context_state_missing_blocks
 ansich_content_block_derivations
 ansich_relations
 ansich_relation_evidence
@@ -795,6 +819,12 @@ ansich_alert_read_model
 
 Usage rows always carry `as_of` and source Observation references even though
 they are measurements rather than semantic states.
+
+The embedded Phase 3 slice keeps `tool_calls_issued` and
+`tool_calls_executed` on the Task summary read model. `executed` advances only
+from `tool.started` or stronger execution evidence; denied and
+unknown-terminal observations do not increment it. A later dedicated usage
+projection may normalize these counters without changing their evidence rule.
 
 ### 8.6 Projection infrastructure
 

@@ -504,16 +504,12 @@ def create_summarization_middleware(
             thinking_enabled=False,
             app_config=resolved_app_config,
             attach_tracing=False,
-            ansich_call_class="system_operation",
-            ansich_operation_kind="summarization",
         )
     else:
         model = create_chat_model(
             thinking_enabled=False,
             app_config=resolved_app_config,
             attach_tracing=False,
-            ansich_call_class="system_operation",
-            ansich_operation_kind="summarization",
         )
     model = model.with_config(tags=["middleware:summarize"])
 

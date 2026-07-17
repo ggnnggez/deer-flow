@@ -10,6 +10,8 @@ import type {
   AnsichTaskResponse,
   AnsichTimelineResponse,
   AnsichHealth,
+  AnsichToolCallResponse,
+  AnsichToolResultPayloadResponse,
 } from "./types";
 
 export class AnsichApiError extends Error {
@@ -152,6 +154,53 @@ export async function fetchAnsichContentPayload(
     await throwAnsichApiError(
       response,
       `Failed to load Ansich raw payload: ${response.statusText}`,
+    );
+  }
+  return response.json();
+}
+
+export async function fetchAnsichToolCall(
+  toolCallId: string,
+): Promise<AnsichToolCallResponse> {
+  const response = await fetch(
+    ansichUrl(`/tool-calls/${encodeURIComponent(toolCallId)}`),
+  );
+  if (!response.ok) {
+    await throwAnsichApiError(
+      response,
+      `Failed to load Ansich ToolCall: ${response.statusText}`,
+    );
+  }
+  return response.json();
+}
+
+export async function fetchAnsichToolRawResult(
+  toolCallId: string,
+): Promise<AnsichToolResultPayloadResponse> {
+  const response = await fetch(
+    ansichUrl(`/tool-calls/${encodeURIComponent(toolCallId)}/raw-result`),
+    { cache: "no-store" },
+  );
+  if (!response.ok) {
+    await throwAnsichApiError(
+      response,
+      `Failed to load Ansich raw tool result: ${response.statusText}`,
+    );
+  }
+  return response.json();
+}
+
+export async function fetchAnsichToolVisibleResult(
+  toolCallId: string,
+): Promise<AnsichToolResultPayloadResponse> {
+  const response = await fetch(
+    ansichUrl(`/tool-calls/${encodeURIComponent(toolCallId)}/visible-result`),
+    { cache: "no-store" },
+  );
+  if (!response.ok) {
+    await throwAnsichApiError(
+      response,
+      `Failed to load Ansich visible tool result: ${response.statusText}`,
     );
   }
   return response.json();

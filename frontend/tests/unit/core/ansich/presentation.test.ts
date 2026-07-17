@@ -1,6 +1,7 @@
 import { describe, expect, it } from "@rstest/core";
 
 import {
+  countMissingContextItems,
   countLostObservations,
   formatAnsichTimestamp,
 } from "@/core/ansich/presentation";
@@ -32,5 +33,15 @@ describe("Ansich presentation", () => {
       "not-a-timestamp",
     );
     expect(formatAnsichTimestamp(null, "en-US")).toBe("—");
+  });
+
+  it("counts ordinal-preserving missing context entries", () => {
+    expect(
+      countMissingContextItems([
+        { resolution_status: "available" },
+        { resolution_status: "missing" },
+        { resolution_status: "missing" },
+      ]),
+    ).toBe(2);
   });
 });

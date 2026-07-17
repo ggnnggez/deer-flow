@@ -7,16 +7,16 @@
 | 编号 | 摘要 | 状态 | 修复时间 | Commit |
 | ---- | ---- | ---- | -------- | ------ |
 | H1 | Timeline 轮询端点泄漏原始内容体,绕过带日志的 raw 通道 | ✅ 已修复 | 2026-07-17 | `c64d8ea2` |
-| H2 | 上下文快照物理全量重录，产生 O(N²) 写放大和投影队列风险 | ⬜ 未修复 | — | — |
-| M1 | 新增 `inline_payload_max_bytes` 未 bump `config_version` | ⬜ 未修复 | — | — |
-| M2 | 模型实例上的 `_ansich_call_class` 元数据无读取方 | ⬜ 未修复 | — | — |
-| M3 | raw-payload 端点缺 `Cache-Control: no-store` | ⬜ 未修复 | — | — |
-| M4 | LLM 错误 fallback 时 Step 记为 `final_answer` 的语义待确认 | ⬜ 未修复 | — | — |
-| M5 | `list_system_operations` 按随机 UUID 排序 | ⬜ 未修复 | — | — |
-| L1 | 迁移 0007 自写 `_add_column` 而非 `_helpers.safe_add_column` | ⬜ 未修复 | — | — |
-| L2 | worker 使用字面量 `"__ansich_execution_context"` 而非常量 | ⬜ 未修复 | — | — |
-| L3 | `usage_json` 列混存 usage 与 response_metadata,命名误导 | ⬜ 未修复 | — | — |
-| L4 | `get_max_step_seq` 依赖投影追平的前提未标注 | ⬜ 未修复 | — | — |
+| H2 | 上下文快照物理全量重录，产生 O(N²) 写放大和投影队列风险 | 🟡 A-C 与 D 存储基础完成；压缩谱系留在 Phase 4 | 2026-07-17 | 待提交 |
+| M1 | 新增 `inline_payload_max_bytes` 未 bump `config_version` | ✅ 已修复 | 2026-07-17 | 待提交 |
+| M2 | 模型实例上的 `_ansich_call_class` 元数据无读取方 | ✅ 已修复 | 2026-07-17 | 待提交 |
+| M3 | raw-payload 端点缺 `Cache-Control: no-store` | ✅ 已修复 | 2026-07-17 | 待提交 |
+| M4 | LLM 错误 fallback 时 Step 记为 `final_answer` 的语义待确认 | ✅ 已修复 | 2026-07-17 | 待提交 |
+| M5 | `list_system_operations` 按随机 UUID 排序 | ✅ 已修复 | 2026-07-17 | 待提交 |
+| L1 | 迁移 0007 自写 `_add_column` 而非 `_helpers.safe_add_column` | ✅ 已修复 | 2026-07-17 | 待提交 |
+| L2 | worker 使用字面量 `"__ansich_execution_context"` 而非常量 | ✅ 已修复 | 2026-07-17 | 待提交 |
+| L3 | `usage_json` 列混存 usage 与 response_metadata,命名误导 | ✅ 已修复 | 2026-07-17 | 待提交 |
+| L4 | `get_max_step_seq` 依赖投影追平的前提未标注 | ✅ 已修复 | 2026-07-17 | 待提交 |
 
 ## H1. Timeline 轮询端点泄漏原始内容体,绕过带日志的 raw 通道
 
@@ -28,7 +28,7 @@
 
 ## H2. 上下文快照物理全量重录，产生 O(N²) 写放大和投影队列风险
 
-- 状态：⬜ 未修复。以下方案保留 Phase 2 的“每个物理模型请求都有完整、严格有序的逻辑快照”语义，只优化其物理存储和投影方式。
+- 状态：🟡 分阶段修复。阶段 A、B、C 以及阶段 D 的 ContextState/Delta/物化存储基础已落地；常见 append-only 对话不再重复写历史 occurrence 和完整 snapshot inventory。阶段 D 的 `context.compressed` source/preserved/removed inventory 与 `derived_from` 边仍按原归属留在 Phase 4，不能用前后文本 diff 代替。该剩余项不阻塞 Phase 3，因为 Phase 3 前置条件是阶段 A 的长上下文队列与投影风险治理。
 - 位置：`deerflow/ansich/middleware.py::_record_captured_request`、`ansich/serialization.py::serialize_model_request` / `_block`、`ansich/service.py::AnsichService.record`、`sql.py::persist_and_project` / `_project_context_snapshot`。
 
 ### H2.1 当前全量重录机制
@@ -96,6 +96,8 @@ registry 命中但 hash 改变表示内容发生了变换或 source identity 被
 
 归属：Phase 2 follow-up；在 Phase 3 前开始真实长上下文负载试用时必须先完成。
 
+状态：✅ 已完成。Observation kind 显式路由、typed missing inventory/晚到修复、snapshot bundle 接收指标、队列最高水位与大快照/乱序/永久缺失回归测试均已落地；Operations UI 会显式显示 incomplete snapshot 和 unknown gap。
+
 1. 为 Observation kind 建立显式 projector routing，只为真正消费该 kind 的 projector 创建 job。`task.created/started/...` 仍按依赖顺序进入 structural/control；`step.*`、`llm.*`、`content.produced`、`context.snapshotted` 只进入 task-step。不能只在 projector 内 no-op。
 2. 让缺失 block 的 snapshot 进入结构化 `incomplete` 状态，保存缺失 block inventory，并允许晚到的 `content.produced` 回填后转为 `complete`；永久缺失应表现为 unknown gap，而不是反复 poison 同一 projection job。缺失引用必须使用 typed row 或等价的受约束结构，不能只塞进 JSON warning。
 3. 增加 snapshot 级运行指标：`snapshot_item_count`、`snapshot_visible_bytes`、每次 request 接受/丢弃的 Observation 数、队列 high-watermark、incomplete snapshot 数和 missing block 数。指标不包含 raw body。
@@ -106,6 +108,8 @@ registry 命中但 hash 改变表示内容发生了变换或 source identity 被
 #### 阶段 B：ContentBlob 物理 payload 去重
 
 归属：Phase 4 的数据库与 retention 基础，可独立于完整谱系遍历先交付。
+
+状态：✅ 已提前完成。`ansich_content_blobs`、block→blob 引用、并发 upsert、逐字节 hash 冲突防御、raw 授权边界、migration/backfill/downgrade 与 SQLite 回归测试已落地。
 
 1. 新增 `ansich_content_blobs`，至少包含 `blob_key/content_hash`、`byte_size`、`content_type`、`canonicalization_version`、`payload_status` 和 `payload_ref/body`；为去重键建立唯一约束。
 2. `ansich_content_blocks` 新增 `blob_key` FK。ContentBlock 的 `block_id`、producer、kind、sensitivity/provenance 仍独立保存。
@@ -119,6 +123,8 @@ registry 命中但 hash 改变表示内容发生了变换或 source identity 被
 
 归属：Phase 4 `ContextProvenanceRegistry`。
 
+状态：✅ 已提前完成。稳定 source identity、确定性 UUID4 block/Observation identity、持久化确认后复用、失败后幂等重发、checkpoint/restart 预加载及 typed occurrence 表已落地。
+
 1. 把稳定的 message occurrence identity 保存在 Task-local sidecar registry 中：`source identity -> (block_id, content_hash, producer_obs_id, kind)`。不要仅依赖 message 文本、数组 ordinal、Python 对象地址或 provider ID。
 2. 序列化 snapshot 时，registry 命中且 hash 一致则只在 snapshot inventory 中引用既有 `block_id`，不再发重复的 `content.produced`；未命中、hash 改变或发生 transform 时创建新 block。
 3. 当前 serializer 已读取顶层 `message_id`，但 snapshot item SQL 投影没有保存该字段；落地 registry 前必须把稳定 source identity 持久化为受约束列/表，以支持 checkpoint、恢复、replay 和诊断。
@@ -130,6 +136,8 @@ registry 命中但 hash 改变表示内容发生了变换或 source identity 被
 #### 阶段 D：增量 ContextState 与快照谱系
 
 归属：Phase 4 上下文谱系与压缩的完整方案。
+
+状态：🟡 存储基础已完成。attempt-specific ContextSnapshot 已改为引用可复用 immutable ContextState；ordered append/remove/replace/reorder delta、确定性物化、最大链深 32 的 checkpoint、父状态/内容块晚到修复和 replay/rebuild 测试已落地。压缩 source/preserved/removed inventory 与 summary `derived_from` 边仍是 Phase 4 工作，不在本轮冒充完成。
 
 1. 将可复用的不可变 `ContextState` 与“某次 attempt 捕获了它”的 `ContextSnapshot` 分开。当前 `ansich_context_snapshots.request_obs_id` 唯一且保存 `attempt_no`，不能直接让不同 attempts 共用同一 snapshot row。
 2. `ContextState` 支持 `parent_state_id + ordered delta`，delta 至少表达 append/remove/replace/reorder，并记录产生变化的 Observation/transform；系统仍需提供确定性的 full materialization。
@@ -151,11 +159,15 @@ registry 命中但 hash 改变表示内容发生了变换或 source identity 被
 
 ## M1. 新增 `inline_payload_max_bytes` 未 bump `config_version`
 
+- 状态：✅ 已修复。`config.example.yaml` 已从 27 升到 28，存量配置会进入正常 upgrade 提示/合并路径。
+
 - 位置:`config.example.yaml`(仍为 27)。
 - 现状:`make config-upgrade` 不会向存量用户合并新字段,违反仓库"改 schema 必 bump"约定。
 - 方向:bump 到 28,一行修复;下次任何 config 变更时顺带处理亦可。
 
 ## M2. 模型实例上的 `_ansich_call_class` 元数据无读取方
+
+- 状态：✅ 已修复。删除 factory 参数、私有属性 stamp 及所有调用点；Agent Step 与 system operation 分类继续由实际 Ansich middleware/observe 边界显式决定，避免死元数据泄漏到 mock 或 provider kwargs。
 
 - 位置:`deerflow/models/factory.py::create_chat_model`(`object.__setattr__` stamp)。
 - 现状:全部调用点都传了 `ansich_call_class`/`ansich_operation_kind`,但仓库内无任何读取方(仅测试断言存在)—— 死代码,或本应作为 Decision middleware 的 actor 判定来源而漏接线。
@@ -163,11 +175,15 @@ registry 命中但 hash 改变表示内容发生了变换或 source identity 被
 
 ## M3. raw-payload 端点缺 `Cache-Control: no-store`
 
+- 状态：✅ 已修复。成功读取响应带 `Cache-Control: no-store`，并有路由回归测试。
+
 - 位置:`routers/ansich.py::get_content_block_payload`。
 - 现状:原始提示词体可能被浏览器/中间层缓存;Phase 11 §7 明确要求 no-store,端点既然提前落地就应带上。
 - 方向:响应加 `Cache-Control: no-store` 头,一行修复;Phase 11 落地 fail-closed 审计时复查。
 
 ## M4. LLM 错误 fallback 时 Step 记为 `final_answer` 的语义待确认
+
+- 状态：✅ 已修复。Decision middleware 识别 `deerflow_error_fallback=true` 并关闭为 `model_failed`；中间件顺序测试同时断言 attempt 全失败且无 effective attempt。
 
 - 位置:middleware 链顺序 —— `AnsichDecisionMiddleware` 在 `LLMErrorHandlingMiddleware` 外侧。
 - 现状:provider 异常被转成 fallback AIMessage 后,Decision 记 `step.closed result="final_answer"`,而该 Step 的 attempts 全为 `failed`、`effective_attempt_no=None`,读数自相矛盾。
@@ -175,11 +191,15 @@ registry 命中但 hash 改变表示内容发生了变换或 source identity 被
 
 ## M5. `list_system_operations` 按随机 UUID 排序
 
+- 状态：✅ 已修复。SQL 查询关联 request Observation 并按 `ingest_seq, attempt_no` 排序；回归测试故意使用与摄入顺序相反的 UUID。
+
 - 位置:`sql.py::list_system_operations` 的 `order_by(request_obs_id, attempt_no)`。
 - 现状:`request_obs_id` 是 UUID,排序无业务意义,系统操作列表顺序实际随机。
 - 方向:改按关联观测的 ingest_seq 或 attempt 创建时间排序。
 
 ## L1–L4(低优先级,顺带处理)
+
+- 状态：✅ 全部修复。L1 改用 `safe_add_column/safe_drop_column`；L2 使用 `ANSICH_EXECUTION_CONTEXT_KEY`；L3 通过 0012 migration 拆为 `usage_json` 与 `response_metadata_json` 并 backfill；L4 在 worker 分配 step sequence 前 flush task，同时在 service 标注投影追平前提。
 
 - **L1** 迁移 0007 自写 `_add_column`,应复用 `migrations/_helpers.py::safe_add_column`(行为等价,约定不符)。
 - **L2** `runtime/runs/worker.py` goal-continuation 处用字面量 `"__ansich_execution_context"`,应使用已导入的 `ANSICH_EXECUTION_CONTEXT_KEY`。

@@ -260,8 +260,6 @@ def create_goal_evaluator_model(
         thinking_enabled=False,
         app_config=app_config,
         attach_tracing=True,
-        ansich_call_class="system_operation",
-        ansich_operation_kind="goal",
     )
 
 

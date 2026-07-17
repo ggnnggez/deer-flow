@@ -6,6 +6,19 @@
 
 Phase 3 不实现完整 Scope/AuthorizationSnapshot/副作用模型；Phase 9 会扩展它。当前阶段必须保留授权 attachment point，并且绝不把“没有执行证据”解释为“执行成功且无副作用”。
 
+## 实施状态（2026-07-17）
+
+本阶段的本地纵向切片已经落地：
+
+- `AnsichDecisionMiddleware` 从最终 AIMessage 分配 UUID4 `tool_call_id`，按数组顺序写 `tool.issued`，provider ID 仅作为非唯一属性；参数经过 canonical safe serializer 后只保存 hash 与受控 preview。
+- `AnsichVisibleToolMiddleware` 是 Tool wrapper 的最外层观测边界；`AnsichRawToolMiddleware` 位于 `ToolErrorHandlingMiddleware` 内侧、真实 callable 的最近可用 Agent middleware 边界。两者分别写 raw/visible ContentBlock 与 transform edge，不把 normalized error 伪装成 raw success。
+- run-scoped registry 使用 provider ID、name、args hash 和 Step/call sequence 解析并行调用；持久化 ToolCall 会在新 worker execution context 中恢复，Gateway 重启后仍能继续匹配或在 Task terminal 写 `unknown_terminal`。
+- `0013_ansich_tool_accountability` 新增 typed ToolCall/result/derivation 表和 Task issued/executed counters；投影支持 raw/visible 先到、重放、provider ID 重用和冲突终态。冲突 evidence 全部保留为 hard assertion，由 `tool-terminal-precedence@1` 选择当前值，并把 Task observability 标为 degraded。
+- Step 只有在全部 issued ToolCall 获得 terminal/unknown-terminal evidence，且后续 Step 或 Task terminal 已观测时才从 acting 关闭。
+- 管理员 API 分离 ToolCall inventory、raw result 和 visible result；后两者独立鉴权、独立审计并返回 `Cache-Control: no-store`。Operations Step 页面按 `call_seq` 展示 Issued → Authorization → Execution → Visible to model，payload 仅在明确点击后加载。
+
+已覆盖成功、exception/error normalization、timeout、cooperative cancellation、binary payload 安全封装、short-circuit deny、missing-terminal reconciliation、worker terminal 顺序、进程恢复、并行顺序、provider ID 重用、known-secret exclusion、collector fail-open、乱序投影、冲突终态、restart/rebuild、usage 幂等、管理员/普通用户 API 边界。SQLite 和本地前端验证完成；PostgreSQL migration matrix 与生产负载演练不在本阶段本地实现结果中冒充完成。
+
 ## 2. ToolCall 身份与映射
 
 ToolCall 主身份是 Ansich `tool_call_id`，由应用生成 UUID4；稳定序号为 `(step_id, call_seq)`。`call_seq` 按最终 AIMessage 中 ToolCalls 的数组顺序从 1 开始，多个并行调用共享 Step。
@@ -32,9 +45,9 @@ reconciliation.py
 2. **Raw execution probe**：尽可能贴近真正的 Tool callable，在调用前发 `tool.started`，对原始返回值/异常/timeout/cancellation 发 `tool.returned_raw`、`tool.failed`、`tool.timed_out` 或 `tool.cancelled`。
 3. **Visible result probe**：位于 ToolErrorHandling、sanitization、output budget、externalization 和 normalization 之后，捕获最终送回 Agent state 的 ToolMessage，发 `tool.result_visible`。
 
-编码前为现有 `ToolErrorHandlingMiddleware`、`ToolResultSanitizationMiddleware`、`ToolOutputBudgetMiddleware`、MCP routing、Clarification 和 LoopDetection 写 middleware-order characterization tests。若框架 wrap 顺序无法形成明确 raw/visible 边界，则 raw probe 包装最终 `BaseTool.ainvoke/invoke`，visible probe 从 tools node 输出/下一次模型输入的 ToolMessage reconciliation 捕获。
+现有 middleware-order characterization test 固定了 visible observer 在 output budget/sanitization 外侧、raw observer 在 ToolErrorHandling 内侧的顺序；lead/subagent 使用相同边界，关闭 Ansich 时两者均不安装。
 
-sync Tool 在 worker thread 中执行时，显式传递 `AnsichToolContext`，不要依赖 async event-loop local。probe 的记录仍为非阻塞 Collector 调用。
+sync Tool 在 worker thread 中通过 ToolCallRequest runtime 显式取得 run-scoped `AnsichExecutionContext`；当前调用只在 wrapper 动态范围内使用 instance-local ContextVar 关联 raw/visible 片段，身份解析和 Collector handle 不依赖 event-loop global。probe 的记录仍为非阻塞 Collector 调用。
 
 ## 4. 原始结果、可见结果与转换
 

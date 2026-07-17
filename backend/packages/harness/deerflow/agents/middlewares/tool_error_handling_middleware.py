@@ -181,6 +181,10 @@ def _build_runtime_middlewares(
         ToolOutputBudgetMiddleware.from_app_config(app_config),
         ToolResultSanitizationMiddleware(),
     ]
+    if app_config.ansich.enabled:
+        from deerflow.ansich.tool_middleware import AnsichVisibleToolMiddleware
+
+        outer_wrappers.insert(0, AnsichVisibleToolMiddleware())
 
     # Layer 2 — before_agent hooks that read/annotate thread-scoped data.
     thread_hooks: list[AgentMiddleware] = [
@@ -253,6 +257,10 @@ def _build_runtime_middlewares(
         tail.append(_ToolProgressMiddleware.from_config(tool_progress_config))
 
     tail.append(ToolErrorHandlingMiddleware(app_config=app_config))
+    if app_config.ansich.enabled:
+        from deerflow.ansich.tool_middleware import AnsichRawToolMiddleware
+
+        tail.append(AnsichRawToolMiddleware())
 
     middlewares = [*outer_wrappers, *thread_hooks, *tail]
 

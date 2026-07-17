@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import inspect
+
 import pytest
 from langchain.chat_models import BaseChatModel
 
@@ -99,30 +101,17 @@ def _capturing_class(base_cls: type, captured: dict) -> type:
     return _Capturing
 
 
-def test_ansich_call_classification_is_adapter_metadata_not_provider_kwargs(monkeypatch):
-    config = _make_app_config([_make_model("classified")])
-    _patch_factory(monkeypatch, config)
-
-    model = factory_module.create_chat_model(
-        name="classified",
-        ansich_call_class="system_operation",
-        ansich_operation_kind="summarization",
-    )
-
-    assert model._ansich_call_class == "system_operation"
-    assert model._ansich_operation_kind == "summarization"
-    assert "ansich_call_class" not in FakeChatModel.captured_kwargs
-    assert "ansich_operation_kind" not in FakeChatModel.captured_kwargs
-
-
-def test_unknown_model_call_defaults_to_system_operation_other(monkeypatch):
+def test_ansich_classification_is_not_dead_model_factory_metadata(monkeypatch):
     config = _make_app_config([_make_model("unclassified")])
     _patch_factory(monkeypatch, config)
 
     model = factory_module.create_chat_model(name="unclassified")
 
-    assert model._ansich_call_class == "system_operation"
-    assert model._ansich_operation_kind == "other"
+    parameters = inspect.signature(factory_module.create_chat_model).parameters
+    assert "ansich_call_class" not in parameters
+    assert "ansich_operation_kind" not in parameters
+    assert not hasattr(model, "_ansich_call_class")
+    assert not hasattr(model, "_ansich_operation_kind")
 
 
 # ---------------------------------------------------------------------------

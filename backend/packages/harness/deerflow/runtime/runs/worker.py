@@ -32,6 +32,7 @@ from typing import Any, Literal, cast
 from langgraph.checkpoint.base import empty_checkpoint
 
 from deerflow.agents.goal_state import GoalEvaluation, GoalState
+from deerflow.ansich.execution import ANSICH_EXECUTION_CONTEXT_KEY
 from deerflow.config.app_config import AppConfig
 from deerflow.runtime.context_keys import CURRENT_RUN_PRE_EXISTING_MESSAGE_IDS_KEY
 from deerflow.runtime.goal import (
@@ -284,6 +285,7 @@ async def run_agent(
     # streaming starts and flushed in the finally block. Pre-bound to None so the
     # finally is safe even if an exception fires before streaming begins.
     subagent_events: _SubagentEventBuffer | None = None
+    ansich_execution_context: Any | None = None
 
     if ansich_task is None and ctx.ansich_service is not None:
         from deerflow.ansich.probes import create_task_control_probe
@@ -378,14 +380,25 @@ async def run_agent(
         runtime_ctx = _build_runtime_context(thread_id, run_id, config.get("context"), ctx.app_config)
         if ansich_task is not None and ctx.ansich_service is not None:
             try:
-                from deerflow.ansich.execution import ANSICH_EXECUTION_CONTEXT_KEY, AnsichExecutionContext
+                from deerflow.ansich.execution import AnsichExecutionContext
 
+                # Step sequence allocation reads the task-step projection. Flush
+                # this task first so a resumed run cannot allocate from a stale
+                # maximum and collide with an already durable Step.
+                await ctx.ansich_service.flush_task(ansich_task.task_id)
                 max_step_seq = await ctx.ansich_service.get_max_step_seq(ansich_task.task_id)
-                runtime_ctx[ANSICH_EXECUTION_CONTEXT_KEY] = AnsichExecutionContext(
+                content_occurrences = await ctx.ansich_service.list_content_occurrences(ansich_task.task_id)
+                context_state = await ctx.ansich_service.get_latest_context_state(ansich_task.task_id)
+                existing_steps = await ctx.ansich_service.list_steps(ansich_task.task_id)
+                ansich_execution_context = AnsichExecutionContext(
                     task_id=ansich_task.task_id,
                     service=ctx.ansich_service,
                     next_step_seq=max_step_seq + 1,
+                    content_occurrences=content_occurrences,
+                    context_state=context_state,
+                    tool_calls=(tool_call for step in existing_steps for tool_call in step.tool_calls),
                 )
+                runtime_ctx[ANSICH_EXECUTION_CONTEXT_KEY] = ansich_execution_context
             except Exception:
                 logger.warning("Run %s: could not initialize Ansich execution context", run_id, exc_info=True)
         runtime_ctx[CURRENT_RUN_PRE_EXISTING_MESSAGE_IDS_KEY] = frozenset(pre_existing_message_ids)
@@ -563,7 +576,7 @@ async def run_agent(
                 abort_event=record.abort_event,
                 user_id=resolve_runtime_user_id(runtime),
                 deerflow_trace_id=deerflow_trace_id,
-                ansich_execution_context=(runtime.context.get("__ansich_execution_context") if isinstance(runtime.context, dict) else None),
+                ansich_execution_context=(runtime.context.get(ANSICH_EXECUTION_CONTEXT_KEY) if isinstance(runtime.context, dict) else None),
             )
             if continuation_input is None or record.abort_event.is_set():
                 break
@@ -648,6 +661,17 @@ async def run_agent(
         )
 
     finally:
+        if ansich_execution_context is not None:
+            try:
+                from deerflow.ansich.tool_middleware import reconcile_open_tool_calls
+
+                reconcile_open_tool_calls(ansich_execution_context)
+            except Exception:
+                logger.warning(
+                    "Run %s: could not reconcile open Ansich tool calls",
+                    run_id,
+                    exc_info=True,
+                )
         if ansich_task is not None:
             await ansich_task.terminal(record.status.value)
 

@@ -409,8 +409,6 @@ def _host_default_llm() -> Any:
 
         return create_chat_model(
             name=None,
-            ansich_call_class="system_operation",
-            ansich_operation_kind="memory",
         )
     except Exception:  # noqa: BLE001 - no default model is a config state, not a crash
         logger.warning("Could not build host default model for DeerMem memory extraction; memory extraction will be disabled", exc_info=True)

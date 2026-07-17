@@ -17,8 +17,19 @@ TaskLifecycleKind = Literal[
 ]
 StepObservationKind = Literal["step.started", "step.closed"]
 LlmObservationKind = Literal["llm.requested", "llm.responded", "llm.failed"]
-ContextObservationKind = Literal["content.produced", "context.snapshotted"]
-ObservationKind = TaskLifecycleKind | StepObservationKind | LlmObservationKind | ContextObservationKind | Literal["observability.degraded"]
+ContextObservationKind = Literal["content.produced", "context.state_recorded", "context.snapshotted"]
+ToolObservationKind = Literal[
+    "tool.issued",
+    "tool.started",
+    "tool.returned_raw",
+    "tool.result_visible",
+    "tool.denied",
+    "tool.timed_out",
+    "tool.cancelled",
+    "tool.failed",
+    "tool.unknown_terminal",
+]
+ObservationKind = TaskLifecycleKind | StepObservationKind | LlmObservationKind | ContextObservationKind | ToolObservationKind | Literal["observability.degraded"]
 ControlValue = Literal["unknown", "created", "running", "completed", "failed", "interrupted"]
 
 _SECRET_FIELD_NAMES = frozenset(
@@ -89,7 +100,7 @@ class ObservationEnvelope(BaseModel):
     recorded_at: datetime = Field(default_factory=lambda: datetime.now(UTC))
     task_id: str
     step_id: str | None = None
-    subject_type: Literal["task", "step", "llm_attempt", "content_block", "context_snapshot"] = "task"
+    subject_type: Literal["task", "step", "llm_attempt", "tool_call", "content_block", "context_state", "context_snapshot"] = "task"
     subject_id: str
     fidelity_class: Literal["hard"] = "hard"
     producer: Producer
@@ -115,8 +126,12 @@ class ObservationEnvelope(BaseModel):
                 raise ValueError("step observation subject must identify step_id")
         elif self.kind.startswith("llm.") and self.subject_type != "llm_attempt":
             raise ValueError("LLM observation subject_type must be llm_attempt")
+        elif self.kind.startswith("tool.") and self.subject_type != "tool_call":
+            raise ValueError("Tool observation subject_type must be tool_call")
         elif self.kind == "content.produced" and self.subject_type != "content_block":
             raise ValueError("content observation subject_type must be content_block")
+        elif self.kind == "context.state_recorded" and self.subject_type != "context_state":
+            raise ValueError("context state observation subject_type must be context_state")
         elif self.kind == "context.snapshotted" and self.subject_type != "context_snapshot":
             raise ValueError("context snapshot observation subject_type must be context_snapshot")
         if self.occurred_at.tzinfo is None or self.recorded_at.tzinfo is None:
@@ -242,3 +257,6 @@ class TaskView(BaseModel):
     source_kind: str
     source_id: str
     control: ControlBelief
+    observability_status: Literal["healthy", "degraded"] = "healthy"
+    tool_calls_issued: int = 0
+    tool_calls_executed: int = 0
