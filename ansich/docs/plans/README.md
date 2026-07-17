@@ -9,6 +9,7 @@
 - Phase 2 已形成可运行的本地纵向切片：逻辑 Step 与 adapter attempt 分层、内部 LLM system operation、有序模型输入快照、payload 分层、SQL 投影/API，以及 Operations 的 Timeline/Steps/Context 页面均已实现。SQLite、相关后端回归、前端全量单测和真实浏览器 E2E 已验证；PostgreSQL 迁移矩阵、关闭 Ansich 的性能基准和生产 paper drill 完成前不标记最终完成。
 - Phase 3–12 尚未开始实现；页面不得提前显示 ToolCall 责任链、进度百分比、预算或语义判断的占位数据。
 - Phase 1 代码评审的跟进项登记在 [phase-1-review-followups.md](phase-1-review-followups.md)，各项带有修复状态、归属阶段与对应 commit；Phase 2 的实施前提 F4（projector 显式优先级）已修复。
+- Phase 2 代码评审的跟进项登记在 [phase-2-review-followups.md](phase-2-review-followups.md)；其中 H2（上下文快照写放大与 hash 去重）是 Phase 4 实施时必须吸收的输入。
 
 ## 固定实现边界
 
