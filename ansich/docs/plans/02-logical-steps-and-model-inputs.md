@@ -10,6 +10,8 @@
 
 依赖 Phase 1 的 Collector、Observation store、projection job、Task ID 和管理员 API。本阶段只建立 ToolCall 的 issued 占位信息，Tool 的执行责任链在 Phase 3 完成；完整压缩谱系在 Phase 4 完成。
 
+实施前提：先完成 [Phase 1 评审跟进项 F4](phase-1-review-followups.md)——projection job 的执行顺序目前依赖 `projector_name` 字母序巧合，新增 Step projector 前必须改为显式优先级，否则 structural/control/step 的投影顺序会静默失效。
+
 “实际模型输入”的边界是 LangChain model adapter 接收的最终结构化 request，而不是 provider HTTP wire。provider SDK 内部不可见的网络 retry 不伪装成独立 attempt；若 provider 响应暴露 retry metadata，则作为该 attempt 的属性记录。
 
 ## 3. 新增领域类型和运行上下文
