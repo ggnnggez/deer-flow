@@ -10,7 +10,8 @@
 - Phase 3 已形成可运行的本地纵向切片：Tool intent、raw callable boundary、模型可见结果和 unknown/denied authorization attachment point 分离；Task terminal reconciliation、重启恢复、typed SQL 投影、issued/executed usage、管理员 API 以及四段责任链页面均已实现。SQLite migration/rebuild、后端 Ansich 回归、前端类型/lint 和 raw/visible 权限边界已验证；PostgreSQL 迁移矩阵与生产负载演练仍属于后续生产就绪门禁。
 - Phase 4–12 尚未开始实现；页面不得提前显示压缩谱系、进度百分比、预算或语义判断的占位数据。
 - Phase 1 代码评审的跟进项登记在 [phase-1-review-followups.md](phase-1-review-followups.md)，各项带有修复状态、归属阶段与对应 commit；Phase 2 的实施前提 F4（projector 显式优先级）已修复。
-- Phase 2 代码评审的跟进项登记在 [phase-2-review-followups.md](phase-2-review-followups.md)；其中 H2（上下文快照写放大与 hash 去重）是 Phase 4 实施时必须吸收的输入。
+- Phase 2 代码评审的跟进项登记在 [phase-2-review-followups.md](phase-2-review-followups.md)；其中 H2（上下文快照写放大与 hash 去重）的存储基础已随 Phase 3 落地，压缩谱系部分仍是 Phase 4 实施时必须吸收的输入。
+- Phase 3 代码评审的跟进项登记在 [phase-3-review-followups.md](phase-3-review-followups.md)；其中 M2（transform 显式元数据）需在 Phase 4 前完成，M3（队列字节水位）需在 Phase 5 前完成。
 
 ## 固定实现边界
 

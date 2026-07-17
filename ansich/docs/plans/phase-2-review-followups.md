@@ -7,16 +7,16 @@
 | 编号 | 摘要 | 状态 | 修复时间 | Commit |
 | ---- | ---- | ---- | -------- | ------ |
 | H1 | Timeline 轮询端点泄漏原始内容体,绕过带日志的 raw 通道 | ✅ 已修复 | 2026-07-17 | `c64d8ea2` |
-| H2 | 上下文快照物理全量重录，产生 O(N²) 写放大和投影队列风险 | 🟡 A-C 与 D 存储基础完成；压缩谱系留在 Phase 4 | 2026-07-17 | 待提交 |
-| M1 | 新增 `inline_payload_max_bytes` 未 bump `config_version` | ✅ 已修复 | 2026-07-17 | 待提交 |
-| M2 | 模型实例上的 `_ansich_call_class` 元数据无读取方 | ✅ 已修复 | 2026-07-17 | 待提交 |
-| M3 | raw-payload 端点缺 `Cache-Control: no-store` | ✅ 已修复 | 2026-07-17 | 待提交 |
-| M4 | LLM 错误 fallback 时 Step 记为 `final_answer` 的语义待确认 | ✅ 已修复 | 2026-07-17 | 待提交 |
-| M5 | `list_system_operations` 按随机 UUID 排序 | ✅ 已修复 | 2026-07-17 | 待提交 |
-| L1 | 迁移 0007 自写 `_add_column` 而非 `_helpers.safe_add_column` | ✅ 已修复 | 2026-07-17 | 待提交 |
-| L2 | worker 使用字面量 `"__ansich_execution_context"` 而非常量 | ✅ 已修复 | 2026-07-17 | 待提交 |
-| L3 | `usage_json` 列混存 usage 与 response_metadata,命名误导 | ✅ 已修复 | 2026-07-17 | 待提交 |
-| L4 | `get_max_step_seq` 依赖投影追平的前提未标注 | ✅ 已修复 | 2026-07-17 | 待提交 |
+| H2 | 上下文快照物理全量重录，产生 O(N²) 写放大和投影队列风险 | 🟡 A-C 与 D 存储基础完成；压缩谱系留在 Phase 4 | 2026-07-17 | `6177d53d` |
+| M1 | 新增 `inline_payload_max_bytes` 未 bump `config_version` | ✅ 已修复 | 2026-07-17 | `6177d53d` |
+| M2 | 模型实例上的 `_ansich_call_class` 元数据无读取方 | ✅ 已修复 | 2026-07-17 | `6177d53d` |
+| M3 | raw-payload 端点缺 `Cache-Control: no-store` | ✅ 已修复 | 2026-07-17 | `6177d53d` |
+| M4 | LLM 错误 fallback 时 Step 记为 `final_answer` 的语义待确认 | ✅ 已修复 | 2026-07-17 | `6177d53d` |
+| M5 | `list_system_operations` 按随机 UUID 排序 | ✅ 已修复 | 2026-07-17 | `6177d53d` |
+| L1 | 迁移 0007 自写 `_add_column` 而非 `_helpers.safe_add_column` | ✅ 已修复 | 2026-07-17 | `6177d53d` |
+| L2 | worker 使用字面量 `"__ansich_execution_context"` 而非常量 | ✅ 已修复 | 2026-07-17 | `6177d53d` |
+| L3 | `usage_json` 列混存 usage 与 response_metadata,命名误导 | ✅ 已修复 | 2026-07-17 | `6177d53d` |
+| L4 | `get_max_step_seq` 依赖投影追平的前提未标注 | ✅ 已修复 | 2026-07-17 | `6177d53d` |
 
 ## H1. Timeline 轮询端点泄漏原始内容体,绕过带日志的 raw 通道
 
