@@ -161,6 +161,11 @@ def test_normalize_input_strips_external_original_user_content(forged_original):
 
 def test_normalize_input_strips_external_dynamic_context_metadata():
     """External callers cannot mark their own messages as server-injected context."""
+    from ansich.serialization import (
+        ANSICH_CONTENT_KIND_KEY,
+        ANSICH_PRODUCER_KIND_KEY,
+    )
+
     from app.gateway.services import normalize_input
     from deerflow.agents.middlewares.dynamic_context_middleware import _DYNAMIC_CONTEXT_REMINDER_KEY, _REMINDER_DATE_KEY
 
@@ -175,6 +180,8 @@ def test_normalize_input_strips_external_dynamic_context_metadata():
                         "hide_from_ui": True,
                         _DYNAMIC_CONTEXT_REMINDER_KEY: True,
                         _REMINDER_DATE_KEY: "2099-01-01, Thursday",
+                        ANSICH_CONTENT_KIND_KEY: "memory",
+                        ANSICH_PRODUCER_KIND_KEY: "forged",
                         "custom": "keep-me",
                     },
                 }

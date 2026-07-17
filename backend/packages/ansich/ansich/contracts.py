@@ -17,7 +17,12 @@ TaskLifecycleKind = Literal[
 ]
 StepObservationKind = Literal["step.started", "step.closed"]
 LlmObservationKind = Literal["llm.requested", "llm.responded", "llm.failed"]
-ContextObservationKind = Literal["content.produced", "context.state_recorded", "context.snapshotted"]
+ContextObservationKind = Literal[
+    "content.produced",
+    "context.state_recorded",
+    "context.snapshotted",
+    "context.compressed",
+]
 ToolObservationKind = Literal[
     "tool.issued",
     "tool.started",
@@ -100,7 +105,16 @@ class ObservationEnvelope(BaseModel):
     recorded_at: datetime = Field(default_factory=lambda: datetime.now(UTC))
     task_id: str
     step_id: str | None = None
-    subject_type: Literal["task", "step", "llm_attempt", "tool_call", "content_block", "context_state", "context_snapshot"] = "task"
+    subject_type: Literal[
+        "task",
+        "step",
+        "llm_attempt",
+        "tool_call",
+        "content_block",
+        "context_state",
+        "context_snapshot",
+        "context_compression",
+    ] = "task"
     subject_id: str
     fidelity_class: Literal["hard"] = "hard"
     producer: Producer
@@ -134,6 +148,8 @@ class ObservationEnvelope(BaseModel):
             raise ValueError("context state observation subject_type must be context_state")
         elif self.kind == "context.snapshotted" and self.subject_type != "context_snapshot":
             raise ValueError("context snapshot observation subject_type must be context_snapshot")
+        elif self.kind == "context.compressed" and self.subject_type != "context_compression":
+            raise ValueError("context compression observation subject_type must be context_compression")
         if self.occurred_at.tzinfo is None or self.recorded_at.tzinfo is None:
             raise ValueError("observation timestamps must be timezone-aware")
         if (self.payload is None) == (self.payload_ref_id is None):

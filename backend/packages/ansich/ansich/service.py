@@ -8,8 +8,10 @@ from threading import Lock
 from weakref import ReferenceType, WeakMethod, ref
 
 from ansich.backend import AnsichBackend
+from ansich.compression import ContextCompressionView
 from ansich.context_state import ContextStateView
 from ansich.contracts import AnsichHealth, ControlValue, FlushResult, LostRange, ObservationEnvelope, Producer, RecordReceipt, TaskView
+from ansich.lineage import ContentLineageView, LineageDirection, PossibleExposureView, find_possible_exposures, traverse_content_lineage
 from ansich.memory import InMemoryAnsichBackend
 from ansich.step import ContentBlockPayloadView, ContentOccurrenceView, ContextSnapshotView, LlmAttemptView, StepView
 from ansich.tool import ToolCallView
@@ -312,8 +314,53 @@ class AnsichService:
     async def get_step_context(self, step_id: str) -> ContextSnapshotView | None:
         return await self._backend.get_step_context(step_id)
 
+    async def get_context_snapshot(
+        self,
+        snapshot_id: str,
+    ) -> ContextSnapshotView | None:
+        return await self._backend.get_context_snapshot(snapshot_id)
+
     async def get_content_block_payload(self, block_id: str) -> ContentBlockPayloadView | None:
         return await self._backend.get_content_block_payload(block_id)
+
+    async def get_context_compression(
+        self,
+        compression_id: str,
+    ) -> ContextCompressionView | None:
+        return await self._backend.get_context_compression(compression_id)
+
+    async def get_content_lineage(
+        self,
+        block_id: str,
+        *,
+        direction: LineageDirection = "backward",
+        max_depth: int = 8,
+        max_nodes: int = 500,
+    ) -> ContentLineageView | None:
+        return await traverse_content_lineage(
+            block_id,
+            direction=direction,
+            max_depth=max_depth,
+            max_nodes=max_nodes,
+            get_blocks=self._backend.get_content_blocks,
+            get_derivations=self._backend.list_content_derivations,
+        )
+
+    async def get_possible_exposures(
+        self,
+        block_id: str,
+        *,
+        max_depth: int = 8,
+        max_nodes: int = 500,
+    ) -> PossibleExposureView | None:
+        return await find_possible_exposures(
+            block_id,
+            max_depth=max_depth,
+            max_nodes=max_nodes,
+            get_blocks=self._backend.get_content_blocks,
+            get_derivations=self._backend.list_content_derivations,
+            list_snapshot_exposures=self._backend.list_snapshot_exposures,
+        )
 
     async def rebuild_projections(self) -> int:
         rebuild = getattr(self._backend, "rebuild_projections", None)

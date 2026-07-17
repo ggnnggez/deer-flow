@@ -321,7 +321,7 @@ CORS is same-origin by default when requests enter through nginx on port 2026. S
 | **Models** (`/api/models`) | `GET /` - list models; `GET /{name}` - model details |
 | **Features** (`/api/features`) | `GET /` - report config-gated feature availability (currently `agents_api.enabled`) for frontend UI gating |
 | **Console** (`/api/console`) | Read-only cross-thread observability for the current user (the data layer for an operations dashboard or external monitoring): `GET /stats` - headline counters (runs/threads/agents/tokens/cost); `GET /runs` - paginated run history joined with thread titles (per-run cost); `GET /usage` - zero-filled daily token series + per-model breakdown with spend. Queries `runs`/`threads_meta` directly as a reporting layer (no new `RunStore` methods); requires a SQL database backend — returns 503 on `database.backend: memory`. Real-cost estimation reads optional `models[*].pricing` (`currency`, `input_per_million`, `output_per_million`, `input_cache_hit_per_million`; `ModelConfig` is `extra="allow"`, so no schema change) and prices each run from its `token_usage_by_model` input/output split. Pricing is **cache-aware**: `RunJournal` accumulates prompt-cache hits from `usage_metadata.input_token_details.cache_read` into a sparse `cache_read_tokens` bucket key (also threaded through `SubagentTokenCollector` → `record_external_llm_usage_records`), and cache-hit input tokens are billed at `input_cache_hit_per_million` (omitted → billed at the miss price, a conservative upper bound). Legacy rows fall back to run-level totals at `model_name`; unpriced models yield `cost: null` and cost fields are null when no pricing is configured |
-| **Ansich** (`/api/ansich`) | Admin-only developer/operator Agent observability, gated by startup-only `ansich.enabled`. Task reads include evidence-backed ControlBelief, a cursor-paged lifecycle/Step/system-operation timeline, logical Steps with physical LLM retry attempts, ordered adapter-visible ContextSnapshot inventory, and ordered ToolCall accountability. ToolCall inventory, raw result, and model-visible result have separate endpoints; payload endpoints are logged and `no-store`. `GET /health` remains process-local and readable when SQL storage is unavailable; projection reads return 503 with the same health summary when storage is unavailable. |
+| **Ansich** (`/api/ansich`) | Admin-only developer/operator Agent observability, gated by startup-only `ansich.enabled`. Task reads include evidence-backed ControlBelief, a cursor-paged lifecycle/Step/system-operation timeline, logical Steps with physical LLM retry attempts, ordered adapter-visible ContextSnapshot inventory, ordered ToolCall accountability, typed context-compression inventories, bounded ContentBlock provenance, and forward possible-exposure queries. ToolCall inventory, raw result, and model-visible result have separate endpoints; payload endpoints are logged and `no-store`. Lineage/snapshot/compression endpoints return metadata only and never read raw bodies. `GET /health` remains process-local and readable when SQL storage is unavailable; projection reads return 503 with the same health summary when storage is unavailable. |
 | **MCP** (`/api/mcp`) | `GET /config` - get config; `PUT /config` - update config (saves to extensions_config.json) |
 | **Skills** (`/api/skills`) | `GET /` - list skills; `GET /{name}` - details; `PUT /{name}` - update enabled; `POST /install` - install from .skill archive (accepts standard optional frontmatter like `version`, `author`, `compatibility`) |
 | **Memory** (`/api/memory`) | `GET /` - memory data; `POST /reload` - force reload; `GET /config` - config; `GET /status` - config + data |
@@ -368,6 +368,28 @@ observability, and worker-finally reconciliation writes `unknown_terminal`
 before the Task terminal. Task summaries count issued separately from executed,
 so denied or evidence-free calls never become successful execution. Restored
 workers hydrate persisted ToolCalls into the run context before continuing.
+Phase 4 freezes the exact message-occurrence inventory before summarization and
+projects ordered `source`/`preserved`/`removed` memberships, a summary block,
+and `compressed` derivations only after summary generation succeeds. Consecutive
+compressions link the next summary to the previous summary block; an unresolved
+pre-existing summary is retained as a full `unknown_origin` block instead of
+receiving guessed edges. Successful LLM responses produce assistant/tool-request
+ContentBlocks immediately, including final answers that never enter a later
+request. Server-owned content-kind/producer markers distinguish memory, skill,
+durable/dynamic context, and vision injection from genuine user input; Gateway
+removes externally supplied marker values and the attempt adapter strips the
+internal markers before provider invocation. System-message coalescing records
+the exact ordered input blocks and `coalesced` edges. Durable summary rendering
+links its composite request block back to the durable summary block, so exposure
+can traverse raw Tool result -> summary -> later request without claiming model
+reliance. Content lineage uses typed producer/derivation tables
+and a bounded, layer-batched BFS in the framework-independent core. Edges point
+`derived -> source`; backward reads are labeled `provenance`, while snapshot
+reverse-index reads are explicitly `possible_exposure`, never model reliance or
+causality. A minimal `(snapshot_id, ordinal, content_block_id)` membership table
+indexes materialized ContextState inventories for reverse lookup without
+duplicating Phase 2's full snapshot item payload. Snapshot, compression,
+lineage, and exposure routes are admin-only, lazy, and metadata-only.
 `database.backend: memory` cannot provide durable Ansich storage and therefore
 surfaces `status=failed` without preventing Agent runs. See
 `ansich/docs/ansich-design-document.md` and `ansich/docs/plans/`.
@@ -708,6 +730,7 @@ This invokes `alembic revision --autogenerate` against the live ORM models. Revi
 - `migrations/versions/0011_ansich_context_states.py` — reusable immutable ContextState checkpoints/deltas and snapshot references
 - `migrations/versions/0012_ansich_attempt_metadata.py` — split LLM usage and provider response metadata columns
 - `migrations/versions/0013_ansich_tool_accountability.py` — typed ToolCall intent/execution/visible-result projections, derivations, and issued/executed counters
+- `migrations/versions/0014_ansich_context_lineage.py` — typed ContentBlock producers, exact ordered context-compression inventories, bidirectional derivation indexes, and materialized snapshot-block reverse memberships
 - `persistence/bootstrap.py` — `bootstrap_schema(engine, backend=...)`, the three-branch decision + locking
 - Tests: `tests/test_persistence_bootstrap.py` (branches), `tests/test_persistence_bootstrap_concurrency.py` (concurrency), `tests/test_persistence_bootstrap_regression.py` (issue #3682), `tests/test_persistence_migrations_env.py` (filter), `tests/blocking_io/test_persistence_bootstrap.py` (asyncio.to_thread anchor)
 

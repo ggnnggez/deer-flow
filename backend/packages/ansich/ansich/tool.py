@@ -28,8 +28,14 @@ ToolTransformKind = Literal[
     "externalized",
     "coalesced",
     "clarification_card",
+    "compressed",
+    "memory_injected",
+    "skill_injected",
+    "vision_converted",
+    "copied",
     "unknown",
 ]
+ContentDerivationSourceRole = Literal["source", "preserved", "removed", "supporting"]
 
 
 class ToolBelief(BaseModel):
@@ -64,6 +70,8 @@ class ContentDerivationView(BaseModel):
     transform_kind: ToolTransformKind
     transform_version: str
     established_obs_id: str
+    source_role: ContentDerivationSourceRole = "source"
+    ordinal: int | None = None
 
 
 class ToolCallView(BaseModel):

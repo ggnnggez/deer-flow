@@ -1,5 +1,22 @@
 # Phase 4 — 上下文谱系与压缩
 
+## 实现状态（2026-07-17）
+
+Phase 4 已完成代码实现与本地校验，等待提交。当前落地包括：
+
+- Ansich core 中的纯 BFS 谱系遍历，默认上限为 8 层/500 节点，硬上限为 32 层/2,000 节点；repository 每层批量读取节点和边。
+- `derived -> source` 双向索引、typed block producer、`source_role`/`ordinal`，以及 raw Tool result → model-visible Tool result → provider request block 的可查询链路。
+- LLM response 在返回时立即形成 assistant/tool-request ContentBlock，因此没有下一次请求的 final answer 也不会丢失 producer；memory、skill、durable/dynamic context、vision 使用 server-owned structured marker 分类，不依赖正文匹配。Gateway 会移除外部伪造 marker，attempt adapter 在 provider 调用前移除内部 marker。
+- system-message coalescing 在变换点记录严格有序的源块和 `coalesced` 边；durable context 中的 summary rendering 通过 `supporting` 边连接已持久化 summary，使 raw Tool result → summary → later ContextSnapshot 的 possible-exposure 查询闭合。
+- summarization 调用前冻结 message occurrence inventory；成功后写 summary ContentBlock、`context.compressed` 和严格有序的 `source`/`preserved`/`removed` typed memberships。失败或 Ansich 拒绝写入均保持 Agent fail-open。
+- 连续压缩复用上一次成功记录的 summary block；对于进程恢复后只能看到 summary 文本、无法解析原记录的情况，保存完整 `unknown_origin` summary block，不伪造来源边。
+- 新增 metadata-only、admin-only 的 snapshot、compression、lineage、possible-exposure API，以及 Operations 的点击后加载局部图、压缩明细和表格 fallback。
+- Alembic revision `0014_ansich_context_lineage` 包含升级回填和降级路径。
+
+实现对第 6 节作了一项保持 Phase 2 H2 语义的物理调整：ContextSnapshot 的完整 inventory 仍由可复用 `ContextState` checkpoint/delta 物化，不重新复制一份完整 `ansich_context_snapshot_items`。Phase 4 新增最小的 `ansich_context_snapshot_block_memberships(snapshot_id, ordinal, content_block_id)` 反向索引表；它只复制 exposure 查询所需的关系键，避免破坏 ContextState 去重，同时让 SQLite/PostgreSQL 都能通过 typed join 查询 block → snapshot。
+
+本地验证记录：backend ruff check/format 通过；`tests/ansich` 139 项通过；migration、summarization、context middleware 与 Gateway 边界相关回归 323 项通过；frontend lint/typecheck 与 653 项单测通过；production build 通过；Ansich Playwright 2 项通过。Next/Turbopack build 仍会报告仓库既有 mock artifact route 的 NFT tracing warning，但不影响编译或测试结果。
+
 ## 1. 交付目标
 
 本阶段把 Phase 2/3 的 ContextSnapshot 和 ContentBlock 扩展成可查询的有向谱系。开发者能够从一个模型可见块向后追到 user input、Agent output、Tool raw result、memory、skill 或 middleware producer，也能够向前找出哪些后续 Step 可能看见该块或其衍生物。

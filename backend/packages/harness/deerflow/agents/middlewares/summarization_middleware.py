@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import html
 import logging
+from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any, Protocol, override, runtime_checkable
 
@@ -16,6 +17,12 @@ from langgraph.graph.message import REMOVE_ALL_MESSAGES
 from langgraph.runtime import Runtime
 
 from deerflow.agents.middlewares.dynamic_context_middleware import is_dynamic_context_reminder
+from deerflow.ansich.compression import (
+    FrozenContextCompression,
+    freeze_context_compression,
+    record_context_compression,
+)
+from deerflow.ansich.execution import ExecutionCall
 from deerflow.ansich.middleware import execution_context_from_runtime, observe_system_model_ainvoke, observe_system_model_invoke
 from deerflow.config.app_config import get_app_config
 from deerflow.models import create_chat_model
@@ -114,6 +121,7 @@ class DeerFlowSummarizationMiddleware(SummarizationMiddleware):
         previous_summary: str | None = None,
         *,
         runtime: Runtime | None = None,
+        call_observer: Callable[[ExecutionCall], None] | None = None,
     ) -> str | None:
         """Mirror the parent ``_create_summary`` but invoke the nostream-tagged model.
 
@@ -135,6 +143,7 @@ class DeerFlowSummarizationMiddleware(SummarizationMiddleware):
                 operation_kind="summarization",
                 config={"metadata": {"lc_source": "summarization"}},
                 runtime_context=None if runtime is None else runtime.context,
+                call_observer=call_observer,
             )
             return response.text.strip()
         except Exception:
@@ -147,6 +156,7 @@ class DeerFlowSummarizationMiddleware(SummarizationMiddleware):
         previous_summary: str | None = None,
         *,
         runtime: Runtime | None = None,
+        call_observer: Callable[[ExecutionCall], None] | None = None,
     ) -> str | None:
         """Async counterpart of :meth:`_summarize_with` using the nostream model."""
         if not messages_to_summarize:
@@ -162,6 +172,7 @@ class DeerFlowSummarizationMiddleware(SummarizationMiddleware):
                 operation_kind="summarization",
                 config={"metadata": {"lc_source": "summarization"}},
                 runtime_context=None if runtime is None else runtime.context,
+                call_observer=call_observer,
             )
             return response.text.strip()
         except Exception:
@@ -274,9 +285,7 @@ class DeerFlowSummarizationMiddleware(SummarizationMiddleware):
 
     def _build_summary_prompt(self, messages_to_summarize: list[AnyMessage], previous_summary: str | None = None) -> str | None:
         """Build the summary prompt, returning ``None`` when trimming leaves nothing."""
-        trimmed_messages = self._trim_messages_for_summary(messages_to_summarize)
-        if not trimmed_messages:
-            trimmed_messages = messages_to_summarize[-1:]
+        trimmed_messages = self._source_messages_for_summary(messages_to_summarize)
         if not trimmed_messages:
             return None
         # Format messages to avoid token inflation from metadata when str() is called on
@@ -286,6 +295,13 @@ class DeerFlowSummarizationMiddleware(SummarizationMiddleware):
         if not formatted_messages:
             return None
         return self.summary_prompt.format(messages=formatted_messages).rstrip()
+
+    def _source_messages_for_summary(
+        self,
+        messages_to_summarize: list[AnyMessage],
+    ) -> list[AnyMessage]:
+        trimmed_messages = self._trim_messages_for_summary(messages_to_summarize)
+        return trimmed_messages or messages_to_summarize[-1:]
 
     def before_model(self, state: AgentState, runtime: Runtime) -> dict | None:
         return self._maybe_summarize(state, runtime)
@@ -330,9 +346,28 @@ class DeerFlowSummarizationMiddleware(SummarizationMiddleware):
             return None
         messages_to_summarize, preserved_messages, previous_summary, total_tokens = prepared
         self._fire_hooks(messages_to_summarize, preserved_messages, runtime)
-        summary = self._summarize_with(messages_to_summarize, previous_summary=previous_summary, runtime=runtime)
+        frozen = self._freeze_ansich_compression(
+            state,
+            messages_to_summarize,
+            preserved_messages,
+            total_tokens,
+            runtime,
+        )
+        summary_calls: list[ExecutionCall] = []
+        summary = self._summarize_with(
+            messages_to_summarize,
+            previous_summary=previous_summary,
+            runtime=runtime,
+            call_observer=summary_calls.append if frozen is not None else None,
+        )
         if summary is None:
             return None
+        self._record_ansich_compression(
+            frozen,
+            summary=summary,
+            summary_call=summary_calls[-1] if summary_calls else None,
+            preserved_messages=preserved_messages,
+        )
         return ContextCompactionResult(
             summary_text=summary,
             messages_to_summarize=tuple(messages_to_summarize),
@@ -352,15 +387,82 @@ class DeerFlowSummarizationMiddleware(SummarizationMiddleware):
             return None
         messages_to_summarize, preserved_messages, previous_summary, total_tokens = prepared
         self._fire_hooks(messages_to_summarize, preserved_messages, runtime)
-        summary = await self._asummarize_with(messages_to_summarize, previous_summary=previous_summary, runtime=runtime)
+        frozen = self._freeze_ansich_compression(
+            state,
+            messages_to_summarize,
+            preserved_messages,
+            total_tokens,
+            runtime,
+        )
+        summary_calls: list[ExecutionCall] = []
+        summary = await self._asummarize_with(
+            messages_to_summarize,
+            previous_summary=previous_summary,
+            runtime=runtime,
+            call_observer=summary_calls.append if frozen is not None else None,
+        )
         if summary is None:
             return None
+        self._record_ansich_compression(
+            frozen,
+            summary=summary,
+            summary_call=summary_calls[-1] if summary_calls else None,
+            preserved_messages=preserved_messages,
+        )
         return ContextCompactionResult(
             summary_text=summary,
             messages_to_summarize=tuple(messages_to_summarize),
             preserved_messages=tuple(preserved_messages),
             total_tokens=total_tokens,
         )
+
+    def _freeze_ansich_compression(
+        self,
+        state: AgentState,
+        messages_to_summarize: list[AnyMessage],
+        preserved_messages: list[AnyMessage],
+        total_tokens: int,
+        runtime: Runtime,
+    ) -> FrozenContextCompression | None:
+        execution = execution_context_from_runtime(runtime)
+        if execution is None:
+            return None
+        try:
+            return freeze_context_compression(
+                execution=execution,
+                messages=state["messages"],
+                source_messages=self._source_messages_for_summary(messages_to_summarize),
+                preserved_messages=preserved_messages,
+                removed_messages=messages_to_summarize,
+                before_tokens=total_tokens,
+                previous_summary=(state.get("summary_text") if isinstance(state.get("summary_text"), str) else None),
+                runtime_context=runtime.context,
+            )
+        except Exception:
+            logger.exception("Ansich failed to freeze context-compression inventory")
+            return None
+
+    def _record_ansich_compression(
+        self,
+        frozen: FrozenContextCompression | None,
+        *,
+        summary: str,
+        summary_call: ExecutionCall | None,
+        preserved_messages: list[AnyMessage],
+    ) -> None:
+        if frozen is None:
+            return
+        try:
+            after_tokens = self.token_counter(self._messages_for_trigger_count(preserved_messages, summary))
+            if not record_context_compression(
+                frozen,
+                summary_text=summary,
+                summary_call=summary_call,
+                after_tokens=after_tokens,
+            ):
+                logger.warning("Ansich rejected context-compression observations")
+        except Exception:
+            logger.exception("Ansich failed to record context compression")
 
     def _maybe_summarize(self, state: AgentState, runtime: Runtime) -> dict | None:
         result = self.compact_state(state, runtime, force=False)

@@ -90,6 +90,15 @@ lazily after an explicit admin click and must never be placed in the polling
 response or TanStack query cache pre-emptively. Tool raw and model-visible
 payloads use separate `no-store` API calls and separate buttons; never collapse
 them into one generic result field.
+Phase 4 keeps lineage lazy as well: each ContentBlock row loads its local
+backward provenance, forward descendants, or possible exposures only after the
+admin selects that action. The graph view must retain depth, transform labels,
+truncation, and unknown gaps, and must ship an equivalent table fallback.
+Forward results are always labeled “possible exposure” and never imply model
+attention or causality. `context.compressed` timeline entries only supply IDs;
+the Context & Lineage tab fetches compression detail on demand and renders the
+typed `source`/`preserved`/`removed` memberships in strict disposition/ordinal
+order. Snapshot, compression, and lineage polling must never fetch raw bodies.
 
 `/goal` and `/compact` are built-in composer commands, not skill activations. `src/components/workspace/input-box.tsx` intercepts `/goal`, `/goal clear`, and `/goal <condition>` before normal chat submission, calling Gateway `GET/PUT/DELETE /api/threads/{thread_id}/goal`. Setting `/goal <condition>` also submits the condition text as the next user task so the agent starts running immediately; status and clear do not start a run. Goal and compact requests are tied to the current `threadId` with an `AbortController`, so switching threads or unmounting the composer aborts in-flight requests and stale responses cannot update the new thread's composer state. The chat pages render `GoalStatus` above the composer from `AgentThreadState.goal`, with local optimistic state until the next stream `values` update arrives. `/compact` calls `POST /api/threads/{thread_id}/compact` to summarize older active context while leaving the full visible chat history intact; it is skipped on new/empty threads and blocked server-side while a run is in flight.
 

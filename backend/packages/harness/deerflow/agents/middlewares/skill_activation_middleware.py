@@ -13,6 +13,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, override
 
+from ansich.serialization import ANSICH_CONTENT_KIND_KEY, ANSICH_PRODUCER_KIND_KEY
 from langchain.agents.middleware import AgentMiddleware
 from langchain.agents.middleware.types import ModelRequest, ModelResponse
 from langchain_core.messages import AIMessage, HumanMessage
@@ -548,6 +549,8 @@ Follow this skill before choosing a general workflow. Load supporting resources 
         additional_kwargs = {
             "hide_from_ui": True,
             _SLASH_SKILL_ACTIVATION_KEY: True,
+            ANSICH_CONTENT_KIND_KEY: "skill_instruction",
+            ANSICH_PRODUCER_KIND_KEY: "skill_activation",
         }
         if target.id:
             additional_kwargs[_SLASH_SKILL_ACTIVATION_TARGET_ID_KEY] = target.id

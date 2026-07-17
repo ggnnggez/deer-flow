@@ -7,8 +7,12 @@ from uuid import uuid4
 
 from ansich import ContextStateItem, ObservationEnvelope, Producer, new_id
 from ansich.serialization import (
+    ANSICH_BLOCK_REF_KEY,
+    ANSICH_CONTENT_KIND_KEY,
+    ANSICH_PRODUCER_KIND_KEY,
     ContextSnapshotCapture,
     ContextSnapshotItemCapture,
+    context_snapshot_item_source_identity,
     serialize_model_request,
     serialize_observed_content,
 )
@@ -123,13 +127,14 @@ class AnsichAttemptMiddleware(AgentMiddleware):
         call = execution.current_call() if execution is not None else None
         if execution is None or call is None:
             return handler(request)
+        provider_request = _request_without_ansich_metadata(request)
         try:
             attempt_id, attempt_no, request_obs_id = _record_request(execution, call, request)
         except Exception:
-            return handler(request)
+            return handler(provider_request)
         started = time.monotonic()
         try:
-            result = handler(request)
+            result = handler(provider_request)
         except BaseException as exc:
             try:
                 _record_attempt_failure(execution, call, attempt_id, attempt_no, request_obs_id, exc, started)
@@ -137,7 +142,16 @@ class AnsichAttemptMiddleware(AgentMiddleware):
                 pass
             raise
         try:
-            response_obs_id = _record_attempt_response(execution, call, attempt_id, attempt_no, request_obs_id, result, started)
+            response_obs_id = _record_attempt_response(
+                execution,
+                call,
+                attempt_id,
+                attempt_no,
+                request_obs_id,
+                result,
+                started,
+                runtime_context=getattr(request.runtime, "context", None),
+            )
             call.effective_attempt_no = attempt_no
             call.last_response_obs_id = response_obs_id
         except Exception:
@@ -153,13 +167,14 @@ class AnsichAttemptMiddleware(AgentMiddleware):
         call = execution.current_call() if execution is not None else None
         if execution is None or call is None:
             return await handler(request)
+        provider_request = _request_without_ansich_metadata(request)
         try:
             attempt_id, attempt_no, request_obs_id = _record_request(execution, call, request)
         except Exception:
-            return await handler(request)
+            return await handler(provider_request)
         started = time.monotonic()
         try:
-            result = await handler(request)
+            result = await handler(provider_request)
         except BaseException as exc:
             try:
                 _record_attempt_failure(execution, call, attempt_id, attempt_no, request_obs_id, exc, started)
@@ -167,7 +182,16 @@ class AnsichAttemptMiddleware(AgentMiddleware):
                 pass
             raise
         try:
-            response_obs_id = _record_attempt_response(execution, call, attempt_id, attempt_no, request_obs_id, result, started)
+            response_obs_id = _record_attempt_response(
+                execution,
+                call,
+                attempt_id,
+                attempt_no,
+                request_obs_id,
+                result,
+                started,
+                runtime_context=getattr(request.runtime, "context", None),
+            )
             call.effective_attempt_no = attempt_no
             call.last_response_obs_id = response_obs_id
         except Exception:
@@ -178,6 +202,25 @@ class AnsichAttemptMiddleware(AgentMiddleware):
 def _execution_context(request: ModelRequest) -> AnsichExecutionContext | None:
     runtime = getattr(request, "runtime", None)
     return execution_context_from_runtime(runtime)
+
+
+def _request_without_ansich_metadata(request: ModelRequest) -> ModelRequest:
+    owned_keys = {
+        ANSICH_BLOCK_REF_KEY,
+        ANSICH_CONTENT_KIND_KEY,
+        ANSICH_PRODUCER_KIND_KEY,
+    }
+
+    def clean(message):
+        additional_kwargs = getattr(message, "additional_kwargs", None)
+        if not isinstance(additional_kwargs, Mapping) or not owned_keys.intersection(additional_kwargs):
+            return message
+        return message.model_copy(update={"additional_kwargs": {key: value for key, value in additional_kwargs.items() if key not in owned_keys}})
+
+    return request.override(
+        system_message=(None if request.system_message is None else clean(request.system_message)),
+        messages=[clean(message) for message in request.messages],
+    )
 
 
 def execution_context_from_runtime(runtime: object) -> AnsichExecutionContext | None:
@@ -196,12 +239,15 @@ def observe_system_model_invoke(
     operation_kind: OperationKind,
     config: object | None = None,
     runtime_context: object | None = None,
+    call_observer: Callable[[ExecutionCall], None] | None = None,
 ):
     """Invoke a standalone internal model call without creating an Agent Step."""
 
     if execution is None:
         return model.invoke(input_value, config=config)
     call = execution.begin_call(actor_kind="system_operation", operation_kind=operation_kind)
+    if call_observer is not None:
+        call_observer(call)
     try:
         attempt_id, attempt_no, request_obs_id = _record_system_request(
             execution,
@@ -222,7 +268,17 @@ def observe_system_model_invoke(
             pass
         raise
     try:
-        _record_attempt_response(execution, call, attempt_id, attempt_no, request_obs_id, result, started)
+        call.last_response_obs_id = _record_attempt_response(
+            execution,
+            call,
+            attempt_id,
+            attempt_no,
+            request_obs_id,
+            result,
+            started,
+            runtime_context=runtime_context,
+        )
+        call.effective_attempt_no = attempt_no
     except Exception:
         pass
     return result
@@ -236,12 +292,15 @@ async def observe_system_model_ainvoke(
     operation_kind: OperationKind,
     config: object | None = None,
     runtime_context: object | None = None,
+    call_observer: Callable[[ExecutionCall], None] | None = None,
 ):
     """Async counterpart of :func:`observe_system_model_invoke`."""
 
     if execution is None:
         return await model.ainvoke(input_value, config=config)
     call = execution.begin_call(actor_kind="system_operation", operation_kind=operation_kind)
+    if call_observer is not None:
+        call_observer(call)
     try:
         attempt_id, attempt_no, request_obs_id = _record_system_request(
             execution,
@@ -262,7 +321,17 @@ async def observe_system_model_ainvoke(
             pass
         raise
     try:
-        _record_attempt_response(execution, call, attempt_id, attempt_no, request_obs_id, result, started)
+        call.last_response_obs_id = _record_attempt_response(
+            execution,
+            call,
+            attempt_id,
+            attempt_no,
+            request_obs_id,
+            result,
+            started,
+            runtime_context=runtime_context,
+        )
+        call.effective_attempt_no = attempt_no
     except Exception:
         pass
     return result
@@ -401,7 +470,8 @@ def _record_captured_request(
     for item in capture.items:
         source_identity = _content_source_identity(item)
         resolution: ContentOccurrenceResolution | None = None
-        if source_identity is not None:
+        block_ref = item.metadata.get(ANSICH_BLOCK_REF_KEY)
+        if source_identity is not None and not isinstance(block_ref, str):
             resolution = execution.resolve_content_occurrence(
                 source_identity=source_identity,
                 content_hash=item.block.content_hash,
@@ -413,6 +483,16 @@ def _record_captured_request(
         if resolution is not None and not resolution.should_emit:
             continue
         block = item.block
+        derivation_sources = execution.content_derivations(block.block_id)
+        provider_tool_call_id = item.metadata.get("tool_call_id")
+        source_block_id = (
+            execution.visible_tool_block_id(
+                provider_tool_call_id,
+                message_id=item.message_id,
+            )
+            if isinstance(provider_tool_call_id, str)
+            else None
+        )
         observations.append(
             ObservationEnvelope(
                 obs_id=resolution.producer_obs_id if resolution is not None else new_id(),
@@ -431,6 +511,27 @@ def _record_captured_request(
                     "attempt_id": attempt_id,
                     "occurrence_ordinal": item.ordinal,
                     "source_identity": source_identity,
+                    "producer_kind": str(item.metadata.get("producer_kind") or "model_request"),
+                    "derivation_sources": [
+                        {
+                            "source_block_id": source.source_block_id,
+                            "transform_kind": source.transform_kind,
+                            "transform_version": source.transform_version,
+                            "source_role": source.source_role,
+                            "ordinal": source.ordinal,
+                        }
+                        for source in derivation_sources
+                    ],
+                    **(
+                        {
+                            "source_block_id": source_block_id,
+                            "transform_kind": "copied",
+                            "transform_version": "1",
+                            "source_role": "source",
+                        }
+                        if source_block_id is not None
+                        else {}
+                    ),
                     **block.model_dump(mode="json"),
                 },
             )
@@ -517,19 +618,7 @@ def _record_captured_request(
 
 
 def _content_source_identity(item: ContextSnapshotItemCapture) -> str | None:
-    if item.channel == "message" and item.message_id:
-        occurrence_seq = item.metadata.get("message_occurrence_seq", 1)
-        if not isinstance(occurrence_seq, int):
-            return None
-        part_ordinal = item.metadata.get("part_ordinal")
-        if isinstance(part_ordinal, int):
-            return f"message:{item.message_id}:occurrence:{occurrence_seq}:content:{part_ordinal}"
-        tool_call_ordinal = item.metadata.get("tool_call_ordinal")
-        if isinstance(tool_call_ordinal, int):
-            return f"message:{item.message_id}:occurrence:{occurrence_seq}:tool-call:{tool_call_ordinal}"
-    if item.channel == "tool_schema" and item.name:
-        return f"tool-schema:{item.name}"
-    return None
+    return context_snapshot_item_source_identity(item)
 
 
 def _record_attempt_response(
@@ -540,6 +629,8 @@ def _record_attempt_response(
     request_obs_id: str,
     result: ModelCallResult,
     started: float,
+    *,
+    runtime_context: object | None = None,
 ) -> str:
     message = _ai_message(result)
     response_observation = ObservationEnvelope(
@@ -563,7 +654,59 @@ def _record_attempt_response(
             "response_metadata": _response_metadata(message),
         },
     )
-    _record(execution, response_observation)
+    observations = [response_observation]
+    if message is not None:
+        capture = serialize_model_request(
+            system_message=None,
+            messages=(message,),
+            tools=(),
+            response_format=None,
+            model_settings={},
+            model=None,
+            known_secrets=tuple(
+                {
+                    *extract_request_secrets(runtime_context).values(),
+                    *read_active_secrets(runtime_context).values(),
+                }
+            ),
+        )
+        for item in capture.items:
+            source_identity = context_snapshot_item_source_identity(item)
+            if source_identity is None:
+                source_identity = f"llm-attempt:{attempt_id}:response:{item.ordinal}"
+            resolution = execution.resolve_content_occurrence(
+                source_identity=source_identity,
+                content_hash=item.block.content_hash,
+                kind=item.block.kind,
+            )
+            if not resolution.should_emit:
+                continue
+            block = item.block.model_copy(update={"block_id": resolution.block_id})
+            observations.append(
+                ObservationEnvelope(
+                    obs_id=resolution.producer_obs_id,
+                    kind="content.produced",
+                    occurred_at=datetime.now(UTC),
+                    task_id=execution.task_id,
+                    step_id=call.step_id,
+                    subject_type="content_block",
+                    subject_id=block.block_id,
+                    producer=_producer(),
+                    producer_seq=execution.next_producer_seq(),
+                    source_event_id=resolution.source_event_id,
+                    correlation_id=execution.task_id,
+                    causation_obs_id=response_observation.obs_id,
+                    payload={
+                        "attempt_id": attempt_id,
+                        "occurrence_ordinal": item.ordinal,
+                        "source_identity": source_identity,
+                        "producer_kind": "llm_response",
+                        "producer_entity_id": attempt_id,
+                        **block.model_dump(mode="json"),
+                    },
+                )
+            )
+    _record_batch(execution, observations, batch_kind="llm_response")
     return response_observation.obs_id
 
 

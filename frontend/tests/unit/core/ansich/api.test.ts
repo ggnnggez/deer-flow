@@ -6,7 +6,11 @@ rs.mock("@/core/api/fetcher", () => ({
 
 import {
   AnsichApiError,
+  fetchAnsichContentExposures,
+  fetchAnsichContentLineage,
   fetchAnsichContentPayload,
+  fetchAnsichContextCompression,
+  fetchAnsichContextSnapshot,
   fetchAnsichStep,
   fetchAnsichStepContext,
   fetchAnsichTask,
@@ -92,6 +96,28 @@ describe("Ansich API", () => {
       expect.stringContaining(`/api/ansich/steps/${encoded}`),
       expect.stringContaining(`/api/ansich/steps/${encoded}/context`),
       expect.stringContaining(`/api/ansich/content-blocks/${encoded}/payload`),
+    ]);
+  });
+
+  it("loads lineage, possible exposure, snapshot, and compression details lazily by identifier", async () => {
+    mockedFetch.mockResolvedValue(jsonResponse({}));
+    const identifier = "lineage/id with spaces";
+
+    await fetchAnsichContentLineage(identifier, "backward", 4, 80);
+    await fetchAnsichContentExposures(identifier, 6, 120);
+    await fetchAnsichContextSnapshot(identifier);
+    await fetchAnsichContextCompression(identifier);
+
+    const encoded = encodeURIComponent(identifier);
+    expect(mockedFetch.mock.calls.map((call) => call[0])).toEqual([
+      expect.stringContaining(
+        `/api/ansich/content-blocks/${encoded}/lineage?direction=backward&depth=4&nodes=80`,
+      ),
+      expect.stringContaining(
+        `/api/ansich/content-blocks/${encoded}/exposures?depth=6&nodes=120`,
+      ),
+      expect.stringContaining(`/api/ansich/context-snapshots/${encoded}`),
+      expect.stringContaining(`/api/ansich/context-compressions/${encoded}`),
     ]);
   });
 

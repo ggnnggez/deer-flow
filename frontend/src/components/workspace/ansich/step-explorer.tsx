@@ -22,6 +22,11 @@ import type {
 } from "@/core/ansich/types";
 import { useI18n } from "@/core/i18n/hooks";
 
+import {
+  AnsichBlockLineageExplorer,
+  AnsichCompressionExplorer,
+} from "./lineage-explorer";
+
 export function AnsichStepsPanel({ taskId }: { taskId: string }) {
   const { t } = useI18n();
   const query = useAnsichTaskSteps(taskId);
@@ -79,7 +84,13 @@ export function AnsichStepsPanel({ taskId }: { taskId: string }) {
   );
 }
 
-export function AnsichContextPanel({ taskId }: { taskId: string }) {
+export function AnsichContextPanel({
+  taskId,
+  compressionIds = [],
+}: {
+  taskId: string;
+  compressionIds?: string[];
+}) {
   const { t } = useI18n();
   const stepsQuery = useAnsichTaskSteps(taskId);
   const eligibleSteps = (stepsQuery.data?.items ?? []).filter(
@@ -122,7 +133,10 @@ export function AnsichContextPanel({ taskId }: { taskId: string }) {
       ) : contextQuery.error ? (
         <InlineError message={contextQuery.error.message} />
       ) : contextQuery.data ? (
-        <ContextSnapshotCard context={contextQuery.data.context} />
+        <div className="space-y-4">
+          <ContextSnapshotCard context={contextQuery.data.context} />
+          <AnsichCompressionExplorer compressionIds={compressionIds} />
+        </div>
       ) : null}
     </div>
   );
@@ -441,6 +455,9 @@ function ContextItem({ item }: { item: AnsichContextItem }) {
         <pre className="bg-muted/60 max-h-72 overflow-auto rounded-md p-3 text-xs">
           {JSON.stringify(raw, null, 2)}
         </pre>
+      )}
+      {item.resolution_status === "available" && (
+        <AnsichBlockLineageExplorer blockId={item.block_id} />
       )}
     </div>
   );

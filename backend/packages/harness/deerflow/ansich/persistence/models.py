@@ -300,12 +300,104 @@ class AnsichContentBlockDerivationRow(Base):
     source_block_id: Mapped[str] = mapped_column(String(36), ForeignKey("ansich_content_blocks.entity_id", ondelete="CASCADE"), primary_key=True)
     transform_kind: Mapped[str] = mapped_column(String(32), primary_key=True)
     transform_version: Mapped[str] = mapped_column(String(32), nullable=False)
+    source_role: Mapped[str] = mapped_column(String(16), nullable=False, default="source")
+    ordinal: Mapped[int | None] = mapped_column(Integer)
     established_obs_id: Mapped[str] = mapped_column(String(36), ForeignKey("ansich_observations.obs_id", ondelete="RESTRICT"), nullable=False)
 
     __table_args__ = (
         Index("ix_ansich_derivations_derived", "derived_block_id"),
         Index("ix_ansich_derivations_source", "source_block_id"),
+        Index(
+            "ix_ansich_derivations_derived_source",
+            "derived_block_id",
+            "source_block_id",
+        ),
+        Index(
+            "ix_ansich_derivations_source_derived",
+            "source_block_id",
+            "derived_block_id",
+        ),
     )
+
+
+class AnsichBlockProducerRow(Base):
+    __tablename__ = "ansich_block_producers"
+
+    block_id: Mapped[str] = mapped_column(
+        String(36),
+        ForeignKey("ansich_content_blocks.entity_id", ondelete="CASCADE"),
+        primary_key=True,
+    )
+    producer_kind: Mapped[str] = mapped_column(String(64), nullable=False)
+    producer_entity_id: Mapped[str | None] = mapped_column(String(36))
+    producer_obs_id: Mapped[str] = mapped_column(
+        String(36),
+        ForeignKey("ansich_observations.obs_id", ondelete="RESTRICT"),
+        nullable=False,
+        unique=True,
+    )
+
+    __table_args__ = (Index("ix_ansich_block_producers_entity", "producer_kind", "producer_entity_id"),)
+
+
+class AnsichContextCompressionRow(Base):
+    __tablename__ = "ansich_context_compressions"
+
+    entity_id: Mapped[str] = mapped_column(
+        String(36),
+        ForeignKey("ansich_entities.entity_id", ondelete="CASCADE"),
+        primary_key=True,
+    )
+    task_id: Mapped[str] = mapped_column(
+        String(36),
+        ForeignKey("ansich_tasks.entity_id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    operation_id: Mapped[str | None] = mapped_column(String(36))
+    summary_block_id: Mapped[str] = mapped_column(
+        String(36),
+        ForeignKey("ansich_content_blocks.entity_id", ondelete="RESTRICT"),
+        nullable=False,
+    )
+    before_tokens: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    after_tokens: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    before_visible_bytes: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    after_visible_bytes: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    algorithm: Mapped[str] = mapped_column(String(64), nullable=False)
+    algorithm_version: Mapped[str] = mapped_column(String(32), nullable=False)
+    source_obs_id: Mapped[str] = mapped_column(
+        String(36),
+        ForeignKey("ansich_observations.obs_id", ondelete="RESTRICT"),
+        nullable=False,
+        unique=True,
+    )
+    status: Mapped[str] = mapped_column(
+        String(16),
+        nullable=False,
+        default="complete",
+        server_default="complete",
+    )
+
+    __table_args__ = (Index("ix_ansich_context_compressions_task", "task_id", "source_obs_id"),)
+
+
+class AnsichContextCompressionItemRow(Base):
+    __tablename__ = "ansich_context_compression_items"
+
+    compression_id: Mapped[str] = mapped_column(
+        String(36),
+        ForeignKey("ansich_context_compressions.entity_id", ondelete="CASCADE"),
+        primary_key=True,
+    )
+    disposition: Mapped[str] = mapped_column(String(16), primary_key=True)
+    ordinal: Mapped[int] = mapped_column(Integer, primary_key=True)
+    block_id: Mapped[str] = mapped_column(
+        String(36),
+        ForeignKey("ansich_content_blocks.entity_id", ondelete="RESTRICT"),
+        nullable=False,
+    )
+
+    __table_args__ = (Index("ix_ansich_context_compression_items_block", "block_id", "compression_id"),)
 
 
 class AnsichContextStateRow(Base):
@@ -430,7 +522,38 @@ class AnsichContextSnapshotItemRow(Base):
     estimated_tokens: Mapped[int] = mapped_column(BigInteger, nullable=False)
     metadata_json: Mapped[dict] = mapped_column(JSON, nullable=False, default=dict)
 
-    __table_args__ = (Index("ix_ansich_context_snapshot_items_block", "content_block_id"),)
+    __table_args__ = (
+        Index("ix_ansich_context_snapshot_items_block", "content_block_id"),
+        Index(
+            "ix_ansich_context_snapshot_items_block_snapshot",
+            "content_block_id",
+            "snapshot_id",
+        ),
+    )
+
+
+class AnsichContextSnapshotBlockMembershipRow(Base):
+    __tablename__ = "ansich_context_snapshot_block_memberships"
+
+    snapshot_id: Mapped[str] = mapped_column(
+        String(36),
+        ForeignKey("ansich_context_snapshots.entity_id", ondelete="CASCADE"),
+        primary_key=True,
+    )
+    ordinal: Mapped[int] = mapped_column(Integer, primary_key=True)
+    content_block_id: Mapped[str] = mapped_column(
+        String(36),
+        ForeignKey("ansich_content_blocks.entity_id", ondelete="RESTRICT"),
+        nullable=False,
+    )
+
+    __table_args__ = (
+        Index(
+            "ix_ansich_snapshot_block_memberships_block",
+            "content_block_id",
+            "snapshot_id",
+        ),
+    )
 
 
 class AnsichContextSnapshotMissingItemRow(Base):

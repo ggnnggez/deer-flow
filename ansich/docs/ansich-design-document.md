@@ -612,6 +612,13 @@ Compression creates a summary block derived from every block it compressed and
 records preserved and removed block inventories. Tool result transformations
 similarly preserve raw-to-visible edges.
 
+The embedded implementation traverses the graph with a bounded layer-batched
+BFS rather than a database-specific recursive CTE. Edges are stored
+`derived -> source` with indexes in both directions. Backward results use the
+semantic label `provenance`; forward snapshot matches use
+`possible_exposure`. A match proves only that a later or ordering-unknown model
+request contained the root block or a recorded descendant.
+
 ### 6.2 Scope and effect conclusions
 
 D4 conclusions distinguish:
@@ -762,8 +769,10 @@ ansich_context_windows(entity_id FK, task_id, capacity, ...)
 ansich_content_blobs(blob_key, content_hash, byte_size, content_type, payload_status, ...)
 ansich_content_blocks(entity_id FK, kind, content_hash, blob_key FK, ...)
 ansich_content_occurrences(task_id, source_identity, content_hash, kind, block_id FK, ...)
+ansich_block_producers(block_id FK, producer_kind, producer_entity_id?, producer_obs_id FK)
 ansich_context_states(state_id FK, task_id, parent_state_id, state_hash, chain_depth, ...)
 ansich_context_snapshots(entity_id FK, step_id, attempt_no, state_id FK, ...)
+ansich_context_compressions(entity_id FK, task_id, operation_id?, summary_block_id FK, ...)
 ansich_task_budgets(entity_id FK, task_id, dimension, aggregation_scope, ...)
 ansich_scopes(entity_id FK, scope_kind, parent_scope_id?, ...)
 ansich_alerts(entity_id FK, alert_key, episode, alert_type, ...)
@@ -793,11 +802,13 @@ Assertions are append-only; current rows are materialized resolver output.
 
 ```text
 ansich_context_snapshot_items
+ansich_context_snapshot_block_memberships
 ansich_context_snapshot_missing_items
 ansich_context_state_checkpoint_items
 ansich_context_state_deltas
 ansich_context_state_missing_blocks
 ansich_content_block_derivations
+ansich_context_compression_items
 ansich_relations
 ansich_relation_evidence
 ansich_authorization_snapshots
@@ -807,6 +818,15 @@ ansich_tool_effects
 High-volume ordered/graph relations have typed tables. Low-frequency relations
 such as `follows_up`, `spawned`, and `within_scope` may use the generic relation
 table with indexed type/from/to columns.
+
+`ansich_context_compression_items` has the primary identity
+`(compression_id, disposition, ordinal)` and stores `source`, `preserved`, and
+`removed` inventories without treating JSON IDs as relational truth.
+`ansich_context_snapshot_block_memberships(snapshot_id, ordinal,
+content_block_id)` is deliberately a minimal reverse-index projection: the full
+ordered inventory remains deduplicated in ContextState checkpoint/delta rows,
+while this table makes block-to-snapshot exposure joins portable and avoids
+copying all snapshot item metadata.
 
 ### 8.5 Usage/read projections
 
@@ -950,6 +970,26 @@ coalescing.
 Summarization must explicitly record source, preserved, and removed blocks; an
 LLM summary response alone is insufficient.
 
+The middleware freezes exact message occurrences before invoking the summary
+model and emits `context.compressed` only after a usable summary succeeds.
+Consecutive compression includes the previous recorded summary block as a
+source. If a restored process sees summary text whose prior block reference is
+unavailable, it records the complete text as an `unknown_origin` summary block
+and does not manufacture earlier provenance. Ansich enqueue/projection failure
+remains fail-open for Agent execution.
+
+Every successful LLM response also emits assistant/tool-request ContentBlocks at
+response time, so a final answer does not depend on appearing in a later model
+request. Middleware-created messages carry server-owned content-kind and
+producer markers; the Gateway removes externally supplied values and the
+attempt adapter removes internal values before provider invocation.
+System-message coalescing freezes its ordered SystemMessage inputs, emits source
+blocks, and registers `coalesced` edges to the adapter-visible merged block.
+Durable-context rendering links its composite block to an already durable
+summary with `source_role=supporting`; if that summary is not durably resolvable,
+the edge is omitted rather than guessed. These links allow possible-exposure
+queries to cross compression and later request materialization.
+
 ### 10.5 Subagents
 
 Child execution receives `ansich_task_id`, parent Task, spawning Step,
@@ -990,6 +1030,8 @@ GET /api/ansich/steps/{step_id}/context
 GET /api/ansich/content-blocks/{block_id}/payload
 GET /api/ansich/content-blocks/{block_id}/lineage
 GET /api/ansich/content-blocks/{block_id}/exposures
+GET /api/ansich/context-snapshots/{snapshot_id}
+GET /api/ansich/context-compressions/{compression_id}
 GET /api/ansich/observations/{obs_id}
 GET /api/ansich/observations/{obs_id}/payload
 GET /api/ansich/agent-releases
@@ -997,8 +1039,11 @@ GET /api/ansich/agent-releases/{release_id}
 GET /api/ansich/agent-releases/compare?left=...&right=...
 ```
 
-Lineage endpoints enforce depth/node limits and return a `truncated` flag.
-Forward lineage is labeled possible exposure. Raw payload reads are audited.
+Lineage endpoints default to 8 levels/500 nodes, enforce hard limits of 32
+levels/2,000 nodes, and return a `truncated` reason plus structured unknown gaps.
+Forward lineage is labeled possible exposure. Snapshot, compression, lineage,
+and exposure reads are metadata-only; raw payload reads remain separate and
+audited.
 
 ### 11.3 Operator endpoints
 

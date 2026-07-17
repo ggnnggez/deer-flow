@@ -8,8 +8,12 @@ from uuid import uuid4
 
 from ansich import (
     ContentBlockPayloadView,
+    ContentBlockView,
     ContentDerivationView,
     ContentOccurrenceView,
+    ContentProducerView,
+    ContextCompressionItemView,
+    ContextCompressionView,
     ContextSnapshotItemView,
     ContextSnapshotView,
     ContextStateDelta,
@@ -19,6 +23,7 @@ from ansich import (
     LlmAttemptView,
     NamedVersion,
     ObservationEnvelope,
+    PossibleExposureItemView,
     Producer,
     StepView,
     TaskView,
@@ -27,9 +32,12 @@ from ansich import (
     ToolResultView,
     new_id,
 )
+from ansich.compression import CompressionDisposition
 from ansich.context_state import context_state_hash, materialize_context_state
 from ansich.contracts import ControlValue
 from ansich.control import should_select_control_candidate
+from ansich.lineage import LineageDirection
+from ansich.tool import ContentDerivationSourceRole, ToolTransformKind
 from sqlalchemy import and_, case, delete, func, or_, select, update
 from sqlalchemy.dialects.postgresql import insert as postgresql_insert
 from sqlalchemy.dialects.sqlite import insert as sqlite_insert
@@ -38,10 +46,14 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from deerflow.ansich.persistence.models import (
     AnsichBeliefAssertionRow,
     AnsichBeliefEvidenceRow,
+    AnsichBlockProducerRow,
     AnsichContentBlobRow,
     AnsichContentBlockDerivationRow,
     AnsichContentBlockRow,
     AnsichContentOccurrenceRow,
+    AnsichContextCompressionItemRow,
+    AnsichContextCompressionRow,
+    AnsichContextSnapshotBlockMembershipRow,
     AnsichContextSnapshotItemRow,
     AnsichContextSnapshotMissingItemRow,
     AnsichContextSnapshotRow,
@@ -86,6 +98,7 @@ _STEP_PROJECTION_KINDS = frozenset(
         "content.produced",
         "context.state_recorded",
         "context.snapshotted",
+        "context.compressed",
         "tool.issued",
         "tool.started",
         "tool.returned_raw",
@@ -116,6 +129,10 @@ _TOOL_TERMINAL_PRECEDENCE = {
     "failed": 4,
     "returned": 5,
 }
+
+
+class _ProjectionDependencyPending(RuntimeError):
+    """A replay-safe projection dependency has not landed yet."""
 
 
 def _projectors_for_kind(kind: str) -> tuple[tuple[str, str], ...]:
@@ -434,14 +451,18 @@ class SqlAnsichBackend:
         async with self._session_factory() as session, session.begin():
             for model in (
                 AnsichContextSnapshotMissingItemRow,
+                AnsichContextSnapshotBlockMembershipRow,
                 AnsichContextSnapshotItemRow,
                 AnsichContextSnapshotRow,
                 AnsichContextWindowRow,
+                AnsichContextCompressionItemRow,
+                AnsichContextCompressionRow,
                 AnsichContextStateMissingBlockRow,
                 AnsichContextStateDeltaRow,
                 AnsichContextStateCheckpointItemRow,
                 AnsichContextStateRow,
                 AnsichContentBlockDerivationRow,
+                AnsichBlockProducerRow,
                 AnsichToolCallResultRow,
                 AnsichToolCallRow,
                 AnsichContentOccurrenceRow,
@@ -531,6 +552,14 @@ class SqlAnsichBackend:
             if job is None:
                 return
             message = str(exc)[:4_000]
+            if isinstance(exc, _ProjectionDependencyPending):
+                job.status = "pending"
+                job.attempts = max(0, job.attempts - 1)
+                job.available_at = datetime.now(UTC) + timedelta(milliseconds=250)
+                job.lease_owner = None
+                job.lease_expires_at = None
+                job.last_error = message
+                return
             job.status = "failed" if attempt >= self._projector_max_attempts else "pending"
             if job.status == "failed":
                 self._failed_jobs += 1
@@ -781,7 +810,15 @@ class SqlAnsichBackend:
             step = await session.get(AnsichStepRow, step_id)
             if step is None or step.effective_context_snapshot_id is None:
                 return None
-            snapshot = await session.get(AnsichContextSnapshotRow, step.effective_context_snapshot_id)
+            snapshot_id = step.effective_context_snapshot_id
+        return await self.get_context_snapshot(snapshot_id)
+
+    async def get_context_snapshot(
+        self,
+        snapshot_id: str,
+    ) -> ContextSnapshotView | None:
+        async with self._session_factory() as session:
+            snapshot = await session.get(AnsichContextSnapshotRow, snapshot_id)
             if snapshot is None:
                 return None
             status = snapshot.status
@@ -1007,6 +1044,223 @@ class SqlAnsichBackend:
                     return None
                 return ContentBlockPayloadView(block_id=block_id, body=decoded["body"])
             return ContentBlockPayloadView(block_id=block_id, body=observation.payload_json["body"])
+
+    async def get_context_compression(
+        self,
+        compression_id: str,
+    ) -> ContextCompressionView | None:
+        async with self._session_factory() as session:
+            compression = await session.get(
+                AnsichContextCompressionRow,
+                compression_id,
+            )
+            if compression is None:
+                return None
+            item_rows = list(
+                (
+                    await session.execute(
+                        select(AnsichContextCompressionItemRow)
+                        .where(AnsichContextCompressionItemRow.compression_id == compression_id)
+                        .order_by(
+                            case(
+                                (AnsichContextCompressionItemRow.disposition == "source", 0),
+                                (AnsichContextCompressionItemRow.disposition == "preserved", 1),
+                                else_=2,
+                            ),
+                            AnsichContextCompressionItemRow.ordinal,
+                        )
+                    )
+                ).scalars()
+            )
+            summary_block_id = compression.summary_block_id
+            task_id = compression.task_id
+            operation_id = compression.operation_id
+            before_tokens = compression.before_tokens
+            after_tokens = compression.after_tokens
+            before_visible_bytes = compression.before_visible_bytes
+            after_visible_bytes = compression.after_visible_bytes
+            algorithm = compression.algorithm
+            algorithm_version = compression.algorithm_version
+            source_obs_id = compression.source_obs_id
+            stored_status = compression.status
+
+        block_ids = tuple(dict.fromkeys([summary_block_id, *[item.block_id for item in item_rows]]))
+        blocks = {block.block_id: block for block in await self.get_content_blocks(block_ids)}
+        summary_block = blocks.get(summary_block_id)
+        if summary_block is None:
+            return None
+        items = tuple(
+            ContextCompressionItemView(
+                disposition=cast(CompressionDisposition, item.disposition),
+                ordinal=item.ordinal,
+                block=blocks[item.block_id],
+            )
+            for item in item_rows
+            if item.block_id in blocks
+        )
+        status = "complete" if stored_status == "complete" and len(items) == len(item_rows) else "incomplete"
+        return ContextCompressionView(
+            compression_id=compression_id,
+            task_id=task_id,
+            summary_operation_id=operation_id,
+            summary_block=summary_block,
+            before_tokens=before_tokens,
+            after_tokens=after_tokens,
+            before_visible_bytes=before_visible_bytes,
+            after_visible_bytes=after_visible_bytes,
+            algorithm=algorithm,
+            algorithm_version=algorithm_version,
+            source_obs_id=source_obs_id,
+            status=cast(Literal["complete", "incomplete"], status),
+            items=items,
+        )
+
+    async def get_content_blocks(
+        self,
+        block_ids: tuple[str, ...],
+    ) -> list[ContentBlockView]:
+        if not block_ids:
+            return []
+        async with self._session_factory() as session:
+            rows = list(
+                (
+                    await session.execute(
+                        select(
+                            AnsichContentBlockRow,
+                            AnsichBlockProducerRow,
+                            AnsichObservationRow,
+                            AnsichContentBlobRow,
+                        )
+                        .outerjoin(
+                            AnsichBlockProducerRow,
+                            AnsichBlockProducerRow.block_id == AnsichContentBlockRow.entity_id,
+                        )
+                        .join(
+                            AnsichObservationRow,
+                            AnsichObservationRow.obs_id == AnsichContentBlockRow.producer_obs_id,
+                        )
+                        .outerjoin(
+                            AnsichContentBlobRow,
+                            AnsichContentBlobRow.blob_key == AnsichContentBlockRow.blob_key,
+                        )
+                        .where(AnsichContentBlockRow.entity_id.in_(block_ids))
+                    )
+                ).all()
+            )
+        by_id = {
+            block.entity_id: ContentBlockView(
+                block_id=block.entity_id,
+                kind=block.kind,
+                content_hash=block.content_hash,
+                byte_size=block.byte_size,
+                token_estimate=block.token_estimate,
+                sensitivity_flags=tuple(block.sensitivity_flags_json),
+                payload_status=cast(
+                    Literal["available", "missing"],
+                    "available" if blob is None else blob.payload_status,
+                ),
+                producer=ContentProducerView(
+                    producer_kind=(observation.producer_name if producer is None else producer.producer_kind),
+                    producer_entity_id=(None if producer is None else producer.producer_entity_id),
+                    producer_obs_id=(observation.obs_id if producer is None else producer.producer_obs_id),
+                ),
+            )
+            for block, producer, observation, blob in rows
+        }
+        return [by_id[block_id] for block_id in block_ids if block_id in by_id]
+
+    async def list_content_derivations(
+        self,
+        block_ids: tuple[str, ...],
+        direction: LineageDirection,
+    ) -> list[ContentDerivationView]:
+        if not block_ids:
+            return []
+        endpoint = AnsichContentBlockDerivationRow.derived_block_id if direction == "backward" else AnsichContentBlockDerivationRow.source_block_id
+        async with self._session_factory() as session:
+            rows = list(
+                (
+                    await session.execute(
+                        select(AnsichContentBlockDerivationRow)
+                        .where(endpoint.in_(block_ids))
+                        .order_by(
+                            AnsichContentBlockDerivationRow.derived_block_id,
+                            AnsichContentBlockDerivationRow.source_block_id,
+                            AnsichContentBlockDerivationRow.transform_kind,
+                        )
+                    )
+                ).scalars()
+            )
+        return [
+            ContentDerivationView(
+                derived_block_id=row.derived_block_id,
+                source_block_id=row.source_block_id,
+                transform_kind=cast(ToolTransformKind, row.transform_kind),
+                transform_version=row.transform_version,
+                established_obs_id=row.established_obs_id,
+                source_role=cast(ContentDerivationSourceRole, row.source_role),
+                ordinal=row.ordinal,
+            )
+            for row in rows
+        ]
+
+    async def list_snapshot_exposures(
+        self,
+        root_block_id: str,
+        descendant_block_ids: tuple[str, ...],
+    ) -> list[PossibleExposureItemView]:
+        if not descendant_block_ids:
+            return []
+        async with self._session_factory() as session:
+            root_block = await session.get(AnsichContentBlockRow, root_block_id)
+            if root_block is None:
+                return []
+            root_observation = await session.scalar(select(AnsichObservationRow).where(AnsichObservationRow.obs_id == root_block.producer_obs_id))
+            if root_observation is None:
+                return []
+            rows = list(
+                (
+                    await session.execute(
+                        select(
+                            AnsichContextSnapshotBlockMembershipRow,
+                            AnsichContextSnapshotRow,
+                            AnsichStepRow,
+                            AnsichObservationRow,
+                        )
+                        .join(
+                            AnsichContextSnapshotRow,
+                            AnsichContextSnapshotRow.entity_id == AnsichContextSnapshotBlockMembershipRow.snapshot_id,
+                        )
+                        .join(
+                            AnsichStepRow,
+                            AnsichStepRow.entity_id == AnsichContextSnapshotRow.step_id,
+                        )
+                        .join(
+                            AnsichObservationRow,
+                            AnsichObservationRow.obs_id == AnsichContextSnapshotRow.request_obs_id,
+                        )
+                        .where(AnsichContextSnapshotBlockMembershipRow.content_block_id.in_(descendant_block_ids))
+                        .order_by(
+                            AnsichStepRow.step_seq,
+                            AnsichContextSnapshotRow.entity_id,
+                            AnsichContextSnapshotBlockMembershipRow.ordinal,
+                            AnsichContextSnapshotBlockMembershipRow.content_block_id,
+                        )
+                    )
+                ).all()
+            )
+        return [
+            PossibleExposureItemView(
+                task_id=snapshot.task_id,
+                step_id=step.entity_id,
+                step_seq=step.step_seq,
+                snapshot_id=snapshot.entity_id,
+                snapshot_ordinal=item.ordinal,
+                descendant_block_id=item.content_block_id,
+                ordering=("later" if request.occurred_at > root_observation.occurred_at else "unknown"),
+            )
+            for item, snapshot, step, request in rows
+        ]
 
     @staticmethod
     async def _content_blob_bytes(session: AsyncSession, blob: AnsichContentBlobRow) -> bytes:
@@ -1379,7 +1633,7 @@ class SqlAnsichBackend:
         if observation.payload is None:
             raise ValueError(f"{observation.kind} requires inline projection payload")
         if await session.get(AnsichTaskRow, observation.task_id) is None:
-            raise ValueError(f"Ansich task is not projected: {observation.task_id}")
+            raise _ProjectionDependencyPending(f"Ansich task is not projected: {observation.task_id}")
 
         payload = observation.payload
         if observation.kind == "step.started":
@@ -1418,7 +1672,7 @@ class SqlAnsichBackend:
                 raise ValueError("step.closed is missing step_id")
             step = await session.get(AnsichStepRow, observation.step_id)
             if step is None:
-                raise ValueError(f"step.started has not been projected: {observation.step_id}")
+                raise _ProjectionDependencyPending(f"step.started has not been projected: {observation.step_id}")
             result = str(payload["result"])
             step.result = result
             step.status = "model_failed" if result == "model_failed" else "acting" if result == "acting" else "closed"
@@ -1462,6 +1716,61 @@ class SqlAnsichBackend:
                     )
                 )
                 await session.flush()
+            if await session.get(AnsichBlockProducerRow, observation.subject_id) is None:
+                producer_entity_id = next(
+                    (payload.get(key) for key in ("producer_entity_id", "compression_id", "attempt_id") if isinstance(payload.get(key), str)),
+                    None,
+                )
+                session.add(
+                    AnsichBlockProducerRow(
+                        block_id=observation.subject_id,
+                        producer_kind=str(payload.get("producer_kind") or observation.producer.name),
+                        producer_entity_id=producer_entity_id,
+                        producer_obs_id=observation.obs_id,
+                    )
+                )
+            raw_derivations = [item for item in payload.get("derivation_sources", []) if isinstance(item, dict)]
+            source_block_id = payload.get("source_block_id")
+            if isinstance(source_block_id, str):
+                raw_derivations.append(
+                    {
+                        "source_block_id": source_block_id,
+                        "transform_kind": payload.get("transform_kind", "unknown"),
+                        "transform_version": payload.get("transform_version", "1"),
+                        "source_role": payload.get("source_role", "source"),
+                        "ordinal": payload.get("source_ordinal"),
+                    }
+                )
+            for derivation in raw_derivations:
+                source_block_id = derivation.get("source_block_id")
+                if not isinstance(source_block_id, str) or source_block_id == observation.subject_id:
+                    continue
+                if await session.get(AnsichContentBlockRow, source_block_id) is None:
+                    raise _ProjectionDependencyPending(f"source content block has not been projected: {source_block_id}")
+                transform_kind = str(derivation.get("transform_kind", "unknown"))
+                derivation_key = (
+                    observation.subject_id,
+                    source_block_id,
+                    transform_kind,
+                )
+                if (
+                    await session.get(
+                        AnsichContentBlockDerivationRow,
+                        derivation_key,
+                    )
+                    is None
+                ):
+                    session.add(
+                        AnsichContentBlockDerivationRow(
+                            derived_block_id=observation.subject_id,
+                            source_block_id=source_block_id,
+                            transform_kind=transform_kind,
+                            transform_version=str(derivation.get("transform_version", "1")),
+                            source_role=str(derivation.get("source_role", "source")),
+                            ordinal=(int(derivation["ordinal"]) if isinstance(derivation.get("ordinal"), int) else None),
+                            established_obs_id=observation.obs_id,
+                        )
+                    )
             source_identity = payload.get("source_identity")
             if isinstance(source_identity, str) and source_identity:
                 occurrence_key = (
@@ -1501,6 +1810,20 @@ class SqlAnsichBackend:
                             metadata_json=missing.metadata_json,
                         )
                     )
+                if (
+                    await session.get(
+                        AnsichContextSnapshotBlockMembershipRow,
+                        (missing.snapshot_id, missing.ordinal),
+                    )
+                    is None
+                ):
+                    session.add(
+                        AnsichContextSnapshotBlockMembershipRow(
+                            snapshot_id=missing.snapshot_id,
+                            ordinal=missing.ordinal,
+                            content_block_id=observation.subject_id,
+                        )
+                    )
                 await session.delete(missing)
             if affected_snapshot_ids:
                 await session.flush()
@@ -1529,6 +1852,10 @@ class SqlAnsichBackend:
             await self._project_context_snapshot(session, observation)
             return True
 
+        if observation.kind == "context.compressed":
+            await self._project_context_compression(session, observation)
+            return True
+
         if observation.kind.startswith("tool."):
             await self._project_tool_call(session, observation)
             return False
@@ -1539,7 +1866,7 @@ class SqlAnsichBackend:
             if observation.step_id is not None:
                 step = await session.get(AnsichStepRow, observation.step_id)
                 if step is None:
-                    raise ValueError(f"step.started has not been projected: {observation.step_id}")
+                    raise _ProjectionDependencyPending(f"step.started has not been projected: {observation.step_id}")
                 actor_kind = step.actor_kind
             attempt = AnsichLlmAttemptRow(
                 attempt_id=observation.subject_id,
@@ -1584,7 +1911,7 @@ class SqlAnsichBackend:
             raise ValueError(f"{observation.kind} requires step_id and payload")
         step = await session.get(AnsichStepRow, observation.step_id)
         if step is None:
-            raise ValueError(f"step.started has not been projected: {observation.step_id}")
+            raise _ProjectionDependencyPending(f"step.started has not been projected: {observation.step_id}")
         payload = observation.payload
         tool_call = await session.get(AnsichToolCallRow, observation.subject_id)
         if tool_call is None:
@@ -1656,7 +1983,7 @@ class SqlAnsichBackend:
                         )
                     )
             source_block_id = payload.get("source_block_id")
-            if isinstance(result_block_id, str) and isinstance(source_block_id, str):
+            if isinstance(result_block_id, str) and isinstance(source_block_id, str) and result_block_id != source_block_id:
                 transform_kind = str(payload.get("transform_kind", "unknown"))
                 derivation_key = (result_block_id, source_block_id, transform_kind)
                 if await session.get(AnsichContentBlockDerivationRow, derivation_key) is None:
@@ -1982,8 +2309,47 @@ class SqlAnsichBackend:
                 )
             state.status = "complete" if block_ids == available else "incomplete"
             await session.execute(update(AnsichContextSnapshotRow).where(AnsichContextSnapshotRow.state_id == state_id).values(status="complete" if state.status == "complete" else "incomplete"))
+            snapshot_ids = list((await session.execute(select(AnsichContextSnapshotRow.entity_id).where(AnsichContextSnapshotRow.state_id == state_id))).scalars())
+            for snapshot_id in snapshot_ids:
+                await self._sync_snapshot_block_memberships(
+                    session,
+                    snapshot_id=snapshot_id,
+                    items=items,
+                    available_block_ids=available,
+                )
             children = list((await session.execute(select(AnsichContextStateRow.state_id).where(AnsichContextStateRow.parent_state_id == state_id))).scalars())
             pending.extend(children)
+
+    @staticmethod
+    async def _sync_snapshot_block_memberships(
+        session: AsyncSession,
+        *,
+        snapshot_id: str,
+        items: tuple[ContextStateItem, ...],
+        available_block_ids: set[str] | None = None,
+    ) -> None:
+        available = available_block_ids
+        if available is None:
+            block_ids = {item.block_id for item in items}
+            available = set((await session.execute(select(AnsichContentBlockRow.entity_id).where(AnsichContentBlockRow.entity_id.in_(block_ids)))).scalars()) if block_ids else set()
+        for item in items:
+            if item.block_id not in available:
+                continue
+            key = (snapshot_id, item.ordinal)
+            existing = await session.get(
+                AnsichContextSnapshotBlockMembershipRow,
+                key,
+            )
+            if existing is None:
+                session.add(
+                    AnsichContextSnapshotBlockMembershipRow(
+                        snapshot_id=snapshot_id,
+                        ordinal=item.ordinal,
+                        content_block_id=item.block_id,
+                    )
+                )
+            elif existing.content_block_id != item.block_id:
+                raise ValueError("snapshot block membership conflicts with existing ordinal")
 
     async def _project_context_snapshot(
         self,
@@ -1996,7 +2362,7 @@ class SqlAnsichBackend:
         attempt_id = str(payload["attempt_id"])
         attempt = await session.get(AnsichLlmAttemptRow, attempt_id)
         if attempt is None:
-            raise ValueError(f"llm.requested has not been projected: {attempt_id}")
+            raise _ProjectionDependencyPending(f"llm.requested has not been projected: {attempt_id}")
         state_id = payload.get("state_id") if isinstance(payload.get("state_id"), str) else None
         state = None
         if state_id is not None:
@@ -2066,6 +2432,20 @@ class SqlAnsichBackend:
 
         if state_id is not None:
             attempt.context_snapshot_id = snapshot.entity_id
+            if state is not None and state.created_obs_id is not None:
+                try:
+                    items = await self._materialize_context_state(
+                        session,
+                        state_id,
+                        frozenset(),
+                    )
+                except ValueError:
+                    items = ()
+                await self._sync_snapshot_block_memberships(
+                    session,
+                    snapshot_id=snapshot.entity_id,
+                    items=items,
+                )
             return
 
         for raw_item in payload.get("items", []):
@@ -2109,7 +2489,115 @@ class SqlAnsichBackend:
                         metadata_json=dict(raw_item.get("metadata", {})),
                     )
                 )
+            if (
+                await session.get(
+                    AnsichContextSnapshotBlockMembershipRow,
+                    (snapshot.entity_id, ordinal),
+                )
+                is None
+            ):
+                session.add(
+                    AnsichContextSnapshotBlockMembershipRow(
+                        snapshot_id=snapshot.entity_id,
+                        ordinal=ordinal,
+                        content_block_id=block_id,
+                    )
+                )
         attempt.context_snapshot_id = snapshot.entity_id
+
+    async def _project_context_compression(
+        self,
+        session: AsyncSession,
+        observation: ObservationEnvelope,
+    ) -> None:
+        if observation.payload is None:
+            raise ValueError("context.compressed is missing payload")
+        payload = observation.payload
+        summary_block_id = payload.get("summary_block_id")
+        if not isinstance(summary_block_id, str):
+            raise ValueError("context.compressed is missing summary_block_id")
+        if await session.get(AnsichContentBlockRow, summary_block_id) is None:
+            raise _ProjectionDependencyPending(f"summary content block has not been projected: {summary_block_id}")
+        raw_items = payload.get("items", [])
+        if not isinstance(raw_items, list):
+            raise ValueError("context.compressed items must be a list")
+        block_ids = {str(item["block_id"]) for item in raw_items if isinstance(item, dict) and isinstance(item.get("block_id"), str)}
+        available_block_ids = set((await session.execute(select(AnsichContentBlockRow.entity_id).where(AnsichContentBlockRow.entity_id.in_(block_ids)))).scalars()) if block_ids else set()
+        missing_block_ids = block_ids - available_block_ids
+        if missing_block_ids:
+            raise _ProjectionDependencyPending("compression content blocks have not been projected: " + ",".join(sorted(missing_block_ids)))
+
+        if await session.get(AnsichEntityRow, observation.subject_id) is None:
+            session.add(
+                AnsichEntityRow(
+                    entity_id=observation.subject_id,
+                    entity_type="context_compression",
+                    discovered_obs_id=observation.obs_id,
+                )
+            )
+        compression = await session.get(
+            AnsichContextCompressionRow,
+            observation.subject_id,
+        )
+        if compression is None:
+            compression = AnsichContextCompressionRow(
+                entity_id=observation.subject_id,
+                task_id=observation.task_id,
+                operation_id=(payload.get("summary_operation_id") if isinstance(payload.get("summary_operation_id"), str) else None),
+                summary_block_id=summary_block_id,
+                before_tokens=int(payload["before_tokens"]),
+                after_tokens=int(payload["after_tokens"]),
+                before_visible_bytes=int(payload.get("before_visible_bytes", 0)),
+                after_visible_bytes=int(payload.get("after_visible_bytes", 0)),
+                algorithm=str(payload["algorithm"]),
+                algorithm_version=str(payload["algorithm_version"]),
+                source_obs_id=observation.obs_id,
+                status="complete",
+            )
+            session.add(compression)
+            await session.flush()
+
+        for raw_item in raw_items:
+            if not isinstance(raw_item, dict):
+                raise ValueError("context.compressed item must be an object")
+            disposition = raw_item.get("disposition")
+            if disposition not in {"source", "preserved", "removed"}:
+                raise ValueError(f"invalid context compression disposition: {disposition}")
+            block_id = raw_item.get("block_id")
+            if not isinstance(block_id, str):
+                raise ValueError("context.compressed item is missing block_id")
+            ordinal = int(raw_item["ordinal"])
+            item_key = (compression.entity_id, disposition, ordinal)
+            existing_item = await session.get(
+                AnsichContextCompressionItemRow,
+                item_key,
+            )
+            if existing_item is None:
+                session.add(
+                    AnsichContextCompressionItemRow(
+                        compression_id=compression.entity_id,
+                        disposition=disposition,
+                        ordinal=ordinal,
+                        block_id=block_id,
+                    )
+                )
+            elif existing_item.block_id != block_id:
+                raise ValueError("context compression membership conflicts with existing ordinal")
+            if disposition != "source" or block_id == summary_block_id:
+                continue
+            derivation_key = (summary_block_id, block_id, "compressed")
+            if await session.get(AnsichContentBlockDerivationRow, derivation_key) is None:
+                session.add(
+                    AnsichContentBlockDerivationRow(
+                        derived_block_id=summary_block_id,
+                        source_block_id=block_id,
+                        transform_kind="compressed",
+                        transform_version=str(payload["algorithm_version"]),
+                        source_role="source",
+                        ordinal=ordinal,
+                        established_obs_id=observation.obs_id,
+                    )
+                )
 
     async def _project_scopes(self, session: AsyncSession, observation: ObservationEnvelope) -> None:
         if observation.payload is None:

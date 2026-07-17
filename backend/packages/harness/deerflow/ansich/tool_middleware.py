@@ -267,6 +267,7 @@ def _record_visible_result(
     capture: ObservedContentCapture,
     *,
     transforms: tuple[Mapping[str, object], ...] = (),
+    visible_message_id: str | None = None,
 ) -> None:
     registration = invocation.registration
     observations: list[ObservationEnvelope] = []
@@ -344,9 +345,18 @@ def _record_visible_result(
     accepted = _record_batch(execution, observations, batch_kind="tool_visible_result")
     if accepted:
         if invocation.raw_recorded or not invocation.started:
-            execution.mark_tool_terminal(registration.tool_call_id, visible=True)
+            execution.mark_tool_terminal(
+                registration.tool_call_id,
+                visible=True,
+                visible_block_id=block_id,
+                visible_message_id=visible_message_id,
+            )
         else:
-            execution.mark_tool_visible(registration.tool_call_id)
+            execution.mark_tool_visible(
+                registration.tool_call_id,
+                visible_block_id=block_id,
+                visible_message_id=visible_message_id,
+            )
 
 
 class AnsichVisibleToolMiddleware(AgentMiddleware):
@@ -371,11 +381,13 @@ class AnsichVisibleToolMiddleware(AgentMiddleware):
             try:
                 invocation = execution.current_tool_invocation()
                 if invocation is not None:
+                    visible_message = _tool_message(result, request)
                     _record_visible_result(
                         execution,
                         invocation,
                         _capture_result(result, request, kind="tool_result_visible"),
-                        transforms=read_tool_transforms(_tool_message(result, request)),
+                        transforms=read_tool_transforms(visible_message),
+                        visible_message_id=(visible_message.id if visible_message is not None and isinstance(visible_message.id, str) else None),
                     )
             except Exception:
                 pass
@@ -400,11 +412,13 @@ class AnsichVisibleToolMiddleware(AgentMiddleware):
             try:
                 invocation = execution.current_tool_invocation()
                 if invocation is not None:
+                    visible_message = _tool_message(result, request)
                     _record_visible_result(
                         execution,
                         invocation,
                         _capture_result(result, request, kind="tool_result_visible"),
-                        transforms=read_tool_transforms(_tool_message(result, request)),
+                        transforms=read_tool_transforms(visible_message),
+                        visible_message_id=(visible_message.id if visible_message is not None and isinstance(visible_message.id, str) else None),
                     )
             except Exception:
                 pass

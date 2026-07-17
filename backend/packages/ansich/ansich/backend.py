@@ -3,10 +3,12 @@ from __future__ import annotations
 from datetime import datetime
 from typing import Protocol
 
+from ansich.compression import ContextCompressionView
 from ansich.context_state import ContextStateView
 from ansich.contracts import ControlValue, ObservationEnvelope, TaskView
+from ansich.lineage import ContentBlockView, LineageDirection, PossibleExposureItemView
 from ansich.step import ContentBlockPayloadView, ContentOccurrenceView, ContextSnapshotView, LlmAttemptView, StepView
-from ansich.tool import ToolCallView
+from ansich.tool import ContentDerivationView, ToolCallView
 
 
 class AnsichBackend(Protocol):
@@ -52,4 +54,31 @@ class AnsichBackend(Protocol):
 
     async def get_step_context(self, step_id: str) -> ContextSnapshotView | None: ...
 
+    async def get_context_snapshot(
+        self,
+        snapshot_id: str,
+    ) -> ContextSnapshotView | None: ...
+
     async def get_content_block_payload(self, block_id: str) -> ContentBlockPayloadView | None: ...
+
+    async def get_context_compression(
+        self,
+        compression_id: str,
+    ) -> ContextCompressionView | None: ...
+
+    async def get_content_blocks(
+        self,
+        block_ids: tuple[str, ...],
+    ) -> list[ContentBlockView]: ...
+
+    async def list_content_derivations(
+        self,
+        block_ids: tuple[str, ...],
+        direction: LineageDirection,
+    ) -> list[ContentDerivationView]: ...
+
+    async def list_snapshot_exposures(
+        self,
+        root_block_id: str,
+        descendant_block_ids: tuple[str, ...],
+    ) -> list[PossibleExposureItemView]: ...

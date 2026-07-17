@@ -3,7 +3,10 @@ import { getBackendBaseURL } from "@/core/config";
 
 import type {
   AnsichContentPayloadResponse,
+  AnsichContentLineageResponse,
+  AnsichContextCompressionResponse,
   AnsichContextResponse,
+  AnsichPossibleExposuresResponse,
   AnsichStepResponse,
   AnsichStepsResponse,
   AnsichTaskListResponse,
@@ -154,6 +157,75 @@ export async function fetchAnsichContentPayload(
     await throwAnsichApiError(
       response,
       `Failed to load Ansich raw payload: ${response.statusText}`,
+    );
+  }
+  return response.json();
+}
+
+export async function fetchAnsichContentLineage(
+  blockId: string,
+  direction: "backward" | "forward" = "backward",
+  depth = 8,
+  nodes = 500,
+): Promise<AnsichContentLineageResponse> {
+  const response = await fetch(
+    ansichUrl(
+      `/content-blocks/${encodeURIComponent(blockId)}/lineage?direction=${direction}&depth=${depth}&nodes=${nodes}`,
+    ),
+  );
+  if (!response.ok) {
+    await throwAnsichApiError(
+      response,
+      `Failed to load Ansich content lineage: ${response.statusText}`,
+    );
+  }
+  return response.json();
+}
+
+export async function fetchAnsichContentExposures(
+  blockId: string,
+  depth = 8,
+  nodes = 500,
+): Promise<AnsichPossibleExposuresResponse> {
+  const response = await fetch(
+    ansichUrl(
+      `/content-blocks/${encodeURIComponent(blockId)}/exposures?depth=${depth}&nodes=${nodes}`,
+    ),
+  );
+  if (!response.ok) {
+    await throwAnsichApiError(
+      response,
+      `Failed to load Ansich possible exposures: ${response.statusText}`,
+    );
+  }
+  return response.json();
+}
+
+export async function fetchAnsichContextSnapshot(
+  snapshotId: string,
+): Promise<AnsichContextResponse> {
+  const response = await fetch(
+    ansichUrl(`/context-snapshots/${encodeURIComponent(snapshotId)}`),
+  );
+  if (!response.ok) {
+    await throwAnsichApiError(
+      response,
+      `Failed to load Ansich ContextSnapshot: ${response.statusText}`,
+    );
+  }
+  return response.json();
+}
+
+export async function fetchAnsichContextCompression(
+  compressionId: string,
+): Promise<AnsichContextCompressionResponse> {
+  const response = await fetch(
+    ansichUrl(`/context-compressions/${encodeURIComponent(compressionId)}`),
+  );
+  if (!response.ok) {
+    await throwAnsichApiError(
+      response,
+      `Failed to load Ansich ContextCompression: ${response.statusText}`,
     );
   }
   return response.json();

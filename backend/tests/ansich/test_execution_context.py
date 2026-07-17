@@ -106,6 +106,74 @@ def test_tool_registry_recovery_reuses_the_strongest_existing_causation_evidence
     assert context.open_tool_calls()[0].issued_obs_id == started_obs_id
 
 
+def test_visible_tool_provenance_refuses_an_ambiguous_provider_id() -> None:
+    context = AnsichExecutionContext(task_id=new_id())
+    first = context.register_tool_call(
+        tool_call_id=new_id(),
+        step_id=new_id(),
+        step_seq=1,
+        call_seq=1,
+        provider_call_id="reused-provider-id",
+        tool_name="first_tool",
+        args_hash="a" * 64,
+        issued_obs_id=new_id(),
+    )
+    second = context.register_tool_call(
+        tool_call_id=new_id(),
+        step_id=new_id(),
+        step_seq=2,
+        call_seq=1,
+        provider_call_id="reused-provider-id",
+        tool_name="second_tool",
+        args_hash="b" * 64,
+        issued_obs_id=new_id(),
+    )
+    first_block_id = new_id()
+    second_block_id = new_id()
+    context.mark_tool_visible(
+        first.tool_call_id,
+        visible_block_id=first_block_id,
+        visible_message_id="first-message",
+    )
+    context.mark_tool_visible(
+        second.tool_call_id,
+        visible_block_id=second_block_id,
+        visible_message_id="second-message",
+    )
+
+    assert context.visible_tool_block_id("reused-provider-id") is None
+    assert (
+        context.visible_tool_block_id(
+            "reused-provider-id",
+            message_id="first-message",
+        )
+        == first_block_id
+    )
+    assert (
+        context.visible_tool_block_id(
+            "reused-provider-id",
+            message_id="second-message",
+        )
+        == second_block_id
+    )
+
+
+def test_summary_reference_is_not_reused_until_its_block_is_durable() -> None:
+    context = AnsichExecutionContext(task_id=new_id())
+    block_id = new_id()
+    producer_obs_id = new_id()
+
+    context.register_context_summary(
+        summary_text="pending summary",
+        block_id=block_id,
+        producer_obs_id=producer_obs_id,
+    )
+
+    assert context.context_summary_block_id("pending summary") is None
+    context.mark_observations_durable((producer_obs_id,))
+    assert context.context_summary_block_id("pending summary") == block_id
+
+
 @pytest.mark.parametrize(
     ("raw_terminal_kind", "body", "expected"),
     [
@@ -456,8 +524,12 @@ def test_direct_final_answer_records_one_step_attempt_and_context_snapshot() -> 
             "context.state_recorded",
             "context.snapshotted",
             "llm.responded",
+            "content.produced",
             "step.closed",
         ]
+        assert observations[-2].payload["kind"] == "assistant_output"
+        assert observations[-2].payload["producer_kind"] == "llm_response"
+        assert observations[-2].causation_obs_id == observations[-3].obs_id
         assert observations[0].payload == {"step_seq": 1, "actor_kind": "lead_agent"}
         assert observations[-1].payload["effective_attempt_no"] == 1
         assert observations[-1].payload["result"] == "final_answer"

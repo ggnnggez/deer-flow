@@ -15,6 +15,11 @@ from collections.abc import Mapping
 from types import SimpleNamespace
 from typing import Any
 
+from ansich.serialization import (
+    ANSICH_BLOCK_REF_KEY,
+    ANSICH_CONTENT_KIND_KEY,
+    ANSICH_PRODUCER_KIND_KEY,
+)
 from fastapi import HTTPException, Request
 from langchain_core.messages import BaseMessage
 from langchain_core.messages.utils import convert_to_messages
@@ -62,6 +67,9 @@ _SERVER_OWNED_DYNAMIC_CONTEXT_KEYS = frozenset(
     {
         _DYNAMIC_CONTEXT_REMINDER_KEY,
         _REMINDER_DATE_KEY,
+        ANSICH_CONTENT_KIND_KEY,
+        ANSICH_PRODUCER_KIND_KEY,
+        ANSICH_BLOCK_REF_KEY,
     }
 )
 

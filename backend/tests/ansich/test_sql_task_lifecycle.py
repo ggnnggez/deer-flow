@@ -1061,17 +1061,18 @@ async def test_content_occurrence_registry_survives_service_restart_and_reuses_b
         await restarted_service.stop()
         await engine.dispose()
 
-    assert len(occurrences) == 1
-    assert occurrences[0].source_identity == "message:durable-user:occurrence:1:content:0"
-    assert occurrence_count == 1
-    assert content_observation_count == 1
+    user_occurrences = [occurrence for occurrence in occurrences if occurrence.kind == "user_input"]
+    assert len(user_occurrences) == 1
+    assert user_occurrences[0].source_identity == "message:durable-user:occurrence:1:content:0"
+    assert occurrence_count == 3
+    assert content_observation_count == 3
     assert len(contexts) == 2
     assert all(context is not None for context in contexts)
     assert len({context.items[0].block_id for context in contexts if context is not None}) == 1
     assert all(context.items[0].message_id == "durable-user" for context in contexts if context is not None)
-    assert all(context.items[0].source_identity == occurrences[0].source_identity for context in contexts if context is not None)
+    assert all(context.items[0].source_identity == user_occurrences[0].source_identity for context in contexts if context is not None)
     assert snapshot_items == []
-    assert {item.source_identity for item in state_items} == {occurrences[0].source_identity}
+    assert {item.source_identity for item in state_items} == {user_occurrences[0].source_identity}
     assert state_count == 1
     assert state_observation_count == 1
 

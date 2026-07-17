@@ -3,11 +3,20 @@ from __future__ import annotations
 from datetime import UTC, datetime
 from typing import cast
 
+from ansich.compression import CompressionDisposition, ContextCompressionItemView, ContextCompressionView
 from ansich.context_state import ContextStateDelta, ContextStateItem, ContextStateView, materialize_context_state
 from ansich.contracts import ControlBelief, ControlValue, NamedVersion, ObservationEnvelope, TaskView
 from ansich.control import should_select_control_candidate
+from ansich.lineage import ContentBlockView, ContentProducerView, LineageDirection, PossibleExposureItemView
 from ansich.step import ContentBlockPayloadView, ContentOccurrenceView, ContextSnapshotItemView, ContextSnapshotView, LlmAttemptView, StepView
-from ansich.tool import ContentDerivationView, ToolBelief, ToolCallView, ToolResultView
+from ansich.tool import (
+    ContentDerivationSourceRole,
+    ContentDerivationView,
+    ToolBelief,
+    ToolCallView,
+    ToolResultView,
+    ToolTransformKind,
+)
 
 _CONTROL_BY_KIND = {
     "task.created": "created",
@@ -241,8 +250,14 @@ class InMemoryAnsichBackend:
         step = await self.get_step(step_id)
         if step is None or step.effective_context_snapshot_id is None:
             return None
+        return await self.get_context_snapshot(step.effective_context_snapshot_id)
+
+    async def get_context_snapshot(
+        self,
+        snapshot_id: str,
+    ) -> ContextSnapshotView | None:
         snapshot = next(
-            (observation for observation in self._observations if observation.kind == "context.snapshotted" and observation.subject_id == step.effective_context_snapshot_id),
+            (observation for observation in self._observations if observation.kind == "context.snapshotted" and observation.subject_id == snapshot_id),
             None,
         )
         if snapshot is None or snapshot.payload is None:
@@ -353,6 +368,226 @@ class InMemoryAnsichBackend:
         if observation is None or observation.payload is None or "body" not in observation.payload:
             return None
         return ContentBlockPayloadView(block_id=block_id, body=observation.payload["body"])
+
+    async def get_context_compression(
+        self,
+        compression_id: str,
+    ) -> ContextCompressionView | None:
+        observation = next(
+            (item for item in self._observations if item.kind == "context.compressed" and item.subject_id == compression_id),
+            None,
+        )
+        if observation is None or observation.payload is None:
+            return None
+        payload = observation.payload
+        raw_items = [item for item in payload.get("items", []) if isinstance(item, dict)]
+        summary_block_id = payload.get("summary_block_id")
+        if not isinstance(summary_block_id, str):
+            return None
+        block_ids = tuple(
+            dict.fromkeys(
+                [
+                    summary_block_id,
+                    *[str(item["block_id"]) for item in raw_items if isinstance(item.get("block_id"), str)],
+                ]
+            )
+        )
+        blocks = {block.block_id: block for block in await self.get_content_blocks(block_ids)}
+        summary_block = blocks.get(summary_block_id)
+        if summary_block is None:
+            return None
+        items = tuple(
+            ContextCompressionItemView(
+                disposition=cast(CompressionDisposition, item["disposition"]),
+                ordinal=int(item["ordinal"]),
+                block=blocks[str(item["block_id"])],
+            )
+            for item in raw_items
+            if isinstance(item.get("block_id"), str) and str(item["block_id"]) in blocks
+        )
+        return ContextCompressionView(
+            compression_id=compression_id,
+            task_id=observation.task_id,
+            summary_operation_id=(payload.get("summary_operation_id") if isinstance(payload.get("summary_operation_id"), str) else None),
+            summary_block=summary_block,
+            before_tokens=int(payload["before_tokens"]),
+            after_tokens=int(payload["after_tokens"]),
+            before_visible_bytes=int(payload.get("before_visible_bytes", 0)),
+            after_visible_bytes=int(payload.get("after_visible_bytes", 0)),
+            algorithm=str(payload["algorithm"]),
+            algorithm_version=str(payload["algorithm_version"]),
+            source_obs_id=observation.obs_id,
+            status=("complete" if len(items) == len(raw_items) else "incomplete"),
+            items=items,
+        )
+
+    async def get_content_blocks(
+        self,
+        block_ids: tuple[str, ...],
+    ) -> list[ContentBlockView]:
+        requested = set(block_ids)
+        blocks: dict[str, ContentBlockView] = {}
+        for observation in self._observations:
+            if observation.kind != "content.produced" or observation.subject_id not in requested or observation.payload is None:
+                continue
+            payload = observation.payload
+            blocks.setdefault(
+                observation.subject_id,
+                ContentBlockView(
+                    block_id=observation.subject_id,
+                    kind=str(payload["kind"]),
+                    content_hash=str(payload["content_hash"]),
+                    byte_size=int(payload["visible_bytes"]),
+                    token_estimate=int(payload["estimated_tokens"]),
+                    sensitivity_flags=tuple(payload.get("sensitivity_flags", [])),
+                    payload_status=("available" if "body" in payload else "missing"),
+                    producer=ContentProducerView(
+                        producer_kind=str(payload.get("producer_kind") or observation.producer.name),
+                        producer_entity_id=(payload.get("producer_entity_id") if isinstance(payload.get("producer_entity_id"), str) else None),
+                        producer_obs_id=observation.obs_id,
+                    ),
+                ),
+            )
+        return [blocks[block_id] for block_id in block_ids if block_id in blocks]
+
+    async def list_content_derivations(
+        self,
+        block_ids: tuple[str, ...],
+        direction: LineageDirection,
+    ) -> list[ContentDerivationView]:
+        requested = set(block_ids)
+        derivations: dict[tuple[str, str, str], ContentDerivationView] = {}
+        for observation in self._observations:
+            if observation.payload is None:
+                continue
+            payload = observation.payload
+            candidates: list[tuple[str, str, str, str, int | None]] = []
+            if observation.kind == "content.produced":
+                candidates.extend(
+                    (
+                        observation.subject_id,
+                        str(item["source_block_id"]),
+                        str(item.get("transform_kind", "unknown")),
+                        str(item.get("source_role", "source")),
+                        (int(item["ordinal"]) if isinstance(item.get("ordinal"), int) else None),
+                    )
+                    for item in payload.get("derivation_sources", [])
+                    if isinstance(item, dict) and isinstance(item.get("source_block_id"), str)
+                )
+                source_block_id = payload.get("source_block_id")
+                if isinstance(source_block_id, str):
+                    candidates.append(
+                        (
+                            observation.subject_id,
+                            source_block_id,
+                            str(payload.get("transform_kind", "unknown")),
+                            str(payload.get("source_role", "source")),
+                            (int(payload["source_ordinal"]) if isinstance(payload.get("source_ordinal"), int) else None),
+                        )
+                    )
+            elif observation.kind == "tool.result_visible":
+                derived_block_id = payload.get("result_block_id")
+                source_block_id = payload.get("source_block_id")
+                if isinstance(derived_block_id, str) and isinstance(source_block_id, str):
+                    candidates.append(
+                        (
+                            derived_block_id,
+                            source_block_id,
+                            str(payload.get("transform_kind", "unknown")),
+                            "source",
+                            None,
+                        )
+                    )
+            elif observation.kind == "context.compressed":
+                derived_block_id = payload.get("summary_block_id")
+                if isinstance(derived_block_id, str):
+                    candidates.extend(
+                        (
+                            derived_block_id,
+                            str(item["block_id"]),
+                            "compressed",
+                            "source",
+                            int(item["ordinal"]),
+                        )
+                        for item in payload.get("items", [])
+                        if isinstance(item, dict) and item.get("disposition") == "source" and isinstance(item.get("block_id"), str)
+                    )
+            for derived_block_id, source_block_id, transform_kind, source_role, ordinal in candidates:
+                if derived_block_id == source_block_id:
+                    continue
+                endpoint = derived_block_id if direction == "backward" else source_block_id
+                if endpoint not in requested:
+                    continue
+                key = (derived_block_id, source_block_id, transform_kind)
+                derivations.setdefault(
+                    key,
+                    ContentDerivationView(
+                        derived_block_id=derived_block_id,
+                        source_block_id=source_block_id,
+                        transform_kind=cast(ToolTransformKind, transform_kind),
+                        transform_version=str(payload.get("transform_version", "1")),
+                        established_obs_id=observation.obs_id,
+                        source_role=cast(ContentDerivationSourceRole, source_role),
+                        ordinal=ordinal,
+                    ),
+                )
+        return list(derivations.values())
+
+    async def list_snapshot_exposures(
+        self,
+        root_block_id: str,
+        descendant_block_ids: tuple[str, ...],
+    ) -> list[PossibleExposureItemView]:
+        requested = set(descendant_block_ids)
+        root_observation = next(
+            (observation for observation in self._observations if observation.kind == "content.produced" and observation.subject_id == root_block_id),
+            None,
+        )
+        if root_observation is None:
+            return []
+        exposures: list[PossibleExposureItemView] = []
+        for snapshot in self._observations:
+            if snapshot.kind != "context.snapshotted" or snapshot.step_id is None or snapshot.payload is None:
+                continue
+            state_id = snapshot.payload.get("state_id")
+            if not isinstance(state_id, str):
+                continue
+            state = self._context_state_view(state_id)
+            if state is None:
+                continue
+            started = next(
+                (observation for observation in self._observations if observation.kind == "step.started" and observation.step_id == snapshot.step_id and observation.payload is not None),
+                None,
+            )
+            if started is None or started.payload is None:
+                continue
+            request = next(
+                (observation for observation in self._observations if observation.obs_id == snapshot.causation_obs_id),
+                None,
+            )
+            ordering = "later" if request is not None and request.occurred_at > root_observation.occurred_at else "unknown"
+            exposures.extend(
+                PossibleExposureItemView(
+                    task_id=snapshot.task_id,
+                    step_id=snapshot.step_id,
+                    step_seq=int(started.payload["step_seq"]),
+                    snapshot_id=snapshot.subject_id,
+                    snapshot_ordinal=item.ordinal,
+                    descendant_block_id=item.block_id,
+                    ordering=ordering,
+                )
+                for item in state.items
+                if item.block_id in requested
+            )
+        exposures.sort(
+            key=lambda item: (
+                item.step_seq,
+                item.snapshot_id,
+                item.snapshot_ordinal,
+                item.descendant_block_id,
+            )
+        )
+        return exposures
 
     def _step_view(self, started: ObservationEnvelope) -> StepView:
         if started.payload is None or started.step_id is None:

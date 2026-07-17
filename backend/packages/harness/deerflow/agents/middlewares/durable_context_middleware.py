@@ -11,9 +11,16 @@ from __future__ import annotations
 
 import posixpath
 from collections.abc import Awaitable, Callable, Collection
+from hashlib import sha256
 from html import escape
 from typing import override
+from uuid import UUID
 
+from ansich.serialization import (
+    ANSICH_BLOCK_REF_KEY,
+    ANSICH_CONTENT_KIND_KEY,
+    ANSICH_PRODUCER_KIND_KEY,
+)
 from langchain.agents import AgentState
 from langchain.agents.middleware import AgentMiddleware
 from langchain.agents.middleware.types import ModelCallResult, ModelRequest, ModelResponse
@@ -23,6 +30,8 @@ from langgraph.runtime import Runtime
 from deerflow.agents.middlewares.delegation_ledger import extract_delegations, render_delegation_ledger
 from deerflow.agents.middlewares.skill_context import extract_skills, render_skill_context
 from deerflow.agents.thread_state import _DELEGATION_LEDGER_MAX_ENTRIES, TERMINAL_STATUSES
+from deerflow.ansich.execution import PendingContentDerivation
+from deerflow.ansich.middleware import execution_context_from_runtime
 from deerflow.config.summarization_config import DEFAULT_SKILL_FILE_READ_TOOL_NAMES
 from deerflow.constants import DEFAULT_SKILLS_CONTAINER_PATH
 from deerflow.runtime.context_keys import CURRENT_RUN_PRE_EXISTING_MESSAGE_IDS_KEY
@@ -248,23 +257,63 @@ class DurableContextMiddleware(AgentMiddleware[AgentState]):
 
     def _inject(self, request: ModelRequest) -> ModelRequest:
         state = request.state or {}
+        summary_text = state.get("summary_text")
         data_block = _render_durable_context_data(
-            state.get("summary_text"),
+            summary_text,
             state.get("delegations") or [],
             state.get("skill_context") or [],
         )
         if not data_block:
             return request
+        data_kwargs = {
+            "hide_from_ui": True,
+            _DURABLE_CONTEXT_DATA_KEY: True,
+            ANSICH_CONTENT_KIND_KEY: "middleware_injection",
+            ANSICH_PRODUCER_KIND_KEY: "durable_context",
+        }
+        execution = execution_context_from_runtime(getattr(request, "runtime", None))
+        summary_block_id = execution.context_summary_block_id(summary_text) if execution is not None and isinstance(summary_text, str) else None
+        if execution is not None and summary_block_id is not None:
+            identity = "\0".join(
+                (
+                    execution.task_id,
+                    "durable-context@1",
+                    summary_block_id,
+                    sha256(data_block.encode("utf-8")).hexdigest(),
+                )
+            )
+            derived_block_id = str(
+                UUID(
+                    bytes=sha256(identity.encode("utf-8")).digest()[:16],
+                    version=4,
+                )
+            )
+            execution.register_content_derivations(
+                derived_block_id=derived_block_id,
+                sources=(
+                    PendingContentDerivation(
+                        source_block_id=summary_block_id,
+                        transform_kind="copied",
+                        transform_version="1",
+                        source_role="supporting",
+                        ordinal=0,
+                    ),
+                ),
+            )
+            data_kwargs[ANSICH_BLOCK_REF_KEY] = derived_block_id
         messages = _insert_after_leading_system_messages(
             list(request.messages),
             [
-                SystemMessage(content=_AUTHORITY_CONTRACT),
+                SystemMessage(
+                    content=_AUTHORITY_CONTRACT,
+                    additional_kwargs={
+                        ANSICH_CONTENT_KIND_KEY: "middleware_injection",
+                        ANSICH_PRODUCER_KIND_KEY: "durable_context_authority",
+                    },
+                ),
                 HumanMessage(
                     content=data_block,
-                    additional_kwargs={
-                        "hide_from_ui": True,
-                        _DURABLE_CONTEXT_DATA_KEY: True,
-                    },
+                    additional_kwargs=data_kwargs,
                 ),
             ],
         )

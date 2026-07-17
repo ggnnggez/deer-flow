@@ -58,6 +58,23 @@ class _ContentOccurrenceEntry:
 
 
 @dataclass(frozen=True)
+class SummaryBlockReference:
+    block_id: str
+    content_hash: str
+    producer_obs_id: str
+    durable: bool
+
+
+@dataclass(frozen=True)
+class PendingContentDerivation:
+    source_block_id: str
+    transform_kind: str
+    transform_version: str
+    source_role: str = "source"
+    ordinal: int | None = None
+
+
+@dataclass(frozen=True)
 class ContextStateResolution:
     state_id: str
     state_hash: str
@@ -92,6 +109,8 @@ class ToolCallRegistration:
     claimed: bool = False
     terminal_recorded: bool = False
     visible_recorded: bool = False
+    visible_block_id: str | None = None
+    visible_message_id: str | None = None
 
 
 @dataclass
@@ -133,6 +152,11 @@ class AnsichExecutionContext:
         self._producer_seq = 0
         self._content_occurrences: dict[tuple[str, str, str], _ContentOccurrenceEntry] = {}
         self._content_observation_keys: dict[str, tuple[str, str, str]] = {}
+        self._latest_summary_block: SummaryBlockReference | None = None
+        self._pending_content_derivations: dict[
+            str,
+            tuple[PendingContentDerivation, ...],
+        ] = {}
         for occurrence in content_occurrences:
             if occurrence.task_id != task_id:
                 raise ValueError("content occurrence belongs to a different task")
@@ -151,6 +175,7 @@ class AnsichExecutionContext:
         for tool_call in tool_calls:
             if tool_call.task_id != task_id:
                 raise ValueError("tool call belongs to a different task")
+            visible_results = getattr(tool_call, "visible_results", ())
             self._tool_calls[tool_call.tool_call_id] = ToolCallRegistration(
                 tool_call_id=tool_call.tool_call_id,
                 step_id=tool_call.step_id,
@@ -170,6 +195,7 @@ class AnsichExecutionContext:
                     "unknown_terminal",
                 },
                 visible_recorded=tool_call.visible_result.value == "available",
+                visible_block_id=(visible_results[-1].content_block_id if visible_results else None),
             )
         if context_state is not None:
             if context_state.task_id != task_id:
@@ -313,7 +339,14 @@ class AnsichExecutionContext:
     def current_tool_invocation(self) -> ToolInvocation | None:
         return self._current_tool_invocation.get()
 
-    def mark_tool_terminal(self, tool_call_id: str, *, visible: bool = False) -> None:
+    def mark_tool_terminal(
+        self,
+        tool_call_id: str,
+        *,
+        visible: bool = False,
+        visible_block_id: str | None = None,
+        visible_message_id: str | None = None,
+    ) -> None:
         with self._lock:
             registration = self._tool_calls.get(tool_call_id)
             if registration is None:
@@ -321,12 +354,38 @@ class AnsichExecutionContext:
             registration.terminal_recorded = True
             if visible:
                 registration.visible_recorded = True
+                registration.visible_block_id = visible_block_id
+                registration.visible_message_id = visible_message_id
 
-    def mark_tool_visible(self, tool_call_id: str) -> None:
+    def mark_tool_visible(
+        self,
+        tool_call_id: str,
+        *,
+        visible_block_id: str | None = None,
+        visible_message_id: str | None = None,
+    ) -> None:
         with self._lock:
             registration = self._tool_calls.get(tool_call_id)
             if registration is not None:
                 registration.visible_recorded = True
+                registration.visible_block_id = visible_block_id
+                registration.visible_message_id = visible_message_id
+
+    def visible_tool_block_id(
+        self,
+        provider_call_id: str,
+        *,
+        message_id: str | None = None,
+    ) -> str | None:
+        with self._lock:
+            candidates = [registration for registration in self._tool_calls.values() if registration.provider_call_id == provider_call_id and registration.visible_block_id is not None]
+            if message_id is not None:
+                exact = [registration for registration in candidates if registration.visible_message_id == message_id]
+                if len(exact) == 1:
+                    return exact[0].visible_block_id
+            if len(candidates) != 1:
+                return None
+            return candidates[0].visible_block_id
 
     def open_tool_calls(self) -> tuple[ToolCallRegistration, ...]:
         with self._lock:
@@ -387,6 +446,46 @@ class AnsichExecutionContext:
                 should_emit=not entry.durable,
             )
 
+    def register_context_summary(
+        self,
+        *,
+        summary_text: str,
+        block_id: str,
+        producer_obs_id: str,
+        durable: bool = False,
+    ) -> None:
+        with self._lock:
+            self._latest_summary_block = SummaryBlockReference(
+                block_id=block_id,
+                content_hash=sha256(summary_text.encode("utf-8")).hexdigest(),
+                producer_obs_id=producer_obs_id,
+                durable=durable,
+            )
+
+    def register_content_derivations(
+        self,
+        *,
+        derived_block_id: str,
+        sources: tuple[PendingContentDerivation, ...],
+    ) -> None:
+        with self._lock:
+            self._pending_content_derivations[derived_block_id] = sources
+
+    def content_derivations(
+        self,
+        derived_block_id: str,
+    ) -> tuple[PendingContentDerivation, ...]:
+        with self._lock:
+            return self._pending_content_derivations.get(derived_block_id, ())
+
+    def context_summary_block_id(self, summary_text: str) -> str | None:
+        content_hash = sha256(summary_text.encode("utf-8")).hexdigest()
+        with self._lock:
+            reference = self._latest_summary_block
+            if reference is None or not reference.durable or reference.content_hash != content_hash:
+                return None
+            return reference.block_id
+
     def mark_observations_durable(self, observation_ids: tuple[str, ...]) -> None:
         with self._lock:
             for observation_id in observation_ids:
@@ -396,6 +495,9 @@ class AnsichExecutionContext:
                 state_hash = self._context_state_observation_keys.get(observation_id)
                 if state_hash is not None:
                     self._context_states_by_hash[state_hash].durable = True
+                summary = self._latest_summary_block
+                if summary is not None and summary.producer_obs_id == observation_id:
+                    self._latest_summary_block = replace(summary, durable=True)
 
     def resolve_context_state(
         self,

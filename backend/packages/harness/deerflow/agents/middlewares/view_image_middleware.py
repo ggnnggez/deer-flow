@@ -6,6 +6,7 @@ import logging
 from pathlib import Path
 from typing import override
 
+from ansich.serialization import ANSICH_CONTENT_KIND_KEY, ANSICH_PRODUCER_KIND_KEY
 from langchain.agents.middleware import AgentMiddleware
 from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
 from langgraph.runtime import Runtime
@@ -229,7 +230,14 @@ class ViewImageMiddleware(AgentMiddleware[ViewImageMiddlewareState]):
         # Create a new human message with mixed content (text + images). This is
         # internal context for the model only, so hide it from the chat UI and IM
         # channels (matches the other middleware-injected context messages).
-        human_msg = HumanMessage(content=image_content, additional_kwargs={"hide_from_ui": True})
+        human_msg = HumanMessage(
+            content=image_content,
+            additional_kwargs={
+                "hide_from_ui": True,
+                ANSICH_CONTENT_KIND_KEY: "middleware_injection",
+                ANSICH_PRODUCER_KIND_KEY: "vision_conversion",
+            },
+        )
 
         logger.debug("Injecting image details message with images before LLM call")
 
@@ -273,6 +281,13 @@ class ViewImageMiddleware(AgentMiddleware[ViewImageMiddlewareState]):
         # Image reads + base64 encoding can be slow (up to 20MB), so offload
         # the blocking work to a thread rather than stalling the event loop.
         image_content = await asyncio.to_thread(self._create_image_details_message, state)
-        human_msg = HumanMessage(content=image_content, additional_kwargs={"hide_from_ui": True})
+        human_msg = HumanMessage(
+            content=image_content,
+            additional_kwargs={
+                "hide_from_ui": True,
+                ANSICH_CONTENT_KIND_KEY: "middleware_injection",
+                ANSICH_PRODUCER_KIND_KEY: "vision_conversion",
+            },
+        )
         logger.debug("Injecting image details message with images before LLM call")
         return {"messages": [human_msg]}

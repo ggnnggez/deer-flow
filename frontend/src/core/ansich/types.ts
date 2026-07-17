@@ -20,6 +20,7 @@ export type AnsichObservationKind =
   | "content.produced"
   | "context.state_recorded"
   | "context.snapshotted"
+  | "context.compressed"
   | "tool.issued"
   | "tool.started"
   | "tool.returned_raw"
@@ -76,7 +77,8 @@ export interface AnsichObservation {
     | "tool_call"
     | "content_block"
     | "context_state"
-    | "context_snapshot";
+    | "context_snapshot"
+    | "context_compression";
   subject_id: string;
   fidelity_class: "hard";
   producer: AnsichProducer;
@@ -210,9 +212,96 @@ export interface AnsichContentDerivation {
     | "externalized"
     | "coalesced"
     | "clarification_card"
+    | "compressed"
+    | "memory_injected"
+    | "skill_injected"
+    | "vision_converted"
+    | "copied"
     | "unknown";
   transform_version: string;
   established_obs_id: string;
+  source_role: "source" | "preserved" | "removed" | "supporting";
+  ordinal: number | null;
+}
+
+export interface AnsichContentBlock {
+  block_id: string;
+  kind: string;
+  content_hash: string;
+  byte_size: number;
+  token_estimate: number;
+  sensitivity_flags: string[];
+  payload_status: "available" | "missing";
+  producer: {
+    producer_kind: string;
+    producer_entity_id: string | null;
+    producer_obs_id: string;
+  } | null;
+}
+
+export interface AnsichLineageNode extends AnsichContentBlock {
+  depth: number;
+}
+
+export interface AnsichLineageGap {
+  block_id: string;
+  depth: number;
+  reason: "missing_content_block";
+}
+
+export interface AnsichContentLineage {
+  semantic: "provenance";
+  root_block_id: string;
+  direction: "backward" | "forward";
+  nodes: AnsichLineageNode[];
+  edges: AnsichContentDerivation[];
+  truncated: boolean;
+  truncation_reason: "max_depth" | "max_nodes" | null;
+  unknown_gaps: AnsichLineageGap[];
+}
+
+export interface AnsichPossibleExposureItem {
+  task_id: string;
+  step_id: string;
+  step_seq: number;
+  snapshot_id: string;
+  snapshot_ordinal: number;
+  descendant_block_id: string;
+  descendant_depth: number;
+  ordering: "later" | "unknown";
+}
+
+export interface AnsichPossibleExposures {
+  semantic: "possible_exposure";
+  root_block_id: string;
+  nodes: AnsichLineageNode[];
+  edges: AnsichContentDerivation[];
+  items: AnsichPossibleExposureItem[];
+  truncated: boolean;
+  truncation_reason: "max_depth" | "max_nodes" | null;
+  unknown_gaps: AnsichLineageGap[];
+}
+
+export interface AnsichContextCompressionItem {
+  disposition: "source" | "preserved" | "removed";
+  ordinal: number;
+  block: AnsichContentBlock;
+}
+
+export interface AnsichContextCompression {
+  compression_id: string;
+  task_id: string;
+  summary_operation_id: string | null;
+  summary_block: AnsichContentBlock;
+  before_tokens: number;
+  after_tokens: number;
+  before_visible_bytes: number;
+  after_visible_bytes: number;
+  algorithm: string;
+  algorithm_version: string;
+  source_obs_id: string;
+  status: "complete" | "incomplete";
+  items: AnsichContextCompressionItem[];
 }
 
 export interface AnsichToolCall {
@@ -304,6 +393,21 @@ export interface AnsichContentPayloadResponse {
     content_type: string;
     body: unknown;
   };
+}
+
+export interface AnsichContentLineageResponse {
+  lineage: AnsichContentLineage;
+  projection_status: AnsichHealth;
+}
+
+export interface AnsichPossibleExposuresResponse {
+  exposures: AnsichPossibleExposures;
+  projection_status: AnsichHealth;
+}
+
+export interface AnsichContextCompressionResponse {
+  compression: AnsichContextCompression;
+  projection_status: AnsichHealth;
 }
 
 export interface AnsichToolCallResponse {

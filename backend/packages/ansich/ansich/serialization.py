@@ -6,7 +6,7 @@ import importlib.metadata
 import json
 import math
 from collections.abc import Mapping, Sequence
-from typing import Literal
+from typing import Literal, cast
 
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -21,8 +21,34 @@ ContentKind = Literal[
     "system_prompt",
     "tool_schema",
     "image_or_attachment",
+    "summary",
+    "memory",
+    "skill_instruction",
+    "middleware_injection",
     "unknown",
 ]
+
+ANSICH_CONTENT_KIND_KEY = "ansich_content_kind"
+ANSICH_PRODUCER_KIND_KEY = "ansich_producer_kind"
+ANSICH_BLOCK_REF_KEY = "ansich_block_ref"
+
+_CONTENT_KINDS = frozenset(
+    {
+        "user_input",
+        "assistant_output",
+        "tool_request",
+        "tool_result_raw",
+        "tool_result_visible",
+        "system_prompt",
+        "tool_schema",
+        "image_or_attachment",
+        "summary",
+        "memory",
+        "skill_instruction",
+        "middleware_injection",
+        "unknown",
+    }
+)
 
 _REDACTED = "<redacted>"
 _SECRET_FIELDS = frozenset(
@@ -153,6 +179,24 @@ class ContextSnapshotCapture(BaseModel):
     warnings: tuple[str, ...] = ()
 
 
+def context_snapshot_item_source_identity(item: ContextSnapshotItemCapture) -> str | None:
+    """Return the Task-local occurrence identity represented by a snapshot item."""
+
+    if item.channel == "message" and item.message_id:
+        occurrence_seq = item.metadata.get("message_occurrence_seq", 1)
+        if not isinstance(occurrence_seq, int):
+            return None
+        part_ordinal = item.metadata.get("part_ordinal")
+        if isinstance(part_ordinal, int):
+            return f"message:{item.message_id}:occurrence:{occurrence_seq}:content:{part_ordinal}"
+        tool_call_ordinal = item.metadata.get("tool_call_ordinal")
+        if isinstance(tool_call_ordinal, int):
+            return f"message:{item.message_id}:occurrence:{occurrence_seq}:tool-call:{tool_call_ordinal}"
+    if item.channel == "tool_schema" and item.name:
+        return f"tool-schema:{item.name}"
+    return None
+
+
 def serialize_model_request(
     *,
     system_message: object | None,
@@ -179,18 +223,23 @@ def serialize_model_request(
 
     for message_index, message in enumerate(ordered_messages):
         role = _message_role(message)
+        additional_kwargs = getattr(message, "additional_kwargs", None)
+        declared_kind = additional_kwargs.get(ANSICH_CONTENT_KIND_KEY) if isinstance(additional_kwargs, Mapping) else None
+        producer_kind = additional_kwargs.get(ANSICH_PRODUCER_KIND_KEY) if isinstance(additional_kwargs, Mapping) else None
+        block_ref = additional_kwargs.get(ANSICH_BLOCK_REF_KEY) if isinstance(additional_kwargs, Mapping) else None
         message_id = _string_attribute(message, "id")
         message_occurrence_seq = 1
         if message_id is not None:
             message_occurrence_seq = message_occurrence_counts.get(message_id, 0) + 1
             message_occurrence_counts[message_id] = message_occurrence_seq
         name = _string_attribute(message, "name")
+        tool_call_id = _string_attribute(message, "tool_call_id")
         content = getattr(message, "content", None)
         parts = content if isinstance(content, list | tuple) else [content]
         for part_index, part in enumerate(parts):
             path = f"messages[{message_index}].content[{part_index}]"
             body = _content_part_body(part, path, secret_values, redactions, warnings)
-            kind = _content_kind(role, part)
+            kind = _content_kind(role, part, declared_kind=declared_kind)
             items.append(
                 ContextSnapshotItemCapture(
                     ordinal=len(items),
@@ -198,11 +247,14 @@ def serialize_model_request(
                     role=role,
                     message_id=message_id,
                     name=name,
-                    block=_block(kind, body),
+                    block=_block(kind, body).model_copy(update={"block_id": block_ref}) if isinstance(block_ref, str) else _block(kind, body),
                     metadata={
                         "message_ordinal": message_index,
                         "message_occurrence_seq": message_occurrence_seq,
                         "part_ordinal": part_index,
+                        "producer_kind": (producer_kind if isinstance(producer_kind, str) else _default_producer_kind(kind)),
+                        **({ANSICH_BLOCK_REF_KEY: block_ref} if isinstance(block_ref, str) else {}),
+                        **({"tool_call_id": tool_call_id} if tool_call_id is not None else {}),
                     },
                 )
             )
@@ -226,6 +278,7 @@ def serialize_model_request(
                         "message_ordinal": message_index,
                         "message_occurrence_seq": message_occurrence_seq,
                         "tool_call_ordinal": tool_index,
+                        "producer_kind": (producer_kind if isinstance(producer_kind, str) else "llm_response"),
                     },
                 )
             )
@@ -238,7 +291,10 @@ def serialize_model_request(
                 channel="tool_schema",
                 name=body.get("name") if isinstance(body.get("name"), str) else None,
                 block=_block("tool_schema", body),
-                metadata={"tool_ordinal": tool_index},
+                metadata={
+                    "tool_ordinal": tool_index,
+                    "producer_kind": "tool_catalog",
+                },
             )
         )
 
@@ -292,17 +348,42 @@ def _message_role(message: object) -> Literal["system", "user", "assistant", "to
     }.get(message_type, "user")
 
 
-def _content_kind(role: str, part: object) -> ContentKind:
+def _content_kind(
+    role: str,
+    part: object,
+    *,
+    declared_kind: object = None,
+) -> ContentKind:
     if isinstance(part, Mapping):
         part_type = part.get("type")
         if part_type in {"image", "image_url", "file", "attachment"}:
             return "image_or_attachment"
+    if isinstance(declared_kind, str) and declared_kind in _CONTENT_KINDS:
+        return cast(ContentKind, declared_kind)
     return {
         "system": "system_prompt",
         "user": "user_input",
         "assistant": "assistant_output",
         "tool": "tool_result_visible",
     }.get(role, "unknown")
+
+
+def _default_producer_kind(kind: ContentKind) -> str:
+    return {
+        "user_input": "gateway_input",
+        "assistant_output": "llm_response",
+        "tool_request": "llm_response",
+        "tool_result_visible": "tool_visible_result",
+        "system_prompt": "system_prompt",
+        "tool_schema": "tool_catalog",
+        "image_or_attachment": "vision_input",
+        "summary": "context_compression",
+        "memory": "memory_injection",
+        "skill_instruction": "skill_activation",
+        "middleware_injection": "middleware_injection",
+        "unknown": "unknown",
+        "tool_result_raw": "tool_raw_result",
+    }[kind]
 
 
 def _content_part_body(

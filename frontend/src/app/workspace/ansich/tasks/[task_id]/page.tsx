@@ -47,6 +47,9 @@ export default function AnsichTaskDetailPage() {
     taskQuery.data?.projection_status ??
     null;
   const queryError = taskQuery.error ?? timelineQuery.error;
+  const compressionIds = (timelineQuery.data?.items ?? [])
+    .filter((observation) => observation.kind === "context.compressed")
+    .map((observation) => observation.subject_id);
 
   useEffect(() => {
     document.title = `${t.ansich.task} ${taskId} - ${t.pages.appName}`;
@@ -105,7 +108,9 @@ export default function AnsichTaskDetailPage() {
                     {t.ansich.timeline}
                   </TabsTrigger>
                   <TabsTrigger value="steps">{t.ansich.steps}</TabsTrigger>
-                  <TabsTrigger value="context">{t.ansich.context}</TabsTrigger>
+                  <TabsTrigger value="context">
+                    {t.ansich.contextAndLineage}
+                  </TabsTrigger>
                 </TabsList>
 
                 <TabsContent value="overview">
@@ -171,7 +176,10 @@ export default function AnsichTaskDetailPage() {
                 </TabsContent>
 
                 <TabsContent value="context">
-                  <AnsichContextPanel taskId={taskId} />
+                  <AnsichContextPanel
+                    taskId={taskId}
+                    compressionIds={compressionIds}
+                  />
                 </TabsContent>
               </Tabs>
             </>

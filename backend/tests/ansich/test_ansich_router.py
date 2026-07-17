@@ -1,4 +1,6 @@
 from datetime import UTC, datetime
+from types import SimpleNamespace
+from unittest.mock import MagicMock
 from uuid import uuid4
 
 import pytest
@@ -13,6 +15,7 @@ from langchain_core.tools import tool
 
 from app.gateway.auth.models import User
 from app.gateway.routers import ansich as ansich_router
+from deerflow.agents.middlewares.summarization_middleware import DeerFlowSummarizationMiddleware
 from deerflow.ansich import create_embedded_ansich_service
 from deerflow.ansich.execution import ANSICH_EXECUTION_CONTEXT_KEY, AnsichExecutionContext
 from deerflow.ansich.middleware import AnsichAttemptMiddleware, AnsichDecisionMiddleware
@@ -272,6 +275,8 @@ async def test_step_context_inventory_and_raw_payload_are_separate(caplog):
             step_id = steps_response.json()["items"][0]["step_id"]
             step_response = await client.get(f"/api/ansich/steps/{step_id}")
             context_response = await client.get(f"/api/ansich/steps/{step_id}/context")
+            snapshot_id = context_response.json()["context"]["snapshot_id"]
+            snapshot_response = await client.get(f"/api/ansich/context-snapshots/{snapshot_id}")
             context_item = context_response.json()["context"]["items"][0]
             payload_response = await client.get(f"/api/ansich/content-blocks/{context_item['block_id']}/payload")
     finally:
@@ -282,6 +287,9 @@ async def test_step_context_inventory_and_raw_payload_are_separate(caplog):
     assert len(steps_response.json()["system_operations"]) == 1
     assert steps_response.json()["system_operations"][0]["operation_kind"] == "summarization"
     assert step_response.json()["step"]["attempts"][0]["effective"] is True
+    assert snapshot_response.status_code == 200
+    assert snapshot_response.json()["context"]["snapshot_id"] == snapshot_id
+    assert all(item["body"] is None for item in snapshot_response.json()["context"]["items"])
     assert context_item["body"] is None
     assert payload_response.json()["payload"]["body"] == "inspect me"
     assert payload_response.headers["cache-control"] == "no-store"
@@ -350,6 +358,140 @@ async def test_tool_call_inventory_and_raw_visible_payloads_use_separate_endpoin
 
 
 @pytest.mark.anyio
+async def test_admin_can_lazy_load_backward_content_lineage_without_raw_payloads() -> None:
+    service = AnsichService.in_memory()
+    await service.start()
+    task_id = new_id()
+    service.record(
+        ObservationEnvelope.task_lifecycle(
+            kind="task.created",
+            task_id=task_id,
+            source_kind="deerflow_run",
+            source_id="run-lineage-api",
+            occurred_at=datetime.now(UTC),
+            source_event_id="run:run-lineage-api:created",
+        )
+    )
+    await service.flush_task(task_id)
+    execution = AnsichExecutionContext(task_id=task_id, service=service)
+    agent = create_agent(
+        model=_ApiToolThenFinalModel(),
+        tools=[_api_observed_tool],
+        middleware=[
+            AnsichDecisionMiddleware(),
+            AnsichVisibleToolMiddleware(),
+            AnsichRawToolMiddleware(),
+            AnsichAttemptMiddleware(),
+        ],
+    )
+    await agent.ainvoke(
+        {"messages": [HumanMessage(content="inspect lineage lazily")]},
+        context={ANSICH_EXECUTION_CONTEXT_KEY: execution},
+    )
+    await service.flush_task(task_id)
+    tool_call = (await service.list_steps(task_id))[0].tool_calls[0]
+    visible_block_id = tool_call.visible_results[-1].content_block_id
+    raw_block_id = tool_call.raw_results[-1].content_block_id
+    app = make_authed_test_app(user_factory=admin_user)
+    app.state.ansich_service = service
+    app.include_router(ansich_router.router)
+
+    try:
+        async with AsyncClient(
+            transport=ASGITransport(app=app),
+            base_url="http://test",
+        ) as client:
+            response = await client.get(
+                f"/api/ansich/content-blocks/{visible_block_id}/lineage",
+                params={"direction": "backward", "depth": 8, "nodes": 500},
+            )
+            exposures_response = await client.get(
+                f"/api/ansich/content-blocks/{raw_block_id}/exposures",
+                params={"depth": 8, "nodes": 500},
+            )
+    finally:
+        await service.stop()
+
+    assert response.status_code == 200
+    lineage = response.json()["lineage"]
+    assert lineage["semantic"] == "provenance"
+    assert [node["block_id"] for node in lineage["nodes"]] == [
+        visible_block_id,
+        raw_block_id,
+    ]
+    assert lineage["truncated"] is False
+    assert "body" not in response.text
+    assert exposures_response.status_code == 200
+    exposures = exposures_response.json()["exposures"]
+    assert exposures["semantic"] == "possible_exposure"
+    assert exposures["items"]
+    assert all(item["descendant_depth"] == 2 for item in exposures["items"])
+    assert any(edge["derived_block_id"] == visible_block_id and edge["source_block_id"] == raw_block_id for edge in exposures["edges"])
+    assert all(item["ordering"] in {"later", "unknown"} for item in exposures["items"])
+    assert "body" not in exposures_response.text
+
+
+@pytest.mark.anyio
+async def test_admin_can_lazy_load_typed_context_compression_without_raw_payloads() -> None:
+    service = AnsichService.in_memory()
+    await service.start()
+    task_id = new_id()
+    execution = AnsichExecutionContext(task_id=task_id, service=service)
+    model = MagicMock()
+    model.with_config.return_value = model
+    model.invoke.return_value = SimpleNamespace(text="compressed for operations")
+    middleware = DeerFlowSummarizationMiddleware(
+        model=model,
+        trigger=("messages", 4),
+        keep=("messages", 2),
+        token_counter=len,
+    )
+    result = middleware.compact_state(
+        {
+            "messages": [
+                HumanMessage(id="compression-old-user", content="old user"),
+                AIMessage(id="compression-old-ai", content="old answer"),
+                HumanMessage(id="compression-new-user", content="new user"),
+                AIMessage(id="compression-new-ai", content="new answer"),
+            ]
+        },
+        SimpleNamespace(
+            context={ANSICH_EXECUTION_CONTEXT_KEY: execution},
+        ),
+        force=True,
+    )
+    assert result is not None
+    await service.flush_task(task_id)
+    compression_id = next(observation.subject_id for observation in await service.list_observations(task_id) if observation.kind == "context.compressed")
+    app = make_authed_test_app(user_factory=admin_user)
+    app.state.ansich_service = service
+    app.include_router(ansich_router.router)
+
+    try:
+        async with AsyncClient(
+            transport=ASGITransport(app=app),
+            base_url="http://test",
+        ) as client:
+            response = await client.get(f"/api/ansich/context-compressions/{compression_id}")
+    finally:
+        await service.stop()
+
+    assert response.status_code == 200
+    compression = response.json()["compression"]
+    assert compression["compression_id"] == compression_id
+    assert compression["summary_block"]["kind"] == "summary"
+    assert [item["disposition"] for item in compression["items"]] == [
+        "source",
+        "source",
+        "preserved",
+        "preserved",
+        "removed",
+        "removed",
+    ]
+    assert "body" not in response.text
+
+
+@pytest.mark.anyio
 async def test_task_list_filters_control_and_returns_an_opaque_cursor():
     service = AnsichService.in_memory()
     await service.start()
@@ -398,12 +540,18 @@ async def test_regular_user_is_forbidden_from_ansich_operations():
         tool_response = await client.get(f"/api/ansich/tool-calls/{new_id()}")
         tool_raw_response = await client.get(f"/api/ansich/tool-calls/{new_id()}/raw-result")
         tool_visible_response = await client.get(f"/api/ansich/tool-calls/{new_id()}/visible-result")
+        compression_response = await client.get(f"/api/ansich/context-compressions/{new_id()}")
+        exposures_response = await client.get(f"/api/ansich/content-blocks/{new_id()}/exposures")
+        snapshot_response = await client.get(f"/api/ansich/context-snapshots/{new_id()}")
 
     assert response.status_code == 403
     assert raw_response.status_code == 403
     assert tool_response.status_code == 403
     assert tool_raw_response.status_code == 403
     assert tool_visible_response.status_code == 403
+    assert compression_response.status_code == 403
+    assert exposures_response.status_code == 403
+    assert snapshot_response.status_code == 403
 
 
 @pytest.mark.anyio

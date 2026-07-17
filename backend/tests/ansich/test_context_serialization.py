@@ -75,6 +75,43 @@ def test_duplicate_message_ids_receive_stable_in_snapshot_occurrence_sequences()
     assert [item.metadata["message_occurrence_seq"] for item in capture.items] == [1, 2]
 
 
+def test_snapshot_uses_structured_injection_markers_instead_of_user_role() -> None:
+    capture = serialize_model_request(
+        system_message=None,
+        messages=[
+            HumanMessage(
+                id="memory-message",
+                content="remembered preference",
+                additional_kwargs={
+                    "ansich_content_kind": "memory",
+                    "ansich_producer_kind": "dynamic_context_memory",
+                },
+            ),
+            HumanMessage(
+                id="skill-message",
+                content="skill instructions",
+                additional_kwargs={
+                    "ansich_content_kind": "skill_instruction",
+                    "ansich_producer_kind": "skill_activation",
+                },
+            ),
+        ],
+        tools=[],
+        response_format=None,
+        model_settings={},
+        model=None,
+    )
+
+    assert [item.block.kind for item in capture.items] == [
+        "memory",
+        "skill_instruction",
+    ]
+    assert [item.metadata["producer_kind"] for item in capture.items] == [
+        "dynamic_context_memory",
+        "skill_activation",
+    ]
+
+
 def test_snapshot_structurally_excludes_secret_fields_and_redacts_known_values() -> None:
     secret = "request-secret-value"
     capture = serialize_model_request(

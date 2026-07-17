@@ -3,6 +3,7 @@ import binascii
 import json
 import logging
 from datetime import datetime
+from typing import Literal
 
 from ansich.contracts import ControlValue
 from fastapi import APIRouter, HTTPException, Query, Request, Response
@@ -259,6 +260,32 @@ async def get_step_context(step_id: str, request: Request) -> dict:
     return {"context": context.model_dump(mode="json"), "projection_status": _projection_status(service)}
 
 
+@router.get("/context-snapshots/{snapshot_id}")
+async def get_context_snapshot(snapshot_id: str, request: Request) -> dict:
+    await require_admin_user(request, detail=_ADMIN_REQUIRED)
+    service = _service_or_503(request)
+    _ensure_queryable(service)
+    try:
+        context = await service.get_context_snapshot(snapshot_id)
+    except Exception as exc:
+        raise HTTPException(
+            status_code=503,
+            detail={
+                "message": "Ansich ContextSnapshot query failed",
+                "projection_status": _projection_status(service),
+            },
+        ) from exc
+    if context is None:
+        raise HTTPException(
+            status_code=404,
+            detail="Ansich ContextSnapshot not found",
+        )
+    return {
+        "context": context.model_dump(mode="json"),
+        "projection_status": _projection_status(service),
+    }
+
+
 async def _tool_call_or_404(service, tool_call_id: str):
     try:
         tool_call = await service.get_tool_call(tool_call_id)
@@ -390,6 +417,98 @@ async def get_content_block_payload(block_id: str, request: Request, response: R
     )
     response.headers["Cache-Control"] = "no-store"
     return {"payload": payload.model_dump(mode="json")}
+
+
+@router.get("/content-blocks/{block_id}/lineage")
+async def get_content_block_lineage(
+    block_id: str,
+    request: Request,
+    direction: Literal["backward", "forward"] = Query(default="backward"),
+    depth: int = Query(default=8, ge=0, le=32),
+    nodes: int = Query(default=500, ge=1, le=2_000),
+) -> dict:
+    await require_admin_user(request, detail=_ADMIN_REQUIRED)
+    service = _service_or_503(request)
+    _ensure_queryable(service)
+    try:
+        lineage = await service.get_content_lineage(
+            block_id,
+            direction=direction,
+            max_depth=depth,
+            max_nodes=nodes,
+        )
+    except Exception as exc:
+        raise HTTPException(
+            status_code=503,
+            detail={
+                "message": "Ansich content lineage query failed",
+                "projection_status": _projection_status(service),
+            },
+        ) from exc
+    if lineage is None:
+        raise HTTPException(status_code=404, detail="Ansich ContentBlock not found")
+    return {
+        "lineage": lineage.model_dump(mode="json"),
+        "projection_status": _projection_status(service),
+    }
+
+
+@router.get("/content-blocks/{block_id}/exposures")
+async def get_content_block_exposures(
+    block_id: str,
+    request: Request,
+    depth: int = Query(default=8, ge=0, le=32),
+    nodes: int = Query(default=500, ge=1, le=2_000),
+) -> dict:
+    await require_admin_user(request, detail=_ADMIN_REQUIRED)
+    service = _service_or_503(request)
+    _ensure_queryable(service)
+    try:
+        exposures = await service.get_possible_exposures(
+            block_id,
+            max_depth=depth,
+            max_nodes=nodes,
+        )
+    except Exception as exc:
+        raise HTTPException(
+            status_code=503,
+            detail={
+                "message": "Ansich possible exposure query failed",
+                "projection_status": _projection_status(service),
+            },
+        ) from exc
+    if exposures is None:
+        raise HTTPException(status_code=404, detail="Ansich ContentBlock not found")
+    return {
+        "exposures": exposures.model_dump(mode="json"),
+        "projection_status": _projection_status(service),
+    }
+
+
+@router.get("/context-compressions/{compression_id}")
+async def get_context_compression(compression_id: str, request: Request) -> dict:
+    await require_admin_user(request, detail=_ADMIN_REQUIRED)
+    service = _service_or_503(request)
+    _ensure_queryable(service)
+    try:
+        compression = await service.get_context_compression(compression_id)
+    except Exception as exc:
+        raise HTTPException(
+            status_code=503,
+            detail={
+                "message": "Ansich context compression query failed",
+                "projection_status": _projection_status(service),
+            },
+        ) from exc
+    if compression is None:
+        raise HTTPException(
+            status_code=404,
+            detail="Ansich ContextCompression not found",
+        )
+    return {
+        "compression": compression.model_dump(mode="json"),
+        "projection_status": _projection_status(service),
+    }
 
 
 @router.get("/health")
