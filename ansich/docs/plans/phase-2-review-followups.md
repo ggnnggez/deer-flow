@@ -6,7 +6,7 @@
 
 | 编号 | 摘要 | 状态 | 修复时间 | Commit |
 | ---- | ---- | ---- | -------- | ------ |
-| H1 | Timeline 轮询端点泄漏原始内容体,绕过带日志的 raw 通道 | ⬜ 未修复 | — | — |
+| H1 | Timeline 轮询端点泄漏原始内容体,绕过带日志的 raw 通道 | ✅ 已修复 | 2026-07-17 | `c64d8ea2` |
 | H2 | 上下文快照全量重录,O(N²) 写放大且无 hash 去重 | ⬜ 未修复 | — | — |
 | M1 | 新增 `inline_payload_max_bytes` 未 bump `config_version` | ⬜ 未修复 | — | — |
 | M2 | 模型实例上的 `_ansich_call_class` 元数据无读取方 | ⬜ 未修复 | — | — |
@@ -20,7 +20,7 @@
 
 ## H1. Timeline 轮询端点泄漏原始内容体,绕过带日志的 raw 通道
 
-- 状态:⬜ 未修复。
+- 状态:✅ 已修复(2026-07-17,commit `c64d8ea2`)。按 TDD 修复:timeline DTO 转换剥离 `content.produced` payload 的 `body` 字段,保留 hash/size 清单;新增"timeline 轮询响应不含原始 body"回归测试。raw-payload 端点仍是唯一 body 出口。以下为原始诊断记录。
 - 位置:`backend/app/gateway/routers/ansich.py::get_task_timeline`(原样 `model_dump()` 观测 payload)+ `deerflow/ansich/middleware.py::_record_captured_request`(`content.produced` payload 内联完整 `body`)+ `frontend/.../observation-timeline.tsx`(渲染 `observation.payload`)。
 - 现状:≤`inline_payload_max_bytes` 的原始提示词/工具输出(绝大多数)进入 5 秒轮询响应与 TanStack 缓存,且不触发 raw-payload 端点的访问日志 —— 同时违反 frontend/AGENTS.md("raw body 绝不进轮询响应或 query cache")与 backend/AGENTS.md("raw body 只经 logged 端点")。路由测试未覆盖"timeline 不含 body",因此漏网。
 - 方向:timeline DTO 转换时剥离 `content.produced` payload 的 `body` 字段(保留 hash/size 摘要),或从 timeline 排除该 kind;补"timeline 响应不含原始 body"回归测试。
