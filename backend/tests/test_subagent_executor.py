@@ -19,11 +19,13 @@ import importlib
 import sys
 import threading
 from datetime import datetime
+from importlib.metadata import version as package_version
 from pathlib import Path
 from types import ModuleType, SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import pytest
+from packaging.version import Version
 
 from deerflow.skills.types import Skill
 
@@ -39,6 +41,8 @@ _MOCKED_MODULE_NAMES = [
     "deerflow.models",
     "deerflow.skills.storage",
 ]
+
+_LANGGRAPH_HAS_ROOT_LINEAGE_STREAM_REGRESSION = Version(package_version("langgraph")) >= Version("1.2.6")
 
 
 def _default_app_config():
@@ -77,6 +81,7 @@ def _setup_executor_classes():
         sys.modules[name] = MagicMock()
     storage_module = ModuleType("deerflow.skills.storage")
     storage_module.get_or_new_skill_storage = lambda **kwargs: SimpleNamespace(load_skills=lambda *, enabled_only: [])
+    storage_module.get_or_new_user_skill_storage = lambda user_id, **kwargs: SimpleNamespace(load_skills=lambda *, enabled_only: [])
     sys.modules["deerflow.skills.storage"] = storage_module
 
     # Import real classes inside fixture
@@ -2596,6 +2601,10 @@ class TestSubagentCheckpointLineage:
         assert fake_agent.captured_context["thread_id"] == "parent-thread-1"
 
     @pytest.mark.anyio
+    @pytest.mark.skipif(
+        not _LANGGRAPH_HAS_ROOT_LINEAGE_STREAM_REGRESSION,
+        reason="root-lineage message leak only manifests on LangGraph >=1.2.6",
+    )
     async def test_parent_message_stream_excludes_delegated_graph_messages(
         self,
         classes,
@@ -2603,6 +2612,7 @@ class TestSubagentCheckpointLineage:
     ):
         """Child AI/tool frames stay outside the parent's messages stream."""
         from langchain_core.messages import AIMessage, ToolMessage
+        from langgraph.checkpoint.memory import MemorySaver
         from langgraph.graph import END, START, MessagesState, StateGraph
 
         executor_module = importlib.import_module("deerflow.subagents.executor")
@@ -2679,8 +2689,19 @@ class TestSubagentCheckpointLineage:
         monkeypatch.setattr(executor, "_create_agent", lambda *args, **kwargs: child_graph)
 
         async def delegate(_state):
-            result = executor.execute("run the child graph")
-            assert result.status.value == "completed"
+            task_id = executor.execute_async("run the child graph")
+            try:
+                deadline = asyncio.get_running_loop().time() + 5
+                while True:
+                    result = executor_module.get_background_task_result(task_id)
+                    if result is not None and result.status.is_terminal:
+                        break
+                    if asyncio.get_running_loop().time() >= deadline:
+                        pytest.fail("background subagent did not complete")
+                    await asyncio.sleep(0.001)
+                assert result.status.value == "completed"
+            finally:
+                executor_module.cleanup_background_task(task_id)
             return {
                 "messages": [
                     AIMessage(
@@ -2694,7 +2715,7 @@ class TestSubagentCheckpointLineage:
         parent_builder.add_node("delegate", delegate)
         parent_builder.add_edge(START, "delegate")
         parent_builder.add_edge("delegate", END)
-        parent_graph = parent_builder.compile()
+        parent_graph = parent_builder.compile(checkpointer=MemorySaver())
 
         streamed_messages = [
             message
@@ -3112,3 +3133,121 @@ class TestSubagentGuardrailAttribution:
         from langchain_core.messages import HumanMessage
 
         return ({"messages": [HumanMessage(content=task)]}, [], None)
+
+    @pytest.mark.anyio
+    async def test_aexecute_writes_is_internal_true(
+        self,
+        classes,
+        monkeypatch,
+    ):
+        """is_internal=True must propagate to subagent context."""
+        SubagentExecutor = classes["SubagentExecutor"]
+        SubagentConfig = classes["SubagentConfig"]
+        executor = SubagentExecutor(
+            config=SubagentConfig(
+                name="general-purpose",
+                description="is_internal test",
+                system_prompt="test",
+                max_turns=5,
+                timeout_seconds=30,
+            ),
+            tools=[],
+            thread_id="t1",
+            is_internal=True,
+        )
+        fake_agent = _FakeStreamAgent()
+        monkeypatch.setattr(executor, "_build_initial_state", self._noop_build_initial_state)
+        monkeypatch.setattr(executor, "_create_agent", lambda *a, **kw: fake_agent)
+
+        await executor._aexecute("do something")
+
+        context = fake_agent.captured_context
+        assert context is not None
+        assert context.get("is_internal") is True
+
+    @pytest.mark.anyio
+    async def test_aexecute_writes_is_internal_false(
+        self,
+        classes,
+        monkeypatch,
+    ):
+        """is_internal=False must be written explicitly, not omitted."""
+        SubagentExecutor = classes["SubagentExecutor"]
+        SubagentConfig = classes["SubagentConfig"]
+        executor = SubagentExecutor(
+            config=SubagentConfig(
+                name="general-purpose",
+                description="is_internal false test",
+                system_prompt="test",
+                max_turns=5,
+                timeout_seconds=30,
+            ),
+            tools=[],
+            thread_id="t1",
+            is_internal=False,
+        )
+        fake_agent = _FakeStreamAgent()
+        monkeypatch.setattr(executor, "_build_initial_state", self._noop_build_initial_state)
+        monkeypatch.setattr(executor, "_create_agent", lambda *a, **kw: fake_agent)
+
+        await executor._aexecute("do something")
+
+        context = fake_agent.captured_context
+        assert context is not None
+        assert context.get("is_internal") is False
+
+    @pytest.mark.anyio
+    async def test_aexecute_copies_attributes_on_writeback(
+        self,
+        classes,
+        monkeypatch,
+    ):
+        """authz_attributes must be copied on write-back; mutating context copy
+        doesn't affect executor's internal copy."""
+        SubagentExecutor = classes["SubagentExecutor"]
+        SubagentConfig = classes["SubagentConfig"]
+        source_attributes = {"dept": "eng"}
+        executor = SubagentExecutor(
+            config=SubagentConfig(
+                name="general-purpose",
+                description="attributes copy test",
+                system_prompt="test",
+                max_turns=5,
+                timeout_seconds=30,
+            ),
+            tools=[],
+            thread_id="t1",
+            authz_attributes=source_attributes,
+        )
+        source_attributes["dept"] = "changed-before-run"
+        assert executor.authz_attributes == {"dept": "eng"}
+        fake_agent = _FakeStreamAgent()
+        monkeypatch.setattr(executor, "_build_initial_state", self._noop_build_initial_state)
+        monkeypatch.setattr(executor, "_create_agent", lambda *a, **kw: fake_agent)
+
+        await executor._aexecute("do something")
+
+        context = fake_agent.captured_context
+        assert context is not None
+        assert context.get("authz_attributes") == {"dept": "eng"}
+        # Mutate the context copy
+        context["authz_attributes"]["dept"] = "changed"
+        # Executor's internal copy should be unaffected
+        assert executor.authz_attributes["dept"] == "eng"
+
+    def test_executor_rejects_non_mapping_attributes(self, classes):
+        """Constructor must raise TypeError for non-Mapping authz_attributes."""
+        SubagentExecutor = classes["SubagentExecutor"]
+        SubagentConfig = classes["SubagentConfig"]
+        with pytest.raises(TypeError, match="authz_attributes must be a Mapping"):
+            SubagentExecutor(
+                config=SubagentConfig(
+                    name="general-purpose",
+                    description="test",
+                    system_prompt="test",
+                    max_turns=5,
+                    timeout_seconds=30,
+                ),
+                tools=[],
+                authz_attributes=["not", "a", "mapping"],
+            )

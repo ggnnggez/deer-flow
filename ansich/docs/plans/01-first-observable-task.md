@@ -106,7 +106,7 @@ Collector 内部使用有界 `deque`、`threading.Lock` 和 event-loop `call_soo
 
 ## 6. 第一批物理表
 
-新增下一条 Alembic revision（当前仓库预期为 `0005_ansich_task_core`），模型进入 `deerflow.persistence.models` 的 import 集合，确保空库 `create_all + stamp head` 路径不会跳过 Ansich 表。
+新增下一条 Alembic revision（当前仓库预期为 `0006_ansich_task_core`），模型进入 `deerflow.persistence.models` 的 import 集合，确保空库 `create_all + stamp head` 路径不会跳过 Ansich 表。
 
 本阶段创建：
 

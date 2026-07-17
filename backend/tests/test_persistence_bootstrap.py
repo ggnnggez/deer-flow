@@ -48,7 +48,7 @@ from deerflow.persistence.migrations._helpers import _normalize_default
 asyncio_test = pytest.mark.asyncio
 
 
-HEAD = "0005_ansich_task_core"
+HEAD = "0006_ansich_task_core"
 BASELINE = "0001_baseline"
 
 

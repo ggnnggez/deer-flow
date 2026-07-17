@@ -46,7 +46,7 @@ class RecordingRunManager:
     async def has_later_started_run(self, *_args, **_kwargs) -> bool:
         return False
 
-    async def set_status(self, _run_id, status, *, error=None) -> None:
+    async def set_status(self, _run_id, status, *, error=None, stop_reason=None) -> None:
         self.record.status = status
         self.record.error = error
         self.record.updated_at = datetime.now(UTC).isoformat()
