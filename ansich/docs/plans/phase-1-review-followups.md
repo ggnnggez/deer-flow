@@ -46,7 +46,9 @@
 - 方向:每请求取一次 health 快照复用。可与 F2 或 Phase 11 §9 的 health endpoint 扩展一并处理。
 - 归属:随 F2 或 Phase 11 §9 顺带处理。
 
-## F7. `rebuild_projections` 与后台 projector 并发认领导致重建结果不确定(测试间歇失败)
+## F7. `rebuild_projections` 与后台 projector 并发认领导致重建结果不确定(测试间歇失败)——已修复
+
+> 已按 TDD 修复:重建入口上移到 `AnsichService.rebuild_projections()`,持 `_projection_lock` 后再委托 backend;新增互斥契约测试(可控 fake backend 证明重建窗口内无后台投影),SQL 重建测试改走 service 入口并连跑 12 次稳定。以下为原始诊断记录。
 
 - 位置:`sql.py::rebuild_projections` 与 `AnsichService._projector_loop` 的交互。
 - 现状:`rebuild_projections()` 直接调用 backend 自身的 `project_pending`,绕过 service 的 `_projection_lock`;服务运行中触发重建时,两个认领者并发处理同一批重置的 job(SQLite 上 `FOR UPDATE SKIP LOCKED` 是 no-op)。两者可同时读到同一 current belief 快照并各自通过 `should_select_control_candidate`,后提交者覆盖先提交者——可观测为 `completed` 被 `running` 回写。`tests/ansich/test_sql_task_lifecycle.py::test_projection_tables_can_be_rebuilt_from_durable_observations` 因此以约 30% 概率间歇失败(已在 merge 前的 commit 复现,属 Phase 1 存量问题,非合并引入)。

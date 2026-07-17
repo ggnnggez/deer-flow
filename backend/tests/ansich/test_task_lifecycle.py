@@ -404,6 +404,67 @@ async def test_storage_recovery_persists_observability_degraded_for_known_loss()
     ]
 
 
+class RebuildProbeBackend:
+    """Records whether background projection runs while a rebuild is in flight."""
+
+    def __init__(self) -> None:
+        self.rebuild_started = anyio.Event()
+        self.release_rebuild = anyio.Event()
+        self.in_rebuild = False
+        self.project_pending_during_rebuild = 0
+
+    async def persist_and_project(self, observations: list[ObservationEnvelope]) -> int:
+        return len(observations)
+
+    async def project_pending(self, *, limit: int = 200) -> int:
+        if self.in_rebuild:
+            self.project_pending_during_rebuild += 1
+        return 0
+
+    async def rebuild_projections(self) -> int:
+        self.in_rebuild = True
+        self.rebuild_started.set()
+        await self.release_rebuild.wait()
+        self.in_rebuild = False
+        return 3
+
+    async def get_task(self, task_id: str) -> TaskView | None:
+        return None
+
+    async def get_task_by_source(self, source_kind: str, source_id: str) -> TaskView | None:
+        return None
+
+    async def list_tasks(self, **kwargs) -> list[TaskView]:
+        return []
+
+    async def list_observations(self, task_id: str) -> list[ObservationEnvelope]:
+        return []
+
+
+@pytest.mark.anyio
+async def test_rebuild_is_mutually_exclusive_with_background_projection():
+    backend = RebuildProbeBackend()
+    service = AnsichService(backend, projector_poll_interval_ms=1)
+    await service.start()
+
+    try:
+        async with anyio.create_task_group() as task_group:
+
+            async def run_rebuild() -> None:
+                assert await service.rebuild_projections() == 3
+
+            task_group.start_soon(run_rebuild)
+            await backend.rebuild_started.wait()
+            # Give the 1ms projector poll loop ample opportunity to claim
+            # jobs while the rebuild is deliberately held open.
+            await anyio.sleep(0.05)
+            backend.release_rebuild.set()
+    finally:
+        await service.stop()
+
+    assert backend.project_pending_during_rebuild == 0
+
+
 @pytest.mark.anyio
 async def test_record_is_safe_from_multiple_producer_threads():
     service = AnsichService.in_memory(queue_capacity=64, flush_interval_ms=60_000)

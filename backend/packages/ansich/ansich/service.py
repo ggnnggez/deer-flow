@@ -199,6 +199,18 @@ class AnsichService:
     async def list_observations(self, task_id: str) -> list[ObservationEnvelope]:
         return await self._backend.list_observations(task_id)
 
+    async def rebuild_projections(self) -> int:
+        rebuild = getattr(self._backend, "rebuild_projections", None)
+        if not callable(rebuild):
+            return 0
+        projection_lock = self._projection_lock
+        if projection_lock is None:
+            return int(await rebuild())
+        # The reset-and-replay must never interleave with the background
+        # projector loop claiming the same jobs (SQLite has no SKIP LOCKED).
+        async with projection_lock:
+            return int(await rebuild())
+
     async def stop(self) -> None:
         if not self._running:
             return

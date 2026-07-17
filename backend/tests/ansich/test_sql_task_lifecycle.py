@@ -189,7 +189,9 @@ async def test_projection_tables_can_be_rebuilt_from_durable_observations(tmp_pa
         await service.flush_task(task_id)
         before = await service.get_task(task_id)
 
-        await backend.rebuild_projections()
+        # Rebuild must go through the service so it cannot race the
+        # background projector loop over the same reset jobs (F7).
+        assert await service.rebuild_projections() > 0
 
         after = await service.get_task(task_id)
         observations = await service.list_observations(task_id)
