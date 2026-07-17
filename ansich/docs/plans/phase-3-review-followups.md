@@ -7,7 +7,7 @@
 | 编号 | 摘要 | 状态 | 修复时间 | Commit |
 | ---- | ---- | ---- | -------- | ------ |
 | M1 | `resolve_tool_call` 回退匹配可能把证据错绑到其他 ToolCall | ✅ 已修复 | 2026-07-17 | `8044ecfc` |
-| M2 | transform 分类靠字符串嗅探,与上游中间件措辞硬耦合 | ⬜ 未修复 | — | — |
+| M2 | transform 分类靠字符串嗅探,与上游中间件措辞硬耦合 | ✅ 已修复 | 2026-07-17 | `6c655ddb` |
 | M3 | Collector 队列按条数而非字节 bound,大 artifact 内存上限不受控 | ⬜ 未修复 | — | — |
 | L1 | 观察开销(canonical JSON + sha256 + 锁内 delta)基准缺位 | ⬜ 未修复 | — | — |
 | L2 | 已推送迁移 0007/0009 被原位修改(行为等价,记录留档) | ℹ️ 无需修复 | — | `6177d53d` |
@@ -22,7 +22,7 @@
 
 ## M2. transform 分类靠字符串嗅探,与上游中间件措辞硬耦合
 
-- 状态:⬜ 未修复。
+- 状态:✅ 已修复(2026-07-17,commit `6c655ddb`)。按 TDD 修复:变换中间件在 `additional_kwargs.deerflow_tool_transforms` 上追加声明式条目(budget → `truncated`/`externalized`,sanitizer → `sanitized`;`tool_transform_meta.py` 提供 append/read helper);观察者按"content-hash 相等 → raw 终态 error_normalized → 声明 trail 末项 → 措辞启发式兜底"的优先级分类,payload 新增 `classified_by` 与完整有序 `transforms` trail。四条回归测试覆盖两个中间件的声明、"措辞无关"分类与启发式降级标注。Phase 4 新增 transform 种类时只需在对应变换处 append 声明条目。以下为原始诊断记录。
 - 位置:`backend/packages/harness/deerflow/ansich/tool_middleware.py::_transform_kind`。
 - 现状:`"chars omitted"`→`truncated`、`"full output"+"outputs/"`→`externalized`、`"&lt;"/"&gt;"`→`sanitized`、`"human_input"`→`clarification_card` —— 与 `ToolOutputBudgetMiddleware`/`ToolResultSanitizationMiddleware`/`ClarificationMiddleware` 的输出措辞硬耦合。上游改一个提示词,分类静默退化为 `unknown`;工具输出恰好含这些子串会误分类;`coalesced` 永远不会被产生。`transform_version="1"` 已为演进预留空间。
 - 方向:让实施变换的中间件在 `deerflow_tool_meta`(或专用键)上显式标注 transform 事实,观察者优先读结构化元数据,字符串启发式仅作无元数据时的兜底并在 payload 标注 `classified_by=heuristic`;每种 transform 至少一条"上游措辞变更不破坏分类"的测试。
