@@ -21,6 +21,34 @@ class BlockingBackend(UnavailableBackend):
         return 0
 
 
+class SlowProjectionBackend:
+    """Persists durably but never reports the task's projection as settled."""
+
+    def __init__(self) -> None:
+        self.inner = InMemoryAnsichBackend()
+
+    async def persist_and_project(self, observations: list[ObservationEnvelope]) -> int:
+        return await self.inner.persist_and_project(observations)
+
+    async def project_pending(self, *, limit: int = 200) -> int:
+        return 0
+
+    async def has_pending_for_task(self, task_id: str) -> bool:
+        return True
+
+    async def get_task(self, task_id: str) -> TaskView | None:
+        return await self.inner.get_task(task_id)
+
+    async def get_task_by_source(self, source_kind: str, source_id: str) -> TaskView | None:
+        return await self.inner.get_task_by_source(source_kind, source_id)
+
+    async def list_tasks(self, **kwargs) -> list[TaskView]:
+        return await self.inner.list_tasks(**kwargs)
+
+    async def list_observations(self, task_id: str) -> list[ObservationEnvelope]:
+        return await self.inner.list_observations(task_id)
+
+
 class RecoveringBackend:
     def __init__(self) -> None:
         self.inner = InMemoryAnsichBackend()
@@ -295,6 +323,41 @@ async def test_terminal_flush_timeout_is_fail_open_and_reports_loss():
     assert result.persisted is False
     assert result.reason == "terminal_flush_timeout"
     assert health.status == "degraded"
+
+
+@pytest.mark.anyio
+async def test_projection_settle_timeout_after_successful_persist_is_not_reported_as_loss():
+    backend = SlowProjectionBackend()
+    service = AnsichService(
+        backend,
+        flush_interval_ms=60_000,
+        terminal_flush_timeout_ms=20,
+    )
+    await service.start()
+    task_id = new_id()
+    service.record(
+        ObservationEnvelope.task_lifecycle(
+            kind="task.completed",
+            task_id=task_id,
+            source_kind="deerflow_run",
+            source_id="run-slow-projection",
+            occurred_at=datetime(2026, 7, 17, 17, 30, tzinfo=UTC),
+            source_event_id="run:run-slow-projection:task:terminal:completed",
+        )
+    )
+
+    try:
+        result = await service.flush_task(task_id)
+        health = service.get_health()
+        observations = await service.list_observations(task_id)
+    finally:
+        await service.stop()
+
+    assert result.persisted is True
+    assert result.reason == "projection_settle_timeout"
+    assert [observation.kind for observation in observations] == ["task.completed"]
+    assert health.dropped_count == 0
+    assert health.lost_ranges == ()
 
 
 @pytest.mark.anyio

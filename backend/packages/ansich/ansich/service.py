@@ -148,6 +148,7 @@ class AnsichService:
         if persist_lock is None:
             return FlushResult(persisted=False, processed_count=0, reason="service_not_running")
         selected: list[tuple[int, ObservationEnvelope]] = []
+        persist_result: FlushResult | None = None
         try:
             async with asyncio.timeout(self._terminal_flush_timeout_seconds):
                 async with persist_lock:
@@ -155,9 +156,14 @@ class AnsichService:
                         selected = self._take_task_items(task_id)
                     result = await self._persist_items(selected)
                     if result.persisted:
+                        persist_result = result
                         await self._project_until_task_settled(task_id)
                     return result
         except TimeoutError:
+            if persist_result is not None:
+                # Observations are already durable; only projection settling
+                # timed out, so the read model is lagging — never data loss.
+                return persist_result.model_copy(update={"reason": "projection_settle_timeout"})
             with self._lock:
                 if not selected:
                     selected = self._take_task_items(task_id)

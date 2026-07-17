@@ -16,6 +16,15 @@ _PRODUCER_INSTANCE_ID = str(uuid4())
 _PRODUCER_SEQUENCE = count(1)
 _PRODUCER_SEQUENCE_LOCK = Lock()
 
+#: Every terminal RunStatus must map to a terminal Task control kind; a run
+#: that times out is a failure from the observability perspective.
+_TERMINAL_KIND_BY_STATUS = {
+    "success": "task.completed",
+    "error": "task.failed",
+    "timeout": "task.failed",
+    "interrupted": "task.interrupted",
+}
+
 
 def _next_producer_sequence() -> int:
     with _PRODUCER_SEQUENCE_LOCK:
@@ -48,13 +57,15 @@ class TaskControlProbe:
         self._record("task.started")
 
     async def terminal(self, status: str) -> None:
-        kind = {
-            "success": "task.completed",
-            "error": "task.failed",
-            "interrupted": "task.interrupted",
-        }.get(status)
+        kind = _TERMINAL_KIND_BY_STATUS.get(status)
         if kind is not None:
             self._record(kind)
+        else:
+            logger.warning(
+                "Ansich has no terminal control mapping for run %s status %r; Task control stays non-terminal",
+                self._run_id,
+                status,
+            )
         if self._service is not None:
             try:
                 await self._service.flush_task(self.task_id)
