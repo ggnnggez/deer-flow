@@ -317,3 +317,41 @@ async def test_health_remains_readable_but_task_query_is_503_when_storage_is_una
     assert health.json()["status"] == "failed"
     assert tasks.status_code == 503
     assert tasks.json()["detail"]["projection_status"]["status"] == "failed"
+
+
+@pytest.mark.anyio
+async def test_timeline_polling_response_never_carries_raw_content_bodies():
+    """Raw ContentBlock bodies must only leave through the logged raw-payload endpoint (H1)."""
+    service = AnsichService.in_memory()
+    await service.start()
+    task_id = new_id()
+    service.record(
+        ObservationEnvelope.task_lifecycle(
+            kind="task.created",
+            task_id=task_id,
+            source_kind="deerflow_run",
+            source_id="run-timeline-bodies",
+            occurred_at=datetime.now(UTC),
+            source_event_id="run:run-timeline-bodies:created",
+        )
+    )
+    await service.flush_task(task_id)
+    await _record_observed_call(service, task_id)
+    app = make_authed_test_app(user_factory=admin_user)
+    app.state.ansich_service = service
+    app.include_router(ansich_router.router)
+
+    try:
+        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+            response = await client.get(f"/api/ansich/tasks/{task_id}/timeline")
+    finally:
+        await service.stop()
+
+    assert response.status_code == 200
+    content_items = [item for item in response.json()["items"] if item["kind"] == "content.produced"]
+    assert content_items
+    for item in content_items:
+        assert item["payload"] is not None
+        assert "body" not in item["payload"]
+        assert "content_hash" in item["payload"]
+    assert "inspect me" not in response.text

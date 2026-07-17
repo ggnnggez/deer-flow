@@ -179,10 +179,20 @@ async def get_task_timeline(
         last_seq, last_observation = page[-1]
         next_cursor = _encode_timeline_cursor(last_observation.occurred_at, last_seq)
     return {
-        "items": [{"ingest_seq": ingest_seq, **observation.model_dump(mode="json")} for ingest_seq, observation in page],
+        "items": [_timeline_item(ingest_seq, observation) for ingest_seq, observation in page],
         "next_cursor": next_cursor,
         "projection_status": _projection_status(service),
     }
+
+
+def _timeline_item(ingest_seq: int, observation) -> dict:
+    item = {"ingest_seq": ingest_seq, **observation.model_dump(mode="json")}
+    payload = item.get("payload")
+    # Raw ContentBlock bodies leave only through the logged raw-payload
+    # endpoint; the polling timeline carries inventory metadata only.
+    if observation.kind == "content.produced" and isinstance(payload, dict):
+        item["payload"] = {key: value for key, value in payload.items() if key != "body"}
+    return item
 
 
 @router.get("/tasks/{task_id}/steps")
