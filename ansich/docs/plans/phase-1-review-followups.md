@@ -13,7 +13,7 @@
 | F1 | `flush_task` 超时破坏性丢弃队列观测(设计决策待确认) | ⬜ 未修复 | — | — |
 | F2 | `_lost_ranges` 无上限内存增长 | ⬜ 未修复 | — | — |
 | F3 | 多 Gateway 实例写入竞态产生假丢失 | ⬜ 未修复 | — | — |
-| F4 | projector 执行顺序依赖字母序巧合 | ⬜ 未修复(Phase 2 前置) | — | — |
+| F4 | projector 执行顺序依赖字母序巧合 | ✅ 已修复 | 2026-07-17 | `66b426ed` |
 | F5 | `list_tasks` N+1 查询,前端轮询放大 | ⬜ 未修复 | — | — |
 | F6 | 每请求多次 `get_health()`(次要) | ⬜ 未修复 | — | — |
 | F7 | `rebuild_projections` 与后台 projector 并发认领,重建结果不确定 | ✅ 已修复 | 2026-07-17 | `58b1e92c` |
@@ -46,7 +46,7 @@
 
 ## F4. projector 执行顺序依赖字母序巧合
 
-- 状态:⬜ 未修复;是 Phase 2 的实施前提。
+- 状态:✅ 已修复(2026-07-17,commit `66b426ed`)。按 TDD 修复:`_PROJECTORS` 注册顺序即执行优先级,claim 查询由注册表派生 CASE 优先级表达式(未知名排最后,name 作确定性 tiebreaker),无 schema 变更;回归测试向注册表追加字母序会插队的名字并断言按注册顺序认领。Phase 2 前置已满足。以下为原始诊断记录。
 - 位置:`sql.py::_claim_projection_job` 的 `order_by(ingest_seq, projector_name.desc())`。
 - 现状:`"task-structural" > "task-control"` 的字符串降序恰好使 structural 先于 control 执行;`_project_control` 自带 `_project_structural` 兜底掩盖了脆弱性。新增第三个 projector(Phase 2 的 Step projector 即会触发)时这个隐式排序会悄悄失效。
 - 方向:在 `_PROJECTORS` 注册表和 `ansich_projection_jobs` claim 排序中引入显式优先级(注册顺序或 priority 列),并加一条"新增 projector 不破坏既有顺序"的测试。
