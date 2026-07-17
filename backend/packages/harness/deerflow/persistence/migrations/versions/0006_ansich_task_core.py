@@ -1,7 +1,7 @@
 """Ansich Task observation and control projection core.
 
 Revision ID: 0006_ansich_task_core
-Revises: 0005_run_stop_reason
+Revises: 0005_run_stop_reason, 0005_ansich_task_core
 Create Date: 2026-07-17
 """
 
@@ -13,7 +13,10 @@ import sqlalchemy as sa
 from alembic import op
 
 revision: str = "0006_ansich_task_core"
-down_revision: str | Sequence[str] | None = "0005_run_stop_reason"
+down_revision: str | Sequence[str] | None = (
+    "0005_run_stop_reason",
+    "0005_ansich_task_core",
+)
 branch_labels: str | Sequence[str] | None = None
 depends_on: str | Sequence[str] | None = None
 

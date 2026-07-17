@@ -405,6 +405,33 @@ async def test_versioned_branch_is_noop_at_head(tmp_path: Path) -> None:
         await engine.dispose()
 
 
+@asyncio_test
+async def test_versioned_phase1_ansich_revision_upgrades_to_head(tmp_path: Path) -> None:
+    """A database released with Phase 1's original revision id must start.
+
+    Phase 1 shipped ``0005_ansich_task_core`` before an upstream merge added a
+    different 0005 migration. Renumbering the Ansich file must not orphan
+    databases whose ``alembic_version`` still names the released revision.
+    """
+
+    engine = create_async_engine(_url(tmp_path))
+    try:
+        cfg = _get_alembic_config(engine)
+        await asyncio.to_thread(_upgrade, cfg, "0004_run_ownership")
+        async with engine.begin() as conn:
+            await conn.execute(sa.text("UPDATE alembic_version SET version_num = '0005_ansich_task_core'"))
+
+        await bootstrap_schema(engine, backend="sqlite")
+
+        assert await _alembic_version(engine) == HEAD
+        assert "stop_reason" in await _runs_columns(engine)
+        tables = await _table_names(engine)
+        assert "ansich_tasks" in tables
+        assert "ansich_steps" in tables
+    finally:
+        await engine.dispose()
+
+
 # ---------------------------------------------------------------------------
 # Schema-parity guard: legacy-upgraded DB must end up structurally identical
 # to a fresh DB on the columns the migration touches. This is the property

@@ -684,6 +684,7 @@ This invokes `alembic revision --autogenerate` against the live ORM models. Revi
 - `migrations/_helpers.py` — `safe_add_column` / `safe_drop_column`
 - `migrations/versions/0001_baseline.py` — chain root, matches the schema `create_all` produces from `Base.metadata`
 - `migrations/versions/0002_runs_token_usage.py` — fixes issue #3682
+- `migrations/versions/0005_ansich_task_core.py` — no-op compatibility anchor for databases stamped by the originally released Phase 1 revision; do not remove or rename
 - `migrations/versions/0006_ansich_task_core.py` — Ansich Observation/job zone and rebuildable Phase 1 Task/Scope/Belief projections
 - `migrations/versions/0007_ansich_steps_and_context.py` — Ansich logical Steps, physical LLM attempts, and ordered request-context snapshots
 - `persistence/bootstrap.py` — `bootstrap_schema(engine, backend=...)`, the three-branch decision + locking
