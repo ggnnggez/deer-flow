@@ -282,13 +282,17 @@ class AnsichExecutionContext:
         args_hash: str,
     ) -> ToolCallRegistration | None:
         with self._lock:
-            candidates = [
-                registration
-                for registration in self._tool_calls.values()
-                if not registration.claimed and not registration.terminal_recorded and registration.provider_call_id == provider_call_id and registration.tool_name == tool_name and registration.args_hash == args_hash
-            ]
+            open_calls = [registration for registration in self._tool_calls.values() if not registration.claimed and not registration.terminal_recorded]
+            candidates = [registration for registration in open_calls if registration.provider_call_id == provider_call_id and registration.tool_name == tool_name and registration.args_hash == args_hash]
             if not candidates:
-                candidates = [registration for registration in self._tool_calls.values() if not registration.claimed and not registration.terminal_recorded and registration.provider_call_id == provider_call_id]
+                # Args serialization can drift between issue-time and
+                # execution-time capture, so fall back within the same provider
+                # id AND tool name only. Without a provider id an ambiguous
+                # fallback must refuse to bind: misattributed evidence is worse
+                # than the reconciler's honest unknown_terminal.
+                candidates = [registration for registration in open_calls if registration.provider_call_id == provider_call_id and registration.tool_name == tool_name]
+                if provider_call_id is None and len(candidates) > 1:
+                    return None
             if not candidates:
                 return None
             registration = max(candidates, key=lambda item: (item.step_seq, -item.call_seq))

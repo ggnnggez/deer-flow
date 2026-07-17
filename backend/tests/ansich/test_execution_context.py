@@ -1462,3 +1462,60 @@ def test_enabled_ansich_places_decision_outside_retry_and_attempt_at_adapter_bou
     assert "AnsichAttemptMiddleware" not in disabled_names
     assert "AnsichVisibleToolMiddleware" not in disabled_names
     assert "AnsichRawToolMiddleware" not in disabled_names
+
+
+def test_tool_registry_fallback_never_binds_across_tool_names() -> None:
+    """A drifted args hash may fall back only within the same tool (phase-3 M1)."""
+    context = AnsichExecutionContext(task_id="00000000-0000-4000-8000-000000000001")
+    context.register_tool_call(
+        tool_call_id="00000000-0000-4000-8000-000000000020",
+        step_id="00000000-0000-4000-8000-000000000021",
+        step_seq=1,
+        call_seq=1,
+        provider_call_id=None,
+        tool_name="web_search",
+        args_hash="a" * 64,
+        issued_obs_id="00000000-0000-4000-8000-000000000022",
+    )
+    write_file = context.register_tool_call(
+        tool_call_id="00000000-0000-4000-8000-000000000023",
+        step_id="00000000-0000-4000-8000-000000000021",
+        step_seq=1,
+        call_seq=2,
+        provider_call_id=None,
+        tool_name="write_file",
+        args_hash="b" * 64,
+        issued_obs_id="00000000-0000-4000-8000-000000000024",
+    )
+
+    resolved = context.resolve_tool_call(
+        provider_call_id=None,
+        tool_name="write_file",
+        args_hash="c" * 64,
+    )
+
+    assert resolved is write_file
+
+
+def test_tool_registry_refuses_ambiguous_binding_without_provider_id() -> None:
+    """Two same-name providerless calls with drifted hashes must not guess (phase-3 M1)."""
+    context = AnsichExecutionContext(task_id="00000000-0000-4000-8000-000000000001")
+    for suffix, args_hash in (("30", "a" * 64), ("33", "b" * 64)):
+        context.register_tool_call(
+            tool_call_id=f"00000000-0000-4000-8000-0000000000{suffix}",
+            step_id="00000000-0000-4000-8000-000000000031",
+            step_seq=1,
+            call_seq=int(suffix) - 29,
+            provider_call_id=None,
+            tool_name="bash",
+            args_hash=args_hash,
+            issued_obs_id=f"00000000-0000-4000-8000-0000000000{int(suffix) + 2}",
+        )
+
+    resolved = context.resolve_tool_call(
+        provider_call_id=None,
+        tool_name="bash",
+        args_hash="c" * 64,
+    )
+
+    assert resolved is None
