@@ -6,7 +6,7 @@
 
 | 编号 | 摘要 | 状态 | 修复时间 | Commit |
 | ---- | ---- | ---- | -------- | ------ |
-| M1 | `resolve_tool_call` 回退匹配可能把证据错绑到其他 ToolCall | ⬜ 未修复 | — | — |
+| M1 | `resolve_tool_call` 回退匹配可能把证据错绑到其他 ToolCall | ✅ 已修复 | 2026-07-17 | `8044ecfc` |
 | M2 | transform 分类靠字符串嗅探,与上游中间件措辞硬耦合 | ⬜ 未修复 | — | — |
 | M3 | Collector 队列按条数而非字节 bound,大 artifact 内存上限不受控 | ⬜ 未修复 | — | — |
 | L1 | 观察开销(canonical JSON + sha256 + 锁内 delta)基准缺位 | ⬜ 未修复 | — | — |
@@ -14,7 +14,7 @@
 
 ## M1. `resolve_tool_call` 回退匹配可能把证据错绑到其他 ToolCall
 
-- 状态:⬜ 未修复。
+- 状态:✅ 已修复(2026-07-17,commit `8044ecfc`)。按 TDD 修复:回退匹配同时要求 `tool_name` 相等;`provider_call_id is None` 且同名候选多于一个时拒绝绑定(交给 terminal reconcile 记 `unknown_terminal`);真实 provider id 的重用消歧保留 `(step_seq, -call_seq)` 选择。新增"跨工具名不回退绑定"与"无 id 歧义拒绝绑定"两条回归测试。以下为原始诊断记录。
 - 位置:`backend/packages/harness/deerflow/ansich/execution.py::resolve_tool_call` 的回退分支。
 - 现状:精确 `(provider_call_id, tool_name, args_hash)` 不中时,回退条件只剩 `provider_call_id` 相等。当 provider 不回传 id(`None`)且同一响应有多个未认领调用时,回退集是"所有 provider_id 为 None 的未认领调用",raw/visible 证据可能被挂到**不同工具**或**不同参数**的 ToolCall 上。责任链里错误归属比缺失更有害:缺失会被 terminal reconcile 如实标 `unknown_terminal`,错绑则是无警告的假证据。
 - 方向:回退匹配至少同时要求 `tool_name` 相等;`provider_call_id is None` 且候选仍多于一个时放弃绑定(返回 None,由 reconcile 收尾)。附"不同名不回退绑定"与"无 id 歧义时拒绝绑定"两条回归测试。
