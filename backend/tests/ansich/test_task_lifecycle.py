@@ -217,6 +217,40 @@ async def test_full_queue_is_fail_open_and_visible_as_a_known_lost_range():
 
 
 @pytest.mark.anyio
+async def test_context_snapshot_batch_is_accepted_or_dropped_atomically():
+    service = AnsichService.in_memory(queue_capacity=2)
+    await service.start()
+    task_id = new_id()
+    observed_at = datetime(2026, 7, 17, 11, 30, tzinfo=UTC)
+    observations = tuple(
+        ObservationEnvelope.task_lifecycle(
+            kind="task.started",
+            task_id=task_id,
+            source_kind="deerflow_run",
+            source_id="run-atomic-snapshot",
+            occurred_at=observed_at,
+            source_event_id=f"run:run-atomic-snapshot:item:{index}",
+            producer_seq=index,
+        )
+        for index in range(1, 4)
+    )
+
+    try:
+        receipts = service.record_batch(observations, batch_kind="context_snapshot")
+        health = service.get_health()
+    finally:
+        await service.stop()
+
+    assert [receipt.accepted for receipt in receipts] == [False, False, False]
+    assert {receipt.reason for receipt in receipts} == {"queue_full"}
+    assert health.queue_depth == 0
+    assert health.snapshot_request_count == 1
+    assert health.snapshot_observations_accepted == 0
+    assert health.snapshot_observations_dropped == 3
+    assert health.queue_high_watermark == 0
+
+
+@pytest.mark.anyio
 async def test_storage_failure_during_flush_is_fail_open_and_marks_task_degraded():
     service = AnsichService(UnavailableBackend())
     await service.start()

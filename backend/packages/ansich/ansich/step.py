@@ -52,13 +52,14 @@ class ContextSnapshotItemView(BaseModel):
     role: Literal["system", "user", "assistant", "tool"] | None
     name: str | None
     block_id: str
-    kind: str
-    content_hash: str
+    kind: str | None
+    content_hash: str | None
     visible_bytes: int
     estimated_tokens: int
     metadata: dict[str, object]
     sensitivity_flags: tuple[str, ...] = ()
     payload_available: bool
+    resolution_status: Literal["available", "missing"] = "available"
     body: None = None
 
 
@@ -85,6 +86,7 @@ class ContextSnapshotView(BaseModel):
     redactions: tuple[dict[str, object], ...]
     warnings: tuple[str, ...]
     items: tuple[ContextSnapshotItemView, ...]
+    status: Literal["complete", "incomplete"] = "complete"
 
 
 class ContentBlockPayloadView(BaseModel):

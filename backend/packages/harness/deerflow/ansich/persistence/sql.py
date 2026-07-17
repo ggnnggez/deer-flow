@@ -3,7 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 from datetime import UTC, datetime, timedelta
-from typing import cast
+from typing import Literal, cast
 from uuid import uuid4
 
 from ansich import (
@@ -27,8 +27,10 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from deerflow.ansich.persistence.models import (
     AnsichBeliefAssertionRow,
     AnsichBeliefEvidenceRow,
+    AnsichContentBlobRow,
     AnsichContentBlockRow,
     AnsichContextSnapshotItemRow,
+    AnsichContextSnapshotMissingItemRow,
     AnsichContextSnapshotRow,
     AnsichContextWindowRow,
     AnsichCurrentBeliefRow,
@@ -55,11 +57,32 @@ _CONTROL_BY_KIND = {
     "task.failed": "failed",
     "task.interrupted": "interrupted",
 }
+_STEP_PROJECTION_KINDS = frozenset(
+    {
+        "step.started",
+        "step.closed",
+        "llm.requested",
+        "llm.responded",
+        "llm.failed",
+        "content.produced",
+        "context.snapshotted",
+    }
+)
 #: Registration order is execution priority for jobs of one observation:
 #: structural projections must land before belief/control projections, and
 #: future projectors (e.g. Phase 2 steps) run after both. Claim ordering
 #: derives from this tuple — never from projector_name collation.
 _PROJECTORS = (("task-structural", "1"), ("task-control", "1"), ("task-step", "1"))
+_PROJECTOR_KINDS = {
+    "task-structural": frozenset(_CONTROL_BY_KIND),
+    "task-control": frozenset(_CONTROL_BY_KIND),
+    "task-step": _STEP_PROJECTION_KINDS,
+}
+_CONTENT_CANONICALIZATION_VERSION = "1"
+
+
+def _projectors_for_kind(kind: str) -> tuple[tuple[str, str], ...]:
+    return tuple(registration for registration in _PROJECTORS if kind in _PROJECTOR_KINDS.get(registration[0], ()))
 
 
 def _projector_priority_expression():
@@ -71,6 +94,22 @@ def _as_utc(value: datetime) -> datetime:
     if value.tzinfo is None:
         return value.replace(tzinfo=UTC)
     return value.astimezone(UTC)
+
+
+def _canonical_content_bytes(body: object) -> tuple[str, bytes]:
+    if isinstance(body, str):
+        return "text/plain; charset=utf-8", body.encode("utf-8")
+    return (
+        "application/json",
+        json.dumps(body, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8"),
+    )
+
+
+def _content_blob_key(content_type: str, body: bytes) -> str:
+    digest = hashlib.sha256()
+    digest.update(f"ansich-content:{_CONTENT_CANONICALIZATION_VERSION}:{content_type}\0".encode())
+    digest.update(body)
+    return digest.hexdigest()
 
 
 class SqlAnsichBackend:
@@ -91,6 +130,16 @@ class SqlAnsichBackend:
         self._failed_jobs = 0
         self._latest_recorded_at: datetime | None = None
         self._latest_projected_at: datetime | None = None
+        self._context_metrics = {
+            "snapshot_count": 0,
+            "snapshot_item_count": 0,
+            "snapshot_visible_bytes": 0,
+            "incomplete_snapshot_count": 0,
+            "missing_content_block_count": 0,
+        }
+
+    async def initialize_metrics(self) -> None:
+        await self._refresh_context_metrics()
 
     async def persist_and_project(self, observations: list[ObservationEnvelope]) -> int:
         processed = 0
@@ -112,6 +161,50 @@ class SqlAnsichBackend:
                     continue
                 payload_json = observation.payload
                 payload_ref_id = observation.payload_ref_id
+                if observation.kind == "content.produced" and payload_json is not None and "body" in payload_json:
+                    body = payload_json["body"]
+                    content_type, content_bytes = _canonical_content_bytes(body)
+                    content_hash = hashlib.sha256(content_bytes).hexdigest()
+                    if payload_json.get("content_hash") != content_hash:
+                        raise ValueError("content.produced hash does not match canonical body")
+                    blob_key = _content_blob_key(content_type, content_bytes)
+                    blob = await session.get(AnsichContentBlobRow, blob_key)
+                    if blob is None:
+                        blob_payload_ref_id = None
+                        inline_body = content_bytes
+                        if len(content_bytes) > self._inline_payload_max_bytes:
+                            blob_payload_ref_id = new_id()
+                            inline_body = None
+                            session.add(
+                                AnsichPayloadRow(
+                                    payload_id=blob_payload_ref_id,
+                                    content_type=content_type,
+                                    encoding="utf-8",
+                                    compression="none",
+                                    byte_size=len(content_bytes),
+                                    sha256=content_hash,
+                                    body=content_bytes,
+                                )
+                            )
+                        blob = AnsichContentBlobRow(
+                            blob_key=blob_key,
+                            content_hash=content_hash,
+                            byte_size=len(content_bytes),
+                            content_type=content_type,
+                            canonicalization_version=_CONTENT_CANONICALIZATION_VERSION,
+                            inline_body=inline_body,
+                            payload_ref_id=blob_payload_ref_id,
+                        )
+                        session.add(blob)
+                    else:
+                        existing_bytes = await self._content_blob_bytes(session, blob)
+                        if existing_bytes != content_bytes:
+                            raise ValueError("Ansich ContentBlob key collision")
+                    payload_json = dict(payload_json)
+                    payload_json.pop("body", None)
+                    payload_json["blob_key"] = blob_key
+                    payload_json["content_type"] = content_type
+                    payload_json["canonicalization_version"] = _CONTENT_CANONICALIZATION_VERSION
                 if payload_json is not None:
                     encoded_payload = json.dumps(
                         payload_json,
@@ -157,7 +250,7 @@ class SqlAnsichBackend:
                     )
                 )
                 await session.flush()
-                for projector_name, projector_version in _PROJECTORS:
+                for projector_name, projector_version in _projectors_for_kind(observation.kind):
                     version = await session.get(AnsichProjectorVersionRow, (projector_name, projector_version))
                     if version is None:
                         session.add(
@@ -189,13 +282,14 @@ class SqlAnsichBackend:
                 break
             job_id, projector_name, observation, ingest_seq, attempt = claim
             try:
+                context_metrics_changed = False
                 async with self._session_factory() as session, session.begin():
                     if projector_name == "task-structural":
                         await self._project_structural(session, observation)
                     elif projector_name == "task-control":
                         await self._project_control(session, observation, ingest_seq=ingest_seq)
                     elif projector_name == "task-step":
-                        await self._project_step(session, observation)
+                        context_metrics_changed = await self._project_step(session, observation)
                     else:
                         raise ValueError(f"unknown Ansich projector: {projector_name}")
                     job = await session.get(AnsichProjectionJobRow, job_id)
@@ -205,6 +299,8 @@ class SqlAnsichBackend:
                     job.lease_owner = None
                     job.lease_expires_at = None
                     job.last_error = None
+                if context_metrics_changed:
+                    await self._refresh_context_metrics()
                 processed += 1
                 self._watermark = ingest_seq if self._watermark is None else max(self._watermark, ingest_seq)
                 if self._latest_projected_at is None or observation.recorded_at > self._latest_projected_at:
@@ -225,6 +321,22 @@ class SqlAnsichBackend:
             "watermark": self._watermark,
             "lag_ms": lag_ms,
             "failed_jobs": self._failed_jobs,
+            **self._context_metrics,
+        }
+
+    async def _refresh_context_metrics(self) -> None:
+        async with self._session_factory() as session:
+            snapshot_count = await session.scalar(select(func.count()).select_from(AnsichContextSnapshotRow))
+            snapshot_visible_bytes = await session.scalar(select(func.coalesce(func.sum(AnsichContextSnapshotRow.visible_bytes), 0)))
+            complete_items = await session.scalar(select(func.count()).select_from(AnsichContextSnapshotItemRow))
+            missing_items = await session.scalar(select(func.count()).select_from(AnsichContextSnapshotMissingItemRow))
+            incomplete_snapshots = await session.scalar(select(func.count()).select_from(AnsichContextSnapshotRow).where(AnsichContextSnapshotRow.status == "incomplete"))
+        self._context_metrics = {
+            "snapshot_count": int(snapshot_count or 0),
+            "snapshot_item_count": int(complete_items or 0) + int(missing_items or 0),
+            "snapshot_visible_bytes": int(snapshot_visible_bytes or 0),
+            "incomplete_snapshot_count": int(incomplete_snapshots or 0),
+            "missing_content_block_count": int(missing_items or 0),
         }
 
     async def has_pending_for_task(self, task_id: str) -> bool:
@@ -249,6 +361,7 @@ class SqlAnsichBackend:
 
         async with self._session_factory() as session, session.begin():
             for model in (
+                AnsichContextSnapshotMissingItemRow,
                 AnsichContextSnapshotItemRow,
                 AnsichContextSnapshotRow,
                 AnsichContextWindowRow,
@@ -286,6 +399,7 @@ class SqlAnsichBackend:
             processed = await self.project_pending(limit=200)
             replayed += processed
             if processed == 0:
+                await self._refresh_context_metrics()
                 return replayed
 
     async def _claim_projection_job(
@@ -542,7 +656,10 @@ class SqlAnsichBackend:
                     )
                 ).all()
             )
-            items = tuple(
+            missing_rows = list(
+                (await session.execute(select(AnsichContextSnapshotMissingItemRow).where(AnsichContextSnapshotMissingItemRow.snapshot_id == snapshot.entity_id).order_by(AnsichContextSnapshotMissingItemRow.ordinal))).scalars()
+            )
+            items = [
                 ContextSnapshotItemView(
                     ordinal=item.ordinal,
                     channel=item.channel,
@@ -558,7 +675,25 @@ class SqlAnsichBackend:
                     payload_available=True,
                 )
                 for item, block in item_rows
+            ]
+            items.extend(
+                ContextSnapshotItemView(
+                    ordinal=item.ordinal,
+                    channel=cast(Literal["message", "tool_schema"], item.channel),
+                    role=cast(Literal["system", "user", "assistant", "tool"] | None, item.role),
+                    name=item.name,
+                    block_id=item.expected_content_block_id,
+                    kind=None,
+                    content_hash=None,
+                    visible_bytes=item.visible_bytes,
+                    estimated_tokens=item.estimated_tokens,
+                    metadata=item.metadata_json,
+                    payload_available=False,
+                    resolution_status="missing",
+                )
+                for item in missing_rows
             )
+            items.sort(key=lambda item: item.ordinal)
             return ContextSnapshotView(
                 snapshot_id=snapshot.entity_id,
                 task_id=snapshot.task_id,
@@ -579,7 +714,8 @@ class SqlAnsichBackend:
                 generation_settings=snapshot.generation_settings_json,
                 redactions=tuple(snapshot.redactions_json),
                 warnings=tuple(snapshot.warnings_json),
-                items=items,
+                items=tuple(items),
+                status=cast(Literal["complete", "incomplete"], snapshot.status),
             )
 
     async def get_content_block_payload(self, block_id: str) -> ContentBlockPayloadView | None:
@@ -587,6 +723,13 @@ class SqlAnsichBackend:
             block = await session.get(AnsichContentBlockRow, block_id)
             if block is None:
                 return None
+            if block.blob_key is not None:
+                blob = await session.get(AnsichContentBlobRow, block.blob_key)
+                if blob is None:
+                    return None
+                body_bytes = await self._content_blob_bytes(session, blob)
+                body = body_bytes.decode("utf-8") if blob.content_type.startswith("text/plain") else json.loads(body_bytes.decode("utf-8"))
+                return ContentBlockPayloadView(block_id=block_id, content_type=blob.content_type, body=body)
             observation = await session.scalar(select(AnsichObservationRow).where(AnsichObservationRow.obs_id == block.payload_obs_id))
             if observation is None or observation.payload_json is None or "body" not in observation.payload_json:
                 if observation is None or observation.payload_ref_id is None:
@@ -599,6 +742,17 @@ class SqlAnsichBackend:
                     return None
                 return ContentBlockPayloadView(block_id=block_id, body=decoded["body"])
             return ContentBlockPayloadView(block_id=block_id, body=observation.payload_json["body"])
+
+    @staticmethod
+    async def _content_blob_bytes(session: AsyncSession, blob: AnsichContentBlobRow) -> bytes:
+        if blob.inline_body is not None:
+            return bytes(blob.inline_body)
+        if blob.payload_ref_id is None:
+            raise ValueError(f"Ansich ContentBlob has no payload: {blob.blob_key}")
+        payload = await session.get(AnsichPayloadRow, blob.payload_ref_id)
+        if payload is None:
+            raise ValueError(f"Ansich ContentBlob payload disappeared: {blob.payload_ref_id}")
+        return bytes(payload.body)
 
     @staticmethod
     async def _step_view(session: AsyncSession, step: AnsichStepRow) -> StepView:
@@ -796,7 +950,7 @@ class SqlAnsichBackend:
             summary.projection_watermark = ingest_seq
             summary.updated_at = observation.recorded_at
 
-    async def _project_step(self, session: AsyncSession, observation: ObservationEnvelope) -> None:
+    async def _project_step(self, session: AsyncSession, observation: ObservationEnvelope) -> bool:
         """Project logical decisions, physical LLM attempts, and request context.
 
         The projector is deliberately event-specific. Task lifecycle events are
@@ -813,7 +967,7 @@ class SqlAnsichBackend:
             "content.produced",
             "context.snapshotted",
         }:
-            return
+            return False
         if observation.payload is None:
             raise ValueError(f"{observation.kind} requires inline projection payload")
         if await session.get(AnsichTaskRow, observation.task_id) is None:
@@ -843,7 +997,7 @@ class SqlAnsichBackend:
                         issued_tools_json=[],
                     )
                 )
-            return
+            return False
 
         if observation.kind == "step.closed":
             if observation.step_id is None:
@@ -868,7 +1022,7 @@ class SqlAnsichBackend:
                 if attempt is not None:
                     step.effective_attempt_no = attempt.attempt_no
                     step.effective_context_snapshot_id = attempt.context_snapshot_id
-            return
+            return False
 
         if observation.kind == "content.produced":
             if await session.get(AnsichEntityRow, observation.subject_id) is None:
@@ -887,16 +1041,45 @@ class SqlAnsichBackend:
                         content_hash=str(payload["content_hash"]),
                         payload_obs_id=observation.obs_id,
                         producer_obs_id=observation.obs_id,
+                        blob_key=payload.get("blob_key") if isinstance(payload.get("blob_key"), str) else None,
                         byte_size=int(payload["visible_bytes"]),
                         token_estimate=int(payload["estimated_tokens"]),
                         sensitivity_flags_json=list(payload.get("sensitivity_flags", [])),
                     )
                 )
-            return
+                await session.flush()
+            missing_items = list((await session.execute(select(AnsichContextSnapshotMissingItemRow).where(AnsichContextSnapshotMissingItemRow.expected_content_block_id == observation.subject_id))).scalars())
+            affected_snapshot_ids: set[str] = set()
+            for missing in missing_items:
+                affected_snapshot_ids.add(missing.snapshot_id)
+                if await session.get(AnsichContextSnapshotItemRow, (missing.snapshot_id, missing.ordinal)) is None:
+                    session.add(
+                        AnsichContextSnapshotItemRow(
+                            snapshot_id=missing.snapshot_id,
+                            ordinal=missing.ordinal,
+                            channel=missing.channel,
+                            role=missing.role,
+                            name=missing.name,
+                            content_block_id=observation.subject_id,
+                            visible_bytes=missing.visible_bytes,
+                            estimated_tokens=missing.estimated_tokens,
+                            metadata_json=missing.metadata_json,
+                        )
+                    )
+                await session.delete(missing)
+            if affected_snapshot_ids:
+                await session.flush()
+                for snapshot_id in affected_snapshot_ids:
+                    remaining = await session.scalar(select(func.count()).select_from(AnsichContextSnapshotMissingItemRow).where(AnsichContextSnapshotMissingItemRow.snapshot_id == snapshot_id))
+                    if not remaining:
+                        repaired_snapshot = await session.get(AnsichContextSnapshotRow, snapshot_id)
+                        if repaired_snapshot is not None:
+                            repaired_snapshot.status = "complete"
+            return bool(affected_snapshot_ids)
 
         if observation.kind == "context.snapshotted":
             await self._project_context_snapshot(session, observation)
-            return
+            return True
 
         attempt = await session.get(AnsichLlmAttemptRow, observation.subject_id)
         if attempt is None:
@@ -940,6 +1123,7 @@ class SqlAnsichBackend:
             attempt.failure_obs_id = observation.obs_id
             attempt.status = "failed"
             attempt.latency_ms = int(payload["latency_ms"])
+        return False
 
     async def _project_context_snapshot(
         self,
@@ -1005,6 +1189,7 @@ class SqlAnsichBackend:
                 generation_settings_json=dict(payload.get("generation_settings", {})),
                 redactions_json=list(payload.get("redactions", [])),
                 warnings_json=list(payload.get("warnings", [])),
+                status="complete",
             )
             session.add(snapshot)
             await session.flush()
@@ -1014,7 +1199,24 @@ class SqlAnsichBackend:
                 continue
             block_id = str(raw_item["block_id"])
             if await session.get(AnsichContentBlockRow, block_id) is None:
-                raise ValueError(f"content.produced has not been projected: {block_id}")
+                ordinal = int(raw_item["ordinal"])
+                if await session.get(AnsichContextSnapshotMissingItemRow, (snapshot.entity_id, ordinal)) is None:
+                    session.add(
+                        AnsichContextSnapshotMissingItemRow(
+                            snapshot_id=snapshot.entity_id,
+                            ordinal=ordinal,
+                            expected_content_block_id=block_id,
+                            channel=str(raw_item["channel"]),
+                            role=raw_item.get("role") if isinstance(raw_item.get("role"), str) else None,
+                            name=raw_item.get("name") if isinstance(raw_item.get("name"), str) else None,
+                            message_id=raw_item.get("message_id") if isinstance(raw_item.get("message_id"), str) else None,
+                            visible_bytes=int(raw_item["visible_bytes"]),
+                            estimated_tokens=int(raw_item["estimated_tokens"]),
+                            metadata_json=dict(raw_item.get("metadata", {})),
+                        )
+                    )
+                snapshot.status = "incomplete"
+                continue
             ordinal = int(raw_item["ordinal"])
             if await session.get(AnsichContextSnapshotItemRow, (snapshot.entity_id, ordinal)) is None:
                 session.add(

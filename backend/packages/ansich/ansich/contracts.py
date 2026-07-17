@@ -212,6 +212,15 @@ class AnsichHealth(BaseModel):
     loss_detected: bool = False
     range_known: bool = True
     storage_available: bool = True
+    queue_high_watermark: int = 0
+    snapshot_request_count: int = 0
+    snapshot_observations_accepted: int = 0
+    snapshot_observations_dropped: int = 0
+    snapshot_count: int = 0
+    snapshot_item_count: int = 0
+    snapshot_visible_bytes: int = 0
+    incomplete_snapshot_count: int = 0
+    missing_content_block_count: int = 0
 
 
 class ControlBelief(BaseModel):

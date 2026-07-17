@@ -72,6 +72,7 @@ def test_direct_final_answer_records_one_step_attempt_and_context_snapshot() -> 
         steps = await service.list_steps(task_id)
         context = await service.get_step_context(steps[0].step_id)
         payload = await service.get_content_block_payload(context.items[0].block_id)
+        health = service.get_health()
         await service.stop()
 
         assert [observation.kind for observation in observations] == [
@@ -90,6 +91,9 @@ def test_direct_final_answer_records_one_step_attempt_and_context_snapshot() -> 
         assert context.items[0].body is None
         assert payload is not None
         assert payload.body == "hello"
+        assert health.snapshot_request_count == 1
+        assert health.snapshot_observations_accepted == 3
+        assert health.snapshot_observations_dropped == 0
 
     asyncio.run(scenario())
 
@@ -178,6 +182,38 @@ def test_tool_decision_is_acting_and_next_decision_closes_with_final_answer() ->
             (2, "closed", "final_answer"),
         ]
         assert steps[0].issued_tools == ({"provider_call_id": "provider-call-1", "name": "_observed_noop"},)
+
+    asyncio.run(scenario())
+
+
+def test_same_message_occurrence_reuses_content_block_across_snapshots() -> None:
+    async def scenario() -> None:
+        service = AnsichService.in_memory()
+        await service.start()
+        task_id = new_id()
+        execution = AnsichExecutionContext(task_id=task_id, service=service)
+        agent = create_agent(
+            model=_ToolThenFinalModel(),
+            tools=[_observed_noop],
+            middleware=[AnsichDecisionMiddleware(), AnsichAttemptMiddleware()],
+        )
+
+        await agent.ainvoke(
+            {"messages": [HumanMessage(id="stable-user-message", content="use a tool")]},
+            context={ANSICH_EXECUTION_CONTEXT_KEY: execution},
+        )
+        await service.flush_task(task_id)
+        observations = await service.list_observations(task_id)
+        await service.stop()
+
+        snapshots = [observation for observation in observations if observation.kind == "context.snapshotted"]
+        user_block_ids = [item["block_id"] for snapshot in snapshots if snapshot.payload is not None for item in snapshot.payload["items"] if item.get("message_id") == "stable-user-message"]
+        user_blocks = [observation for observation in observations if observation.kind == "content.produced" and observation.payload is not None and observation.payload.get("kind") == "user_input"]
+        assert len(snapshots) == 2
+        assert len(user_block_ids) == 2
+        assert len(set(user_block_ids)) == 1
+        assert len(user_blocks) == 1
+        assert user_blocks[0].subject_id == user_block_ids[0]
 
     asyncio.run(scenario())
 

@@ -193,11 +193,45 @@ class AnsichContentBlockRow(Base):
     content_hash: Mapped[str] = mapped_column(String(64), nullable=False)
     payload_obs_id: Mapped[str] = mapped_column(String(36), ForeignKey("ansich_observations.obs_id"), nullable=False)
     producer_obs_id: Mapped[str] = mapped_column(String(36), ForeignKey("ansich_observations.obs_id"), nullable=False, unique=True)
+    blob_key: Mapped[str | None] = mapped_column(
+        String(64),
+        ForeignKey("ansich_content_blobs.blob_key", ondelete="RESTRICT", name="fk_ansich_content_blocks_blob_key"),
+    )
     byte_size: Mapped[int] = mapped_column(BigInteger, nullable=False)
     token_estimate: Mapped[int] = mapped_column(BigInteger, nullable=False)
     sensitivity_flags_json: Mapped[list] = mapped_column(JSON, nullable=False, default=list)
 
-    __table_args__ = (Index("ix_ansich_content_blocks_hash", "content_hash"),)
+    __table_args__ = (
+        Index("ix_ansich_content_blocks_hash", "content_hash"),
+        Index("ix_ansich_content_blocks_blob", "blob_key"),
+    )
+
+
+class AnsichContentBlobRow(Base):
+    __tablename__ = "ansich_content_blobs"
+
+    blob_key: Mapped[str] = mapped_column(String(64), primary_key=True)
+    content_hash: Mapped[str] = mapped_column(String(64), nullable=False)
+    byte_size: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    content_type: Mapped[str] = mapped_column(String(64), nullable=False)
+    canonicalization_version: Mapped[str] = mapped_column(String(16), nullable=False)
+    inline_body: Mapped[bytes | None] = mapped_column(LargeBinary)
+    payload_ref_id: Mapped[str | None] = mapped_column(String(36), ForeignKey("ansich_payloads.payload_id", ondelete="RESTRICT"))
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, default=_utc_now)
+
+    __table_args__ = (
+        CheckConstraint(
+            "(inline_body IS NOT NULL AND payload_ref_id IS NULL) OR (inline_body IS NULL AND payload_ref_id IS NOT NULL)",
+            name="ck_ansich_content_blob_payload_one_of",
+        ),
+        UniqueConstraint(
+            "content_hash",
+            "byte_size",
+            "content_type",
+            "canonicalization_version",
+            name="uq_ansich_content_blob_value",
+        ),
+    )
 
 
 class AnsichContextWindowRow(Base):
@@ -232,6 +266,7 @@ class AnsichContextSnapshotRow(Base):
     generation_settings_json: Mapped[dict] = mapped_column(JSON, nullable=False, default=dict)
     redactions_json: Mapped[list] = mapped_column(JSON, nullable=False, default=list)
     warnings_json: Mapped[list] = mapped_column(JSON, nullable=False, default=list)
+    status: Mapped[str] = mapped_column(String(16), nullable=False, default="complete", server_default="complete")
 
     __table_args__ = (Index("ix_ansich_context_snapshots_task_request", "task_id", "request_obs_id"),)
 
@@ -250,6 +285,23 @@ class AnsichContextSnapshotItemRow(Base):
     metadata_json: Mapped[dict] = mapped_column(JSON, nullable=False, default=dict)
 
     __table_args__ = (Index("ix_ansich_context_snapshot_items_block", "content_block_id"),)
+
+
+class AnsichContextSnapshotMissingItemRow(Base):
+    __tablename__ = "ansich_context_snapshot_missing_items"
+
+    snapshot_id: Mapped[str] = mapped_column(String(36), ForeignKey("ansich_context_snapshots.entity_id", ondelete="CASCADE"), primary_key=True)
+    ordinal: Mapped[int] = mapped_column(Integer, primary_key=True)
+    expected_content_block_id: Mapped[str] = mapped_column(String(36), nullable=False)
+    channel: Mapped[str] = mapped_column(String(32), nullable=False)
+    role: Mapped[str | None] = mapped_column(String(16))
+    name: Mapped[str | None] = mapped_column(String(256))
+    message_id: Mapped[str | None] = mapped_column(String(256))
+    visible_bytes: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    estimated_tokens: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    metadata_json: Mapped[dict] = mapped_column(JSON, nullable=False, default=dict)
+
+    __table_args__ = (Index("ix_ansich_context_snapshot_missing_items_block", "expected_content_block_id"),)
 
 
 class AnsichScopeRow(Base):

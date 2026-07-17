@@ -6,7 +6,7 @@ from datetime import UTC, datetime
 from uuid import uuid4
 
 from ansich import ObservationEnvelope, Producer, new_id
-from ansich.serialization import ContextSnapshotCapture, serialize_model_request
+from ansich.serialization import ContextSnapshotCapture, ContextSnapshotItemCapture, serialize_model_request
 from langchain.agents.middleware import AgentMiddleware
 from langchain.agents.middleware.types import ExtendedModelResponse, ModelCallResult, ModelRequest, ModelResponse
 from langchain_core.messages import AIMessage, HumanMessage
@@ -372,11 +372,25 @@ def _record_captured_request(
             "configured_model": capture.configured_model,
         },
     )
-    _record(execution, request_observation)
+    observations = [request_observation]
+    resolved_items: list[tuple[ContextSnapshotItemCapture, str | None, bool]] = []
     for item in capture.items:
+        source_identity = _content_source_identity(item)
+        is_new_occurrence = True
+        if source_identity is not None:
+            block_id, is_new_occurrence = execution.resolve_content_occurrence(
+                source_identity=source_identity,
+                content_hash=item.block.content_hash,
+                kind=item.block.kind,
+                proposed_block_id=item.block.block_id,
+            )
+            if block_id != item.block.block_id:
+                item = item.model_copy(update={"block": item.block.model_copy(update={"block_id": block_id})})
+        resolved_items.append((item, source_identity, is_new_occurrence))
+        if not is_new_occurrence:
+            continue
         block = item.block
-        _record(
-            execution,
+        observations.append(
             ObservationEnvelope(
                 kind="content.produced",
                 occurred_at=datetime.now(UTC),
@@ -392,12 +406,12 @@ def _record_captured_request(
                 payload={
                     "attempt_id": attempt_id,
                     "occurrence_ordinal": item.ordinal,
+                    "source_identity": source_identity,
                     **block.model_dump(mode="json"),
                 },
-            ),
+            )
         )
-    _record(
-        execution,
+    observations.append(
         ObservationEnvelope(
             kind="context.snapshotted",
             occurred_at=datetime.now(UTC),
@@ -435,16 +449,31 @@ def _record_captured_request(
                         "message_id": item.message_id,
                         "name": item.name,
                         "block_id": item.block.block_id,
+                        "source_identity": source_identity,
                         "visible_bytes": item.block.visible_bytes,
                         "estimated_tokens": item.block.estimated_tokens,
                         "metadata": item.metadata,
                     }
-                    for item in capture.items
+                    for item, source_identity, _ in resolved_items
                 ],
             },
-        ),
+        )
     )
+    _record_batch(execution, observations, batch_kind="context_snapshot")
     return attempt_id, attempt_no, request_observation.obs_id
+
+
+def _content_source_identity(item: ContextSnapshotItemCapture) -> str | None:
+    if item.channel == "message" and item.message_id:
+        part_ordinal = item.metadata.get("part_ordinal")
+        if isinstance(part_ordinal, int):
+            return f"message:{item.message_id}:content:{part_ordinal}"
+        tool_call_ordinal = item.metadata.get("tool_call_ordinal")
+        if isinstance(tool_call_ordinal, int):
+            return f"message:{item.message_id}:tool-call:{tool_call_ordinal}"
+    if item.channel == "tool_schema" and item.name:
+        return f"tool-schema:{item.name}"
+    return None
 
 
 def _record_attempt_response(
@@ -598,5 +627,18 @@ def _record(execution: AnsichExecutionContext, observation: ObservationEnvelope)
     try:
         if execution.service is not None:
             execution.service.record(observation)
+    except Exception:
+        return
+
+
+def _record_batch(
+    execution: AnsichExecutionContext,
+    observations: list[ObservationEnvelope],
+    *,
+    batch_kind: str,
+) -> None:
+    try:
+        if execution.service is not None:
+            execution.service.record_batch(observations, batch_kind=batch_kind)
     except Exception:
         return

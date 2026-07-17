@@ -48,6 +48,10 @@ class AnsichService:
         self._record_sequence = 0
         self._accepted_count = 0
         self._dropped_count = 0
+        self._queue_high_watermark = 0
+        self._snapshot_request_count = 0
+        self._snapshot_observations_accepted = 0
+        self._snapshot_observations_dropped = 0
         self._lost_ranges: list[LostRange] = []
         self._reported_lost_range_count = 0
         self._loop: asyncio.AbstractEventLoop | None = None
@@ -80,6 +84,9 @@ class AnsichService:
     async def start(self) -> None:
         if self._running:
             return
+        initialize_metrics = getattr(self._backend, "initialize_metrics", None)
+        if callable(initialize_metrics):
+            await initialize_metrics()
         self._loop = asyncio.get_running_loop()
         self._wake_event = asyncio.Event()
         self._projector_wake_event = asyncio.Event()
@@ -91,23 +98,50 @@ class AnsichService:
             self._projector_task = asyncio.create_task(self._projector_loop(), name="ansich-projector")
 
     def record(self, observation: ObservationEnvelope) -> RecordReceipt:
+        return self.record_batch((observation,))[0]
+
+    def record_batch(
+        self,
+        observations: tuple[ObservationEnvelope, ...] | list[ObservationEnvelope],
+        *,
+        batch_kind: str | None = None,
+    ) -> tuple[RecordReceipt, ...]:
+        batch = tuple(observations)
+        if not batch:
+            return ()
         with self._lock:
-            self._record_sequence += 1
-            sequence = self._record_sequence
-            if not isinstance(observation, ObservationEnvelope):
-                self._record_loss(sequence, None)
-                return RecordReceipt(obs_id=None, accepted=False, reason="validation_failed")
-            if self._unavailable_reason is not None:
-                self._record_observation_loss(observation)
-                return RecordReceipt(obs_id=observation.obs_id, accepted=False, reason=self._unavailable_reason)
-            if not self._running:
-                self._record_observation_loss(observation)
-                return RecordReceipt(obs_id=observation.obs_id, accepted=False, reason="service_not_running")
-            if len(self._queue) >= self._capacity:
-                self._record_observation_loss(observation)
-                return RecordReceipt(obs_id=observation.obs_id, accepted=False, reason="queue_full")
-            self._queue.append((sequence, observation))
-            self._accepted_count += 1
+            first_sequence = self._record_sequence + 1
+            self._record_sequence += len(batch)
+            sequences = tuple(range(first_sequence, self._record_sequence + 1))
+            if batch_kind == "context_snapshot":
+                self._snapshot_request_count += 1
+            reason = None
+            if any(not isinstance(observation, ObservationEnvelope) for observation in batch):
+                reason = "validation_failed"
+            elif self._unavailable_reason is not None:
+                reason = self._unavailable_reason
+            elif not self._running:
+                reason = "service_not_running"
+            elif len(self._queue) + len(batch) > self._capacity:
+                reason = "queue_full"
+            if reason is not None:
+                self._record_batch_loss(sequences, batch)
+                if batch_kind == "context_snapshot":
+                    self._snapshot_observations_dropped += len(batch)
+                return tuple(
+                    RecordReceipt(
+                        obs_id=observation.obs_id if isinstance(observation, ObservationEnvelope) else None,
+                        accepted=False,
+                        reason=reason,
+                    )
+                    for observation in batch
+                )
+            for sequence, observation in zip(sequences, batch, strict=True):
+                self._queue.append((sequence, observation))
+            self._accepted_count += len(batch)
+            self._queue_high_watermark = max(self._queue_high_watermark, len(self._queue))
+            if batch_kind == "context_snapshot":
+                self._snapshot_observations_accepted += len(batch)
             loop = self._loop
             wake_event = self._wake_event
         if loop is not None and wake_event is not None:
@@ -115,13 +149,18 @@ class AnsichService:
                 loop.call_soon_threadsafe(wake_event.set)
             except RuntimeError:
                 with self._lock:
-                    retained = deque(item for item in self._queue if item[0] != sequence)
-                    if len(retained) != len(self._queue):
+                    sequence_set = set(sequences)
+                    retained = deque(item for item in self._queue if item[0] not in sequence_set)
+                    removed_count = len(self._queue) - len(retained)
+                    if removed_count:
                         self._queue = retained
-                        self._accepted_count -= 1
-                        self._record_observation_loss(observation)
-                return RecordReceipt(obs_id=observation.obs_id, accepted=False, reason="event_loop_closed")
-        return RecordReceipt(obs_id=observation.obs_id, accepted=True)
+                        self._accepted_count -= removed_count
+                        self._record_batch_loss(sequences, batch)
+                        if batch_kind == "context_snapshot":
+                            self._snapshot_observations_accepted -= removed_count
+                            self._snapshot_observations_dropped += removed_count
+                return tuple(RecordReceipt(obs_id=observation.obs_id, accepted=False, reason="event_loop_closed") for observation in batch)
+        return tuple(RecordReceipt(obs_id=observation.obs_id, accepted=True) for observation in batch)
 
     def get_health(self) -> AnsichHealth:
         with self._lock:
@@ -142,6 +181,15 @@ class AnsichService:
                 loss_detected=self._dropped_count > 0,
                 range_known=True,
                 storage_available=self._unavailable_reason is None,
+                queue_high_watermark=self._queue_high_watermark,
+                snapshot_request_count=self._snapshot_request_count,
+                snapshot_observations_accepted=self._snapshot_observations_accepted,
+                snapshot_observations_dropped=self._snapshot_observations_dropped,
+                snapshot_count=int(metrics.get("snapshot_count", 0)),
+                snapshot_item_count=int(metrics.get("snapshot_item_count", 0)),
+                snapshot_visible_bytes=int(metrics.get("snapshot_visible_bytes", 0)),
+                incomplete_snapshot_count=int(metrics.get("incomplete_snapshot_count", 0)),
+                missing_content_block_count=int(metrics.get("missing_content_block_count", 0)),
             )
 
     async def flush_task(self, task_id: str) -> FlushResult:
@@ -282,6 +330,22 @@ class AnsichService:
                 producer_instance_id=producer_instance_id,
             )
         )
+
+    def _record_batch_loss(
+        self,
+        sequences: tuple[int, ...],
+        observations: tuple[object, ...],
+    ) -> None:
+        for sequence, observation in zip(sequences, observations, strict=True):
+            if isinstance(observation, ObservationEnvelope):
+                self._record_loss(
+                    sequence,
+                    observation.task_id,
+                    producer_name=observation.producer.name,
+                    producer_instance_id=observation.producer.instance_id,
+                )
+            else:
+                self._record_loss(sequence, None)
 
     def _record_observation_loss(self, observation: ObservationEnvelope) -> None:
         self._record_loss(

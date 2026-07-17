@@ -48,6 +48,7 @@ class AnsichExecutionContext:
         self.service = service
         self._next_step_seq = next_step_seq
         self._producer_seq = 0
+        self._content_occurrences: dict[tuple[str, str, str], str] = {}
         self._lock = Lock()
         self._current_call: ContextVar[ExecutionCall | None] = ContextVar(
             f"ansich-execution-call-{task_id}",
@@ -104,3 +105,19 @@ class AnsichExecutionContext:
         with self._lock:
             self._producer_seq += 1
             return self._producer_seq
+
+    def resolve_content_occurrence(
+        self,
+        *,
+        source_identity: str,
+        content_hash: str,
+        kind: str,
+        proposed_block_id: str,
+    ) -> tuple[str, bool]:
+        key = (source_identity, content_hash, kind)
+        with self._lock:
+            existing = self._content_occurrences.get(key)
+            if existing is not None:
+                return existing, False
+            self._content_occurrences[key] = proposed_block_id
+            return proposed_block_id, True
