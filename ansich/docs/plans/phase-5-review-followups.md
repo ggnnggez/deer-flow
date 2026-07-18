@@ -8,14 +8,14 @@
 | ---- | ---- | ---- | -------- | ------ |
 | M1 | `assess_operations` 每秒无过滤扫描全部历史 budget 行,开销随任务总量线性增长 | ⬜ 未修复 | — | — |
 | M2 | heartbeat belief 去重键含每秒变化的 `age_ms`,断言表按 running 任务每秒 +1 行 | ⬜ 未修复 | — | — |
-| M3 | Operations 页面用 active list 替换全部 Task 列表,历史 Task 失去 UI 入口 | ✅ 已修复 | 2026-07-18 | 待提交 |
+| M3 | Operations 页面用 active list 替换全部 Task 列表,历史 Task 失去 UI 入口 | ✅ 已修复 | 2026-07-18 | `bb9b1126` |
 | L1 | read model 每周期无条件重写 `updated_at`,ETag/304 机制几乎永不命中 | ⬜ 未修复 | — | — |
 | L2 | 两个管理员 GET 在空结果时同步触发全量 assessment(读端点做重写工作) | ⬜ 未修复 | — | — |
 | L3 | token 维度的 `budget.consumed` 未被排除,存在与 `llm.responded` usage 双计的潜在路径 | ⬜ 未修复 | — | — |
 
 ## M1. `assess_operations` 每秒无过滤扫描全部历史 budget 行
 
-- 状态:✅ 已修复(2026-07-18,commit 待提交)。新增 `lifecycle_scope=terminal|active|all`,InMemory/SQLite/PostgreSQL 查询均在 limit/cursor 前应用 scope;Operations 恢复“运行中/历史任务”双视图,历史页不轮询并通过 opaque cursor“加载更多”,terminal 行继续进入原 Task detail。后端 HTTP/SQL、前端 API/polling 与 Playwright 均有回归覆盖。以下保留原始诊断记录。
+- 状态:⬜ 未修复。
 - 位置:`backend/packages/harness/deerflow/ansich/persistence/sql.py::assess_operations` 的 budget 循环(`select(AnsichTaskBudgetRow)` 无任何 task/control 过滤)。
 - 现状:后台 assessor 每 `operations_assessment_interval_ms`(默认 1 秒)运行一次;heartbeat 部分只扫 running 任务,但 budget 部分对**所有历史任务**的每条 budget 行各做一次 usage `session.get` + current belief `session.get` + evidence 查询。terminal 任务的 usage/budget 不再变化,dedup 能避免写入,但查询照做。随历史任务累积(每任务 1–4 条 budget 行),每秒的评估开销线性增长——一万个历史任务约等于每秒数万条 SQL。`GET /operations/active-tasks` 与 `GET /tasks/{id}/budgets` 的懒触发路径(见 L2)同样受累。计划 §5 只要求"terminal 后 absolute breach 仍保留",不要求 terminal 后反复重评。
 - 方向:budget 评估 join `AnsichTaskSummaryRow.control_value == "running"` 过滤;terminal 任务在 terminal 投影时做最后一次 budget 评估并保留 breach 断言,不再进入周期扫描。配"terminal 任务不进入周期评估、breach 断言保留"的回归测试。
@@ -31,7 +31,7 @@
 
 ## M3. Operations 页面替换列表后历史 Task 失去入口
 
-- 状态:⬜ 未修复。
+- 状态:✅ 已修复(2026-07-18,commit `bb9b1126`)。新增 `lifecycle_scope=terminal|active|all`,InMemory/SQLite/PostgreSQL 查询均在 limit/cursor 前应用 scope;Operations 恢复“运行中/历史任务”双视图,历史页不轮询并通过 opaque cursor“加载更多”,terminal 行继续进入原 Task detail。后端 HTTP/SQL、前端 API/polling 与 Playwright 均有回归覆盖。以下保留原始诊断记录。
 - 位置:`frontend/src/app/workspace/ansich/operations/page.tsx` 从 `useAnsichTasks`/`AnsichTaskRow` 改为仅使用 `useAnsichActiveTasks`/`AnsichActiveTaskRow`;`backend/packages/harness/deerflow/ansich/persistence/sql.py::_refresh_active_task_read_model` 只物化 `control_value == "running"` 的 Task。
 - 现状:Phase 5 为了展示 heartbeat、dwell、Usage 和 Budget,把 `/workspace/ansich/operations` 原有的全部 Task 列表直接替换成 `/api/ansich/operations/active-tasks`。Task 进入 completed/failed/interrupted 后会从 active read model 消失,页面没有历史/全部 Task 标签或第二入口。历史数据并未删除:`GET /api/ansich/tasks`、`useAnsichTasks`、Task detail 和持久化投影仍然存在;这是前端信息架构回归,不是采集或 retention 故障。它阻断 dev/op 对已结束运行做事后诊断,与 Ansich 的核心使用场景冲突。
 - 方向:Operations 页面拆成“运行中”和“历史任务”两个明确视图。运行中继续使用 active read model、自适应 5s/10s polling 和 P5 丰富字段;历史任务使用持久化 Task 查询、稳定 cursor、时间范围和 terminal control 过滤,默认不高频轮询。历史过滤必须在 SQL 的 `limit/cursor` 前完成,不能先取一页再由前端排除 running Task,否则会产生短页和错误 next cursor。建议为 `/api/ansich/tasks` 增加 `lifecycle_scope=terminal|active|all`(或等价的多 control 过滤),并在历史行保留现有 Task detail 链接。
