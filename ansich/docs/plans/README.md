@@ -2,7 +2,7 @@
 
 本目录把 [Ansich v0.2 设计](../ansich-design-document.md) 拆成十二个可独立执行、可独立验收的阶段。阶段按顺序交付，每个阶段都必须形成一条可运行的纵向切片，而不是只提交数据表、只提交探针或只提交页面。
 
-## 当前实施状态（2026-07-18）
+## 当前实施状态（2026-07-19）
 
 - Phase 1 已形成可运行纵向切片：嵌入式启动、Run→Task 生命周期、严格 Observation 契约、有界 fail-open Collector、Observation/job 原子写入、独立 leased projector、Task/Scope/Belief 投影、重放、管理员 API，以及 dev/op 工作区列表和详情页均已实现。
 - SQLite、Gateway、Run worker、API、前端类型/lint、前端全量单测，以及管理员列表→Task 详情和 503 的真实浏览器 E2E 已经验证；Phase 1 尚未标记最终完成，因为 PostgreSQL 集成矩阵、关闭 Ansich 的基准对比和生产环境 paper drill 仍待执行。
@@ -16,7 +16,7 @@
 - Phase 3 代码评审的跟进项登记在 [phase-3-review-followups.md](phase-3-review-followups.md)；M2（transform 显式元数据）与 M3（队列字节水位）均已完成，Phase 5 前置项已清；L1 观察开销基准按既定归属留到 Phase 12 验收前，不阻塞 Phase 5。
 - Phase 4 代码评审的跟进项登记在 [phase-4-review-followups.md](phase-4-review-followups.md)；M1/M2/M3、L1/L2 与 L3①/② 均已完成；L3② 的前端压缩列表独立 API 已作为 Phase 6 首批 UI/API 工作落地。
 - Phase 5 代码评审的跟进项登记在 [phase-5-review-followups.md](phase-5-review-followups.md)；M1/M2/M3 与搭车项 L1/L2 均已修复，Phase 6 开工前置项已清；L3（usage 贡献契约收紧）留到 Phase 8 前。
-- Phase 6 代码评审的跟进项登记在 [phase-6-review-followups.md](phase-6-review-followups.md)；L3（wall_time 覆盖语义）已由 `b910ba82` 修复；M1（assessor job 合并）与 L1（对账读放大）仍需在 Phase 7 前完成，L4（未生产的告警类型）需在 Phase 7 前决策归属，L2（孤儿 requested action 回收）留到 Phase 11 前。
+- Phase 6 代码评审的跟进项登记在 [phase-6-review-followups.md](phase-6-review-followups.md)；L3（wall_time 覆盖语义）已由 `b910ba82` 修复，M1（assessor job 合并）与 L1（对账读放大）已由 `4f5ec989` 修复；L4 已由 `0a38a96d` 明确延后到 Phase 11 并隐藏未生产类型。Phase 7 开工前置项已清；L2（孤儿 requested action 回收）仍按原归属留到 Phase 11 前。
 
 ## 固定实现边界
 

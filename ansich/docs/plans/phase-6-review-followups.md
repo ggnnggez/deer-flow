@@ -6,15 +6,15 @@
 
 | 编号 | 摘要 | 状态 | 修复时间 | Commit |
 | ---- | ---- | ---- | -------- | ------ |
-| M1 | assessor job 逐观察入队且每个 job 全量重扫历史,长任务评估成本 O(n²) | ⬜ 未修复 | — | — |
-| L1 | 周期性 heartbeat/dwell 告警对账每秒全量加载该任务全部 episode + evidence | ⬜ 未修复 | — | — |
+| M1 | assessor job 逐观察入队且每个 job 全量重扫历史,长任务评估成本 O(n²) | ✅ 已修复 | 2026-07-19 | `4f5ec989` |
+| L1 | 周期性 heartbeat/dwell 告警对账每秒全量加载该任务全部 episode + evidence | ✅ 已修复 | 2026-07-19 | `4f5ec989` |
 | L2 | operator action 卡在 `requested` 时同 Idempotency-Key 永久 409,无超时回收 | ⬜ 未修复 | — | — |
 | L3 | 绝对预算评估中 heartbeat elapsed 无条件覆盖 wall_time 贡献和,终态边界可能低估 | ✅ 已修复 | 2026-07-19 | `b910ba82` |
-| L4 | `observability_degradation` / `projection_failure` 告警类型已声明但无生产者 | ⬜ 未修复 | — | — |
+| L4 | `observability_degradation` / `projection_failure` 告警类型已声明但无生产者 | ✅ 已决策 | 2026-07-19 | `0a38a96d` |
 
 ## M1. assessor job 逐观察入队且每个 job 全量重扫历史
 
-- 状态:⬜ 未修复。
+- 状态:✅ 已于 2026-07-19 修复(commit `4f5ec989`)。claim 时按 `(subject_id, assessor_name, assessor_version)` 吸收当前可 claim 的较低 watermark job,只在最高 watermark 评估一次；被吸收 job 以 `completed/attempts=0` 收尾,不跨版本也不越过 retry backoff。action-repetition 改为一条带 closed/issued Observation alias 的 Step→Tool batch outer join。SQLite 回归验证多 pending job 只评估一次、最终 runaway/evidence 与完整逐条结果一致、查询数不随 Step 增长；同一查询在 SQLite/PostgreSQL dialect 均编译验证。
 - 位置:`backend/packages/harness/deerflow/ansich/persistence/sql.py::_assessors_after_projection`(每条相关观察各入一个 `(subject, assessor, version, ingest_seq)` job)+ `::_assess_action_repetition_at`(每 job 扫描 watermark 内全部 Step,且**每个 Step 单独发一次 tool 查询**,N+1)+ `::_assess_tool_frequency_at` / `::_assess_absolute_limits_at`(每 job 全量扫描 tool call / contribution 历史)。
 - 现状:每个 `tool.issued` / `step.closed` 都为 action-repetition 和 tool-frequency 各入一个 job,每条 usage/budget/heartbeat 投影为 absolute-limit 入一个 job;每个 job 又从头重扫 ≤ watermark 的全部历史。T 次工具调用、S 个 Step 的任务,action-repetition 的累计代价约 (S+T) 个 job × (1 + S 次查询) —— 随任务活动量平方增长。中间 watermark 的评估结果会立即被更高 watermark 的评估覆盖(其存在价值只是重放确定性),但每个都被完整执行。job 逐条处理(每个独立 claim 事务 + 独立评估事务),在 1 秒 assessor 周期内以 500 个/轮消化,长任务尾部会形成持续积压。
 - 方向:claim 时把同 `(subject_id, assessor_name, assessor_version)` 的更低 watermark pending job 合并/吸收进最高 watermark 的一次评估(评估语义仍严格 ≤ 最高 watermark,重放结果不变;被吸收 job 标 `superseded` 或直接完成);`_assess_action_repetition_at` 的 Step→Tool 查询改为一次 join 批量取回。配"多条 pending job 合并后单次评估、结果与逐条评估等价"与"Step/Tool 查询次数按批量而非按 Step 增长"的回归测试。
@@ -22,7 +22,7 @@
 
 ## L1. 周期性告警对账每秒全量加载 episode + evidence
 
-- 状态:⬜ 未修复。
+- 状态:✅ 已于 2026-07-19 修复(commit `4f5ec989`)。周期 reconcile 通过一条聚合查询只装载未 resolved episode 与每个 `alert_key` 的最大 episode；历史 evidence 不随稳定轮询读取,仅在 existing episode 确实需要 confirm/resolve 比较和写回时按 alert ID 延迟加载。SQLite recurrence 回归构造两个 resolved 历史 episode,验证状态未变时无 evidence 查询；聚合 SQL 同时覆盖 PostgreSQL 编译语义。
 - 位置:`sql.py::assess_operations` 的 heartbeat 分支与 `::_assess_and_reconcile_dwell` —— 每个评估周期(1 秒)对每个 running 任务调用 `_reconcile_alerts_for_assessment` → `_load_alert_episodes`,后者加载该任务**全部** episode(含已 resolved)并逐个查询 evidence 行。
 - 现状:状态未变时对账最终 no-op(`_same_alert_projection` 去重),但读代价照付:episode 数随 recurrence 累积(每个 episode 一次 evidence 查询),长任务多次 fresh↔stale 循环后,每秒的读放大随 episode 总数线性增长。与 P5-M1 修复前的"dedup 省写不省读"是同一模式,只是规模小一档。
 - 方向:reconcile 只需 (a) 未 resolved 的 episode(判断 confirm/resolve)与 (b) 同 alert_key 的最大 episode 号(开新 episode 用)——改为一条聚合查询获取,而不是全量加载所有 episode 及其 evidence;evidence 行仅在实际写入时读取比较。可与 M1 的通道治理一并处理。
@@ -46,7 +46,7 @@
 
 ## L4. 两个已声明的告警类型没有生产者
 
-- 状态:⬜ 未修复。
+- 状态:✅ 已于 2026-07-19 完成归属决策(commit `0a38a96d`),选择方向②。两类信号保留为领域枚举,其 process-wide health/lost-range 事实到 Alert subject 的稳定映射与生产者延后到 Phase 11；Phase 6 Gateway filter、前端公开类型常量和 locale 文案不再暴露它们。后端路由回归固定未生产类型 filter 返回 422,前端单测固定只广告 6 个已有生产者的类型。
 - 位置:`backend/packages/ansich/ansich/alerts/episodes.py::AlertType`(含 `observability_degradation`、`projection_failure`)+ 前端 `types.ts` / i18n 文案。
 - 现状:计划 §5 把这两类列为 Alert 类型,枚举、路由 filter 和前端文案都已就位,但没有任何 assessor 或通道产生它们 —— 投影失败与 observability 降级目前只反映在 `projection_status` / health 摘要里,不进入 Alert episode 流,operator 无法对其 ack/dismiss。属于"计划已声明、实现未闭合"的覆盖缺口,不是回归。
 - 方向:二选一并留档:① 在 assessor 周期把 `health.failed_jobs > 0` / lost-range 事实转化为对应 Alert condition(经同一 episode 状态机去重);② 修订计划,明确这两类告警延后到 Phase 11 的韧性加固,同时从 filter/文案中隐藏未生产的类型,避免 operator 误以为该信号已被覆盖。
@@ -66,7 +66,7 @@
 
 ## 计划测试矩阵缺口(随修复补齐)
 
-- M1:job 合并等价性与查询次数增长率(目前无性能护栏测试)。
+- M1:✅ `4f5ec989` 已补 job 合并等价性、单次最高 watermark 评估与 Step→Tool batch join 查询护栏。
 - L2:begin 后崩溃的孤儿 `requested` 恢复路径。
-- L3:最后一个心跳间隔内的 wall_time breach 在 terminal 后保留。
-- L4:决策后为所选方向补"degradation/projection 告警产生"或"未生产类型不出现在 filter/文案"测试。
+- L3:✅ `b910ba82` 已补最后一个心跳间隔内的 wall_time breach 在 terminal 后保留及双路 evidence 回归。
+- L4:✅ `0a38a96d` 已补“未生产类型不出现在 filter/文案”的后端路由与前端公开常量测试。
