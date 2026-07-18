@@ -530,7 +530,6 @@ export const zhCN: Translations = {
       runaway: "失控行为",
       operational: "运维信号",
       liveness: "存活状态",
-      observability: "观测系统",
     },
     alertTypeLabel: {
       budget_warning: "预算预警",
@@ -539,8 +538,6 @@ export const zhCN: Translations = {
       tool_frequency: "工具调用高频",
       heartbeat_missing: "心跳缺失",
       long_dwell: "停留时间过长",
-      observability_degradation: "观测能力降级",
-      projection_failure: "投影失败",
     },
     alertWorkflow: {
       open: "待处理",

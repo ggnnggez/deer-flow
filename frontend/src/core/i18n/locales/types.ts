@@ -455,7 +455,6 @@ export interface Translations {
       runaway: string;
       operational: string;
       liveness: string;
-      observability: string;
     };
     alertTypeLabel: {
       budget_warning: string;
@@ -464,8 +463,6 @@ export interface Translations {
       tool_frequency: string;
       heartbeat_missing: string;
       long_dwell: string;
-      observability_degradation: string;
-      projection_failure: string;
     };
     alertWorkflow: {
       open: string;

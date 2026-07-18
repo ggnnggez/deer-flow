@@ -362,6 +362,10 @@ async def test_alert_endpoints_list_detail_and_enforce_workflow_version(
                     "task": task_id,
                 },
             )
+            deferred_type_filter = await client.get(
+                "/api/ansich/operations/alerts",
+                params={"type": "projection_failure"},
+            )
             alert_id = listed.json()["items"][0]["alert_id"]
             detail = await client.get(f"/api/ansich/operations/alerts/{alert_id}")
             task_detail = await client.get(f"/api/ansich/tasks/{task_id}")
@@ -389,6 +393,7 @@ async def test_alert_endpoints_list_detail_and_enforce_workflow_version(
 
     assert listed.status_code == 200
     assert listed.json()["next_cursor"] is None
+    assert deferred_type_filter.status_code == 422
     assert detail.status_code == 200
     assert detail.json()["alert"]["source_belief"]["field_name"] == ("tool_frequency:web_search")
     assert task_detail.status_code == 200

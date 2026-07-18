@@ -231,8 +231,6 @@ async def list_alerts(
         "tool_frequency",
         "heartbeat_missing",
         "long_dwell",
-        "observability_degradation",
-        "projection_failure",
     ]
     | None = Query(default=None, alias="type"),
     workflow_state: Literal[

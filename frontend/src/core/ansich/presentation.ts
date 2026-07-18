@@ -3,8 +3,7 @@ import type { AnsichAlertType, AnsichLostRange } from "./types";
 export type AnsichAlertPresentationCategory =
   | "runaway"
   | "operational"
-  | "liveness"
-  | "observability";
+  | "liveness";
 
 export function getAlertPresentationCategory(
   alertType: AnsichAlertType,
@@ -19,9 +18,6 @@ export function getAlertPresentationCategory(
       return "operational";
     case "heartbeat_missing":
       return "liveness";
-    case "observability_degradation":
-    case "projection_failure":
-      return "observability";
   }
 }
 

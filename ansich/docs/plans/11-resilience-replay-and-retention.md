@@ -33,7 +33,7 @@ PostgreSQL claim transaction：
 
 SQLite 遵守现有单 Gateway worker 约束，只运行一个 projector loop，不模拟 `SKIP LOCKED`。lease 过期 job 可由新 worker 领取；projector 幂等保证旧 worker 晚提交不会双写。更新 job 完成状态时带 lease owner/version compare，stale worker 不能覆盖新 lease 结果。
 
-poison job 写 `ansich_projection_errors`，产生 observability degradation Alert 并把 affected Task read model 标 failed；不阻塞其他 Task 或后续 ingest sequence。
+poison job 写 `ansich_projection_errors`，产生 `projection_failure` Alert 并把 affected Task read model 标 failed；Collector/lost-range 事实产生 `observability_degradation` Alert。两类生产者必须先定义 process-wide/unknown scope 到 Alert subject 的稳定映射，再复用 Phase 6 episode 状态机去重与恢复；不阻塞其他 Task 或后续 ingest sequence。
 
 ## 4. Watermark、lag 与 lost range
 

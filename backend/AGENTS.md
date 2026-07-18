@@ -487,6 +487,12 @@ is not loaded during unchanged heartbeat/dwell scans; an existing episode's
 ordered evidence is fetched only when a confirm/resolve candidate must be
 compared and persisted. This keeps recurrence numbering exact without making
 the one-second operations loop scale with all historical episodes.
+Phase 6's public Alert filter exposes only types with producers: budget
+warning/exceeded, exact repetition, Tool frequency, heartbeat missing, and long
+dwell. The domain values `observability_degradation` and `projection_failure`
+remain reserved for Phase 11, where process-wide health/lost-range facts first
+receive an explicit Alert-subject mapping; until then projection health is the
+only operator surface for those failures.
 
 Alert list/detail and acknowledge/dismiss routes are admin-only;
 acknowledge/dismiss require the current `workflow_version`. Task interrupt and

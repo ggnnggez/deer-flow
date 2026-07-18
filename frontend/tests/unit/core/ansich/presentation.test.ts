@@ -7,6 +7,7 @@ import {
   getBudgetPresentation,
   formatAnsichTimestamp,
 } from "@/core/ansich/presentation";
+import { ANSICH_PRODUCED_ALERT_TYPES } from "@/core/ansich/types";
 
 describe("Ansich presentation", () => {
   it("counts every observation represented by inclusive lost ranges", () => {
@@ -81,14 +82,19 @@ describe("Ansich presentation", () => {
     ).toEqual({ status: "exceeded", percent: 107, overshoot: 7 });
   });
 
-  it("keeps runaway, operational, liveness, and observability alerts distinct", () => {
+  it("advertises only alert types with Phase 6 producers", () => {
+    expect(ANSICH_PRODUCED_ALERT_TYPES).toEqual([
+      "budget_warning",
+      "budget_exceeded",
+      "exact_repetition",
+      "tool_frequency",
+      "heartbeat_missing",
+      "long_dwell",
+    ]);
     expect(getAlertPresentationCategory("exact_repetition")).toBe("runaway");
     expect(getAlertPresentationCategory("budget_exceeded")).toBe("runaway");
     expect(getAlertPresentationCategory("tool_frequency")).toBe("operational");
     expect(getAlertPresentationCategory("long_dwell")).toBe("operational");
     expect(getAlertPresentationCategory("heartbeat_missing")).toBe("liveness");
-    expect(getAlertPresentationCategory("projection_failure")).toBe(
-      "observability",
-    );
   });
 });

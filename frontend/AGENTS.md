@@ -118,6 +118,11 @@ duplicates; 409/failure paths refetch and preserve the evidence dialog, never
 show optimistic success. Interrupt copy says that execution stops while the
 current checkpoint is retained and must not call it pause; rollback copy names
 the pre-run checkpoint restore.
+The Phase 6 UI advertises only Alert types with live producers: budget
+warning/exceeded, exact repetition, Tool frequency, heartbeat missing, and long
+dwell. `observability_degradation` and `projection_failure` remain Phase 11
+domain reservations and must not appear in frontend filter constants or locale
+copy before their producer and subject-mapping contracts exist.
 Phase 4 keeps lineage lazy as well: each ContentBlock row loads its local
 backward provenance, forward descendants, or possible exposures only after the
 admin selects that action. The graph view must retain depth, transform labels,

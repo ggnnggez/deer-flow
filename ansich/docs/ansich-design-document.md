@@ -498,6 +498,13 @@ V1 Alert types include budget warning/exceeded, Tool repetition/frequency,
 heartbeat missing, long dwell, attempted/realized Scope violation, unverified
 effect, observability degradation, and projection failure.
 
+Delivery is phased: Phase 6 exposes only the types with implemented Task-level
+producers (budget warning/exceeded, exact repetition, Tool frequency, heartbeat
+missing, and long dwell). `observability_degradation` and
+`projection_failure` remain reserved domain values until Phase 11 defines how
+process-wide health/lost-range facts map to an Alert subject; they must not be
+advertised as Operations filters before that producer path exists.
+
 Acknowledge or dismiss changes Alert lifecycle, not the underlying Task Belief.
 A human dismissal may separately create a higher-priority human semantic
 assertion.

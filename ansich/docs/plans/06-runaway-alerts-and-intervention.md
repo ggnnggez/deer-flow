@@ -79,7 +79,7 @@ Transitions 只用于具有生命周期的状态；`Task.behavior` 的 assertion
 
 `alert_key = sha256(alert_type + subject_id + rule_name + stable_condition_key)`；同一条件未 resolved 时重复确认更新 evidence/as_of，不创建新 Alert。条件恢复后 resolved；后来再次发生，`episode + 1` 创建新实体。`acknowledged`/`dismissed` 是 workflow observation，不删除 underlying assertion。
 
-Alert 类型：budget warning/exceeded、exact repetition、tool frequency、heartbeat missing、long dwell、observability degradation、projection failure。Tool frequency assessor只开 `tool_frequency` Alert，绝不写 behavior=runaway。
+Phase 6 实际生产并公开的 Alert 类型：budget warning/exceeded、exact repetition、tool frequency、heartbeat missing、long dwell。Tool frequency assessor只开 `tool_frequency` Alert，绝不写 behavior=runaway。`observability_degradation` / `projection_failure` 保留为领域枚举，但其 process-wide health/lost-range 事实到 Alert subject 的映射与生产者延后到 Phase 11；在生产者落地前不进入 Gateway filter 或前端文案。
 
 Dismiss 写 `operator.alert_dismissed`，可附结构化 reason；若用户明确标注误报，可另写 human semantic assertion，但该行为必须是显式字段，不能把所有 dismiss 都当作 Task on_track。
 

@@ -264,15 +264,16 @@ export interface AnsichActiveTaskListResponse {
   updated_at: string | null;
 }
 
-export type AnsichAlertType =
-  | "budget_warning"
-  | "budget_exceeded"
-  | "exact_repetition"
-  | "tool_frequency"
-  | "heartbeat_missing"
-  | "long_dwell"
-  | "observability_degradation"
-  | "projection_failure";
+export const ANSICH_PRODUCED_ALERT_TYPES = [
+  "budget_warning",
+  "budget_exceeded",
+  "exact_repetition",
+  "tool_frequency",
+  "heartbeat_missing",
+  "long_dwell",
+] as const;
+
+export type AnsichAlertType = (typeof ANSICH_PRODUCED_ALERT_TYPES)[number];
 
 export type AnsichAlertWorkflowState =
   | "open"

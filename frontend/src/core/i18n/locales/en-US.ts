@@ -547,7 +547,6 @@ export const enUS: Translations = {
       runaway: "Runaway behavior",
       operational: "Operational signal",
       liveness: "Liveness",
-      observability: "Observability",
     },
     alertTypeLabel: {
       budget_warning: "Budget warning",
@@ -556,8 +555,6 @@ export const enUS: Translations = {
       tool_frequency: "High tool frequency",
       heartbeat_missing: "Heartbeat missing",
       long_dwell: "Long dwell",
-      observability_degradation: "Observability degraded",
-      projection_failure: "Projection failure",
     },
     alertWorkflow: {
       open: "Open",
