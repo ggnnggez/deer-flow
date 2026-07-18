@@ -13,6 +13,7 @@ from ansich import (
     ContentOccurrenceView,
     ContentProducerView,
     ContextCompressionItemView,
+    ContextCompressionSummaryView,
     ContextCompressionView,
     ContextSnapshotItemView,
     ContextSnapshotView,
@@ -309,6 +310,40 @@ def _list_task_views_statement(
             AnsichBeliefEvidenceRow.obs_id,
         )
     )
+
+
+def _list_context_compression_summaries_statement(
+    *,
+    task_id: str,
+    limit: int,
+    cursor: tuple[datetime, str] | None = None,
+):
+    statement = (
+        select(
+            AnsichContextCompressionRow,
+            AnsichObservationRow.occurred_at,
+        )
+        .join(
+            AnsichObservationRow,
+            AnsichObservationRow.obs_id == AnsichContextCompressionRow.source_obs_id,
+        )
+        .where(AnsichContextCompressionRow.task_id == task_id)
+    )
+    if cursor is not None:
+        cursor_time, cursor_obs_id = cursor
+        statement = statement.where(
+            or_(
+                AnsichObservationRow.occurred_at < cursor_time,
+                and_(
+                    AnsichObservationRow.occurred_at == cursor_time,
+                    AnsichContextCompressionRow.source_obs_id > cursor_obs_id,
+                ),
+            )
+        )
+    return statement.order_by(
+        AnsichObservationRow.occurred_at.desc(),
+        AnsichContextCompressionRow.source_obs_id,
+    ).limit(limit)
 
 
 def _canonical_content_bytes(body: object) -> tuple[str, bytes]:
@@ -2041,6 +2076,42 @@ class SqlAnsichBackend:
             status=cast(Literal["complete", "incomplete"], status),
             items=items,
         )
+
+    async def list_context_compressions(
+        self,
+        task_id: str,
+        *,
+        limit: int = 100,
+        cursor: tuple[datetime, str] | None = None,
+    ) -> list[ContextCompressionSummaryView]:
+        statement = _list_context_compression_summaries_statement(
+            task_id=task_id,
+            limit=limit,
+            cursor=cursor,
+        )
+        async with self._session_factory() as session:
+            rows = list((await session.execute(statement)).all())
+        return [
+            ContextCompressionSummaryView(
+                compression_id=compression.entity_id,
+                task_id=compression.task_id,
+                summary_operation_id=compression.operation_id,
+                summary_block_id=compression.summary_block_id,
+                before_tokens=compression.before_tokens,
+                after_tokens=compression.after_tokens,
+                before_visible_bytes=compression.before_visible_bytes,
+                after_visible_bytes=compression.after_visible_bytes,
+                algorithm=compression.algorithm,
+                algorithm_version=compression.algorithm_version,
+                source_obs_id=compression.source_obs_id,
+                occurred_at=_as_utc(occurred_at),
+                status=cast(
+                    Literal["complete", "incomplete"],
+                    compression.status,
+                ),
+            )
+            for compression, occurred_at in rows
+        ]
 
     async def get_content_blocks(
         self,

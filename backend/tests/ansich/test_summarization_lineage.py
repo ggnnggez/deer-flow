@@ -16,6 +16,9 @@ from deerflow.ansich import create_sql_ansich_service
 from deerflow.ansich.compression import freeze_context_compression, record_context_compression
 from deerflow.ansich.execution import ANSICH_EXECUTION_CONTEXT_KEY, AnsichExecutionContext
 from deerflow.ansich.persistence.models import AnsichContextCompressionRow
+from deerflow.ansich.persistence.sql import (
+    _list_context_compression_summaries_statement,
+)
 from deerflow.persistence.base import Base
 
 
@@ -137,8 +140,10 @@ async def test_partial_list_content_trim_records_an_incomplete_compression_inven
     )
     await service.flush_task(task_id)
     compression = await service.get_context_compression(frozen.compression_id)
+    compression_list = await service.list_context_compressions(task_id)
     replayed = await service.rebuild_projections()
     rebuilt_compression = await service.get_context_compression(frozen.compression_id)
+    rebuilt_compression_list = await service.list_context_compressions(task_id)
     observations = await service.list_observations(task_id)
     await service.stop()
     await engine.dispose()
@@ -148,6 +153,8 @@ async def test_partial_list_content_trim_records_an_incomplete_compression_inven
     assert replayed > 0
     assert rebuilt_compression is not None
     assert rebuilt_compression.status == "incomplete"
+    assert [item.compression_id for item in compression_list] == [frozen.compression_id]
+    assert rebuilt_compression_list == compression_list
     source_items = [item for item in compression.items if item.disposition == "source"]
     assert len(source_items) == 1
     source_observation = next(observation for observation in observations if observation.subject_id == source_items[0].block.block_id)
@@ -175,6 +182,21 @@ def test_incomplete_compression_status_insert_compiles_for_sqlite_and_postgres()
         compiled = statement.compile(dialect=dialect)
         assert compiled.params["status"] == "incomplete"
         assert "status" in str(compiled).lower()
+
+
+def test_compression_list_cursor_compiles_for_sqlite_and_postgres() -> None:
+    statement = _list_context_compression_summaries_statement(
+        task_id=new_id(),
+        limit=101,
+        cursor=(datetime(2026, 7, 18, 15, 0, tzinfo=UTC), new_id()),
+    )
+
+    for dialect in (sqlite.dialect(), postgresql.dialect()):
+        compiled = " ".join(str(statement.compile(dialect=dialect)).upper().split())
+        assert "JOIN ANSICH_OBSERVATIONS" in compiled
+        assert "ANSICH_CONTEXT_COMPRESSIONS.TASK_ID =" in compiled
+        assert "ANSICH_OBSERVATIONS.OCCURRED_AT <" in compiled
+        assert "ORDER BY ANSICH_OBSERVATIONS.OCCURRED_AT DESC" in compiled
 
 
 @pytest.mark.anyio

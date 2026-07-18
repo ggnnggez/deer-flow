@@ -228,8 +228,16 @@ function LineageNode({ node }: { node: AnsichLineageNode }) {
 
 export function AnsichCompressionExplorer({
   compressionIds,
+  error: listError = null,
+  hasNextPage = false,
+  loadingMore = false,
+  onLoadMore,
 }: {
   compressionIds: string[];
+  error?: string | null;
+  hasNextPage?: boolean;
+  loadingMore?: boolean;
+  onLoadMore?: () => void;
 }) {
   const { t } = useI18n();
   const [compression, setCompression] =
@@ -281,6 +289,19 @@ export function AnsichCompressionExplorer({
               </Button>
             ))}
           </div>
+        )}
+        {listError && (
+          <div className="text-destructive text-xs">{listError}</div>
+        )}
+        {hasNextPage && onLoadMore && (
+          <Button
+            size="sm"
+            variant="outline"
+            disabled={loadingMore}
+            onClick={onLoadMore}
+          >
+            {loadingMore ? t.ansich.loading : t.common.loadMore}
+          </Button>
         )}
         {error && <div className="text-destructive text-xs">{error}</div>}
         {compression && <CompressionDetail compression={compression} />}

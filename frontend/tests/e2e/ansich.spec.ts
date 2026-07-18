@@ -10,6 +10,7 @@ const TOOL_CALL_ID = "3d4a8ed4-3996-41cb-9181-558ca744867b";
 const TOOL_RAW_BLOCK_ID = "967ddaf9-057c-4b8c-88f7-a59476eb50d5";
 const TOOL_VISIBLE_BLOCK_ID = "bb695124-12f7-48fd-bc4e-54058924d85a";
 const COMPRESSION_ID = "ac695124-12f7-48fd-bc4e-54058924d85a";
+const OLDER_COMPRESSION_ID = "9c695124-12f7-48fd-bc4e-54058924d85a";
 const SUMMARY_BLOCK_ID = "cc695124-12f7-48fd-bc4e-54058924d85a";
 const HEALTH = {
   status: "healthy",
@@ -159,30 +160,6 @@ test("admin navigates from Ansich operations to evidence-backed Task detail", as
               source_kind: "deerflow_run",
               source_id: "run-e2e",
             },
-            payload_ref_id: null,
-          },
-          {
-            ingest_seq: 4,
-            obs_id: "23bd27c7-51b1-4164-9380-b98c40c2bfe0",
-            schema_version: 1,
-            kind: "context.compressed",
-            occurred_at: "2026-07-17T12:00:04Z",
-            recorded_at: "2026-07-17T12:00:04Z",
-            task_id: TASK_ID,
-            step_id: null,
-            subject_type: "context_compression",
-            subject_id: COMPRESSION_ID,
-            fidelity_class: "hard",
-            producer: {
-              name: "deerflow-context-compression-observer",
-              version: "1",
-              instance_id: "e2e",
-            },
-            producer_seq: 4,
-            source_event_id: `context-compression:${COMPRESSION_ID}`,
-            correlation_id: TASK_ID,
-            causation_obs_id: null,
-            payload: { summary_block_id: SUMMARY_BLOCK_ID },
             payload_ref_id: null,
           },
         ],
@@ -450,6 +427,41 @@ test("admin navigates from Ansich operations to evidence-backed Task detail", as
     },
   );
   await page.route(
+    `**/api/ansich/tasks/${TASK_ID}/context-compressions?*`,
+    (route) => {
+      const cursor = new URL(route.request().url()).searchParams.get("cursor");
+      const compressionId = cursor === null ? COMPRESSION_ID : OLDER_COMPRESSION_ID;
+      return route.fulfill({
+        status: 200,
+        contentType: "application/json",
+        body: JSON.stringify({
+          items: [
+            {
+              compression_id: compressionId,
+              task_id: TASK_ID,
+              summary_operation_id: "dc695124-12f7-48fd-bc4e-54058924d85a",
+              summary_block_id: SUMMARY_BLOCK_ID,
+              before_tokens: 120,
+              after_tokens: 30,
+              before_visible_bytes: 480,
+              after_visible_bytes: 120,
+              algorithm: "deerflow_summarization_middleware",
+              algorithm_version: "1",
+              source_obs_id: "23bd27c7-51b1-4164-9380-b98c40c2bfe0",
+              occurred_at:
+                cursor === null
+                  ? "2026-07-17T12:00:04Z"
+                  : "2026-07-17T11:00:04Z",
+              status: "complete",
+            },
+          ],
+          next_cursor: cursor === null ? "older-compressions" : null,
+          projection_status: HEALTH,
+        }),
+      });
+    },
+  );
+  await page.route(
     `**/api/ansich/context-compressions/${COMPRESSION_ID}`,
     (route) =>
       route.fulfill({
@@ -561,6 +573,13 @@ test("admin navigates from Ansich operations to evidence-backed Task detail", as
   await page.getByRole("button", { name: "Trace sources" }).click();
   await expect(page.getByText("provenance", { exact: true })).toBeVisible();
   expect(lineageRequests).toBe(1);
+  await expect(
+    page.getByRole("button", { name: "Load compression #1" }),
+  ).toBeVisible();
+  await page.getByRole("button", { name: "Load more" }).click();
+  await expect(
+    page.getByRole("button", { name: "Load compression #2" }),
+  ).toBeVisible();
   await page.getByRole("button", { name: "Load compression #1" }).click();
   await expect(page.getByText("source", { exact: true })).toBeVisible();
   await page.getByRole("button", { name: "Load raw payload" }).click();

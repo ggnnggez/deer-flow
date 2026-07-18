@@ -15,6 +15,7 @@ import {
   fetchAnsichStep,
   fetchAnsichStepContext,
   fetchAnsichTask,
+  fetchAnsichTaskCompressions,
   fetchAnsichTaskSteps,
   fetchAnsichTaskTimeline,
   fetchAnsichTasks,
@@ -74,6 +75,24 @@ describe("Ansich API", () => {
 
     expect(mockedFetch).toHaveBeenCalledWith(
       expect.stringContaining("&cursor=cursor%2Fwith+spaces"),
+    );
+  });
+
+  it("pages Task compression summaries independently from timeline", async () => {
+    mockedFetch.mockResolvedValue(
+      jsonResponse({ items: [], projection_status: { status: "healthy" } }),
+    );
+
+    await fetchAnsichTaskCompressions(
+      "task/with spaces",
+      25,
+      "cursor/with spaces",
+    );
+
+    expect(mockedFetch).toHaveBeenCalledWith(
+      expect.stringContaining(
+        "/api/ansich/tasks/task%2Fwith%20spaces/context-compressions?limit=25&cursor=cursor%2Fwith+spaces",
+      ),
     );
   });
 

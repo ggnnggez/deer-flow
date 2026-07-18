@@ -5,7 +5,7 @@ from uuid import uuid4
 
 import pytest
 from _router_auth_helpers import make_authed_test_app
-from ansich import AnsichService, ObservationEnvelope, new_id
+from ansich import AnsichService, ObservationEnvelope, Producer, new_id
 from httpx import ASGITransport, AsyncClient
 from langchain.agents import create_agent
 from langchain_core.language_models import BaseChatModel
@@ -556,6 +556,80 @@ async def test_admin_can_lazy_load_typed_context_compression_without_raw_payload
 
 
 @pytest.mark.anyio
+async def test_admin_can_page_all_task_compressions_without_timeline_window() -> None:
+    service = AnsichService.in_memory()
+    await service.start()
+    task_id = new_id()
+    observed_at = datetime(2026, 7, 18, 15, 0, tzinfo=UTC)
+    producer = Producer(
+        name="compression-list-test",
+        version="1",
+        instance_id="test",
+    )
+    compression_ids = (new_id(), new_id())
+    observations = [
+        ObservationEnvelope.task_lifecycle(
+            kind="task.created",
+            task_id=task_id,
+            source_kind="deerflow_run",
+            source_id="run-compression-list",
+            occurred_at=observed_at,
+            source_event_id="run:run-compression-list:task:created",
+        )
+    ]
+    for index, compression_id in enumerate(compression_ids, start=1):
+        observations.append(
+            ObservationEnvelope(
+                kind="context.compressed",
+                occurred_at=observed_at.replace(minute=index),
+                task_id=task_id,
+                subject_type="context_compression",
+                subject_id=compression_id,
+                producer=producer,
+                producer_seq=index,
+                source_event_id=f"context-compression:{compression_id}",
+                correlation_id=task_id,
+                payload={
+                    "summary_operation_id": None,
+                    "summary_block_id": new_id(),
+                    "before_tokens": 100 * index,
+                    "after_tokens": 20 * index,
+                    "before_visible_bytes": 1_000 * index,
+                    "after_visible_bytes": 200 * index,
+                    "algorithm": "deerflow-summary",
+                    "algorithm_version": "1",
+                    "status": "complete",
+                    "items": [],
+                },
+            )
+        )
+    service.record_batch(observations)
+    await service.flush_task(task_id)
+
+    app = make_authed_test_app(user_factory=admin_user)
+    app.state.ansich_service = service
+    app.include_router(ansich_router.router)
+    try:
+        async with AsyncClient(
+            transport=ASGITransport(app=app),
+            base_url="http://test",
+        ) as client:
+            first = await client.get(f"/api/ansich/tasks/{task_id}/context-compressions?limit=1")
+            cursor = first.json()["next_cursor"]
+            second = await client.get(f"/api/ansich/tasks/{task_id}/context-compressions?limit=1&cursor={cursor}")
+    finally:
+        await service.stop()
+
+    assert first.status_code == 200
+    assert [item["compression_id"] for item in first.json()["items"]] == [compression_ids[1]]
+    assert cursor
+    assert [item["compression_id"] for item in second.json()["items"]] == [compression_ids[0]]
+    assert second.json()["next_cursor"] is None
+    assert "body" not in first.text
+    assert "body" not in second.text
+
+
+@pytest.mark.anyio
 async def test_task_list_filters_control_and_returns_an_opaque_cursor():
     service = AnsichService.in_memory()
     await service.start()
@@ -605,6 +679,7 @@ async def test_regular_user_is_forbidden_from_ansich_operations():
         tool_raw_response = await client.get(f"/api/ansich/tool-calls/{new_id()}/raw-result")
         tool_visible_response = await client.get(f"/api/ansich/tool-calls/{new_id()}/visible-result")
         compression_response = await client.get(f"/api/ansich/context-compressions/{new_id()}")
+        compression_list_response = await client.get(f"/api/ansich/tasks/{new_id()}/context-compressions")
         exposures_response = await client.get(f"/api/ansich/content-blocks/{new_id()}/exposures")
         snapshot_response = await client.get(f"/api/ansich/context-snapshots/{new_id()}")
         active_response = await client.get("/api/ansich/operations/active-tasks")
@@ -617,6 +692,7 @@ async def test_regular_user_is_forbidden_from_ansich_operations():
     assert tool_raw_response.status_code == 403
     assert tool_visible_response.status_code == 403
     assert compression_response.status_code == 403
+    assert compression_list_response.status_code == 403
     assert exposures_response.status_code == 403
     assert snapshot_response.status_code == 403
     assert active_response.status_code == 403

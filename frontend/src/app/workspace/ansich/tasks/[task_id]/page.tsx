@@ -29,7 +29,11 @@ import {
   WorkspaceContainer,
   WorkspaceHeader,
 } from "@/components/workspace/workspace-container";
-import { useAnsichTask, useAnsichTaskTimeline } from "@/core/ansich/hooks";
+import {
+  useAnsichTask,
+  useAnsichTaskCompressions,
+  useAnsichTaskTimeline,
+} from "@/core/ansich/hooks";
 import { formatAnsichTimestamp } from "@/core/ansich/presentation";
 import { useAuth } from "@/core/auth/AuthProvider";
 import { useI18n } from "@/core/i18n/hooks";
@@ -44,14 +48,24 @@ export default function AnsichTaskDetailPage() {
   const task = taskQuery.data?.task;
   const taskIsRunning = task?.control.value === "running";
   const timelineQuery = useAnsichTaskTimeline(taskId, isAdmin, taskIsRunning);
+  const compressionsQuery = useAnsichTaskCompressions(
+    taskId,
+    100,
+    isAdmin,
+    taskIsRunning,
+  );
   const health =
     timelineQuery.data?.projection_status ??
     taskQuery.data?.projection_status ??
     null;
   const queryError = taskQuery.error ?? timelineQuery.error;
-  const compressionIds = (timelineQuery.data?.items ?? [])
-    .filter((observation) => observation.kind === "context.compressed")
-    .map((observation) => observation.subject_id);
+  const compressionIds = Array.from(
+    new Set(
+      (compressionsQuery.data?.pages ?? []).flatMap((page) =>
+        page.items.map((compression) => compression.compression_id),
+      ),
+    ),
+  );
 
   useEffect(() => {
     document.title = `${t.ansich.task} ${taskId} - ${t.pages.appName}`;
@@ -186,6 +200,12 @@ export default function AnsichTaskDetailPage() {
                   <AnsichContextPanel
                     taskId={taskId}
                     compressionIds={compressionIds}
+                    compressionError={compressionsQuery.error?.message ?? null}
+                    compressionHasNextPage={compressionsQuery.hasNextPage}
+                    compressionLoadingMore={compressionsQuery.isFetchingNextPage}
+                    onLoadMoreCompressions={() =>
+                      void compressionsQuery.fetchNextPage()
+                    }
                     polling={taskIsRunning}
                   />
                 </TabsContent>

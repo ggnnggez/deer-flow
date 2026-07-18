@@ -6,6 +6,7 @@ import type {
   AnsichActiveTaskListResponse,
   AnsichContentLineageResponse,
   AnsichContextCompressionResponse,
+  AnsichContextCompressionListResponse,
   AnsichContextResponse,
   AnsichPossibleExposuresResponse,
   AnsichStepResponse,
@@ -284,6 +285,29 @@ export async function fetchAnsichContextCompression(
     await throwAnsichApiError(
       response,
       `Failed to load Ansich ContextCompression: ${response.statusText}`,
+    );
+  }
+  return response.json();
+}
+
+export async function fetchAnsichTaskCompressions(
+  taskId: string,
+  limit = 100,
+  cursor?: string,
+): Promise<AnsichContextCompressionListResponse> {
+  const query = new URLSearchParams({ limit: String(limit) });
+  if (cursor) {
+    query.set("cursor", cursor);
+  }
+  const response = await fetch(
+    ansichUrl(
+      `/tasks/${encodeURIComponent(taskId)}/context-compressions?${query.toString()}`,
+    ),
+  );
+  if (!response.ok) {
+    await throwAnsichApiError(
+      response,
+      `Failed to load Ansich ContextCompressions: ${response.statusText}`,
     );
   }
   return response.json();

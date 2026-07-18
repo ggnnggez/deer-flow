@@ -1,10 +1,15 @@
 from __future__ import annotations
 
 from datetime import UTC, datetime
-from typing import cast
+from typing import Literal, cast
 
 from ansich.budget import BudgetSourceKind, TaskBudgetsView, TaskBudgetView
-from ansich.compression import CompressionDisposition, ContextCompressionItemView, ContextCompressionView
+from ansich.compression import (
+    CompressionDisposition,
+    ContextCompressionItemView,
+    ContextCompressionSummaryView,
+    ContextCompressionView,
+)
 from ansich.context_state import ContextStateDelta, ContextStateItem, ContextStateView, materialize_context_state
 from ansich.contracts import ControlBelief, ControlValue, NamedVersion, ObservationEnvelope, TaskLifecycleScope, TaskView, control_values_for_lifecycle_scope
 from ansich.control import should_select_control_candidate
@@ -560,6 +565,48 @@ class InMemoryAnsichBackend:
             status=("complete" if payload.get("status", "complete") == "complete" and len(items) == len(raw_items) else "incomplete"),
             items=items,
         )
+
+    async def list_context_compressions(
+        self,
+        task_id: str,
+        *,
+        limit: int = 100,
+        cursor: tuple[datetime, str] | None = None,
+    ) -> list[ContextCompressionSummaryView]:
+        observations = [observation for observation in self._observations if observation.task_id == task_id and observation.kind == "context.compressed" and observation.payload is not None]
+        observations.sort(key=lambda observation: observation.obs_id)
+        observations.sort(
+            key=lambda observation: observation.occurred_at,
+            reverse=True,
+        )
+        if cursor is not None:
+            cursor_time, cursor_obs_id = cursor
+            observations = [observation for observation in observations if observation.occurred_at < cursor_time or (observation.occurred_at == cursor_time and observation.obs_id > cursor_obs_id)]
+        summaries: list[ContextCompressionSummaryView] = []
+        for observation in observations[:limit]:
+            payload = observation.payload
+            assert payload is not None
+            summaries.append(
+                ContextCompressionSummaryView(
+                    compression_id=observation.subject_id,
+                    task_id=task_id,
+                    summary_operation_id=(payload.get("summary_operation_id") if isinstance(payload.get("summary_operation_id"), str) else None),
+                    summary_block_id=str(payload["summary_block_id"]),
+                    before_tokens=int(payload["before_tokens"]),
+                    after_tokens=int(payload["after_tokens"]),
+                    before_visible_bytes=int(payload.get("before_visible_bytes", 0)),
+                    after_visible_bytes=int(payload.get("after_visible_bytes", 0)),
+                    algorithm=str(payload["algorithm"]),
+                    algorithm_version=str(payload["algorithm_version"]),
+                    source_obs_id=observation.obs_id,
+                    occurred_at=observation.occurred_at,
+                    status=cast(
+                        Literal["complete", "incomplete"],
+                        payload.get("status", "complete"),
+                    ),
+                )
+            )
+        return summaries
 
     async def get_content_blocks(
         self,

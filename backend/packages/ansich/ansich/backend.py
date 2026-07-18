@@ -4,7 +4,7 @@ from datetime import datetime
 from typing import Protocol
 
 from ansich.budget import BudgetHealthBelief, TaskBudgetsView
-from ansich.compression import ContextCompressionView
+from ansich.compression import ContextCompressionSummaryView, ContextCompressionView
 from ansich.context_state import ContextStateView
 from ansich.contracts import ControlValue, LostRange, ObservationEnvelope, TaskLifecycleScope, TaskView
 from ansich.heartbeat import TaskHeartbeatView
@@ -110,6 +110,14 @@ class AnsichBackend(Protocol):
         self,
         compression_id: str,
     ) -> ContextCompressionView | None: ...
+
+    async def list_context_compressions(
+        self,
+        task_id: str,
+        *,
+        limit: int = 100,
+        cursor: tuple[datetime, str] | None = None,
+    ) -> list[ContextCompressionSummaryView]: ...
 
     async def get_content_blocks(
         self,

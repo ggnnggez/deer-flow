@@ -60,6 +60,32 @@ def _decode_cursor(value: str | None) -> tuple[datetime, str] | None:
         raise HTTPException(status_code=422, detail="Invalid Ansich task cursor") from exc
 
 
+def _decode_compression_cursor(
+    value: str | None,
+) -> tuple[datetime, str] | None:
+    if value is None:
+        return None
+    try:
+        padded = value + "=" * (-len(value) % 4)
+        decoded = json.loads(base64.urlsafe_b64decode(padded).decode())
+        if not isinstance(decoded, list) or len(decoded) != 2 or not all(isinstance(item, str) for item in decoded):
+            raise ValueError
+        occurred_at = datetime.fromisoformat(decoded[0])
+        if occurred_at.tzinfo is None:
+            raise ValueError
+        return occurred_at, decoded[1]
+    except (
+        binascii.Error,
+        ValueError,
+        UnicodeDecodeError,
+        json.JSONDecodeError,
+    ) as exc:
+        raise HTTPException(
+            status_code=422,
+            detail="Invalid Ansich ContextCompression cursor",
+        ) from exc
+
+
 def _encode_timeline_cursor(occurred_at: datetime, ingest_seq: int) -> str:
     payload = json.dumps([occurred_at.isoformat(), ingest_seq], separators=(",", ":")).encode()
     return base64.urlsafe_b64encode(payload).decode().rstrip("=")
@@ -636,6 +662,50 @@ async def get_context_compression(compression_id: str, request: Request) -> dict
         )
     return {
         "compression": compression.model_dump(mode="json"),
+        "projection_status": _projection_status(service),
+    }
+
+
+@router.get("/tasks/{task_id}/context-compressions")
+async def list_context_compressions(
+    task_id: str,
+    request: Request,
+    limit: int = Query(default=100, ge=1, le=500),
+    cursor: str | None = Query(default=None),
+) -> dict:
+    await require_admin_user(request, detail=_ADMIN_REQUIRED)
+    service = _service_or_503(request)
+    _ensure_queryable(service)
+    decoded_cursor = _decode_compression_cursor(cursor)
+    try:
+        task = await service.get_task(task_id)
+        if task is None:
+            raise HTTPException(status_code=404, detail="Ansich Task not found")
+        compressions = await service.list_context_compressions(
+            task_id,
+            limit=limit + 1,
+            cursor=decoded_cursor,
+        )
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise HTTPException(
+            status_code=503,
+            detail={
+                "message": "Ansich ContextCompression list query failed",
+                "projection_status": _projection_status(service),
+            },
+        ) from exc
+    page = compressions[:limit]
+    next_cursor = None
+    if len(compressions) > limit and page:
+        next_cursor = _encode_cursor(
+            page[-1].occurred_at,
+            page[-1].source_obs_id,
+        )
+    return {
+        "items": [item.model_dump(mode="json") for item in page],
+        "next_cursor": next_cursor,
         "projection_status": _projection_status(service),
     }
 

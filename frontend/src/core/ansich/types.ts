@@ -439,6 +439,22 @@ export interface AnsichContextCompression {
   items: AnsichContextCompressionItem[];
 }
 
+export interface AnsichContextCompressionSummary {
+  compression_id: string;
+  task_id: string;
+  summary_operation_id: string | null;
+  summary_block_id: string;
+  before_tokens: number;
+  after_tokens: number;
+  before_visible_bytes: number;
+  after_visible_bytes: number;
+  algorithm: string;
+  algorithm_version: string;
+  source_obs_id: string;
+  occurred_at: string;
+  status: "complete" | "incomplete";
+}
+
 export interface AnsichToolCall {
   tool_call_id: string;
   task_id: string;
@@ -542,6 +558,12 @@ export interface AnsichPossibleExposuresResponse {
 
 export interface AnsichContextCompressionResponse {
   compression: AnsichContextCompression;
+  projection_status: AnsichHealth;
+}
+
+export interface AnsichContextCompressionListResponse {
+  items: AnsichContextCompressionSummary[];
+  next_cursor: string | null;
   projection_status: AnsichHealth;
 }
 

@@ -9,7 +9,7 @@ from weakref import ReferenceType, WeakMethod, ref
 
 from ansich.backend import AnsichBackend
 from ansich.budget import BudgetHealthBelief, TaskBudgetsView
-from ansich.compression import ContextCompressionView
+from ansich.compression import ContextCompressionSummaryView, ContextCompressionView
 from ansich.context_state import ContextStateView
 from ansich.contracts import AnsichHealth, ControlValue, FlushResult, LostRange, ObservationEnvelope, Producer, RecordReceipt, TaskLifecycleScope, TaskView
 from ansich.heartbeat import TaskHeartbeatView
@@ -463,6 +463,23 @@ class AnsichService:
         compression_id: str,
     ) -> ContextCompressionView | None:
         return await self._backend.get_context_compression(compression_id)
+
+    async def list_context_compressions(
+        self,
+        task_id: str,
+        *,
+        limit: int = 100,
+        cursor: tuple[datetime, str] | None = None,
+    ) -> list[ContextCompressionSummaryView]:
+        if limit < 1:
+            raise ValueError("limit must be positive")
+        return list(
+            await self._backend.list_context_compressions(
+                task_id,
+                limit=limit,
+                cursor=cursor,
+            )
+        )
 
     async def get_content_lineage(
         self,

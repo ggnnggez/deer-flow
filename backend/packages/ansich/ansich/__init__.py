@@ -1,4 +1,8 @@
-from ansich.compression import ContextCompressionItemView, ContextCompressionView
+from ansich.compression import (
+    ContextCompressionItemView,
+    ContextCompressionSummaryView,
+    ContextCompressionView,
+)
 from ansich.context_state import ContextStateDelta, ContextStateItem, ContextStateView
 from ansich.contracts import (
     AnsichHealth,
@@ -31,6 +35,7 @@ __all__ = [
     "AnsichService",
     "ContentBlockPayloadView",
     "ContextCompressionItemView",
+    "ContextCompressionSummaryView",
     "ContextCompressionView",
     "ContentBlockView",
     "ContentLineageView",

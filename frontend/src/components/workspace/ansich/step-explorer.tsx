@@ -93,10 +93,18 @@ export function AnsichStepsPanel({
 export function AnsichContextPanel({
   taskId,
   compressionIds = [],
+  compressionError = null,
+  compressionHasNextPage = false,
+  compressionLoadingMore = false,
+  onLoadMoreCompressions,
   polling = true,
 }: {
   taskId: string;
   compressionIds?: string[];
+  compressionError?: string | null;
+  compressionHasNextPage?: boolean;
+  compressionLoadingMore?: boolean;
+  onLoadMoreCompressions?: () => void;
   polling?: boolean;
 }) {
   const { t } = useI18n();
@@ -116,21 +124,45 @@ export function AnsichContextPanel({
   }, [eligibleSteps, selectedStepId]);
 
   const contextQuery = useAnsichStepContext(selectedStepId, true, polling);
-  if (stepsQuery.isPending) return <Skeleton className="h-48 w-full" />;
-  if (stepsQuery.error)
-    return <InlineError message={stepsQuery.error.message} />;
-  if (
-    eligibleSteps.length === 0 &&
-    (stepsQuery.data?.projection_status.failed_jobs ?? 0) > 0
-  ) {
+  const compressionExplorer = (
+    <AnsichCompressionExplorer
+      compressionIds={compressionIds}
+      error={compressionError}
+      hasNextPage={compressionHasNextPage}
+      loadingMore={compressionLoadingMore}
+      onLoadMore={onLoadMoreCompressions}
+    />
+  );
+
+  if (stepsQuery.isPending)
     return (
-      <ProjectionUnavailableState
-        message={t.ansich.contextProjectionUnavailable}
-      />
+      <div className="space-y-4">
+        <Skeleton className="h-48 w-full" />
+        {compressionExplorer}
+      </div>
     );
-  }
+  if (stepsQuery.error)
+    return (
+      <div className="space-y-4">
+        <InlineError message={stepsQuery.error.message} />
+        {compressionExplorer}
+      </div>
+    );
   if (eligibleSteps.length === 0) {
-    return <EmptyState message={t.ansich.noContext} />;
+    const contextUnavailable =
+      (stepsQuery.data?.projection_status.failed_jobs ?? 0) > 0;
+    return (
+      <div className="space-y-4">
+        {contextUnavailable ? (
+          <ProjectionUnavailableState
+            message={t.ansich.contextProjectionUnavailable}
+          />
+        ) : (
+          <EmptyState message={t.ansich.noContext} />
+        )}
+        {compressionExplorer}
+      </div>
+    );
   }
 
   return (
@@ -154,7 +186,7 @@ export function AnsichContextPanel({
       ) : contextQuery.data ? (
         <div className="space-y-4">
           <ContextSnapshotCard context={contextQuery.data.context} />
-          <AnsichCompressionExplorer compressionIds={compressionIds} />
+          {compressionExplorer}
         </div>
       ) : null}
     </div>

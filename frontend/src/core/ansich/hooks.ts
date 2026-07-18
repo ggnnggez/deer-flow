@@ -3,6 +3,7 @@ import { useInfiniteQuery, useQuery } from "@tanstack/react-query";
 import {
   fetchAnsichStepContext,
   fetchAnsichActiveTasks,
+  fetchAnsichTaskCompressions,
   fetchAnsichTaskSteps,
   fetchAnsichTaskBudgets,
   fetchAnsichTask,
@@ -12,6 +13,7 @@ import {
 } from "./api";
 import type {
   AnsichActiveTaskListResponse,
+  AnsichContextCompressionListResponse,
   AnsichTaskLifecycleScope,
   AnsichTaskListResponse,
   AnsichTaskResponse,
@@ -119,6 +121,47 @@ export function useAnsichTaskTimeline(
   return useQuery({
     queryKey: ["ansich", "tasks", taskId, "timeline"],
     queryFn: () => fetchAnsichTaskTimeline(taskId),
+    enabled: enabled && Boolean(taskId),
+    retry: false,
+    refetchInterval: () =>
+      polling && pageIsVisible() ? REFRESH_INTERVAL_MS : false,
+    refetchIntervalInBackground: false,
+  });
+}
+
+export function useAnsichTaskCompressions(
+  taskId: string,
+  limit = 100,
+  enabled = true,
+  polling = true,
+) {
+  return useInfiniteQuery<
+    AnsichContextCompressionListResponse,
+    Error,
+    {
+      pages: AnsichContextCompressionListResponse[];
+      pageParams: Array<string | undefined>;
+    },
+    readonly [
+      "ansich",
+      "tasks",
+      string,
+      "context-compressions",
+      { limit: number },
+    ],
+    string | undefined
+  >({
+    queryKey: [
+      "ansich",
+      "tasks",
+      taskId,
+      "context-compressions",
+      { limit },
+    ] as const,
+    queryFn: ({ pageParam }) =>
+      fetchAnsichTaskCompressions(taskId, limit, pageParam),
+    initialPageParam: undefined,
+    getNextPageParam: (lastPage) => lastPage.next_cursor ?? undefined,
     enabled: enabled && Boolean(taskId),
     retry: false,
     refetchInterval: () =>
