@@ -5,7 +5,7 @@ import pytest
 from alembic import command as alembic_command
 from alembic.config import Config as AlembicConfig
 from ansich import ObservationEnvelope, Producer, new_id
-from sqlalchemy import create_engine, inspect, text
+from sqlalchemy import create_engine, event, inspect, text
 from sqlalchemy.dialects import postgresql
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 from sqlalchemy.schema import CreateTable
@@ -19,6 +19,78 @@ from deerflow.ansich.persistence.models import (
     AnsichUsageContributionRow,
 )
 from deerflow.persistence.base import Base
+
+
+@pytest.mark.anyio
+async def test_unchanged_active_task_refresh_does_not_write_read_model_row(
+    tmp_path,
+):
+    engine = create_async_engine(f"sqlite+aiosqlite:///{tmp_path / 'ansich-active-task-unchanged.db'}")
+    session_factory = async_sessionmaker(engine, expire_on_commit=False)
+    async with engine.begin() as connection:
+        await connection.run_sync(Base.metadata.create_all)
+    service = create_sql_ansich_service(
+        session_factory,
+        operations_assessment_interval_ms=60_000,
+    )
+    await service.start()
+    task_id = new_id()
+    observed_at = datetime(2026, 7, 18, 9, tzinfo=UTC)
+    assessment_at = observed_at + timedelta(seconds=1)
+    service.record_batch(
+        (
+            ObservationEnvelope.task_lifecycle(
+                kind="task.created",
+                task_id=task_id,
+                source_kind="deerflow_run",
+                source_id="run-active-task-unchanged",
+                occurred_at=observed_at,
+                source_event_id="run:run-active-task-unchanged:task:created",
+            ),
+            ObservationEnvelope.task_lifecycle(
+                kind="task.started",
+                task_id=task_id,
+                source_kind="deerflow_run",
+                source_id="run-active-task-unchanged",
+                occurred_at=observed_at,
+                source_event_id="run:run-active-task-unchanged:task:started",
+            ),
+        )
+    )
+    read_model_updates: list[str] = []
+
+    def capture_read_model_update(
+        _connection,
+        _cursor,
+        statement,
+        _parameters,
+        _context,
+        _executemany,
+    ) -> None:
+        normalized = " ".join(statement.upper().split())
+        if normalized.startswith("UPDATE ANSICH_ACTIVE_TASK_READ_MODEL"):
+            read_model_updates.append(normalized)
+
+    try:
+        await service.flush_task(task_id)
+        await service.assess_operations(now=assessment_at)
+        event.listen(
+            engine.sync_engine,
+            "before_cursor_execute",
+            capture_read_model_update,
+        )
+
+        await service.assess_operations(now=assessment_at)
+    finally:
+        event.remove(
+            engine.sync_engine,
+            "before_cursor_execute",
+            capture_read_model_update,
+        )
+        await service.stop()
+        await engine.dispose()
+
+    assert read_model_updates == []
 
 
 @pytest.mark.anyio

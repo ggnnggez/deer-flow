@@ -141,7 +141,14 @@ async def list_active_tasks(
             default=None,
         ),
     }
-    etag_payload = json.dumps(body, sort_keys=True, default=str).encode()
+    etag_payload = json.dumps(
+        {
+            "items": body["items"],
+            "next_cursor": body["next_cursor"],
+        },
+        sort_keys=True,
+        default=str,
+    ).encode()
     etag = f'"{hashlib.sha256(etag_payload).hexdigest()}"'
     if request.headers.get("if-none-match") == etag:
         return Response(status_code=304, headers={"ETag": etag})

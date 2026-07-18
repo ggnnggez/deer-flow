@@ -3,9 +3,11 @@ from datetime import UTC, datetime, timedelta
 
 import pytest
 from ansich import ObservationEnvelope, new_id
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
 from deerflow.ansich import create_sql_ansich_service
+from deerflow.ansich.persistence.models import AnsichBeliefAssertionRow
 from deerflow.persistence.base import Base
 
 
@@ -84,6 +86,7 @@ async def test_heartbeat_assessor_persists_stale_and_recovery_without_changing_c
     service = create_sql_ansich_service(
         session_factory,
         heartbeat_stale_after_seconds=30,
+        operations_assessment_interval_ms=60_000,
     )
     await service.start()
     task_id = new_id()
@@ -121,10 +124,33 @@ async def test_heartbeat_assessor_persists_stale_and_recovery_without_changing_c
         )
         await service.flush_task(task_id)
 
-        await service.assess_operations(now=started_at + timedelta(seconds=40))
-        fresh = await service.get_task_heartbeat_belief(task_id)
-        await service.assess_operations(now=started_at + timedelta(seconds=41))
+        fresh_changes = await service.assess_operations(now=started_at + timedelta(seconds=39))
+        repeated_fresh_changes = await service.assess_operations(now=started_at + timedelta(seconds=40))
+        active_while_fresh = await service.list_active_tasks()
+        async with session_factory() as session:
+            fresh_assertions = list(
+                (
+                    await session.execute(
+                        select(AnsichBeliefAssertionRow).where(
+                            AnsichBeliefAssertionRow.subject_id == task_id,
+                            AnsichBeliefAssertionRow.field_name == "heartbeat",
+                        )
+                    )
+                ).scalars()
+            )
+        stale_changes = await service.assess_operations(now=started_at + timedelta(seconds=41))
         stale = await service.get_task_heartbeat_belief(task_id)
+        async with session_factory() as session:
+            stale_assertions = list(
+                (
+                    await session.execute(
+                        select(AnsichBeliefAssertionRow).where(
+                            AnsichBeliefAssertionRow.subject_id == task_id,
+                            AnsichBeliefAssertionRow.field_name == "heartbeat",
+                        )
+                    )
+                ).scalars()
+            )
 
         recovery = ObservationEnvelope.task_heartbeat(
             task_id=task_id,
@@ -138,23 +164,32 @@ async def test_heartbeat_assessor_persists_stale_and_recovery_without_changing_c
         )
         service.record(recovery)
         await service.flush_task(task_id)
-        await service.assess_operations(now=started_at + timedelta(seconds=46))
+        recovery_changes = await service.assess_operations(now=started_at + timedelta(seconds=46))
         recovered = await service.get_task_heartbeat_belief(task_id)
         task = await service.get_task(task_id)
     finally:
         await service.stop()
         await engine.dispose()
 
-    assert fresh is not None
-    assert fresh.value == "fresh"
-    assert fresh.age_ms == 30_000
+    assert fresh_changes == 1
+    assert repeated_fresh_changes == 0
+    assert len(fresh_assertions) == 1
+    assert fresh_assertions[0].value_json == {"value": "fresh"}
+    assert active_while_fresh[0].heartbeat.age_ms == 30_000
+    assert stale_changes == 1
+    assert len(stale_assertions) == 2
+    assert [assertion.value_json for assertion in stale_assertions] == [
+        {"value": "fresh"},
+        {"value": "stale"},
+    ]
     assert stale is not None
     assert stale.value == "stale"
     assert stale.age_ms == 31_000
+    assert recovery_changes == 1
     assert recovered is not None
     assert recovered.value == "fresh"
     assert recovered.evidence_obs_ids == (recovery.obs_id,)
-    assert recovered.selected_by.version == fresh.selected_by.version
+    assert recovered.selected_by.version == stale.selected_by.version
     assert task is not None
     assert task.control.value == "running"
 

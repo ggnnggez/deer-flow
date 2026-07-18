@@ -433,7 +433,10 @@ configuration and never mutate DeerFlow Run control state.
 Phase 5 operations projection keeps heartbeat evidence, local Usage
 contributions, TaskBudget admission snapshots, rule Beliefs, and the materialized
 `ansich_active_task_read_model` separate. `GET /operations/active-tasks` is the
-bounded polling read (filters/cursor/ETag); `GET /tasks/{task_id}/usage` returns
+bounded polling read (filters/cursor/ETag); its ETag covers only items plus the
+next cursor, not volatile projection health. Read-model refreshes compare
+normalized content and neither write the row nor bump `updated_at` when it is
+unchanged. `GET /tasks/{task_id}/usage` returns
 local dimensions and explicitly marks inclusive usage unavailable until Phase
 8; `GET /tasks/{task_id}/budgets` returns configured policy plus health Beliefs.
 The general `GET /tasks` read accepts `lifecycle_scope=all|active|terminal` and
@@ -445,6 +448,9 @@ from heartbeat elapsed and terminal wall time from the Task monotonic clock.
 Periodic budget assessment joins Task summaries and scans only running Tasks;
 the terminal control projection performs one final budget assessment so an
 absolute breach remains queryable without rescanning historical Tasks.
+Heartbeat assertions persist only the categorical state; age is calculated for
+the current read-model refresh, so unchanged evidence/state does not append a
+new assertion every assessment tick while Operations still shows current age.
 Unknown heartbeat/dwell/budget values are rule assessments with evidence and
 policy-hash resolver versions; none may overwrite hard control state.
 

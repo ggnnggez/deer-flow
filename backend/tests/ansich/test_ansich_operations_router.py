@@ -23,7 +23,10 @@ def _admin_user() -> User:
 
 
 @pytest.mark.anyio
-async def test_operator_endpoints_return_active_usage_budgets_and_etag(tmp_path):
+async def test_operator_endpoints_return_active_usage_budgets_and_etag(
+    tmp_path,
+    monkeypatch,
+):
     engine = create_async_engine(f"sqlite+aiosqlite:///{tmp_path / 'ansich-operations-router.db'}")
     session_factory = async_sessionmaker(engine, expire_on_commit=False)
     async with engine.begin() as connection:
@@ -109,6 +112,12 @@ async def test_operator_endpoints_return_active_usage_budgets_and_etag(tmp_path)
             active = await client.get("/api/ansich/operations/active-tasks?owner=owner-router")
             usage = await client.get(f"/api/ansich/tasks/{task_id}/usage")
             budgets = await client.get(f"/api/ansich/tasks/{task_id}/budgets")
+            changed_projection_status = service.get_health().model_copy(update={"lag_ms": service.get_health().lag_ms + 1})
+            monkeypatch.setattr(
+                service,
+                "get_health",
+                lambda: changed_projection_status,
+            )
             unchanged = await client.get(
                 "/api/ansich/operations/active-tasks?owner=owner-router",
                 headers={"If-None-Match": active.headers["etag"]},

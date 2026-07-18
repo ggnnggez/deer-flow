@@ -217,6 +217,12 @@ def _as_utc(value: datetime) -> datetime:
     return value.astimezone(UTC)
 
 
+def _read_model_values_equal(current: object, candidate: object) -> bool:
+    if isinstance(current, datetime) and isinstance(candidate, datetime):
+        return _as_utc(current) == _as_utc(candidate)
+    return current == candidate
+
+
 def _list_task_views_statement(
     *,
     limit: int,
@@ -1067,19 +1073,13 @@ class SqlAnsichBackend:
                         current.assertion_id,
                     )
                     current_evidence = tuple((await session.execute(select(AnsichBeliefEvidenceRow.obs_id).where(AnsichBeliefEvidenceRow.assertion_id == current.assertion_id).order_by(AnsichBeliefEvidenceRow.ordinal))).scalars())
-                if (
-                    current_assertion is not None
-                    and current_assertion.value_json == {"value": belief.value, "age_ms": belief.age_ms}
-                    and current_evidence == belief.evidence_obs_ids
-                    and current is not None
-                    and current.resolver_version == belief.selected_by.version
-                ):
+                if current_assertion is not None and current_assertion.value_json == {"value": belief.value} and current_evidence == belief.evidence_obs_ids and current is not None and current.resolver_version == belief.selected_by.version:
                     continue
                 assertion = AnsichBeliefAssertionRow(
                     assertion_id=new_id(),
                     subject_id=task_id,
                     field_name="heartbeat",
-                    value_json={"value": belief.value, "age_ms": belief.age_ms},
+                    value_json={"value": belief.value},
                     as_of=belief.as_of or asserted_at,
                     asserted_at=belief.asserted_at,
                     source_name=belief.source.name,
@@ -1255,6 +1255,8 @@ class SqlAnsichBackend:
     async def get_task_heartbeat_belief(
         self,
         task_id: str,
+        *,
+        now: datetime | None = None,
     ) -> HeartbeatBelief | None:
         async with self._session_factory() as session:
             current = await session.get(
@@ -1271,11 +1273,14 @@ class SqlAnsichBackend:
                 return None
             evidence = tuple((await session.execute(select(AnsichBeliefEvidenceRow.obs_id).where(AnsichBeliefEvidenceRow.assertion_id == assertion.assertion_id).order_by(AnsichBeliefEvidenceRow.ordinal))).scalars())
             value = str(assertion.value_json["value"])
+            as_of = None if value == "unknown" else _as_utc(assertion.as_of)
+            age_reference = _as_utc(assertion.asserted_at) if now is None else now
+            age_ms = None if as_of is None else max(0, int((age_reference - as_of).total_seconds() * 1000))
             return HeartbeatBelief(
                 value=cast(Literal["unknown", "fresh", "stale"], value),
-                as_of=(None if value == "unknown" else _as_utc(assertion.as_of)),
+                as_of=as_of,
                 asserted_at=_as_utc(assertion.asserted_at),
-                age_ms=assertion.value_json.get("age_ms"),
+                age_ms=age_ms,
                 source=NamedVersion(
                     name=assertion.source_name,
                     version=assertion.source_version,
@@ -1358,7 +1363,7 @@ class SqlAnsichBackend:
             task = await self.get_task(task_id)
             if task is None:
                 continue
-            heartbeat = await self.get_task_heartbeat_belief(task_id)
+            heartbeat = await self.get_task_heartbeat_belief(task_id, now=now)
             if heartbeat is None:
                 heartbeat = assess_heartbeat(
                     None,
@@ -1512,7 +1517,6 @@ class SqlAnsichBackend:
                     "budget_health_json": [item.model_dump(mode="json") for item in view.budget_health],
                     "lost_ranges_json": [item.model_dump(mode="json") for item in view.lost_ranges],
                     "last_evidence_at": view.last_evidence_at,
-                    "updated_at": view.updated_at,
                 }
                 row = await session.get(
                     AnsichActiveTaskReadModelRow,
@@ -1522,12 +1526,14 @@ class SqlAnsichBackend:
                     session.add(
                         AnsichActiveTaskReadModelRow(
                             task_id=view.task_id,
+                            updated_at=view.updated_at,
                             **values,
                         )
                     )
-                else:
+                elif any(not _read_model_values_equal(getattr(row, key), value) for key, value in values.items()):
                     for key, value in values.items():
                         setattr(row, key, value)
+                    row.updated_at = view.updated_at
 
     async def list_active_tasks(
         self,
