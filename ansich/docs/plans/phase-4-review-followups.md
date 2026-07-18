@@ -9,7 +9,7 @@
 | M1 | 带 `ansich_block_ref` 的块每次模型调用重复写入含正文的 `content.produced` | ✅ 已修复 | 2026-07-18 | `86221a51` |
 | M2 | 依赖未落地的投影 job 无限 250ms 重试,永不进入 failed、health 不降级 | ✅ 已修复 | 2026-07-18 | `d2dd2b67` |
 | M3 | BFS 在 `depth == max_depth` 层丢弃两端都在结果集内的边且不标记截断 | ✅ 已修复 | 2026-07-18 | `bbc26e84` |
-| L1 | freeze 的 `id()` 身份匹配对 trim 部分副本整体失败,整次压缩记录被放弃 | ⬜ 未修复 | — | — |
+| L1 | freeze 的 `id()` 身份匹配对 trim 部分副本整体失败,整次压缩记录被放弃 | ✅ 已修复 | 2026-07-18 | `ed1251ac` |
 | L2 | Ansich 关闭或无 execution context 时内部 marker 不在 provider 调用前剥离 | ⬜ 未修复 | — | — |
 | L3 | `_pending_content_derivations` 任务级只增不减;前端压缩列表只取当前 timeline 页 | ⬜ 未修复 | — | — |
 
@@ -39,7 +39,7 @@
 
 ## L1. freeze 的 `id()` 身份匹配对 trim 部分副本整体失败
 
-- 状态:⬜ 未修复。
+- 状态:✅ 已修复(2026-07-18,commit `ed1251ac`)。按 TDD 修复:使用真实 `trim_messages(allow_partial=True)` 构造 list-content 边界副本;`_selected_message_ordinals` 对未匹配副本改为跳过并计入不完整状态,其余 source/preserved/removed inventory 继续记录。`status=incomplete` 随 `context.compressed` 写入内存与 SQL 投影并可重放恢复,不以 message.id 回退冒充完整原消息。SQLite 生命周期与 SQLite/PostgreSQL insert 编译语义均有回归覆盖。以下为原始诊断记录。
 - 位置:`backend/packages/harness/deerflow/ansich/compression.py::_selected_message_ordinals`(按 `id(message)` 匹配,未命中即 `raise ValueError`)+ `summarization_middleware.py::_source_messages_for_summary`(经父类 `_trim_messages_for_summary` → `trim_messages(allow_partial=True)`)。
 - 现状:`trim_messages` 对 list-content 边界消息做部分保留时会构造**新对象**,该对象不在 `state["messages"]` 里 → `ValueError` → `_freeze_ansich_compression` 捕获后放弃**整次**压缩记录(仅日志)。`config.example.yaml` 默认 `trim_tokens_to_summarize: 15564`,该路径默认可达;触发条件是多段内容消息(vision 等)恰在 trim 边界。失败只损失观察(Agent fail-open 不受影响),但一旦上下文形态稳定命中,该 Task 的压缩谱系会持续整体缺失。
 - 方向:匹配失败降级为"跳过未匹配消息、compression 标 `incomplete`",而非放弃全部;或对未命中的对象按 `message.id` 兜底匹配。配"部分 trim 副本不放弃整个 inventory"的回归测试。
