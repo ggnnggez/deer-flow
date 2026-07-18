@@ -1,3 +1,11 @@
+from ansich.assessment import (
+    Assessment,
+    AssessorDescriptor,
+    AuthorityClass,
+    EvidenceRef,
+    canonical_config_hash,
+)
+from ansich.belief import BeliefAssertion, ResolvedBelief, resolve_current_belief
 from ansich.compression import (
     ContextCompressionItemView,
     ContextCompressionSummaryView,
@@ -31,8 +39,12 @@ from ansich.step import ContentBlockPayloadView, ContentOccurrenceView, ContextS
 from ansich.tool import ContentDerivationView, ToolBelief, ToolCallView, ToolResultView
 
 __all__ = [
+    "Assessment",
     "AnsichHealth",
     "AnsichService",
+    "AssessorDescriptor",
+    "AuthorityClass",
+    "BeliefAssertion",
     "ContentBlockPayloadView",
     "ContextCompressionItemView",
     "ContextCompressionSummaryView",
@@ -48,6 +60,7 @@ __all__ = [
     "ContextStateView",
     "ContextSnapshotItemView",
     "ContextSnapshotView",
+    "EvidenceRef",
     "FlushResult",
     "LostRange",
     "LineageGapView",
@@ -59,11 +72,14 @@ __all__ = [
     "ObservationEnvelope",
     "Producer",
     "RecordReceipt",
+    "ResolvedBelief",
     "TaskLifecycleScope",
     "TaskView",
     "ToolBelief",
     "ToolCallView",
     "ToolResultView",
     "StepView",
+    "canonical_config_hash",
     "new_id",
+    "resolve_current_belief",
 ]
