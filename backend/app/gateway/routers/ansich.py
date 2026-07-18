@@ -6,7 +6,7 @@ import logging
 from datetime import datetime
 from typing import Literal
 
-from ansich.contracts import ControlValue
+from ansich.contracts import ControlValue, TaskLifecycleScope
 from fastapi import APIRouter, HTTPException, Query, Request, Response
 
 from app.gateway.deps import require_admin_user
@@ -210,6 +210,7 @@ async def get_task_budgets(task_id: str, request: Request) -> dict:
 async def list_tasks(
     request: Request,
     control: ControlValue | None = Query(default=None),
+    lifecycle_scope: TaskLifecycleScope = Query(default="all"),
     from_time: datetime | None = Query(default=None, alias="from"),
     to_time: datetime | None = Query(default=None, alias="to"),
     limit: int = Query(default=100, ge=1, le=500),
@@ -225,6 +226,7 @@ async def list_tasks(
         tasks = await service.list_tasks(
             limit=limit + 1,
             control=control,
+            lifecycle_scope=lifecycle_scope,
             from_time=from_time,
             to_time=to_time,
             cursor=_decode_cursor(cursor),

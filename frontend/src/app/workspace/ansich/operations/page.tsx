@@ -1,20 +1,26 @@
 "use client";
 
 import { AlertCircleIcon } from "lucide-react";
-import { useEffect } from "react";
+import { useEffect, useState } from "react";
 
 import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert";
+import { Button } from "@/components/ui/button";
 import { Skeleton } from "@/components/ui/skeleton";
+import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import {
   AnsichProjectionHealth,
   AnsichActiveTaskRow,
+  AnsichTaskRow,
 } from "@/components/workspace/ansich";
 import {
   WorkspaceBody,
   WorkspaceContainer,
   WorkspaceHeader,
 } from "@/components/workspace/workspace-container";
-import { useAnsichActiveTasks } from "@/core/ansich/hooks";
+import {
+  useAnsichActiveTasks,
+  useAnsichTaskHistory,
+} from "@/core/ansich/hooks";
 import { useAuth } from "@/core/auth/AuthProvider";
 import { useI18n } from "@/core/i18n/hooks";
 
@@ -22,7 +28,27 @@ export default function AnsichOperationsPage() {
   const { t } = useI18n();
   const { user } = useAuth();
   const isAdmin = user?.system_role === "admin";
-  const tasksQuery = useAnsichActiveTasks(100, isAdmin);
+  const [selectedView, setSelectedView] = useState<"active" | "history">(
+    "active",
+  );
+  const activeTasksQuery = useAnsichActiveTasks(
+    100,
+    isAdmin && selectedView === "active",
+  );
+  const historyTasksQuery = useAnsichTaskHistory(
+    100,
+    isAdmin && selectedView === "history",
+  );
+  const historyPages = historyTasksQuery.data?.pages ?? [];
+  const historyTasks = historyPages.flatMap((page) => page.items);
+  const selectedProjectionStatus =
+    selectedView === "active"
+      ? activeTasksQuery.data?.projection_status
+      : historyPages.at(-1)?.projection_status;
+  const selectedError =
+    selectedView === "active"
+      ? activeTasksQuery.error
+      : historyTasksQuery.error;
 
   useEffect(() => {
     document.title = `${t.ansich.title} - ${t.pages.appName}`;
@@ -51,49 +77,101 @@ export default function AnsichOperationsPage() {
               <AlertTitle>{t.ansich.title}</AlertTitle>
               <AlertDescription>{t.ansich.adminOnly}</AlertDescription>
             </Alert>
-          ) : tasksQuery.isError ? (
+          ) : selectedError ? (
             <Alert variant="destructive">
               <AlertCircleIcon />
               <AlertTitle>{t.ansich.loadFailed}</AlertTitle>
-              <AlertDescription>{tasksQuery.error.message}</AlertDescription>
+              <AlertDescription>{selectedError.message}</AlertDescription>
             </Alert>
           ) : (
             <>
-              {tasksQuery.data?.projection_status ? (
-                <AnsichProjectionHealth
-                  health={tasksQuery.data.projection_status}
-                />
+              {selectedProjectionStatus ? (
+                <AnsichProjectionHealth health={selectedProjectionStatus} />
               ) : (
                 <Skeleton className="h-18 w-full" />
               )}
 
-              <section aria-labelledby="ansich-task-list-title">
-                <h2 id="ansich-task-list-title" className="sr-only">
-                  {t.ansich.activeTasks}
-                </h2>
-                <div className="text-muted-foreground mb-2 hidden grid-cols-[minmax(12rem,1.35fr)_minmax(9rem,1fr)_auto_auto_minmax(10rem,1fr)_minmax(9rem,auto)_auto] gap-3 px-4 text-xs font-medium md:grid">
-                  <span>{t.ansich.task}</span>
-                  <span>{t.ansich.currentAction}</span>
-                  <span>{t.ansich.control}</span>
-                  <span>{t.ansich.heartbeat}</span>
-                  <span>{t.ansich.localUsage}</span>
-                  <span>{t.ansich.budget}</span>
-                  <span>{t.ansich.projection}</span>
-                </div>
-                <div className="space-y-2">
-                  {tasksQuery.isPending ? (
-                    <TaskListSkeleton />
-                  ) : tasksQuery.data?.items.length ? (
-                    tasksQuery.data.items.map((task) => (
-                      <AnsichActiveTaskRow key={task.task_id} task={task} />
-                    ))
-                  ) : (
-                    <div className="text-muted-foreground rounded-lg border border-dashed p-10 text-center text-sm">
-                      {t.ansich.noActiveTasks}
+              <Tabs
+                value={selectedView}
+                onValueChange={(value) =>
+                  setSelectedView(value as "active" | "history")
+                }
+                className="space-y-4"
+              >
+                <TabsList variant="line">
+                  <TabsTrigger value="active">
+                    {t.ansich.runningTasks}
+                  </TabsTrigger>
+                  <TabsTrigger value="history">
+                    {t.ansich.taskHistory}
+                  </TabsTrigger>
+                </TabsList>
+                <TabsContent value="active">
+                  <section aria-labelledby="ansich-active-task-list-title">
+                    <h2 id="ansich-active-task-list-title" className="sr-only">
+                      {t.ansich.activeTasks}
+                    </h2>
+                    <div className="text-muted-foreground mb-2 hidden grid-cols-[minmax(12rem,1.35fr)_minmax(9rem,1fr)_auto_auto_minmax(10rem,1fr)_minmax(9rem,auto)_auto] gap-3 px-4 text-xs font-medium md:grid">
+                      <span>{t.ansich.task}</span>
+                      <span>{t.ansich.currentAction}</span>
+                      <span>{t.ansich.control}</span>
+                      <span>{t.ansich.heartbeat}</span>
+                      <span>{t.ansich.localUsage}</span>
+                      <span>{t.ansich.budget}</span>
+                      <span>{t.ansich.projection}</span>
                     </div>
-                  )}
-                </div>
-              </section>
+                    <div className="space-y-2">
+                      {activeTasksQuery.isPending ? (
+                        <TaskListSkeleton />
+                      ) : activeTasksQuery.data?.items.length ? (
+                        activeTasksQuery.data.items.map((task) => (
+                          <AnsichActiveTaskRow key={task.task_id} task={task} />
+                        ))
+                      ) : (
+                        <EmptyTaskList message={t.ansich.noActiveTasks} />
+                      )}
+                    </div>
+                  </section>
+                </TabsContent>
+                <TabsContent value="history">
+                  <section aria-labelledby="ansich-task-history-title">
+                    <h2 id="ansich-task-history-title" className="sr-only">
+                      {t.ansich.taskHistory}
+                    </h2>
+                    <div className="text-muted-foreground mb-2 hidden grid-cols-[minmax(0,1.5fr)_minmax(0,1fr)_auto_minmax(10rem,auto)_auto] gap-3 px-4 text-xs font-medium md:grid">
+                      <span>{t.ansich.task}</span>
+                      <span>{t.ansich.source}</span>
+                      <span>{t.ansich.control}</span>
+                      <span>{t.ansich.asOf}</span>
+                      <span className="w-4" />
+                    </div>
+                    <div className="space-y-2">
+                      {historyTasksQuery.isPending ? (
+                        <TaskListSkeleton />
+                      ) : historyTasks.length ? (
+                        historyTasks.map((task) => (
+                          <AnsichTaskRow key={task.task_id} task={task} />
+                        ))
+                      ) : (
+                        <EmptyTaskList message={t.ansich.noHistoricalTasks} />
+                      )}
+                      {historyTasksQuery.hasNextPage ? (
+                        <div className="flex justify-center pt-2">
+                          <Button
+                            variant="outline"
+                            disabled={historyTasksQuery.isFetchingNextPage}
+                            onClick={() =>
+                              void historyTasksQuery.fetchNextPage()
+                            }
+                          >
+                            {t.common.loadMore}
+                          </Button>
+                        </div>
+                      ) : null}
+                    </div>
+                  </section>
+                </TabsContent>
+              </Tabs>
             </>
           )}
         </div>
@@ -106,4 +184,12 @@ function TaskListSkeleton() {
   return Array.from({ length: 4 }, (_, index) => (
     <Skeleton key={index} className="h-20 w-full" />
   ));
+}
+
+function EmptyTaskList({ message }: { message: string }) {
+  return (
+    <div className="text-muted-foreground rounded-lg border border-dashed p-10 text-center text-sm">
+      {message}
+    </div>
+  );
 }

@@ -400,7 +400,10 @@ export interface Translations {
     taskNotFound: string;
     backToOperations: string;
     activeTasks: string;
+    runningTasks: string;
+    taskHistory: string;
     noActiveTasks: string;
+    noHistoricalTasks: string;
     currentAction: string;
     dwell: string;
     heartbeat: string;

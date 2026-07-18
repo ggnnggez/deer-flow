@@ -6,7 +6,7 @@ from typing import Protocol
 from ansich.budget import BudgetHealthBelief, TaskBudgetsView
 from ansich.compression import ContextCompressionView
 from ansich.context_state import ContextStateView
-from ansich.contracts import ControlValue, LostRange, ObservationEnvelope, TaskView
+from ansich.contracts import ControlValue, LostRange, ObservationEnvelope, TaskLifecycleScope, TaskView
 from ansich.heartbeat import TaskHeartbeatView
 from ansich.lineage import ContentBlockView, LineageDirection, PossibleExposureItemView
 from ansich.operations import ActiveTaskView, HeartbeatBelief
@@ -27,6 +27,7 @@ class AnsichBackend(Protocol):
         *,
         limit: int = 100,
         control: ControlValue | None = None,
+        lifecycle_scope: TaskLifecycleScope = "all",
         from_time: datetime | None = None,
         to_time: datetime | None = None,
         cursor: tuple[datetime, str] | None = None,

@@ -1,4 +1,4 @@
-import { useQuery } from "@tanstack/react-query";
+import { useInfiniteQuery, useQuery } from "@tanstack/react-query";
 
 import {
   fetchAnsichStepContext,
@@ -10,7 +10,12 @@ import {
   fetchAnsichTaskUsage,
   fetchAnsichTasks,
 } from "./api";
-import type { AnsichActiveTaskListResponse, AnsichTaskResponse } from "./types";
+import type {
+  AnsichActiveTaskListResponse,
+  AnsichTaskLifecycleScope,
+  AnsichTaskListResponse,
+  AnsichTaskResponse,
+} from "./types";
 
 const REFRESH_INTERVAL_MS = 5_000;
 const IDLE_REFRESH_INTERVAL_MS = 10_000;
@@ -35,6 +40,14 @@ export function taskDetailRefreshInterval(
   return REFRESH_INTERVAL_MS;
 }
 
+export function taskListRefreshInterval(
+  lifecycleScope: AnsichTaskLifecycleScope,
+  pageVisible: boolean,
+): number | false {
+  if (!pageVisible || lifecycleScope === "terminal") return false;
+  return REFRESH_INTERVAL_MS;
+}
+
 function pageIsVisible(): boolean {
   return typeof document === "undefined" || !document.hidden;
 }
@@ -51,13 +64,37 @@ export function useAnsichActiveTasks(limit = 100, enabled = true) {
   });
 }
 
-export function useAnsichTasks(limit = 100, enabled = true) {
+export function useAnsichTasks(
+  limit = 100,
+  enabled = true,
+  lifecycleScope: AnsichTaskLifecycleScope = "all",
+) {
   return useQuery({
-    queryKey: ["ansich", "tasks", { limit }],
-    queryFn: () => fetchAnsichTasks(limit),
+    queryKey: ["ansich", "tasks", { limit, lifecycleScope }],
+    queryFn: () => fetchAnsichTasks(limit, lifecycleScope),
     enabled,
     retry: false,
-    refetchInterval: REFRESH_INTERVAL_MS,
+    refetchInterval: () =>
+      taskListRefreshInterval(lifecycleScope, pageIsVisible()),
+    refetchIntervalInBackground: false,
+  });
+}
+
+export function useAnsichTaskHistory(limit = 100, enabled = true) {
+  return useInfiniteQuery<
+    AnsichTaskListResponse,
+    Error,
+    { pages: AnsichTaskListResponse[]; pageParams: Array<string | undefined> },
+    readonly ["ansich", "tasks", "history", { limit: number }],
+    string | undefined
+  >({
+    queryKey: ["ansich", "tasks", "history", { limit }] as const,
+    queryFn: ({ pageParam }) => fetchAnsichTasks(limit, "terminal", pageParam),
+    initialPageParam: undefined,
+    getNextPageParam: (lastPage) => lastPage.next_cursor ?? undefined,
+    enabled,
+    retry: false,
+    refetchInterval: false,
     refetchIntervalInBackground: false,
   });
 }

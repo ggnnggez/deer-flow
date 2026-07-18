@@ -11,7 +11,7 @@ from ansich.backend import AnsichBackend
 from ansich.budget import BudgetHealthBelief, TaskBudgetsView
 from ansich.compression import ContextCompressionView
 from ansich.context_state import ContextStateView
-from ansich.contracts import AnsichHealth, ControlValue, FlushResult, LostRange, ObservationEnvelope, Producer, RecordReceipt, TaskView
+from ansich.contracts import AnsichHealth, ControlValue, FlushResult, LostRange, ObservationEnvelope, Producer, RecordReceipt, TaskLifecycleScope, TaskView
 from ansich.heartbeat import TaskHeartbeatView
 from ansich.lineage import ContentLineageView, LineageDirection, PossibleExposureView, find_possible_exposures, traverse_content_lineage
 from ansich.memory import InMemoryAnsichBackend
@@ -296,6 +296,7 @@ class AnsichService:
         *,
         limit: int = 100,
         control: ControlValue | None = None,
+        lifecycle_scope: TaskLifecycleScope = "all",
         from_time: datetime | None = None,
         to_time: datetime | None = None,
         cursor: tuple[datetime, str] | None = None,
@@ -305,6 +306,7 @@ class AnsichService:
         return await self._backend.list_tasks(
             limit=limit,
             control=control,
+            lifecycle_scope=lifecycle_scope,
             from_time=from_time,
             to_time=to_time,
             cursor=cursor,

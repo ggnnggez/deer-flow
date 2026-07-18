@@ -48,6 +48,20 @@ UsageDimension = Literal[
 ]
 ObservationKind = TaskLifecycleKind | StepObservationKind | LlmObservationKind | ContextObservationKind | ToolObservationKind | BudgetObservationKind | Literal["task.heartbeat", "observability.degraded"]
 ControlValue = Literal["unknown", "created", "running", "completed", "failed", "interrupted"]
+TaskLifecycleScope = Literal["all", "active", "terminal"]
+
+
+def control_values_for_lifecycle_scope(
+    scope: TaskLifecycleScope,
+) -> frozenset[ControlValue] | None:
+    if scope == "all":
+        return None
+    if scope == "active":
+        return frozenset(("created", "running"))
+    if scope == "terminal":
+        return frozenset(("completed", "failed", "interrupted"))
+    raise ValueError(f"unsupported Task lifecycle scope: {scope}")
+
 
 _USAGE_DIMENSIONS = frozenset(
     {

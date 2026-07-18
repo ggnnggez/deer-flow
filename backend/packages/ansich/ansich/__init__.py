@@ -9,6 +9,7 @@ from ansich.contracts import (
     ObservationEnvelope,
     Producer,
     RecordReceipt,
+    TaskLifecycleScope,
     TaskView,
 )
 from ansich.ids import new_id
@@ -53,6 +54,7 @@ __all__ = [
     "ObservationEnvelope",
     "Producer",
     "RecordReceipt",
+    "TaskLifecycleScope",
     "TaskView",
     "ToolBelief",
     "ToolCallView",

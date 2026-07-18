@@ -14,7 +14,8 @@ SubagentLimitMiddleware policy 的 requested/effective/enforcement/source。
 `ansich_active_task_read_model`；SQLite upgrade/rebuild 与 PostgreSQL DDL 类型语义已有
 测试。管理员 API 已提供 active-task filters/cursor/ETag、local Usage 和 Budget health；
 Operator Lens 展示当前 Step/Tool、dwell、heartbeat、local Usage、overshoot、lag/loss，
-并实施 active 5 秒、idle 10 秒、hidden 暂停及 terminal detail 停止轮询。真实
+并实施 active 5 秒、idle 10 秒、hidden 暂停及 terminal detail 停止轮询；Operations
+同时保留不自动轮询、可 cursor 分页的历史 Task 视图。真实
 PostgreSQL 升级矩阵、关闭 Ansich 的基准对比和生产 paper drill 仍按总计划作为最终
 生产就绪门禁，不回填为本阶段的占位成功。
 

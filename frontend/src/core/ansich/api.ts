@@ -11,6 +11,7 @@ import type {
   AnsichStepResponse,
   AnsichStepsResponse,
   AnsichTaskListResponse,
+  AnsichTaskLifecycleScope,
   AnsichTaskBudgetsResponse,
   AnsichTaskResponse,
   AnsichTaskUsageResponse,
@@ -64,8 +65,17 @@ function ansichUrl(path: string): string {
 
 export async function fetchAnsichTasks(
   limit = 100,
+  lifecycleScope: AnsichTaskLifecycleScope = "all",
+  cursor?: string,
 ): Promise<AnsichTaskListResponse> {
-  const response = await fetch(ansichUrl(`/tasks?limit=${limit}`));
+  const query = new URLSearchParams({ limit: String(limit) });
+  if (lifecycleScope !== "all") {
+    query.set("lifecycle_scope", lifecycleScope);
+  }
+  if (cursor) {
+    query.set("cursor", cursor);
+  }
+  const response = await fetch(ansichUrl(`/tasks?${query.toString()}`));
   if (!response.ok) {
     await throwAnsichApiError(
       response,

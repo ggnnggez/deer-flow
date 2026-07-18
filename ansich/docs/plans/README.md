@@ -14,7 +14,7 @@
 - Phase 2 代码评审的跟进项登记在 [phase-2-review-followups.md](phase-2-review-followups.md)；H2（上下文快照写放大与谱系完整性）的剩余压缩 inventory 与 derived-from 边已随 Phase 4 commit `a596a310` 落地，现已完成。
 - Phase 3 代码评审的跟进项登记在 [phase-3-review-followups.md](phase-3-review-followups.md)；M2（transform 显式元数据）与 M3（队列字节水位）均已完成，Phase 5 前置项已清；L1 观察开销基准按既定归属留到 Phase 12 验收前，不阻塞 Phase 5。
 - Phase 4 代码评审的跟进项登记在 [phase-4-review-followups.md](phase-4-review-followups.md)；M1/M2/M3、L1/L2 与 L3① 均已完成，Phase 5 前置项已清；L3② 前端压缩列表独立 API 按既定归属留到 Phase 6 UI。
-- Phase 5 代码评审的跟进项登记在 [phase-5-review-followups.md](phase-5-review-followups.md)；M3（历史 Task 失去 UI 入口）立即修复，M1（assessor 全量 budget 扫描）与 M2（heartbeat 断言按秒膨胀）需在 Phase 6 前完成，L1/L2 随 M1/M2 或 Phase 6 UI 处理，L3（usage 贡献契约收紧）留到 Phase 8 前。
+- Phase 5 代码评审的跟进项登记在 [phase-5-review-followups.md](phase-5-review-followups.md)；M3（历史 Task 失去 UI 入口）已修复，M1（assessor 全量 budget 扫描）与 M2（heartbeat 断言按秒膨胀）需在 Phase 6 前完成，L1/L2 随 M1/M2 或 Phase 6 UI 处理，L3（usage 贡献契约收紧）留到 Phase 8 前。
 
 ## 固定实现边界
 

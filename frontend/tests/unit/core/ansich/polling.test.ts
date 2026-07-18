@@ -2,6 +2,7 @@ import { describe, expect, it } from "@rstest/core";
 
 import {
   activeTasksRefreshInterval,
+  taskListRefreshInterval,
   taskDetailRefreshInterval,
 } from "@/core/ansich/hooks";
 import type {
@@ -32,5 +33,11 @@ describe("Ansich polling policy", () => {
     expect(taskDetailRefreshInterval(running, true)).toBe(5_000);
     expect(taskDetailRefreshInterval(completed, true)).toBe(false);
     expect(taskDetailRefreshInterval(running, false)).toBe(false);
+  });
+
+  it("does not poll terminal Task history", () => {
+    expect(taskListRefreshInterval("terminal", true)).toBe(false);
+    expect(taskListRefreshInterval("all", true)).toBe(5_000);
+    expect(taskListRefreshInterval("all", false)).toBe(false);
   });
 });

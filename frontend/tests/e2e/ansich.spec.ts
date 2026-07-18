@@ -3,6 +3,7 @@ import { expect, test } from "@playwright/test";
 import { mockLangGraphAPI } from "./utils/mock-api";
 
 const TASK_ID = "8a54d86c-b524-4f18-83e8-79b729c2a695";
+const HISTORY_TASK_ID = "7b43c75b-a413-4e07-92d7-68a618b1f584";
 const STEP_ID = "bb24aa10-f647-4c07-959a-0594087c818c";
 const BLOCK_ID = "d62dc6fd-4a91-4d32-95ae-3be8e1ddb1a9";
 const TOOL_CALL_ID = "3d4a8ed4-3996-41cb-9181-558ca744867b";
@@ -51,6 +52,11 @@ const TASK = {
     selected_by: { name: "control-state", version: "1" },
     evidence_obs_ids: ["13bd27c7-51b1-4164-9380-b98c40c2bfe0"],
   },
+};
+const HISTORY_TASK = {
+  ...TASK,
+  task_id: HISTORY_TASK_ID,
+  source_id: "run-e2e-history-page-2",
 };
 const ACTIVE_TASK = {
   ...TASK,
@@ -559,6 +565,66 @@ test("admin navigates from Ansich operations to evidence-backed Task detail", as
   await expect(page.getByText("source", { exact: true })).toBeVisible();
   await page.getByRole("button", { name: "Load raw payload" }).click();
   await expect(page.getByText('"inspect me"')).toBeVisible();
+});
+
+test("operations keeps terminal Task history separate from running work", async ({
+  page,
+}) => {
+  mockLangGraphAPI(page, { threads: [] });
+  await page.route("**/api/ansich/operations/active-tasks?*", (route) =>
+    route.fulfill({
+      status: 200,
+      contentType: "application/json",
+      body: JSON.stringify({
+        items: [],
+        next_cursor: null,
+        projection_status: HEALTH,
+      }),
+    }),
+  );
+  await page.route("**/api/ansich/tasks?*", (route) => {
+    const query = new URL(route.request().url()).searchParams;
+    expect(query.get("lifecycle_scope")).toBe("terminal");
+    const cursor = query.get("cursor");
+    return route.fulfill({
+      status: 200,
+      contentType: "application/json",
+      body: JSON.stringify({
+        items: cursor === null ? [TASK] : [HISTORY_TASK],
+        next_cursor: cursor === null ? "history-page-2" : null,
+        projection_status: HEALTH,
+      }),
+    });
+  });
+  await page.route(`**/api/ansich/tasks/${TASK_ID}`, (route) =>
+    route.fulfill({
+      status: 200,
+      contentType: "application/json",
+      body: JSON.stringify({ task: TASK, projection_status: HEALTH }),
+    }),
+  );
+  await page.route(`**/api/ansich/tasks/${TASK_ID}/timeline`, (route) =>
+    route.fulfill({
+      status: 200,
+      contentType: "application/json",
+      body: JSON.stringify({ items: [], projection_status: HEALTH }),
+    }),
+  );
+
+  await page.goto("/workspace/ansich/operations");
+  await expect(
+    page.getByText("No Agent tasks are currently running."),
+  ).toBeVisible();
+  await expect(page.getByText(TASK_ID)).not.toBeVisible();
+  await page.getByRole("tab", { name: "Task history" }).click();
+  await expect(page.getByText(TASK_ID)).toBeVisible();
+  await expect(page.getByText(HISTORY_TASK_ID)).not.toBeVisible();
+  await page.getByRole("button", { name: "Load more" }).click();
+  await expect(page.getByText(HISTORY_TASK_ID)).toBeVisible();
+  await page.getByRole("link", { name: new RegExp(TASK_ID) }).click();
+
+  await page.waitForURL(`**/workspace/ansich/tasks/${TASK_ID}`);
+  await expect(page.getByRole("heading", { name: TASK_ID })).toBeVisible();
 });
 
 test("context tab distinguishes failed projection from no observed context", async ({

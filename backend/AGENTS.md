@@ -436,6 +436,10 @@ contributions, TaskBudget admission snapshots, rule Beliefs, and the materialize
 bounded polling read (filters/cursor/ETag); `GET /tasks/{task_id}/usage` returns
 local dimensions and explicitly marks inclusive usage unavailable until Phase
 8; `GET /tasks/{task_id}/budgets` returns configured policy plus health Beliefs.
+The general `GET /tasks` read accepts `lifecycle_scope=all|active|terminal` and
+applies that scope before its stable cursor/limit; the terminal scope is the
+non-polling Operations history source and includes completed, failed, and
+interrupted Tasks.
 Collector loss makes affected budget health unknown. Active wall time comes
 from heartbeat elapsed and terminal wall time from the Task monotonic clock.
 Unknown heartbeat/dwell/budget values are rule assessments with evidence and

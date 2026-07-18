@@ -168,6 +168,70 @@ async def test_admin_can_list_observed_tasks_with_belief_and_projection_health()
 
 
 @pytest.mark.anyio
+async def test_admin_can_list_terminal_task_history_without_running_tasks():
+    service = AnsichService.in_memory()
+    await service.start()
+    task_ids_by_control: dict[str, str] = {}
+    for index, terminal_kind in enumerate((None, "task.completed", "task.failed", "task.interrupted")):
+        task_id = new_id()
+        task_ids_by_control["running" if terminal_kind is None else terminal_kind.removeprefix("task.")] = task_id
+        occurred_at = datetime(2026, 7, 18, 15, index, tzinfo=UTC)
+        service.record_batch(
+            (
+                ObservationEnvelope.task_lifecycle(
+                    kind="task.created",
+                    task_id=task_id,
+                    source_kind="deerflow_run",
+                    source_id=f"run-history-{index}",
+                    occurred_at=occurred_at,
+                    source_event_id=f"run:run-history-{index}:task:created",
+                ),
+                ObservationEnvelope.task_lifecycle(
+                    kind="task.started",
+                    task_id=task_id,
+                    source_kind="deerflow_run",
+                    source_id=f"run-history-{index}",
+                    occurred_at=occurred_at,
+                    source_event_id=f"run:run-history-{index}:task:started",
+                ),
+            )
+        )
+        if terminal_kind is not None:
+            service.record(
+                ObservationEnvelope.task_lifecycle(
+                    kind=terminal_kind,
+                    task_id=task_id,
+                    source_kind="deerflow_run",
+                    source_id=f"run-history-{index}",
+                    occurred_at=occurred_at,
+                    source_event_id=f"run:run-history-{index}:{terminal_kind}",
+                )
+            )
+        await service.flush_task(task_id)
+
+    app = make_authed_test_app(user_factory=admin_user)
+    app.state.ansich_service = service
+    app.include_router(ansich_router.router)
+    try:
+        async with AsyncClient(
+            transport=ASGITransport(app=app),
+            base_url="http://test",
+        ) as client:
+            response = await client.get("/api/ansich/tasks?lifecycle_scope=terminal")
+    finally:
+        await service.stop()
+
+    assert response.status_code == 200
+    tasks = response.json()["items"]
+    assert {task["control"]["value"] for task in tasks} == {
+        "completed",
+        "failed",
+        "interrupted",
+    }
+    assert task_ids_by_control["running"] not in {task["task_id"] for task in tasks}
+
+
+@pytest.mark.anyio
 async def test_admin_can_read_task_lifecycle_timeline_in_ingest_order():
     service = AnsichService.in_memory()
     task_id = new_id()

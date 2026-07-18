@@ -6,7 +6,7 @@ from typing import cast
 from ansich.budget import BudgetSourceKind, TaskBudgetsView, TaskBudgetView
 from ansich.compression import CompressionDisposition, ContextCompressionItemView, ContextCompressionView
 from ansich.context_state import ContextStateDelta, ContextStateItem, ContextStateView, materialize_context_state
-from ansich.contracts import ControlBelief, ControlValue, NamedVersion, ObservationEnvelope, TaskView
+from ansich.contracts import ControlBelief, ControlValue, NamedVersion, ObservationEnvelope, TaskLifecycleScope, TaskView, control_values_for_lifecycle_scope
 from ansich.control import should_select_control_candidate
 from ansich.heartbeat import TaskHeartbeatView
 from ansich.lineage import ContentBlockView, ContentProducerView, LineageDirection, PossibleExposureItemView
@@ -121,6 +121,7 @@ class InMemoryAnsichBackend:
         *,
         limit: int = 100,
         control: ControlValue | None = None,
+        lifecycle_scope: TaskLifecycleScope = "all",
         from_time: datetime | None = None,
         to_time: datetime | None = None,
         cursor: tuple[datetime, str] | None = None,
@@ -128,6 +129,9 @@ class InMemoryAnsichBackend:
         tasks = [task for task_id in self._tasks if (task := await self.get_task(task_id)) is not None]
         if control is not None:
             tasks = [task for task in tasks if task.control.value == control]
+        lifecycle_controls = control_values_for_lifecycle_scope(lifecycle_scope)
+        if lifecycle_controls is not None:
+            tasks = [task for task in tasks if task.control.value in lifecycle_controls]
         if from_time is not None:
             tasks = [task for task in tasks if task.control.as_of is not None and task.control.as_of >= from_time]
         if to_time is not None:

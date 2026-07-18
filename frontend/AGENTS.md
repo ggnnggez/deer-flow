@@ -74,7 +74,10 @@ Ansich is deliberately separate from chat state. The sidebar entry is rendered
 only for `system_role="admin"`; this is a convenience boundary, while Gateway
 admin authorization remains authoritative. The Phase 5 operations list polls
 its active-task read model every 5 seconds while any Task is running, backs off
-to 10 seconds when empty, and pauses while the page is hidden. Task detail stops
+to 10 seconds when empty, and pauses while the page is hidden. Operations keeps
+this live lens under “Running” and exposes terminal Tasks under a separate,
+non-polling, cursor-paged “Task history” tab; history filtering happens in the
+Gateway before pagination. Task detail stops
 automatic polling after its Task becomes terminal. Both render full Belief
 provenance plus projection health (`watermark`, lag, failed jobs, and lost
 ranges). Unknown heartbeat, Usage, or Budget evidence must be shown as

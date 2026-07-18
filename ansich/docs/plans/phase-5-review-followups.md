@@ -8,14 +8,14 @@
 | ---- | ---- | ---- | -------- | ------ |
 | M1 | `assess_operations` 每秒无过滤扫描全部历史 budget 行,开销随任务总量线性增长 | ⬜ 未修复 | — | — |
 | M2 | heartbeat belief 去重键含每秒变化的 `age_ms`,断言表按 running 任务每秒 +1 行 | ⬜ 未修复 | — | — |
-| M3 | Operations 页面用 active list 替换全部 Task 列表,历史 Task 失去 UI 入口 | ⬜ 未修复 | — | — |
+| M3 | Operations 页面用 active list 替换全部 Task 列表,历史 Task 失去 UI 入口 | ✅ 已修复 | 2026-07-18 | 待提交 |
 | L1 | read model 每周期无条件重写 `updated_at`,ETag/304 机制几乎永不命中 | ⬜ 未修复 | — | — |
 | L2 | 两个管理员 GET 在空结果时同步触发全量 assessment(读端点做重写工作) | ⬜ 未修复 | — | — |
 | L3 | token 维度的 `budget.consumed` 未被排除,存在与 `llm.responded` usage 双计的潜在路径 | ⬜ 未修复 | — | — |
 
 ## M1. `assess_operations` 每秒无过滤扫描全部历史 budget 行
 
-- 状态:⬜ 未修复。
+- 状态:✅ 已修复(2026-07-18,commit 待提交)。新增 `lifecycle_scope=terminal|active|all`,InMemory/SQLite/PostgreSQL 查询均在 limit/cursor 前应用 scope;Operations 恢复“运行中/历史任务”双视图,历史页不轮询并通过 opaque cursor“加载更多”,terminal 行继续进入原 Task detail。后端 HTTP/SQL、前端 API/polling 与 Playwright 均有回归覆盖。以下保留原始诊断记录。
 - 位置:`backend/packages/harness/deerflow/ansich/persistence/sql.py::assess_operations` 的 budget 循环(`select(AnsichTaskBudgetRow)` 无任何 task/control 过滤)。
 - 现状:后台 assessor 每 `operations_assessment_interval_ms`(默认 1 秒)运行一次;heartbeat 部分只扫 running 任务,但 budget 部分对**所有历史任务**的每条 budget 行各做一次 usage `session.get` + current belief `session.get` + evidence 查询。terminal 任务的 usage/budget 不再变化,dedup 能避免写入,但查询照做。随历史任务累积(每任务 1–4 条 budget 行),每秒的评估开销线性增长——一万个历史任务约等于每秒数万条 SQL。`GET /operations/active-tasks` 与 `GET /tasks/{id}/budgets` 的懒触发路径(见 L2)同样受累。计划 §5 只要求"terminal 后 absolute breach 仍保留",不要求 terminal 后反复重评。
 - 方向:budget 评估 join `AnsichTaskSummaryRow.control_value == "running"` 过滤;terminal 任务在 terminal 投影时做最后一次 budget 评估并保留 breach 断言,不再进入周期扫描。配"terminal 任务不进入周期评估、breach 断言保留"的回归测试。

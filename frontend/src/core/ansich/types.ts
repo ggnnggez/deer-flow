@@ -6,6 +6,8 @@ export type AnsichControlValue =
   | "failed"
   | "interrupted";
 
+export type AnsichTaskLifecycleScope = "all" | "active" | "terminal";
+
 export type AnsichObservationKind =
   | "task.created"
   | "task.started"

@@ -51,6 +51,32 @@ describe("Ansich API", () => {
     );
   });
 
+  it("requests terminal Task history before pagination", async () => {
+    mockedFetch.mockResolvedValue(
+      jsonResponse({ items: [], projection_status: { status: "healthy" } }),
+    );
+
+    await fetchAnsichTasks(75, "terminal");
+
+    expect(mockedFetch).toHaveBeenCalledWith(
+      expect.stringContaining(
+        "/api/ansich/tasks?limit=75&lifecycle_scope=terminal",
+      ),
+    );
+  });
+
+  it("continues terminal Task history from an opaque cursor", async () => {
+    mockedFetch.mockResolvedValue(
+      jsonResponse({ items: [], projection_status: { status: "healthy" } }),
+    );
+
+    await fetchAnsichTasks(75, "terminal", "cursor/with spaces");
+
+    expect(mockedFetch).toHaveBeenCalledWith(
+      expect.stringContaining("&cursor=cursor%2Fwith+spaces"),
+    );
+  });
+
   it("uses the Phase 5 active, usage, and budget endpoints", async () => {
     mockedFetch.mockResolvedValue(jsonResponse({}));
     const taskId = "task/operations";

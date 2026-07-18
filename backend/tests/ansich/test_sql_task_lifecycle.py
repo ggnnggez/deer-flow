@@ -764,10 +764,86 @@ async def test_list_tasks_uses_one_joined_query_and_keeps_page_length_with_a_mis
     assert select_count == 1
 
 
+@pytest.mark.anyio
+async def test_terminal_task_history_filters_before_limit_and_continues_with_cursor(
+    tmp_path,
+):
+    engine = create_async_engine(f"sqlite+aiosqlite:///{tmp_path / 'ansich-terminal-history.db'}")
+    session_factory = async_sessionmaker(engine, expire_on_commit=False)
+    async with engine.begin() as connection:
+        await connection.run_sync(Base.metadata.create_all)
+    service = create_sql_ansich_service(session_factory)
+    await service.start()
+    expected_terminal_ids: list[str] = []
+    task_specs = (
+        ("task.interrupted", 5),
+        (None, 4),
+        ("task.failed", 3),
+        (None, 2),
+        ("task.completed", 1),
+    )
+    try:
+        for index, (terminal_kind, minute) in enumerate(task_specs):
+            task_id = new_id()
+            if terminal_kind is not None:
+                expected_terminal_ids.append(task_id)
+            occurred_at = datetime(2026, 7, 18, 16, minute, tzinfo=UTC)
+            observations = [
+                ObservationEnvelope.task_lifecycle(
+                    kind="task.created",
+                    task_id=task_id,
+                    source_kind="deerflow_run",
+                    source_id=f"run-terminal-history-{index}",
+                    occurred_at=occurred_at,
+                    source_event_id=f"run:terminal-history-{index}:task:created",
+                ),
+                ObservationEnvelope.task_lifecycle(
+                    kind="task.started",
+                    task_id=task_id,
+                    source_kind="deerflow_run",
+                    source_id=f"run-terminal-history-{index}",
+                    occurred_at=occurred_at,
+                    source_event_id=f"run:terminal-history-{index}:task:started",
+                ),
+            ]
+            if terminal_kind is not None:
+                observations.append(
+                    ObservationEnvelope.task_lifecycle(
+                        kind=terminal_kind,
+                        task_id=task_id,
+                        source_kind="deerflow_run",
+                        source_id=f"run-terminal-history-{index}",
+                        occurred_at=occurred_at,
+                        source_event_id=(f"run:terminal-history-{index}:{terminal_kind}"),
+                    )
+                )
+            service.record_batch(tuple(observations))
+            await service.flush_task(task_id)
+
+        first_page = await service.list_tasks(
+            limit=2,
+            lifecycle_scope="terminal",
+        )
+        assert first_page[-1].control.as_of is not None
+        second_page = await service.list_tasks(
+            limit=2,
+            lifecycle_scope="terminal",
+            cursor=(first_page[-1].control.as_of, first_page[-1].task_id),
+        )
+    finally:
+        await service.stop()
+        await engine.dispose()
+
+    assert [task.task_id for task in first_page] == expected_terminal_ids[:2]
+    assert [task.task_id for task in second_page] == expected_terminal_ids[2:]
+    assert all(task.control.value != "running" for task in (*first_page, *second_page))
+
+
 def test_list_tasks_page_cte_compiles_before_joins_for_sqlite_and_postgres() -> None:
     statement = _list_task_views_statement(
         limit=100,
         control="running",
+        lifecycle_scope="terminal",
         from_time=datetime(2026, 7, 17, 10, 0, tzinfo=UTC),
         to_time=datetime(2026, 7, 17, 12, 0, tzinfo=UTC),
         cursor=(datetime(2026, 7, 17, 11, 0, tzinfo=UTC), new_id()),
@@ -776,6 +852,7 @@ def test_list_tasks_page_cte_compiles_before_joins_for_sqlite_and_postgres() -> 
     for dialect in (sqlite.dialect(), postgresql.dialect()):
         compiled = " ".join(str(statement.compile(dialect=dialect)).upper().split())
         assert compiled.startswith("WITH ANSICH_TASK_PAGE AS")
+        assert compiled.index("CONTROL_VALUE IN") < compiled.index(" LIMIT ")
         assert compiled.index(" LIMIT ") < compiled.index(" LEFT OUTER JOIN ")
         assert compiled.count(" LEFT OUTER JOIN ") == 3
 

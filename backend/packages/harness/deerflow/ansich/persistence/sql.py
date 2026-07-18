@@ -41,7 +41,7 @@ from ansich.budget import (
 )
 from ansich.compression import CompressionDisposition
 from ansich.context_state import context_state_hash, materialize_context_state
-from ansich.contracts import ControlValue, LostRange
+from ansich.contracts import ControlValue, LostRange, TaskLifecycleScope, control_values_for_lifecycle_scope
 from ansich.control import should_select_control_candidate
 from ansich.heartbeat import TaskHeartbeatView
 from ansich.lineage import LineageDirection
@@ -210,6 +210,7 @@ def _list_task_views_statement(
     *,
     limit: int,
     control: ControlValue | None,
+    lifecycle_scope: TaskLifecycleScope,
     from_time: datetime | None,
     to_time: datetime | None,
     cursor: tuple[datetime, str] | None,
@@ -228,6 +229,9 @@ def _list_task_views_statement(
     )
     if control is not None:
         page_statement = page_statement.where(AnsichTaskSummaryRow.control_value == control)
+    lifecycle_controls = control_values_for_lifecycle_scope(lifecycle_scope)
+    if lifecycle_controls is not None:
+        page_statement = page_statement.where(AnsichTaskSummaryRow.control_value.in_(lifecycle_controls))
     if from_time is not None:
         page_statement = page_statement.where(AnsichTaskSummaryRow.last_evidence_at >= from_time)
     if to_time is not None:
@@ -861,6 +865,7 @@ class SqlAnsichBackend:
         *,
         limit: int = 100,
         control: ControlValue | None = None,
+        lifecycle_scope: TaskLifecycleScope = "all",
         from_time: datetime | None = None,
         to_time: datetime | None = None,
         cursor: tuple[datetime, str] | None = None,
@@ -871,6 +876,7 @@ class SqlAnsichBackend:
                     _list_task_views_statement(
                         limit=limit,
                         control=control,
+                        lifecycle_scope=lifecycle_scope,
                         from_time=from_time,
                         to_time=to_time,
                         cursor=cursor,
