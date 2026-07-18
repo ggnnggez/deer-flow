@@ -7,7 +7,7 @@
 | 编号 | 摘要 | 状态 | 修复时间 | Commit |
 | ---- | ---- | ---- | -------- | ------ |
 | M1 | 带 `ansich_block_ref` 的块每次模型调用重复写入含正文的 `content.produced` | ⬜ 未修复 | — | — |
-| M2 | 依赖未落地的投影 job 无限 250ms 重试,永不进入 failed、health 不降级 | ⬜ 未修复 | — | — |
+| M2 | 依赖未落地的投影 job 无限 250ms 重试,永不进入 failed、health 不降级 | ✅ 已修复 | 2026-07-18 | `d2dd2b67` |
 | M3 | BFS 在 `depth == max_depth` 层丢弃两端都在结果集内的边且不标记截断 | ✅ 已修复 | 2026-07-18 | `bbc26e84` |
 | L1 | freeze 的 `id()` 身份匹配对 trim 部分副本整体失败,整次压缩记录被放弃 | ⬜ 未修复 | — | — |
 | L2 | Ansich 关闭或无 execution context 时内部 marker 不在 provider 调用前剥离 | ⬜ 未修复 | — | — |
@@ -23,7 +23,7 @@
 
 ## M2. 依赖未落地的投影 job 无限 250ms 重试
 
-- 状态:⬜ 未修复。
+- 状态:✅ 已修复(2026-07-18,commit `d2dd2b67`)。按 TDD 修复:projection job 新增持久化的 `dependency_pending_since`,依赖等待使用独立的 `projector_dependency_timeout_seconds`(默认 300 秒),不消耗普通 projector attempt;越过 deadline 后保留 `last_error`、写投影错误证据并进入 `failed`,健康状态随之降级,补齐依赖后既有 `retry_failed_projections` 可恢复。SQLite 回归覆盖从 Alembic 根升级、新列与失败/恢复生命周期;PostgreSQL 方言断言该列编译为 `TIMESTAMP WITH TIME ZONE`。以下为原始诊断记录。
 - 位置:`backend/packages/harness/deerflow/ansich/persistence/sql.py::_release_projection_job` 的 `_ProjectionDependencyPending` 分支(`job.attempts = max(0, job.attempts - 1)`、`available_at = now + 250ms`、status 回 `pending`)。
 - 现状:dependency-pending 不计入 `projector_max_attempts`,永不转 `failed`。依赖**永久**缺失时该 job 每 ~250ms 空转一次:DB 查询 churn、`failed_jobs` 不增长、health 不降级、UI 的"投影不可用"提示不触发 —— 与"采集失败均以结构化状态返回,不表现为健康"的阶段完成条件冲突。永久缺失可达:① `record_batch` 部分接受 —— freeze 的某条 content 观察被有界队列丢弃而 `context.compressed` 已入队,该压缩的源块不会再被重试(freeze 观察只随该次批量提交一次),`_project_context_compression` 永久 spin;② `task.created` 丢失时整个 Task 的所有 job 同状;③ 历史坏数据(`derivation_sources` 指向从未存在的块)。注意大多数 registry 管理的源块**能**自愈(durable 确认前每次请求 re-emit),所以场景窄,但一旦发生就是静默永久空转。
 - 方向:为 dependency-pending 引入独立上限(次数或时限,如超过 5 分钟仍未满足则转 `failed` 并保留 `last_error` 证据),`failed` 后由既有 `retry_failed_projections` 无损恢复;或依赖检查咨询 lost-range 记录,已确认丢失的依赖直接判定不可满足。配"依赖永不出现的 job 最终进入 failed 并计入 health"的回归测试。
