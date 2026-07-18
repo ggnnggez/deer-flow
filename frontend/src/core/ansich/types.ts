@@ -12,6 +12,9 @@ export type AnsichObservationKind =
   | "task.completed"
   | "task.failed"
   | "task.interrupted"
+  | "task.heartbeat"
+  | "budget.configured"
+  | "budget.consumed"
   | "step.started"
   | "step.closed"
   | "llm.requested"
@@ -133,6 +136,133 @@ export interface AnsichTaskListResponse {
 
 export interface AnsichTaskResponse {
   task: AnsichTask;
+  projection_status: AnsichHealth;
+}
+
+export type AnsichUsageDimension =
+  | "input_tokens"
+  | "output_tokens"
+  | "total_tokens"
+  | "llm_attempts"
+  | "steps"
+  | "tool_calls_issued"
+  | "tool_calls_executed"
+  | "wall_time_ms"
+  | "child_tasks_spawned";
+
+export interface AnsichTaskUsageValue {
+  dimension: AnsichUsageDimension;
+  aggregation_scope: "local" | "inclusive";
+  value: number;
+  as_of: string;
+  complete_through_ingest_seq: number;
+}
+
+export interface AnsichTaskUsage {
+  task_id: string;
+  local: AnsichTaskUsageValue[];
+  inclusive_status: "not_available";
+}
+
+export interface AnsichTaskBudget {
+  entity_id: string;
+  task_id: string;
+  dimension: AnsichUsageDimension;
+  aggregation_scope: "local" | "inclusive";
+  warning_limit: number | null;
+  hard_limit: number | null;
+  enforcement: boolean;
+  source_kind: "release_default" | "runtime_override" | "shadow";
+  requested_value: number | null;
+  effective_value: number;
+  configured_obs_id: string;
+}
+
+export interface AnsichTaskBudgets {
+  task_id: string;
+  budgets: AnsichTaskBudget[];
+}
+
+export interface AnsichRuleBeliefBase {
+  asserted_at: string;
+  source: AnsichNamedVersion;
+  fidelity_class: "rule";
+  selected_by: AnsichNamedVersion;
+  evidence_obs_ids: string[];
+}
+
+export interface AnsichHeartbeatBelief extends AnsichRuleBeliefBase {
+  value: "unknown" | "fresh" | "stale";
+  as_of: string | null;
+  age_ms: number | null;
+}
+
+export interface AnsichDwellBelief extends AnsichRuleBeliefBase {
+  value: "unknown" | "normal" | "long";
+  since: string | null;
+  duration_ms: number | null;
+}
+
+export interface AnsichBudgetHealthBelief extends AnsichRuleBeliefBase {
+  dimension: AnsichUsageDimension;
+  aggregation_scope: "local" | "inclusive";
+  value: "unknown" | "within" | "warning" | "exceeded";
+  usage_value: number | null;
+  warning_limit: number | null;
+  hard_limit: number | null;
+  overshoot: number | null;
+  as_of: string | null;
+}
+
+export interface AnsichActiveTask {
+  task_id: string;
+  run_id: string;
+  source_kind: string;
+  owner_id: string | null;
+  thread_id: string | null;
+  agent_id: string | null;
+  control: AnsichControlBelief;
+  current_step: {
+    step_id: string;
+    step_seq: number;
+    actor_kind: string;
+    status: string;
+  } | null;
+  current_tool: {
+    tool_call_id: string;
+    tool_name: string;
+    call_seq: number;
+    status: string;
+  } | null;
+  dwell: AnsichDwellBelief;
+  heartbeat: AnsichHeartbeatBelief;
+  usage: AnsichTaskUsage;
+  budgets: AnsichTaskBudgets;
+  budget_health: AnsichBudgetHealthBelief[];
+  duration_ms: number;
+  observability_status: "healthy" | "degraded";
+  projection_watermark: number | null;
+  projection_lag_ms: number;
+  lost_ranges: AnsichLostRange[];
+  last_evidence_at: string;
+  updated_at: string;
+}
+
+export interface AnsichActiveTaskListResponse {
+  items: AnsichActiveTask[];
+  next_cursor: string | null;
+  projection_status: AnsichHealth;
+  updated_at: string | null;
+}
+
+export interface AnsichTaskUsageResponse {
+  usage: AnsichTaskUsage;
+  projection_status: AnsichHealth;
+}
+
+export interface AnsichTaskBudgetsResponse {
+  budgets: AnsichTaskBudgets;
+  health: AnsichBudgetHealthBelief[];
   projection_status: AnsichHealth;
 }
 

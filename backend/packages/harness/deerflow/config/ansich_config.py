@@ -1,4 +1,6 @@
-from pydantic import BaseModel, Field
+from typing import Self
+
+from pydantic import BaseModel, Field, model_validator
 
 
 class AnsichConfig(BaseModel):
@@ -27,3 +29,24 @@ class AnsichConfig(BaseModel):
         ge=1,
         description="Largest canonical JSON Observation payload stored inline before using ansich_payloads.",
     )
+    heartbeat_interval_seconds: int = Field(
+        default=10,
+        ge=1,
+        description="Interval between outer Run worker liveness observations.",
+    )
+    heartbeat_stale_after_seconds: int = Field(
+        default=30,
+        ge=1,
+        description="Age after which the heartbeat assessor may judge a running Task stale.",
+    )
+    long_dwell_seconds: int = Field(
+        default=120,
+        ge=1,
+        description="Dwell threshold used by the operator-facing Task assessor.",
+    )
+
+    @model_validator(mode="after")
+    def _validate_heartbeat_window(self) -> Self:
+        if self.heartbeat_stale_after_seconds < 2 * self.heartbeat_interval_seconds:
+            raise ValueError("heartbeat_stale_after_seconds must be at least twice heartbeat_interval_seconds")
+        return self

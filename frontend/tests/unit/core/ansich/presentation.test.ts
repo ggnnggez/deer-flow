@@ -3,6 +3,7 @@ import { describe, expect, it } from "@rstest/core";
 import {
   countMissingContextItems,
   countLostObservations,
+  getBudgetPresentation,
   formatAnsichTimestamp,
 } from "@/core/ansich/presentation";
 
@@ -43,5 +44,39 @@ describe("Ansich presentation", () => {
         { resolution_status: "missing" },
       ]),
     ).toBe(2);
+  });
+
+  it("does not invent a healthy budget bar without configuration or complete usage", () => {
+    expect(getBudgetPresentation(undefined, undefined)).toEqual({
+      status: "unconfigured",
+      percent: null,
+      overshoot: null,
+    });
+    expect(
+      getBudgetPresentation(
+        { hard_limit: null },
+        { value: "unknown", usage_value: null, overshoot: null },
+      ),
+    ).toEqual({
+      status: "unconfigured",
+      percent: null,
+      overshoot: null,
+    });
+    expect(
+      getBudgetPresentation(
+        { hard_limit: 100 },
+        { value: "unknown", usage_value: null, overshoot: null },
+      ),
+    ).toEqual({
+      status: "unknown",
+      percent: null,
+      overshoot: null,
+    });
+    expect(
+      getBudgetPresentation(
+        { hard_limit: 100 },
+        { value: "exceeded", usage_value: 107, overshoot: 7 },
+      ),
+    ).toEqual({ status: "exceeded", percent: 107, overshoot: 7 });
   });
 });

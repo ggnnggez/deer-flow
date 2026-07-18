@@ -286,6 +286,7 @@ async def run_agent(
     # finally is safe even if an exception fires before streaming begins.
     subagent_events: _SubagentEventBuffer | None = None
     ansich_execution_context: Any | None = None
+    ansich_heartbeat: Any | None = None
 
     if ansich_task is None and ctx.ansich_service is not None:
         from deerflow.ansich.probes import create_task_control_probe
@@ -295,6 +296,7 @@ async def run_agent(
             run_id=run_id,
             thread_id=thread_id,
             config=config,
+            app_config=ctx.app_config,
         )
         ansich_task.created()
 
@@ -329,6 +331,29 @@ async def run_agent(
         await run_manager.set_status(run_id, RunStatus.running)
         if ansich_task is not None:
             ansich_task.started()
+            ansich_config = getattr(ctx.app_config, "ansich", None)
+            worker_id = getattr(run_manager, "worker_id", None)
+            ownership_epoch = record.owner_worker_id
+            if ctx.ansich_service is not None and ansich_config is not None and isinstance(worker_id, str) and isinstance(ownership_epoch, str) and ownership_epoch == worker_id:
+                try:
+                    from deerflow.ansich.probes import AnsichTaskHeartbeat
+
+                    ansich_heartbeat = AnsichTaskHeartbeat(
+                        ctx.ansich_service,
+                        task_id=ansich_task.task_id,
+                        run_id=run_id,
+                        interval_seconds=float(ansich_config.heartbeat_interval_seconds),
+                        worker_id=worker_id,
+                        ownership_epoch=ownership_epoch,
+                        is_owner=lambda: record.owner_worker_id == worker_id,
+                    )
+                    ansich_heartbeat.start()
+                except Exception:
+                    logger.warning(
+                        "Run %s: could not start Ansich heartbeat",
+                        run_id,
+                        exc_info=True,
+                    )
 
         if event_store is not None:
             workspace_changes_user_id = get_effective_user_id()
@@ -661,6 +686,8 @@ async def run_agent(
         )
 
     finally:
+        if ansich_heartbeat is not None:
+            await ansich_heartbeat.stop()
         if ansich_execution_context is not None:
             try:
                 from deerflow.ansich.tool_middleware import reconcile_open_tool_calls

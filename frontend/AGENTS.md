@@ -72,11 +72,17 @@ The frontend is a stateful chat application. Users create **threads** (conversat
 
 Ansich is deliberately separate from chat state. The sidebar entry is rendered
 only for `system_role="admin"`; this is a convenience boundary, while Gateway
-admin authorization remains authoritative. The operations list and Task detail
-poll their REST read models every 5 seconds and always render full Belief
+admin authorization remains authoritative. The Phase 5 operations list polls
+its active-task read model every 5 seconds while any Task is running, backs off
+to 10 seconds when empty, and pauses while the page is hidden. Task detail stops
+automatic polling after its Task becomes terminal. Both render full Belief
 provenance plus projection health (`watermark`, lag, failed jobs, and lost
-ranges). They must not derive end-user progress percentages or fake Step counts.
-Task detail has Overview, Timeline, Steps, and Context tabs. Logical Steps fold
+ranges). Unknown heartbeat, Usage, or Budget evidence must be shown as
+insufficient evidence rather than healthy; Budget bars exist only when a limit
+and complete Usage are both known, and may show terminal overshoot. Inclusive
+Usage remains explicitly unavailable until Phase 8. They must not derive
+end-user progress percentages or fake Step counts. Task detail has Overview,
+Budgets, Timeline, Steps, and Context tabs. Logical Steps fold
 provider retries into attempts and render internal system operations separately;
 each ToolCall renders an ordered four-stage accountability chain (Issued,
 Authorization, Execution, Visible to model). Unknown authorization/execution is

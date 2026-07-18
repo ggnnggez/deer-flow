@@ -3,10 +3,12 @@ from __future__ import annotations
 from datetime import UTC, datetime
 from typing import cast
 
+from ansich.budget import BudgetSourceKind, TaskBudgetsView, TaskBudgetView
 from ansich.compression import CompressionDisposition, ContextCompressionItemView, ContextCompressionView
 from ansich.context_state import ContextStateDelta, ContextStateItem, ContextStateView, materialize_context_state
 from ansich.contracts import ControlBelief, ControlValue, NamedVersion, ObservationEnvelope, TaskView
 from ansich.control import should_select_control_candidate
+from ansich.heartbeat import TaskHeartbeatView
 from ansich.lineage import ContentBlockView, ContentProducerView, LineageDirection, PossibleExposureItemView
 from ansich.step import ContentBlockPayloadView, ContentOccurrenceView, ContextSnapshotItemView, ContextSnapshotView, LlmAttemptView, StepView
 from ansich.tool import (
@@ -16,6 +18,12 @@ from ansich.tool import (
     ToolCallView,
     ToolResultView,
     ToolTransformKind,
+)
+from ansich.usage import (
+    TaskUsageValue,
+    TaskUsageView,
+    child_task_contribution_for_tool_started,
+    usage_contributions_for_observation,
 )
 
 _CONTROL_BY_KIND = {
@@ -136,6 +144,134 @@ class InMemoryAnsichBackend:
 
     async def list_observations(self, task_id: str) -> list[ObservationEnvelope]:
         return [observation for observation in self._observations if observation.task_id == task_id]
+
+    async def get_task_usage(self, task_id: str) -> TaskUsageView:
+        values: dict[str, int] = {}
+        as_of: dict[str, datetime] = {}
+        complete_through: dict[str, int] = {}
+        seen: set[tuple[str, str]] = set()
+        executed_tool_ids: set[str] = set()
+        for ingest_seq, observation in enumerate(self._observations, start=1):
+            if observation.task_id != task_id:
+                continue
+            if observation.kind == "task.heartbeat" and observation.payload is not None:
+                elapsed_ms = observation.payload.get("elapsed_ms")
+                if isinstance(elapsed_ms, int) and not isinstance(elapsed_ms, bool):
+                    values["wall_time_ms"] = max(
+                        values.get("wall_time_ms", 0),
+                        max(0, elapsed_ms),
+                    )
+                    as_of["wall_time_ms"] = max(
+                        as_of.get("wall_time_ms", observation.occurred_at),
+                        observation.occurred_at,
+                    )
+                    complete_through["wall_time_ms"] = ingest_seq
+            contributions = list(usage_contributions_for_observation(observation))
+            if observation.kind == "tool.started":
+                issued = next(
+                    (item for item in self._observations if item.task_id == task_id and item.subject_id == observation.subject_id and item.kind == "tool.issued" and item.payload is not None),
+                    None,
+                )
+                tool_name = None if issued is None else issued.payload.get("tool_name")
+                if isinstance(tool_name, str):
+                    child = child_task_contribution_for_tool_started(
+                        observation,
+                        tool_name=tool_name,
+                    )
+                    if child is not None:
+                        contributions.append(child)
+            for contribution in contributions:
+                key = (contribution.source_obs_id, contribution.dimension)
+                if key in seen:
+                    continue
+                if contribution.dimension == "tool_calls_executed":
+                    if observation.subject_id in executed_tool_ids:
+                        continue
+                    executed_tool_ids.add(observation.subject_id)
+                seen.add(key)
+                if contribution.dimension == "wall_time_ms":
+                    values[contribution.dimension] = max(
+                        values.get(contribution.dimension, 0),
+                        contribution.delta,
+                    )
+                else:
+                    values[contribution.dimension] = values.get(contribution.dimension, 0) + contribution.delta
+                as_of[contribution.dimension] = max(as_of.get(contribution.dimension, contribution.as_of), contribution.as_of)
+                complete_through[contribution.dimension] = max(complete_through.get(contribution.dimension, ingest_seq), ingest_seq)
+        order = {
+            "input_tokens": 0,
+            "output_tokens": 1,
+            "total_tokens": 2,
+            "llm_attempts": 3,
+            "steps": 4,
+            "tool_calls_issued": 5,
+            "tool_calls_executed": 6,
+            "wall_time_ms": 7,
+            "child_tasks_spawned": 8,
+        }
+        local = tuple(
+            TaskUsageValue(
+                dimension=dimension,
+                aggregation_scope="local",
+                value=value,
+                as_of=as_of[dimension],
+                complete_through_ingest_seq=complete_through[dimension],
+            )
+            for dimension, value in sorted(values.items(), key=lambda item: order[item[0]])
+        )
+        return TaskUsageView(task_id=task_id, local=local)
+
+    async def get_task_budgets(self, task_id: str) -> TaskBudgetsView:
+        budgets: list[TaskBudgetView] = []
+        for observation in self._observations:
+            if observation.task_id != task_id or observation.kind != "budget.configured" or observation.payload is None:
+                continue
+            payload = observation.payload
+            budgets.append(
+                TaskBudgetView(
+                    entity_id=observation.obs_id,
+                    task_id=task_id,
+                    dimension=payload["dimension"],
+                    aggregation_scope=payload["aggregation_scope"],
+                    warning_limit=payload.get("warning_limit"),
+                    hard_limit=payload.get("hard_limit"),
+                    enforcement=payload["enforcement"],
+                    source_kind=cast(BudgetSourceKind, payload["source_kind"]),
+                    requested_value=payload.get("requested_value"),
+                    effective_value=payload["effective_value"],
+                    configured_obs_id=observation.obs_id,
+                )
+            )
+        order = {
+            "input_tokens": 0,
+            "output_tokens": 1,
+            "total_tokens": 2,
+            "llm_attempts": 3,
+            "steps": 4,
+            "tool_calls_issued": 5,
+            "tool_calls_executed": 6,
+            "wall_time_ms": 7,
+            "child_tasks_spawned": 8,
+        }
+        budgets.sort(key=lambda item: (order[item.dimension], item.aggregation_scope))
+        return TaskBudgetsView(task_id=task_id, budgets=tuple(budgets))
+
+    async def get_task_heartbeat(self, task_id: str) -> TaskHeartbeatView | None:
+        observation = max(
+            (item for item in self._observations if item.task_id == task_id and item.kind == "task.heartbeat" and item.payload is not None),
+            key=lambda item: item.occurred_at,
+            default=None,
+        )
+        if observation is None or observation.payload is None:
+            return None
+        return TaskHeartbeatView(
+            task_id=task_id,
+            heartbeat_obs_id=observation.obs_id,
+            occurred_at=observation.occurred_at,
+            producer_instance_id=observation.producer.instance_id,
+            ownership_epoch=str(observation.payload["ownership_epoch"]),
+            elapsed_ms=int(observation.payload["elapsed_ms"]),
+        )
 
     async def list_timeline(
         self,

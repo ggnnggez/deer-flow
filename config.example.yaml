@@ -15,7 +15,7 @@
 # ============================================================================
 # Bump this number when the config schema changes.
 # Run `make config-upgrade` to merge new fields into your local config.yaml.
-config_version: 28
+config_version: 29
 
 # ============================================================================
 # Logging
@@ -1673,6 +1673,11 @@ ansich:
   # Canonical JSON payloads larger than this move to ansich_payloads and are
   # available only through the admin raw-payload endpoint.
   inline_payload_max_bytes: 65536
+  # Outer Run liveness is independent of LangGraph/model/tool events. The stale
+  # rule must allow at least two complete heartbeat intervals.
+  heartbeat_interval_seconds: 10
+  heartbeat_stale_after_seconds: 30
+  long_dwell_seconds: 120
 
 # ============================================================================
 # Run Events Configuration

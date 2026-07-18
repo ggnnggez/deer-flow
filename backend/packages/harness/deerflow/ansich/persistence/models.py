@@ -5,6 +5,7 @@ from datetime import UTC, datetime
 from sqlalchemy import (
     JSON,
     BigInteger,
+    Boolean,
     CheckConstraint,
     DateTime,
     ForeignKey,
@@ -695,3 +696,117 @@ class AnsichTaskSummaryRow(Base):
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, default=_utc_now)
 
     __table_args__ = (Index("ix_ansich_task_summaries_control_evidence", "control_value", "last_evidence_at"),)
+
+
+class AnsichUsageContributionRow(Base):
+    __tablename__ = "ansich_usage_contributions"
+
+    task_id: Mapped[str] = mapped_column(String(36), ForeignKey("ansich_tasks.entity_id", ondelete="CASCADE"), primary_key=True)
+    source_task_id: Mapped[str] = mapped_column(String(36), ForeignKey("ansich_tasks.entity_id", ondelete="CASCADE"), primary_key=True)
+    dimension: Mapped[str] = mapped_column(String(32), primary_key=True)
+    source_obs_id: Mapped[str] = mapped_column(String(36), ForeignKey("ansich_observations.obs_id", ondelete="CASCADE"), primary_key=True)
+    delta: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    as_of: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+
+    __table_args__ = (Index("ix_ansich_usage_contributions_task_dimension", "task_id", "dimension"),)
+
+
+class AnsichTaskUsageRow(Base):
+    __tablename__ = "ansich_task_usage"
+
+    task_id: Mapped[str] = mapped_column(String(36), ForeignKey("ansich_tasks.entity_id", ondelete="CASCADE"), primary_key=True)
+    dimension: Mapped[str] = mapped_column(String(32), primary_key=True)
+    aggregation_scope: Mapped[str] = mapped_column(String(16), primary_key=True)
+    value: Mapped[int] = mapped_column(BigInteger, nullable=False, default=0)
+    as_of: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    complete_through_ingest_seq: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, default=_utc_now)
+
+
+class AnsichTaskBudgetRow(Base):
+    __tablename__ = "ansich_task_budgets"
+
+    entity_id: Mapped[str] = mapped_column(String(36), ForeignKey("ansich_entities.entity_id", ondelete="CASCADE"), primary_key=True)
+    task_id: Mapped[str] = mapped_column(String(36), ForeignKey("ansich_tasks.entity_id", ondelete="CASCADE"), nullable=False)
+    dimension: Mapped[str] = mapped_column(String(32), nullable=False)
+    aggregation_scope: Mapped[str] = mapped_column(String(16), nullable=False)
+    warning_limit: Mapped[int | None] = mapped_column(BigInteger)
+    hard_limit: Mapped[int | None] = mapped_column(BigInteger)
+    enforcement: Mapped[bool] = mapped_column(Boolean, nullable=False)
+    source_kind: Mapped[str] = mapped_column(String(32), nullable=False)
+    requested_value: Mapped[int | None] = mapped_column(BigInteger)
+    effective_value: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    configured_obs_id: Mapped[str] = mapped_column(String(36), ForeignKey("ansich_observations.obs_id", ondelete="CASCADE"), nullable=False)
+
+    __table_args__ = (
+        UniqueConstraint(
+            "task_id",
+            "dimension",
+            "aggregation_scope",
+            "configured_obs_id",
+            name="uq_ansich_task_budget_configuration",
+        ),
+        Index("ix_ansich_task_budgets_task_dimension", "task_id", "dimension"),
+    )
+
+
+class AnsichTaskHeartbeatRow(Base):
+    __tablename__ = "ansich_task_heartbeats"
+
+    heartbeat_obs_id: Mapped[str] = mapped_column(String(36), ForeignKey("ansich_observations.obs_id", ondelete="CASCADE"), primary_key=True)
+    task_id: Mapped[str] = mapped_column(String(36), ForeignKey("ansich_tasks.entity_id", ondelete="CASCADE"), nullable=False)
+    occurred_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    producer_instance_id: Mapped[str] = mapped_column(String(128), nullable=False)
+    ownership_epoch: Mapped[str] = mapped_column(String(128), nullable=False)
+    elapsed_ms: Mapped[int] = mapped_column(BigInteger, nullable=False)
+
+    __table_args__ = (Index("ix_ansich_task_heartbeats_task_occurred", "task_id", "occurred_at"),)
+
+
+class AnsichActiveTaskReadModelRow(Base):
+    __tablename__ = "ansich_active_task_read_model"
+
+    task_id: Mapped[str] = mapped_column(
+        String(36),
+        ForeignKey("ansich_tasks.entity_id", ondelete="CASCADE"),
+        primary_key=True,
+    )
+    run_id: Mapped[str] = mapped_column(String(128), nullable=False)
+    source_kind: Mapped[str] = mapped_column(String(64), nullable=False)
+    owner_id: Mapped[str | None] = mapped_column(String(256))
+    thread_id: Mapped[str | None] = mapped_column(String(256))
+    agent_id: Mapped[str | None] = mapped_column(String(256))
+    control_value: Mapped[str] = mapped_column(String(32), nullable=False)
+    current_step_id: Mapped[str | None] = mapped_column(String(36))
+    current_tool_call_id: Mapped[str | None] = mapped_column(String(36))
+    heartbeat_value: Mapped[str] = mapped_column(String(16), nullable=False)
+    budget_status: Mapped[str] = mapped_column(String(16), nullable=False)
+    duration_ms: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    observability_status: Mapped[str] = mapped_column(String(16), nullable=False)
+    projection_watermark: Mapped[int | None] = mapped_column(BigInteger)
+    projection_lag_ms: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    control_json: Mapped[dict] = mapped_column(JSON, nullable=False)
+    current_step_json: Mapped[dict | None] = mapped_column(JSON)
+    current_tool_json: Mapped[dict | None] = mapped_column(JSON)
+    dwell_json: Mapped[dict] = mapped_column(JSON, nullable=False)
+    heartbeat_json: Mapped[dict] = mapped_column(JSON, nullable=False)
+    usage_json: Mapped[dict] = mapped_column(JSON, nullable=False)
+    budgets_json: Mapped[dict] = mapped_column(JSON, nullable=False)
+    budget_health_json: Mapped[list] = mapped_column(JSON, nullable=False)
+    lost_ranges_json: Mapped[list] = mapped_column(JSON, nullable=False)
+    last_evidence_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+
+    __table_args__ = (
+        Index(
+            "ix_ansich_active_tasks_evidence",
+            "last_evidence_at",
+            "task_id",
+        ),
+        Index(
+            "ix_ansich_active_tasks_filters",
+            "owner_id",
+            "heartbeat_value",
+            "budget_status",
+        ),
+    )

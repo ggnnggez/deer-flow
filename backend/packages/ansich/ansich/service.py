@@ -8,13 +8,17 @@ from threading import Lock
 from weakref import ReferenceType, WeakMethod, ref
 
 from ansich.backend import AnsichBackend
+from ansich.budget import BudgetHealthBelief, TaskBudgetsView
 from ansich.compression import ContextCompressionView
 from ansich.context_state import ContextStateView
 from ansich.contracts import AnsichHealth, ControlValue, FlushResult, LostRange, ObservationEnvelope, Producer, RecordReceipt, TaskView
+from ansich.heartbeat import TaskHeartbeatView
 from ansich.lineage import ContentLineageView, LineageDirection, PossibleExposureView, find_possible_exposures, traverse_content_lineage
 from ansich.memory import InMemoryAnsichBackend
+from ansich.operations import ActiveTaskView, HeartbeatBelief
 from ansich.step import ContentBlockPayloadView, ContentOccurrenceView, ContextSnapshotView, LlmAttemptView, StepView
 from ansich.tool import ToolCallView
+from ansich.usage import TaskUsageView
 
 
 def _serialized_observation_size(observation: ObservationEnvelope) -> int:
@@ -37,6 +41,7 @@ class AnsichService:
         flush_interval_ms: int = 100,
         terminal_flush_timeout_ms: int = 2_000,
         projector_poll_interval_ms: int = 250,
+        operations_assessment_interval_ms: int = 1_000,
         unavailable_reason: str | None = None,
     ) -> None:
         if queue_capacity < 1:
@@ -51,12 +56,15 @@ class AnsichService:
             raise ValueError("terminal_flush_timeout_ms must be positive")
         if projector_poll_interval_ms < 1:
             raise ValueError("projector_poll_interval_ms must be positive")
+        if operations_assessment_interval_ms < 1:
+            raise ValueError("operations_assessment_interval_ms must be positive")
         self._capacity = queue_capacity
         self._byte_capacity = queue_byte_capacity
         self._batch_size = batch_size
         self._flush_interval_seconds = flush_interval_ms / 1000
         self._terminal_flush_timeout_seconds = terminal_flush_timeout_ms / 1000
         self._projector_poll_interval_seconds = projector_poll_interval_ms / 1000
+        self._operations_assessment_interval_seconds = operations_assessment_interval_ms / 1000
         self._queue: deque[tuple[int, ObservationEnvelope, int]] = deque()
         self._queue_bytes = 0
         self._lock = Lock()
@@ -92,6 +100,7 @@ class AnsichService:
         flush_interval_ms: int = 100,
         terminal_flush_timeout_ms: int = 2_000,
         projector_poll_interval_ms: int = 250,
+        operations_assessment_interval_ms: int = 1_000,
     ) -> AnsichService:
         return cls(
             InMemoryAnsichBackend(),
@@ -101,6 +110,7 @@ class AnsichService:
             flush_interval_ms=flush_interval_ms,
             terminal_flush_timeout_ms=terminal_flush_timeout_ms,
             projector_poll_interval_ms=projector_poll_interval_ms,
+            operations_assessment_interval_ms=operations_assessment_interval_ms,
         )
 
     async def start(self) -> None:
@@ -303,6 +313,93 @@ class AnsichService:
     async def list_observations(self, task_id: str) -> list[ObservationEnvelope]:
         return await self._backend.list_observations(task_id)
 
+    async def get_task_usage(self, task_id: str) -> TaskUsageView:
+        return await self._backend.get_task_usage(task_id)
+
+    async def get_task_budgets(self, task_id: str) -> TaskBudgetsView:
+        return await self._backend.get_task_budgets(task_id)
+
+    async def get_task_budget_health(
+        self,
+        task_id: str,
+    ) -> tuple[BudgetHealthBelief, ...]:
+        get_health = getattr(self._backend, "get_task_budget_health", None)
+        if not callable(get_health):
+            return ()
+        return tuple(await get_health(task_id))
+
+    async def get_task_heartbeat(self, task_id: str) -> TaskHeartbeatView | None:
+        return await self._backend.get_task_heartbeat(task_id)
+
+    async def assess_operations(self, *, now: datetime | None = None) -> int:
+        projection_lock = self._projection_lock
+        if projection_lock is None:
+            return await self._assess_operations_unlocked(now=now)
+        async with projection_lock:
+            return await self._assess_operations_unlocked(now=now)
+
+    async def _assess_operations_unlocked(
+        self,
+        *,
+        now: datetime | None = None,
+    ) -> int:
+        assess = getattr(self._backend, "assess_operations", None)
+        if not callable(assess):
+            return 0
+        with self._lock:
+            incomplete_task_ids = tuple(sorted({lost_range.task_id for lost_range in self._lost_ranges if lost_range.task_id is not None}))
+            global_loss = any(lost_range.task_id is None for lost_range in self._lost_ranges)
+            lost_ranges = tuple(self._lost_ranges)
+        return int(
+            await assess(
+                now=now,
+                incomplete_task_ids=incomplete_task_ids,
+                global_loss=global_loss,
+                lost_ranges=lost_ranges,
+            )
+        )
+
+    async def get_task_heartbeat_belief(
+        self,
+        task_id: str,
+    ) -> HeartbeatBelief | None:
+        get_belief = getattr(self._backend, "get_task_heartbeat_belief", None)
+        if not callable(get_belief):
+            return None
+        return await get_belief(task_id)
+
+    async def list_active_tasks(
+        self,
+        *,
+        limit: int = 100,
+        owner_id: str | None = None,
+        agent_id: str | None = None,
+        control: ControlValue | None = None,
+        heartbeat_status: str | None = None,
+        budget_status: str | None = None,
+        min_duration_ms: int | None = None,
+        max_duration_ms: int | None = None,
+        observability_status: str | None = None,
+        cursor: tuple[datetime, str] | None = None,
+    ) -> list[ActiveTaskView]:
+        list_active = getattr(self._backend, "list_active_tasks", None)
+        if not callable(list_active):
+            return []
+        return list(
+            await list_active(
+                limit=limit,
+                owner_id=owner_id,
+                agent_id=agent_id,
+                control=control,
+                heartbeat_status=heartbeat_status,
+                budget_status=budget_status,
+                min_duration_ms=min_duration_ms,
+                max_duration_ms=max_duration_ms,
+                observability_status=observability_status,
+                cursor=cursor,
+            )
+        )
+
     async def list_timeline(
         self,
         task_id: str,
@@ -404,11 +501,15 @@ class AnsichService:
             return 0
         projection_lock = self._projection_lock
         if projection_lock is None:
-            return int(await rebuild())
+            rebuilt = int(await rebuild())
+            await self._assess_operations_unlocked()
+            return rebuilt
         # The reset-and-replay must never interleave with the background
         # projector loop claiming the same jobs (SQLite has no SKIP LOCKED).
         async with projection_lock:
-            return int(await rebuild())
+            rebuilt = int(await rebuild())
+            await self._assess_operations_unlocked()
+            return rebuilt
 
     async def retry_failed_projections(self, *, task_id: str | None = None) -> int:
         retry_failed = getattr(self._backend, "retry_failed_projections", None)
@@ -519,16 +620,35 @@ class AnsichService:
         wake_event = self._projector_wake_event
         if wake_event is None:
             return
+        loop = asyncio.get_running_loop()
+        next_assessment = loop.time()
         while self._running:
             processed = await self._project_pending()
+            current_time = loop.time()
+            if current_time >= next_assessment:
+                try:
+                    await self.assess_operations()
+                except Exception:
+                    pass
+                next_assessment = current_time + self._operations_assessment_interval_seconds
             if processed > 0:
                 continue
             try:
-                await asyncio.wait_for(wake_event.wait(), timeout=self._projector_poll_interval_seconds)
+                await asyncio.wait_for(
+                    wake_event.wait(),
+                    timeout=min(
+                        self._projector_poll_interval_seconds,
+                        max(0.001, next_assessment - loop.time()),
+                    ),
+                )
             except TimeoutError:
                 pass
             wake_event.clear()
         while await self._project_pending() > 0:
+            pass
+        try:
+            await self.assess_operations()
+        except Exception:
             pass
 
     async def _flush_batch(self) -> FlushResult:

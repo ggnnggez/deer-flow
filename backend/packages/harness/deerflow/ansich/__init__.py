@@ -30,10 +30,13 @@ def create_sql_ansich_service(
     flush_interval_ms: int = 100,
     terminal_flush_timeout_ms: int = 2_000,
     projector_poll_interval_ms: int = 250,
+    operations_assessment_interval_ms: int = 1_000,
     projector_lease_seconds: int = 30,
     projector_max_attempts: int = 5,
     projector_dependency_timeout_seconds: int = 300,
     inline_payload_max_bytes: int = 65_536,
+    heartbeat_stale_after_seconds: int = 30,
+    long_dwell_seconds: int = 120,
 ) -> AnsichService:
     return AnsichService(
         SqlAnsichBackend(
@@ -42,6 +45,8 @@ def create_sql_ansich_service(
             projector_max_attempts=projector_max_attempts,
             projector_dependency_timeout_seconds=projector_dependency_timeout_seconds,
             inline_payload_max_bytes=inline_payload_max_bytes,
+            heartbeat_stale_after_seconds=heartbeat_stale_after_seconds,
+            long_dwell_seconds=long_dwell_seconds,
         ),
         queue_capacity=queue_capacity,
         queue_byte_capacity=queue_byte_capacity,
@@ -49,6 +54,7 @@ def create_sql_ansich_service(
         flush_interval_ms=flush_interval_ms,
         terminal_flush_timeout_ms=terminal_flush_timeout_ms,
         projector_poll_interval_ms=projector_poll_interval_ms,
+        operations_assessment_interval_ms=operations_assessment_interval_ms,
     )
 
 
@@ -76,6 +82,8 @@ def create_embedded_ansich_service(config, session_factory):
         projector_max_attempts=config.projector_max_attempts,
         projector_dependency_timeout_seconds=config.projector_dependency_timeout_seconds,
         inline_payload_max_bytes=config.inline_payload_max_bytes,
+        heartbeat_stale_after_seconds=config.heartbeat_stale_after_seconds,
+        long_dwell_seconds=config.long_dwell_seconds,
     )
 
 

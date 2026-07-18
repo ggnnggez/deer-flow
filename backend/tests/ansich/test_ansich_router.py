@@ -543,6 +543,9 @@ async def test_regular_user_is_forbidden_from_ansich_operations():
         compression_response = await client.get(f"/api/ansich/context-compressions/{new_id()}")
         exposures_response = await client.get(f"/api/ansich/content-blocks/{new_id()}/exposures")
         snapshot_response = await client.get(f"/api/ansich/context-snapshots/{new_id()}")
+        active_response = await client.get("/api/ansich/operations/active-tasks")
+        usage_response = await client.get(f"/api/ansich/tasks/{new_id()}/usage")
+        budgets_response = await client.get(f"/api/ansich/tasks/{new_id()}/budgets")
 
     assert response.status_code == 403
     assert raw_response.status_code == 403
@@ -552,6 +555,9 @@ async def test_regular_user_is_forbidden_from_ansich_operations():
     assert compression_response.status_code == 403
     assert exposures_response.status_code == 403
     assert snapshot_response.status_code == 403
+    assert active_response.status_code == 403
+    assert usage_response.status_code == 403
+    assert budgets_response.status_code == 403
 
 
 @pytest.mark.anyio

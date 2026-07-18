@@ -1,5 +1,51 @@
 import type { AnsichLostRange } from "./types";
 
+export interface BudgetPresentation {
+  status: "unconfigured" | "unknown" | "within" | "warning" | "exceeded";
+  percent: number | null;
+  overshoot: number | null;
+}
+
+export function getBudgetPresentation(
+  budget: { hard_limit: number | null } | undefined,
+  health:
+    | {
+        value: "unknown" | "within" | "warning" | "exceeded";
+        usage_value: number | null;
+        overshoot: number | null;
+      }
+    | undefined,
+): BudgetPresentation {
+  const hardLimit = budget?.hard_limit;
+  if (hardLimit === undefined || hardLimit === null) {
+    return { status: "unconfigured", percent: null, overshoot: null };
+  }
+  if (!health || health.value === "unknown" || health.usage_value === null) {
+    return { status: "unknown", percent: null, overshoot: null };
+  }
+  const percent =
+    hardLimit === 0
+      ? health.usage_value > 0
+        ? 100
+        : 0
+      : Math.round((health.usage_value / hardLimit) * 100);
+  return {
+    status: health.value,
+    percent,
+    overshoot: health.overshoot,
+  };
+}
+
+export function formatDuration(milliseconds: number | null): string {
+  if (milliseconds === null) return "—";
+  const seconds = Math.floor(milliseconds / 1_000);
+  if (seconds < 60) return `${seconds}s`;
+  const minutes = Math.floor(seconds / 60);
+  if (minutes < 60) return `${minutes}m ${seconds % 60}s`;
+  const hours = Math.floor(minutes / 60);
+  return `${hours}h ${minutes % 60}m`;
+}
+
 export function countMissingContextItems(
   items: Array<{ resolution_status: "available" | "missing" }>,
 ): number {

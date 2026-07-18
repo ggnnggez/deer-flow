@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 from datetime import UTC, datetime
+from types import SimpleNamespace
 
 import pytest
 from ansich import AnsichService, ObservationEnvelope, Producer, new_id
@@ -34,6 +35,18 @@ class FailingAgent(SuccessfulAgent):
 class InterruptedAgent(SuccessfulAgent):
     async def astream(self, graph_input, *, config, stream_mode, **kwargs):
         raise asyncio.CancelledError
+        yield
+
+
+class SilentUntilReleasedAgent(SuccessfulAgent):
+    def __init__(self) -> None:
+        self.entered = asyncio.Event()
+        self.release = asyncio.Event()
+
+    async def astream(self, graph_input, *, config, stream_mode, **kwargs):
+        self.entered.set()
+        await self.release.wait()
+        return
         yield
 
 
@@ -97,6 +110,7 @@ class LeavesIssuedToolOpenAgent(CapturingExecutionAgent):
 class RecordingRunManager:
     def __init__(self, record: RunRecord) -> None:
         self.record = record
+        self.worker_id = "worker-a"
 
     async def wait_for_prior_finalizing(self, *_args, **_kwargs) -> None:
         return None
@@ -128,6 +142,179 @@ class RecordingBridge:
 
     async def cleanup(self, *_args, **_kwargs) -> None:
         return None
+
+
+def _heartbeat_app_config(*, interval_seconds: float = 0.01) -> SimpleNamespace:
+    return SimpleNamespace(
+        ansich=SimpleNamespace(heartbeat_interval_seconds=interval_seconds),
+    )
+
+
+@pytest.mark.asyncio
+async def test_worker_emits_heartbeat_during_graph_silence_and_stops_before_terminal():
+    service = AnsichService.in_memory(flush_interval_ms=1)
+    await service.start()
+    record = RunRecord(
+        run_id="run-ansich-heartbeat",
+        thread_id="thread-ansich-heartbeat",
+        assistant_id="lead-agent",
+        status=RunStatus.pending,
+        on_disconnect=DisconnectMode.cancel,
+        owner_worker_id="worker-a",
+    )
+    record.abort_event = asyncio.Event()
+    agent = SilentUntilReleasedAgent()
+
+    run_task = asyncio.create_task(
+        run_agent(
+            RecordingBridge(),
+            RecordingRunManager(record),
+            record,
+            ctx=RunContext(
+                checkpointer=None,
+                ansich_service=service,
+                app_config=_heartbeat_app_config(),
+            ),
+            agent_factory=lambda config: agent,
+            graph_input={"messages": []},
+            config={"configurable": {"thread_id": record.thread_id}},
+        )
+    )
+
+    try:
+        await asyncio.wait_for(agent.entered.wait(), timeout=1)
+        async with asyncio.timeout(1):
+            while True:
+                task = await service.get_task_by_source("deerflow_run", record.run_id)
+                if task is not None:
+                    observations = await service.list_observations(task.task_id)
+                    if any(item.kind == "task.heartbeat" for item in observations):
+                        break
+                await asyncio.sleep(0.005)
+
+        agent.release.set()
+        await asyncio.wait_for(run_task, timeout=1)
+        await service.flush_task(task.task_id)
+        observations = await service.list_observations(task.task_id)
+        heartbeat_count = sum(item.kind == "task.heartbeat" for item in observations)
+        terminal_index = next(index for index, item in enumerate(observations) if item.kind in {"task.completed", "task.failed", "task.interrupted"})
+
+        await asyncio.sleep(0.03)
+        await service.flush_task(task.task_id)
+        observations_after_terminal = await service.list_observations(task.task_id)
+    finally:
+        agent.release.set()
+        if not run_task.done():
+            run_task.cancel()
+            await asyncio.gather(run_task, return_exceptions=True)
+        await service.stop()
+
+    assert heartbeat_count >= 1
+    assert all(index < terminal_index for index, item in enumerate(observations) if item.kind == "task.heartbeat")
+    assert sum(item.kind == "task.heartbeat" for item in observations_after_terminal) == heartbeat_count
+
+
+@pytest.mark.asyncio
+async def test_worker_does_not_emit_heartbeat_without_current_run_ownership():
+    service = AnsichService.in_memory(flush_interval_ms=1)
+    await service.start()
+    record = RunRecord(
+        run_id="run-ansich-not-owner",
+        thread_id="thread-ansich-not-owner",
+        assistant_id="lead-agent",
+        status=RunStatus.pending,
+        on_disconnect=DisconnectMode.cancel,
+        owner_worker_id="worker-b",
+    )
+    agent = SilentUntilReleasedAgent()
+    run_task = asyncio.create_task(
+        run_agent(
+            RecordingBridge(),
+            RecordingRunManager(record),
+            record,
+            ctx=RunContext(
+                checkpointer=None,
+                ansich_service=service,
+                app_config=_heartbeat_app_config(),
+            ),
+            agent_factory=lambda config: agent,
+            graph_input={"messages": []},
+            config={"configurable": {"thread_id": record.thread_id}},
+        )
+    )
+
+    try:
+        await asyncio.wait_for(agent.entered.wait(), timeout=1)
+        await asyncio.sleep(0.03)
+        agent.release.set()
+        await asyncio.wait_for(run_task, timeout=1)
+        task = await service.get_task_by_source("deerflow_run", record.run_id)
+        assert task is not None
+        observations = await service.list_observations(task.task_id)
+    finally:
+        agent.release.set()
+        if not run_task.done():
+            run_task.cancel()
+            await asyncio.gather(run_task, return_exceptions=True)
+        await service.stop()
+
+    assert all(item.kind != "task.heartbeat" for item in observations)
+
+
+@pytest.mark.asyncio
+async def test_worker_cancellation_stops_heartbeat_before_interrupted_terminal():
+    service = AnsichService.in_memory(flush_interval_ms=1)
+    await service.start()
+    record = RunRecord(
+        run_id="run-ansich-heartbeat-cancel",
+        thread_id="thread-ansich-heartbeat-cancel",
+        assistant_id="lead-agent",
+        status=RunStatus.pending,
+        on_disconnect=DisconnectMode.cancel,
+        owner_worker_id="worker-a",
+    )
+    agent = SilentUntilReleasedAgent()
+    run_task = asyncio.create_task(
+        run_agent(
+            RecordingBridge(),
+            RecordingRunManager(record),
+            record,
+            ctx=RunContext(
+                checkpointer=None,
+                ansich_service=service,
+                app_config=_heartbeat_app_config(),
+            ),
+            agent_factory=lambda config: agent,
+            graph_input={"messages": []},
+            config={"configurable": {"thread_id": record.thread_id}},
+        )
+    )
+
+    try:
+        await asyncio.wait_for(agent.entered.wait(), timeout=1)
+        async with asyncio.timeout(1):
+            while True:
+                task = await service.get_task_by_source("deerflow_run", record.run_id)
+                if task is not None:
+                    observations = await service.list_observations(task.task_id)
+                    if any(item.kind == "task.heartbeat" for item in observations):
+                        break
+                await asyncio.sleep(0.005)
+
+        run_task.cancel()
+        await asyncio.wait_for(run_task, timeout=1)
+        await service.flush_task(task.task_id)
+        observations = await service.list_observations(task.task_id)
+    finally:
+        agent.release.set()
+        if not run_task.done():
+            run_task.cancel()
+            await asyncio.gather(run_task, return_exceptions=True)
+        await service.stop()
+
+    terminal_index = next(index for index, item in enumerate(observations) if item.kind == "task.interrupted")
+    assert record.status == RunStatus.interrupted
+    assert all(index < terminal_index for index, item in enumerate(observations) if item.kind == "task.heartbeat")
 
 
 @pytest.mark.asyncio
@@ -237,7 +424,7 @@ async def test_ansich_storage_unavailability_does_not_change_successful_run_resu
     assert record.status == RunStatus.success
     assert task is None
     assert health.status == "failed"
-    assert health.dropped_count == 3
+    assert health.dropped_count == 4
 
 
 @pytest.mark.asyncio

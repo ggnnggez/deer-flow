@@ -81,3 +81,35 @@ def test_phase_two_observation_accepts_step_subject_with_explicit_parent() -> No
 
     assert observation.step_id == step_id
     assert observation.subject_id == step_id
+
+
+def test_phase_five_observation_builders_reject_invalid_measurements() -> None:
+    task_id = new_id()
+    now = datetime.now(UTC)
+
+    with pytest.raises(ValidationError, match="elapsed_ms"):
+        ObservationEnvelope.task_heartbeat(
+            task_id=task_id,
+            run_id="run-invalid-heartbeat",
+            occurred_at=now,
+            elapsed_ms=-1,
+            worker_id="worker-a",
+            ownership_epoch="worker-a",
+            source_event_id="run:run-invalid-heartbeat:heartbeat:1",
+        )
+
+    with pytest.raises(ValidationError, match="effective_value"):
+        ObservationEnvelope.budget_configured(
+            task_id=task_id,
+            run_id="run-invalid-budget",
+            occurred_at=now,
+            dimension="steps",
+            aggregation_scope="local",
+            warning_limit=None,
+            hard_limit=None,
+            enforcement=False,
+            source_kind="shadow",
+            requested_value=None,
+            effective_value=-1,
+            source_event_id="run:run-invalid-budget:budget:steps",
+        )

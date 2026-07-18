@@ -399,6 +399,34 @@ export interface Translations {
     loadFailed: string;
     taskNotFound: string;
     backToOperations: string;
+    activeTasks: string;
+    noActiveTasks: string;
+    currentAction: string;
+    dwell: string;
+    heartbeat: string;
+    localUsage: string;
+    budgets: string;
+    budget: string;
+    owner: string;
+    thread: string;
+    evidenceInsufficient: string;
+    unconfigured: string;
+    notAvailable: string;
+    overshoot: string;
+    enforcement: string;
+    enforced: string;
+    shadow: string;
+    heartbeatState: {
+      unknown: string;
+      fresh: string;
+      stale: string;
+    };
+    budgetState: {
+      unknown: string;
+      within: string;
+      warning: string;
+      exceeded: string;
+    };
     status: {
       unknown: string;
       created: string;

@@ -3,12 +3,16 @@ from __future__ import annotations
 from datetime import datetime
 from typing import Protocol
 
+from ansich.budget import BudgetHealthBelief, TaskBudgetsView
 from ansich.compression import ContextCompressionView
 from ansich.context_state import ContextStateView
-from ansich.contracts import ControlValue, ObservationEnvelope, TaskView
+from ansich.contracts import ControlValue, LostRange, ObservationEnvelope, TaskView
+from ansich.heartbeat import TaskHeartbeatView
 from ansich.lineage import ContentBlockView, LineageDirection, PossibleExposureItemView
+from ansich.operations import ActiveTaskView, HeartbeatBelief
 from ansich.step import ContentBlockPayloadView, ContentOccurrenceView, ContextSnapshotView, LlmAttemptView, StepView
 from ansich.tool import ContentDerivationView, ToolCallView
+from ansich.usage import TaskUsageView
 
 
 class AnsichBackend(Protocol):
@@ -29,6 +33,46 @@ class AnsichBackend(Protocol):
     ) -> list[TaskView]: ...
 
     async def list_observations(self, task_id: str) -> list[ObservationEnvelope]: ...
+
+    async def get_task_usage(self, task_id: str) -> TaskUsageView: ...
+
+    async def get_task_budgets(self, task_id: str) -> TaskBudgetsView: ...
+
+    async def get_task_budget_health(
+        self,
+        task_id: str,
+    ) -> tuple[BudgetHealthBelief, ...]: ...
+
+    async def get_task_heartbeat(self, task_id: str) -> TaskHeartbeatView | None: ...
+
+    async def assess_operations(
+        self,
+        *,
+        now: datetime | None = None,
+        incomplete_task_ids: tuple[str, ...] = (),
+        global_loss: bool = False,
+        lost_ranges: tuple[LostRange, ...] = (),
+    ) -> int: ...
+
+    async def get_task_heartbeat_belief(
+        self,
+        task_id: str,
+    ) -> HeartbeatBelief | None: ...
+
+    async def list_active_tasks(
+        self,
+        *,
+        limit: int = 100,
+        owner_id: str | None = None,
+        agent_id: str | None = None,
+        control: ControlValue | None = None,
+        heartbeat_status: str | None = None,
+        budget_status: str | None = None,
+        min_duration_ms: int | None = None,
+        max_duration_ms: int | None = None,
+        observability_status: str | None = None,
+        cursor: tuple[datetime, str] | None = None,
+    ) -> list[ActiveTaskView]: ...
 
     async def list_timeline(
         self,

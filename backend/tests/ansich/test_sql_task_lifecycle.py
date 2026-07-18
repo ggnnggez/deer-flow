@@ -848,7 +848,7 @@ def test_projection_dependency_deadline_migration_upgrades_sqlite(tmp_path) -> N
         engine.dispose()
 
     assert "dependency_pending_since" in column_names
-    assert revision == "0015_ansich_projection_deadline"
+    assert revision == "0016_ansich_operations"
     assert len(revision) <= 32
 
 
@@ -889,7 +889,7 @@ async def test_dependency_pending_job_eventually_fails_health_and_can_be_retried
         health_after_timeout = service.get_health()
         async with session_factory() as session:
             failed_job = await session.scalar(select(AnsichProjectionJobRow).where(AnsichProjectionJobRow.projector_name == "task-step"))
-            error_count = await session.scalar(select(func.count()).select_from(AnsichProjectionErrorRow))
+            error_count = await session.scalar(select(func.count()).select_from(AnsichProjectionErrorRow).where(AnsichProjectionErrorRow.job_id == failed_job.job_id))
 
         service.record(
             ObservationEnvelope.task_lifecycle(
@@ -915,8 +915,8 @@ async def test_dependency_pending_job_eventually_fails_health_and_can_be_retried
     assert "Ansich task is not projected" in (failed_job.last_error or "")
     assert error_count == 1
     assert health_after_timeout.status == "degraded"
-    assert health_after_timeout.failed_jobs == 1
-    assert retried == 1
+    assert health_after_timeout.failed_jobs == 2
+    assert retried == 2
     assert [step.step_id for step in steps] == [step_id]
     assert health_after_retry.failed_jobs == 0
 

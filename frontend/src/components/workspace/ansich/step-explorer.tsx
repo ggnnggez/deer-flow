@@ -27,9 +27,15 @@ import {
   AnsichCompressionExplorer,
 } from "./lineage-explorer";
 
-export function AnsichStepsPanel({ taskId }: { taskId: string }) {
+export function AnsichStepsPanel({
+  taskId,
+  polling = true,
+}: {
+  taskId: string;
+  polling?: boolean;
+}) {
   const { t } = useI18n();
-  const query = useAnsichTaskSteps(taskId);
+  const query = useAnsichTaskSteps(taskId, true, polling);
 
   if (query.isPending) return <Skeleton className="h-48 w-full" />;
   if (query.error) return <InlineError message={query.error.message} />;
@@ -87,12 +93,14 @@ export function AnsichStepsPanel({ taskId }: { taskId: string }) {
 export function AnsichContextPanel({
   taskId,
   compressionIds = [],
+  polling = true,
 }: {
   taskId: string;
   compressionIds?: string[];
+  polling?: boolean;
 }) {
   const { t } = useI18n();
-  const stepsQuery = useAnsichTaskSteps(taskId);
+  const stepsQuery = useAnsichTaskSteps(taskId, true, polling);
   const eligibleSteps = (stepsQuery.data?.items ?? []).filter(
     (step) => step.effective_context_snapshot_id !== null,
   );
@@ -107,7 +115,7 @@ export function AnsichContextPanel({
     }
   }, [eligibleSteps, selectedStepId]);
 
-  const contextQuery = useAnsichStepContext(selectedStepId);
+  const contextQuery = useAnsichStepContext(selectedStepId, true, polling);
   if (stepsQuery.isPending) return <Skeleton className="h-48 w-full" />;
   if (stepsQuery.error)
     return <InlineError message={stepsQuery.error.message} />;

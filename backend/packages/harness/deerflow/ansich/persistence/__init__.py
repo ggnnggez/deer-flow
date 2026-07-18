@@ -1,4 +1,5 @@
 from deerflow.ansich.persistence.models import (
+    AnsichActiveTaskReadModelRow,
     AnsichBeliefAssertionRow,
     AnsichBeliefEvidenceRow,
     AnsichBlockProducerRow,
@@ -29,15 +30,20 @@ from deerflow.ansich.persistence.models import (
     AnsichRelationRow,
     AnsichScopeRow,
     AnsichStepRow,
+    AnsichTaskBudgetRow,
+    AnsichTaskHeartbeatRow,
     AnsichTaskRow,
     AnsichTaskSummaryRow,
+    AnsichTaskUsageRow,
     AnsichToolCallResultRow,
     AnsichToolCallRow,
     AnsichTransitionRow,
+    AnsichUsageContributionRow,
 )
 from deerflow.ansich.persistence.sql import SqlAnsichBackend
 
 __all__ = [
+    "AnsichActiveTaskReadModelRow",
     "AnsichBeliefAssertionRow",
     "AnsichBeliefEvidenceRow",
     "AnsichBlockProducerRow",
@@ -69,9 +75,13 @@ __all__ = [
     "AnsichScopeRow",
     "AnsichStepRow",
     "AnsichTaskRow",
+    "AnsichTaskBudgetRow",
+    "AnsichTaskHeartbeatRow",
     "AnsichTaskSummaryRow",
+    "AnsichTaskUsageRow",
     "AnsichToolCallResultRow",
     "AnsichToolCallRow",
     "AnsichTransitionRow",
+    "AnsichUsageContributionRow",
     "SqlAnsichBackend",
 ]

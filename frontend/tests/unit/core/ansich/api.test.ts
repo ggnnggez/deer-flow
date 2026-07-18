@@ -6,6 +6,7 @@ rs.mock("@/core/api/fetcher", () => ({
 
 import {
   AnsichApiError,
+  fetchAnsichActiveTasks,
   fetchAnsichContentExposures,
   fetchAnsichContentLineage,
   fetchAnsichContentPayload,
@@ -17,6 +18,8 @@ import {
   fetchAnsichTaskSteps,
   fetchAnsichTaskTimeline,
   fetchAnsichTasks,
+  fetchAnsichTaskBudgets,
+  fetchAnsichTaskUsage,
 } from "@/core/ansich/api";
 import { fetch } from "@/core/api/fetcher";
 
@@ -46,6 +49,22 @@ describe("Ansich API", () => {
     expect(mockedFetch).toHaveBeenCalledWith(
       expect.stringContaining("/api/ansich/tasks?limit=75"),
     );
+  });
+
+  it("uses the Phase 5 active, usage, and budget endpoints", async () => {
+    mockedFetch.mockResolvedValue(jsonResponse({}));
+    const taskId = "task/operations";
+
+    await fetchAnsichActiveTasks(75);
+    await fetchAnsichTaskUsage(taskId);
+    await fetchAnsichTaskBudgets(taskId);
+
+    const encoded = encodeURIComponent(taskId);
+    expect(mockedFetch.mock.calls.map((call) => call[0])).toEqual([
+      expect.stringContaining("/api/ansich/operations/active-tasks?limit=75"),
+      expect.stringContaining(`/api/ansich/tasks/${encoded}/usage`),
+      expect.stringContaining(`/api/ansich/tasks/${encoded}/budgets`),
+    ]);
   });
 
   it("URL-encodes a task ID for both task and timeline requests", async () => {

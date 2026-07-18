@@ -766,6 +766,7 @@ async def start_run(
                 run_id=record.run_id,
                 thread_id=thread_id,
                 config=config,
+                app_config=run_ctx.app_config,
             )
             ansich_task.created()
 

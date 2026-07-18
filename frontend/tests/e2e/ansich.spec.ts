@@ -52,17 +52,66 @@ const TASK = {
     evidence_obs_ids: ["13bd27c7-51b1-4164-9380-b98c40c2bfe0"],
   },
 };
+const ACTIVE_TASK = {
+  ...TASK,
+  run_id: "run-e2e",
+  owner_id: "owner-e2e",
+  thread_id: "thread-e2e",
+  agent_id: null,
+  control: { ...TASK.control, value: "running" },
+  current_step: {
+    step_id: STEP_ID,
+    step_seq: 1,
+    actor_kind: "lead_agent",
+    status: "acting",
+  },
+  current_tool: null,
+  dwell: {
+    value: "normal",
+    since: "2026-07-17T12:00:02Z",
+    duration_ms: 1_000,
+    asserted_at: "2026-07-17T12:00:03Z",
+    source: { name: "transition-dwell", version: "1" },
+    fidelity_class: "rule",
+    selected_by: { name: "dwell-state", version: "1:test" },
+    evidence_obs_ids: ["13bd27c7-51b1-4164-9380-b98c40c2bfe0"],
+  },
+  heartbeat: {
+    value: "fresh",
+    as_of: "2026-07-17T12:00:03Z",
+    age_ms: 1_000,
+    asserted_at: "2026-07-17T12:00:04Z",
+    source: { name: "heartbeat", version: "1" },
+    fidelity_class: "rule",
+    selected_by: { name: "heartbeat-state", version: "1:test" },
+    evidence_obs_ids: ["13bd27c7-51b1-4164-9380-b98c40c2bfe0"],
+  },
+  usage: {
+    task_id: TASK_ID,
+    local: [],
+    inclusive_status: "not_available",
+  },
+  budgets: { task_id: TASK_ID, budgets: [] },
+  budget_health: [],
+  duration_ms: 3_000,
+  observability_status: "healthy",
+  projection_watermark: 3,
+  projection_lag_ms: 0,
+  lost_ranges: [],
+  last_evidence_at: "2026-07-17T12:00:03Z",
+  updated_at: "2026-07-17T12:00:04Z",
+};
 
 test("admin navigates from Ansich operations to evidence-backed Task detail", async ({
   page,
 }) => {
   mockLangGraphAPI(page, { threads: [] });
-  await page.route("**/api/ansich/tasks?*", (route) =>
+  await page.route("**/api/ansich/operations/active-tasks?*", (route) =>
     route.fulfill({
       status: 200,
       contentType: "application/json",
       body: JSON.stringify({
-        items: [TASK],
+        items: [ACTIVE_TASK],
         next_cursor: null,
         projection_status: HEALTH,
       }),
@@ -481,7 +530,9 @@ test("admin navigates from Ansich operations to evidence-backed Task detail", as
   await page.getByRole("link", { name: "Ansich" }).click();
   await page.waitForURL("**/workspace/ansich/operations");
   await expect(page.getByRole("heading", { name: "Operations" })).toBeVisible();
-  await expect(page.getByText("Healthy", { exact: true })).toBeVisible();
+  await expect(
+    page.getByText("Healthy", { exact: true }).first(),
+  ).toBeVisible();
   await expect(page.getByText("Queue bytes", { exact: true })).toBeVisible();
   await page.getByRole("link", { name: new RegExp(TASK_ID) }).click();
 
@@ -515,12 +566,12 @@ test("context tab distinguishes failed projection from no observed context", asy
 }) => {
   mockLangGraphAPI(page, { threads: [] });
   const degradedHealth = { ...HEALTH, status: "degraded", failed_jobs: 1 };
-  await page.route("**/api/ansich/tasks?*", (route) =>
+  await page.route("**/api/ansich/operations/active-tasks?*", (route) =>
     route.fulfill({
       status: 200,
       contentType: "application/json",
       body: JSON.stringify({
-        items: [TASK],
+        items: [ACTIVE_TASK],
         next_cursor: null,
         projection_status: degradedHealth,
       }),
@@ -612,7 +663,7 @@ test("operations page preserves storage-unavailable detail from a 503", async ({
   page,
 }) => {
   mockLangGraphAPI(page, { threads: [] });
-  await page.route("**/api/ansich/tasks?*", (route) =>
+  await page.route("**/api/ansich/operations/active-tasks?*", (route) =>
     route.fulfill({
       status: 503,
       contentType: "application/json",

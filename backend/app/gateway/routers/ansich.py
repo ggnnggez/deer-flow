@@ -1,5 +1,6 @@
 import base64
 import binascii
+import hashlib
 import json
 import logging
 from datetime import datetime
@@ -78,6 +79,131 @@ def _decode_timeline_cursor(value: str | None) -> tuple[datetime, int] | None:
         return occurred_at, decoded[1]
     except (binascii.Error, ValueError, UnicodeDecodeError, json.JSONDecodeError) as exc:
         raise HTTPException(status_code=422, detail="Invalid Ansich timeline cursor") from exc
+
+
+@router.get("/operations/active-tasks", response_model=None)
+async def list_active_tasks(
+    request: Request,
+    response: Response,
+    owner: str | None = Query(default=None),
+    agent: str | None = Query(default=None),
+    control: ControlValue | None = Query(default=None),
+    heartbeat: Literal["unknown", "fresh", "stale"] | None = Query(default=None),
+    budget: Literal["unknown", "within", "warning", "exceeded"] | None = Query(default=None),
+    min_duration_ms: int | None = Query(default=None, ge=0),
+    max_duration_ms: int | None = Query(default=None, ge=0),
+    observability: Literal["healthy", "degraded"] | None = Query(default=None),
+    limit: int = Query(default=100, ge=1, le=500),
+    cursor: str | None = Query(default=None),
+) -> dict | Response:
+    await require_admin_user(request, detail=_ADMIN_REQUIRED)
+    service = _service_or_503(request)
+    _ensure_queryable(service)
+    decoded_cursor = _decode_cursor(cursor)
+    query = {
+        "limit": limit + 1,
+        "owner_id": owner,
+        "agent_id": agent,
+        "control": control,
+        "heartbeat_status": heartbeat,
+        "budget_status": budget,
+        "min_duration_ms": min_duration_ms,
+        "max_duration_ms": max_duration_ms,
+        "observability_status": observability,
+        "cursor": decoded_cursor,
+    }
+    try:
+        tasks = await service.list_active_tasks(**query)
+        if not tasks and cursor is None:
+            await service.assess_operations()
+            tasks = await service.list_active_tasks(**query)
+    except Exception as exc:
+        raise HTTPException(
+            status_code=503,
+            detail={
+                "message": "Ansich active Task query failed",
+                "projection_status": _projection_status(service),
+            },
+        ) from exc
+    page = tasks[:limit]
+    next_cursor = None
+    if len(tasks) > limit and page:
+        next_cursor = _encode_cursor(
+            page[-1].last_evidence_at,
+            page[-1].task_id,
+        )
+    body = {
+        "items": [task.model_dump(mode="json") for task in page],
+        "next_cursor": next_cursor,
+        "projection_status": _projection_status(service),
+        "updated_at": max(
+            (task.updated_at for task in page),
+            default=None,
+        ),
+    }
+    etag_payload = json.dumps(body, sort_keys=True, default=str).encode()
+    etag = f'"{hashlib.sha256(etag_payload).hexdigest()}"'
+    if request.headers.get("if-none-match") == etag:
+        return Response(status_code=304, headers={"ETag": etag})
+    response.headers["ETag"] = etag
+    return body
+
+
+@router.get("/tasks/{task_id}/usage")
+async def get_task_usage(task_id: str, request: Request) -> dict:
+    await require_admin_user(request, detail=_ADMIN_REQUIRED)
+    service = _service_or_503(request)
+    _ensure_queryable(service)
+    try:
+        task = await service.get_task(task_id)
+        if task is None:
+            raise HTTPException(status_code=404, detail="Ansich Task not found")
+        usage = await service.get_task_usage(task_id)
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise HTTPException(
+            status_code=503,
+            detail={
+                "message": "Ansich Usage query failed",
+                "projection_status": _projection_status(service),
+            },
+        ) from exc
+    return {
+        "usage": usage.model_dump(mode="json"),
+        "projection_status": _projection_status(service),
+    }
+
+
+@router.get("/tasks/{task_id}/budgets")
+async def get_task_budgets(task_id: str, request: Request) -> dict:
+    await require_admin_user(request, detail=_ADMIN_REQUIRED)
+    service = _service_or_503(request)
+    _ensure_queryable(service)
+    try:
+        task = await service.get_task(task_id)
+        if task is None:
+            raise HTTPException(status_code=404, detail="Ansich Task not found")
+        budgets = await service.get_task_budgets(task_id)
+        health = await service.get_task_budget_health(task_id)
+        if budgets.budgets and not health:
+            await service.assess_operations()
+            health = await service.get_task_budget_health(task_id)
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise HTTPException(
+            status_code=503,
+            detail={
+                "message": "Ansich Budget query failed",
+                "projection_status": _projection_status(service),
+            },
+        ) from exc
+    return {
+        "budgets": budgets.model_dump(mode="json"),
+        "health": [item.model_dump(mode="json") for item in health],
+        "projection_status": _projection_status(service),
+    }
 
 
 @router.get("/tasks")

@@ -32,18 +32,42 @@ from ansich import (
     ToolResultView,
     new_id,
 )
+from ansich.budget import (
+    BudgetHealthBelief,
+    BudgetSourceKind,
+    TaskBudgetsView,
+    TaskBudgetView,
+    assess_budget_health,
+)
 from ansich.compression import CompressionDisposition
 from ansich.context_state import context_state_hash, materialize_context_state
-from ansich.contracts import ControlValue
+from ansich.contracts import ControlValue, LostRange
 from ansich.control import should_select_control_candidate
+from ansich.heartbeat import TaskHeartbeatView
 from ansich.lineage import LineageDirection
+from ansich.operations import (
+    ActiveStepView,
+    ActiveTaskView,
+    ActiveToolView,
+    DwellBelief,
+    HeartbeatBelief,
+    assess_dwell,
+    assess_heartbeat,
+)
 from ansich.tool import ContentDerivationSourceRole, ToolTransformKind
+from ansich.usage import (
+    TaskUsageValue,
+    TaskUsageView,
+    child_task_contribution_for_tool_started,
+    usage_contributions_for_observation,
+)
 from sqlalchemy import and_, case, delete, func, or_, select, update
 from sqlalchemy.dialects.postgresql import insert as postgresql_insert
 from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from deerflow.ansich.persistence.models import (
+    AnsichActiveTaskReadModelRow,
     AnsichBeliefAssertionRow,
     AnsichBeliefEvidenceRow,
     AnsichBlockProducerRow,
@@ -74,11 +98,15 @@ from deerflow.ansich.persistence.models import (
     AnsichRelationRow,
     AnsichScopeRow,
     AnsichStepRow,
+    AnsichTaskBudgetRow,
+    AnsichTaskHeartbeatRow,
     AnsichTaskRow,
     AnsichTaskSummaryRow,
+    AnsichTaskUsageRow,
     AnsichToolCallResultRow,
     AnsichToolCallRow,
     AnsichTransitionRow,
+    AnsichUsageContributionRow,
 )
 
 _CONTROL_BY_KIND = {
@@ -114,11 +142,39 @@ _STEP_PROJECTION_KINDS = frozenset(
 #: structural projections must land before belief/control projections, and
 #: future projectors (e.g. Phase 2 steps) run after both. Claim ordering
 #: derives from this tuple — never from projector_name collation.
-_PROJECTORS = (("task-structural", "1"), ("task-control", "1"), ("task-step", "1"))
+_USAGE_PROJECTION_KINDS = frozenset(
+    {
+        "llm.requested",
+        "llm.responded",
+        "step.started",
+        "tool.issued",
+        "tool.started",
+        "tool.returned_raw",
+        "tool.timed_out",
+        "tool.cancelled",
+        "tool.failed",
+        "budget.consumed",
+    }
+)
+_PROJECTORS = (("task-structural", "1"), ("task-control", "1"), ("task-step", "1"), ("task-usage", "1"), ("task-budget", "1"), ("task-heartbeat", "1"))
 _PROJECTOR_KINDS = {
     "task-structural": frozenset(_CONTROL_BY_KIND),
     "task-control": frozenset(_CONTROL_BY_KIND),
     "task-step": _STEP_PROJECTION_KINDS,
+    "task-usage": _USAGE_PROJECTION_KINDS,
+    "task-budget": frozenset({"budget.configured"}),
+    "task-heartbeat": frozenset({"task.heartbeat"}),
+}
+_USAGE_DIMENSION_ORDER = {
+    "input_tokens": 0,
+    "output_tokens": 1,
+    "total_tokens": 2,
+    "llm_attempts": 3,
+    "steps": 4,
+    "tool_calls_issued": 5,
+    "tool_calls_executed": 6,
+    "wall_time_ms": 7,
+    "child_tasks_spawned": 8,
 }
 _CONTENT_CANONICALIZATION_VERSION = "1"
 _TOOL_TERMINAL_PRECEDENCE = {
@@ -259,12 +315,16 @@ class SqlAnsichBackend:
         projector_max_attempts: int = 5,
         projector_dependency_timeout_seconds: int = 300,
         inline_payload_max_bytes: int = 65_536,
+        heartbeat_stale_after_seconds: int = 30,
+        long_dwell_seconds: int = 120,
     ) -> None:
         self._session_factory = session_factory
         self._projector_lease_seconds = projector_lease_seconds
         self._projector_max_attempts = projector_max_attempts
         self._projector_dependency_timeout = timedelta(seconds=projector_dependency_timeout_seconds)
         self._inline_payload_max_bytes = inline_payload_max_bytes
+        self._heartbeat_stale_after_seconds = heartbeat_stale_after_seconds
+        self._long_dwell_seconds = long_dwell_seconds
         self._lease_owner = str(uuid4())
         self._watermark: int | None = None
         self._failed_jobs = 0
@@ -465,6 +525,16 @@ class SqlAnsichBackend:
                         await self._project_control(session, observation, ingest_seq=ingest_seq)
                     elif projector_name == "task-step":
                         context_metrics_changed = await self._project_step(session, observation)
+                    elif projector_name == "task-usage":
+                        await self._project_usage(session, observation, ingest_seq=ingest_seq)
+                    elif projector_name == "task-budget":
+                        await self._project_budget(session, observation)
+                    elif projector_name == "task-heartbeat":
+                        await self._project_heartbeat(
+                            session,
+                            observation,
+                            ingest_seq=ingest_seq,
+                        )
                     else:
                         raise ValueError(f"unknown Ansich projector: {projector_name}")
                     job = await session.get(AnsichProjectionJobRow, job_id)
@@ -540,6 +610,11 @@ class SqlAnsichBackend:
 
         async with self._session_factory() as session, session.begin():
             for model in (
+                AnsichTaskHeartbeatRow,
+                AnsichActiveTaskReadModelRow,
+                AnsichTaskBudgetRow,
+                AnsichTaskUsageRow,
+                AnsichUsageContributionRow,
                 AnsichContextSnapshotMissingItemRow,
                 AnsichContextSnapshotBlockMembershipRow,
                 AnsichContextSnapshotItemRow,
@@ -846,6 +921,658 @@ class SqlAnsichBackend:
         async with self._session_factory() as session:
             rows = list((await session.execute(select(AnsichObservationRow).where(AnsichObservationRow.task_id == task_id).order_by(AnsichObservationRow.ingest_seq))).scalars())
         return [self._observation_from_row(row) for row in rows]
+
+    async def get_task_usage(self, task_id: str) -> TaskUsageView:
+        async with self._session_factory() as session:
+            rows = list(
+                (
+                    await session.execute(
+                        select(AnsichTaskUsageRow).where(
+                            AnsichTaskUsageRow.task_id == task_id,
+                            AnsichTaskUsageRow.aggregation_scope == "local",
+                        )
+                    )
+                ).scalars()
+            )
+        rows.sort(key=lambda row: _USAGE_DIMENSION_ORDER[row.dimension])
+        return TaskUsageView(
+            task_id=task_id,
+            local=tuple(
+                TaskUsageValue(
+                    dimension=row.dimension,
+                    aggregation_scope="local",
+                    value=row.value,
+                    as_of=_as_utc(row.as_of),
+                    complete_through_ingest_seq=row.complete_through_ingest_seq,
+                )
+                for row in rows
+            ),
+        )
+
+    async def get_task_budgets(self, task_id: str) -> TaskBudgetsView:
+        async with self._session_factory() as session:
+            rows = list((await session.execute(select(AnsichTaskBudgetRow).where(AnsichTaskBudgetRow.task_id == task_id))).scalars())
+        rows.sort(
+            key=lambda row: (
+                _USAGE_DIMENSION_ORDER[row.dimension],
+                row.aggregation_scope,
+            )
+        )
+        return TaskBudgetsView(
+            task_id=task_id,
+            budgets=tuple(
+                TaskBudgetView(
+                    entity_id=row.entity_id,
+                    task_id=row.task_id,
+                    dimension=row.dimension,
+                    aggregation_scope=row.aggregation_scope,
+                    warning_limit=row.warning_limit,
+                    hard_limit=row.hard_limit,
+                    enforcement=row.enforcement,
+                    source_kind=cast(BudgetSourceKind, row.source_kind),
+                    requested_value=row.requested_value,
+                    effective_value=row.effective_value,
+                    configured_obs_id=row.configured_obs_id,
+                )
+                for row in rows
+            ),
+        )
+
+    async def get_task_heartbeat(self, task_id: str) -> TaskHeartbeatView | None:
+        async with self._session_factory() as session:
+            row = await session.scalar(
+                select(AnsichTaskHeartbeatRow)
+                .where(AnsichTaskHeartbeatRow.task_id == task_id)
+                .order_by(
+                    AnsichTaskHeartbeatRow.occurred_at.desc(),
+                    AnsichTaskHeartbeatRow.heartbeat_obs_id.desc(),
+                )
+                .limit(1)
+            )
+        if row is None:
+            return None
+        return TaskHeartbeatView(
+            task_id=row.task_id,
+            heartbeat_obs_id=row.heartbeat_obs_id,
+            occurred_at=_as_utc(row.occurred_at),
+            producer_instance_id=row.producer_instance_id,
+            ownership_epoch=row.ownership_epoch,
+            elapsed_ms=row.elapsed_ms,
+        )
+
+    async def assess_operations(
+        self,
+        *,
+        now: datetime | None = None,
+        incomplete_task_ids: tuple[str, ...] = (),
+        global_loss: bool = False,
+        lost_ranges: tuple[LostRange, ...] = (),
+    ) -> int:
+        asserted_at = datetime.now(UTC) if now is None else now
+        incomplete_tasks = frozenset(incomplete_task_ids)
+        changed = 0
+        async with self._session_factory() as session, session.begin():
+            task_ids = tuple((await session.execute(select(AnsichTaskSummaryRow.task_id).where(AnsichTaskSummaryRow.control_value == "running"))).scalars())
+            for task_id in task_ids:
+                heartbeat_row = await session.scalar(
+                    select(AnsichTaskHeartbeatRow)
+                    .where(AnsichTaskHeartbeatRow.task_id == task_id)
+                    .order_by(
+                        AnsichTaskHeartbeatRow.occurred_at.desc(),
+                        AnsichTaskHeartbeatRow.heartbeat_obs_id.desc(),
+                    )
+                    .limit(1)
+                )
+                heartbeat = None
+                if heartbeat_row is not None:
+                    heartbeat = TaskHeartbeatView(
+                        task_id=heartbeat_row.task_id,
+                        heartbeat_obs_id=heartbeat_row.heartbeat_obs_id,
+                        occurred_at=_as_utc(heartbeat_row.occurred_at),
+                        producer_instance_id=heartbeat_row.producer_instance_id,
+                        ownership_epoch=heartbeat_row.ownership_epoch,
+                        elapsed_ms=heartbeat_row.elapsed_ms,
+                    )
+                belief = assess_heartbeat(
+                    heartbeat,
+                    now=asserted_at,
+                    stale_after_seconds=self._heartbeat_stale_after_seconds,
+                )
+                current = await session.get(
+                    AnsichCurrentBeliefRow,
+                    (task_id, "heartbeat"),
+                )
+                current_assertion = None
+                current_evidence: tuple[str, ...] = ()
+                if current is not None:
+                    current_assertion = await session.get(
+                        AnsichBeliefAssertionRow,
+                        current.assertion_id,
+                    )
+                    current_evidence = tuple((await session.execute(select(AnsichBeliefEvidenceRow.obs_id).where(AnsichBeliefEvidenceRow.assertion_id == current.assertion_id).order_by(AnsichBeliefEvidenceRow.ordinal))).scalars())
+                if (
+                    current_assertion is not None
+                    and current_assertion.value_json == {"value": belief.value, "age_ms": belief.age_ms}
+                    and current_evidence == belief.evidence_obs_ids
+                    and current is not None
+                    and current.resolver_version == belief.selected_by.version
+                ):
+                    continue
+                assertion = AnsichBeliefAssertionRow(
+                    assertion_id=new_id(),
+                    subject_id=task_id,
+                    field_name="heartbeat",
+                    value_json={"value": belief.value, "age_ms": belief.age_ms},
+                    as_of=belief.as_of or asserted_at,
+                    asserted_at=belief.asserted_at,
+                    source_name=belief.source.name,
+                    source_version=belief.source.version,
+                    fidelity_class=belief.fidelity_class,
+                )
+                session.add(assertion)
+                for ordinal, obs_id in enumerate(belief.evidence_obs_ids):
+                    session.add(
+                        AnsichBeliefEvidenceRow(
+                            assertion_id=assertion.assertion_id,
+                            obs_id=obs_id,
+                            evidence_role="supporting",
+                            ordinal=ordinal,
+                        )
+                    )
+                if current is None:
+                    session.add(
+                        AnsichCurrentBeliefRow(
+                            subject_id=task_id,
+                            field_name="heartbeat",
+                            assertion_id=assertion.assertion_id,
+                            resolver_name=belief.selected_by.name,
+                            resolver_version=belief.selected_by.version,
+                        )
+                    )
+                else:
+                    current.assertion_id = assertion.assertion_id
+                    current.resolver_name = belief.selected_by.name
+                    current.resolver_version = belief.selected_by.version
+                changed += 1
+            budget_rows = list((await session.execute(select(AnsichTaskBudgetRow))).scalars())
+            for budget_row in budget_rows:
+                usage_row = await session.get(
+                    AnsichTaskUsageRow,
+                    (
+                        budget_row.task_id,
+                        budget_row.dimension,
+                        budget_row.aggregation_scope,
+                    ),
+                )
+                budget = TaskBudgetView(
+                    entity_id=budget_row.entity_id,
+                    task_id=budget_row.task_id,
+                    dimension=budget_row.dimension,
+                    aggregation_scope=budget_row.aggregation_scope,
+                    warning_limit=budget_row.warning_limit,
+                    hard_limit=budget_row.hard_limit,
+                    enforcement=budget_row.enforcement,
+                    source_kind=cast(BudgetSourceKind, budget_row.source_kind),
+                    requested_value=budget_row.requested_value,
+                    effective_value=budget_row.effective_value,
+                    configured_obs_id=budget_row.configured_obs_id,
+                )
+                usage = None
+                usage_evidence: tuple[str, ...] = ()
+                if usage_row is not None:
+                    usage = TaskUsageValue(
+                        dimension=usage_row.dimension,
+                        aggregation_scope=usage_row.aggregation_scope,
+                        value=usage_row.value,
+                        as_of=_as_utc(usage_row.as_of),
+                        complete_through_ingest_seq=(usage_row.complete_through_ingest_seq),
+                    )
+                    usage_evidence = tuple(
+                        (
+                            await session.execute(
+                                select(AnsichUsageContributionRow.source_obs_id)
+                                .where(
+                                    AnsichUsageContributionRow.task_id == budget_row.task_id,
+                                    AnsichUsageContributionRow.dimension == budget_row.dimension,
+                                )
+                                .order_by(
+                                    AnsichUsageContributionRow.as_of,
+                                    AnsichUsageContributionRow.source_obs_id,
+                                )
+                            )
+                        ).scalars()
+                    )
+                belief = assess_budget_health(
+                    budget,
+                    usage,
+                    now=asserted_at,
+                    usage_complete=(not global_loss and budget_row.task_id not in incomplete_tasks),
+                    usage_evidence_obs_ids=usage_evidence,
+                )
+                field_name = f"budget_health:{belief.dimension}:{belief.aggregation_scope}"
+                value_json = {
+                    "value": belief.value,
+                    "dimension": belief.dimension,
+                    "aggregation_scope": belief.aggregation_scope,
+                    "usage_value": belief.usage_value,
+                    "warning_limit": belief.warning_limit,
+                    "hard_limit": belief.hard_limit,
+                    "overshoot": belief.overshoot,
+                    "as_of_known": belief.as_of is not None,
+                }
+                current = await session.get(
+                    AnsichCurrentBeliefRow,
+                    (budget_row.task_id, field_name),
+                )
+                current_assertion = None
+                current_evidence = ()
+                if current is not None:
+                    current_assertion = await session.get(
+                        AnsichBeliefAssertionRow,
+                        current.assertion_id,
+                    )
+                    current_evidence = tuple((await session.execute(select(AnsichBeliefEvidenceRow.obs_id).where(AnsichBeliefEvidenceRow.assertion_id == current.assertion_id).order_by(AnsichBeliefEvidenceRow.ordinal))).scalars())
+                if current_assertion is not None and current_assertion.value_json == value_json and current_evidence == belief.evidence_obs_ids and current is not None and current.resolver_version == belief.selected_by.version:
+                    continue
+                assertion = AnsichBeliefAssertionRow(
+                    assertion_id=new_id(),
+                    subject_id=budget_row.task_id,
+                    field_name=field_name,
+                    value_json=value_json,
+                    as_of=belief.as_of or asserted_at,
+                    asserted_at=belief.asserted_at,
+                    source_name=belief.source.name,
+                    source_version=belief.source.version,
+                    fidelity_class=belief.fidelity_class,
+                )
+                session.add(assertion)
+                for ordinal, obs_id in enumerate(belief.evidence_obs_ids):
+                    session.add(
+                        AnsichBeliefEvidenceRow(
+                            assertion_id=assertion.assertion_id,
+                            obs_id=obs_id,
+                            evidence_role="supporting",
+                            ordinal=ordinal,
+                        )
+                    )
+                if current is None:
+                    session.add(
+                        AnsichCurrentBeliefRow(
+                            subject_id=budget_row.task_id,
+                            field_name=field_name,
+                            assertion_id=assertion.assertion_id,
+                            resolver_name=belief.selected_by.name,
+                            resolver_version=belief.selected_by.version,
+                        )
+                    )
+                else:
+                    current.assertion_id = assertion.assertion_id
+                    current.resolver_name = belief.selected_by.name
+                    current.resolver_version = belief.selected_by.version
+                changed += 1
+        await self._refresh_active_task_read_model(
+            now=asserted_at,
+            lost_ranges=lost_ranges,
+        )
+        return changed
+
+    async def get_task_heartbeat_belief(
+        self,
+        task_id: str,
+    ) -> HeartbeatBelief | None:
+        async with self._session_factory() as session:
+            current = await session.get(
+                AnsichCurrentBeliefRow,
+                (task_id, "heartbeat"),
+            )
+            if current is None:
+                return None
+            assertion = await session.get(
+                AnsichBeliefAssertionRow,
+                current.assertion_id,
+            )
+            if assertion is None:
+                return None
+            evidence = tuple((await session.execute(select(AnsichBeliefEvidenceRow.obs_id).where(AnsichBeliefEvidenceRow.assertion_id == assertion.assertion_id).order_by(AnsichBeliefEvidenceRow.ordinal))).scalars())
+            value = str(assertion.value_json["value"])
+            return HeartbeatBelief(
+                value=cast(Literal["unknown", "fresh", "stale"], value),
+                as_of=(None if value == "unknown" else _as_utc(assertion.as_of)),
+                asserted_at=_as_utc(assertion.asserted_at),
+                age_ms=assertion.value_json.get("age_ms"),
+                source=NamedVersion(
+                    name=assertion.source_name,
+                    version=assertion.source_version,
+                ),
+                fidelity_class="rule",
+                selected_by=NamedVersion(
+                    name=current.resolver_name,
+                    version=current.resolver_version,
+                ),
+                evidence_obs_ids=evidence,
+            )
+
+    async def get_task_budget_health(
+        self,
+        task_id: str,
+    ) -> tuple[BudgetHealthBelief, ...]:
+        async with self._session_factory() as session:
+            rows = list(
+                (
+                    await session.execute(
+                        select(AnsichCurrentBeliefRow, AnsichBeliefAssertionRow)
+                        .join(
+                            AnsichBeliefAssertionRow,
+                            AnsichBeliefAssertionRow.assertion_id == AnsichCurrentBeliefRow.assertion_id,
+                        )
+                        .where(
+                            AnsichCurrentBeliefRow.subject_id == task_id,
+                            AnsichCurrentBeliefRow.field_name.like("budget_health:%"),
+                        )
+                    )
+                ).all()
+            )
+            beliefs: list[BudgetHealthBelief] = []
+            for current, assertion in rows:
+                evidence = tuple((await session.execute(select(AnsichBeliefEvidenceRow.obs_id).where(AnsichBeliefEvidenceRow.assertion_id == assertion.assertion_id).order_by(AnsichBeliefEvidenceRow.ordinal))).scalars())
+                value_json = assertion.value_json
+                beliefs.append(
+                    BudgetHealthBelief(
+                        dimension=value_json["dimension"],
+                        aggregation_scope=value_json["aggregation_scope"],
+                        value=value_json["value"],
+                        usage_value=value_json.get("usage_value"),
+                        warning_limit=value_json.get("warning_limit"),
+                        hard_limit=value_json.get("hard_limit"),
+                        overshoot=value_json.get("overshoot"),
+                        as_of=(_as_utc(assertion.as_of) if value_json.get("as_of_known") else None),
+                        asserted_at=_as_utc(assertion.asserted_at),
+                        source=NamedVersion(
+                            name=assertion.source_name,
+                            version=assertion.source_version,
+                        ),
+                        fidelity_class="rule",
+                        selected_by=NamedVersion(
+                            name=current.resolver_name,
+                            version=current.resolver_version,
+                        ),
+                        evidence_obs_ids=evidence,
+                    )
+                )
+        beliefs.sort(
+            key=lambda item: (
+                _USAGE_DIMENSION_ORDER[item.dimension],
+                item.aggregation_scope,
+            )
+        )
+        return tuple(beliefs)
+
+    async def _refresh_active_task_read_model(
+        self,
+        *,
+        now: datetime,
+        lost_ranges: tuple[LostRange, ...],
+    ) -> None:
+        async with self._session_factory() as session:
+            running_task_ids = tuple((await session.execute(select(AnsichTaskSummaryRow.task_id).where(AnsichTaskSummaryRow.control_value == "running"))).scalars())
+
+        views: list[ActiveTaskView] = []
+        metrics = self.get_projection_metrics()
+        for task_id in running_task_ids:
+            task = await self.get_task(task_id)
+            if task is None:
+                continue
+            heartbeat = await self.get_task_heartbeat_belief(task_id)
+            if heartbeat is None:
+                heartbeat = assess_heartbeat(
+                    None,
+                    now=now,
+                    stale_after_seconds=self._heartbeat_stale_after_seconds,
+                )
+            usage = await self.get_task_usage(task_id)
+            budgets = await self.get_task_budgets(task_id)
+            budget_health = await self.get_task_budget_health(task_id)
+            async with self._session_factory() as session:
+                scope_rows = list(
+                    (
+                        await session.execute(
+                            select(AnsichScopeRow)
+                            .join(
+                                AnsichRelationRow,
+                                AnsichRelationRow.object_id == AnsichScopeRow.entity_id,
+                            )
+                            .where(
+                                AnsichRelationRow.subject_id == task_id,
+                                AnsichRelationRow.predicate == "within_scope",
+                            )
+                        )
+                    ).scalars()
+                )
+                scopes = {row.scope_kind: row.scope_value for row in scope_rows}
+                step = await session.scalar(
+                    select(AnsichStepRow)
+                    .where(
+                        AnsichStepRow.task_id == task_id,
+                        AnsichStepRow.status.not_in(("closed", "model_failed")),
+                    )
+                    .order_by(AnsichStepRow.step_seq.desc())
+                    .limit(1)
+                )
+                tool = None
+                if step is not None:
+                    tool = await session.scalar(
+                        select(AnsichToolCallRow)
+                        .where(
+                            AnsichToolCallRow.step_id == step.entity_id,
+                            AnsichToolCallRow.execution_status.in_(("issued", "acting")),
+                        )
+                        .order_by(AnsichToolCallRow.call_seq.desc())
+                        .limit(1)
+                    )
+                evidence_obs_id = None
+                if tool is not None:
+                    evidence_obs_id = tool.started_obs_id or tool.issued_obs_id
+                if evidence_obs_id is None and step is not None:
+                    evidence_obs_id = step.started_obs_id
+                action_observation = None if evidence_obs_id is None else await session.scalar(select(AnsichObservationRow).where(AnsichObservationRow.obs_id == evidence_obs_id))
+                running_transition = await session.scalar(
+                    select(AnsichTransitionRow)
+                    .where(
+                        AnsichTransitionRow.subject_id == task_id,
+                        AnsichTransitionRow.field_name == "control",
+                        AnsichTransitionRow.to_value == "running",
+                    )
+                    .order_by(AnsichTransitionRow.occurred_at.desc())
+                    .limit(1)
+                )
+                last_evidence_at = await session.scalar(select(func.max(AnsichObservationRow.occurred_at)).where(AnsichObservationRow.task_id == task_id))
+
+            dwell = assess_dwell(
+                since=(None if action_observation is None else _as_utc(action_observation.occurred_at)),
+                evidence_obs_id=evidence_obs_id,
+                now=now,
+                long_dwell_seconds=self._long_dwell_seconds,
+            )
+            started_at = task.control.as_of if running_transition is None else _as_utc(running_transition.occurred_at)
+            duration_ms = 0 if started_at is None else max(0, int((now - started_at).total_seconds() * 1000))
+            task_lost_ranges = tuple(item for item in lost_ranges if item.task_id is None or item.task_id == task_id)
+            views.append(
+                ActiveTaskView(
+                    task_id=task_id,
+                    run_id=task.source_id,
+                    source_kind=task.source_kind,
+                    owner_id=scopes.get("owner"),
+                    thread_id=scopes.get("thread"),
+                    agent_id=None,
+                    control=task.control,
+                    current_step=(
+                        None
+                        if step is None
+                        else ActiveStepView(
+                            step_id=step.entity_id,
+                            step_seq=step.step_seq,
+                            actor_kind=step.actor_kind,
+                            status=step.status,
+                        )
+                    ),
+                    current_tool=(
+                        None
+                        if tool is None
+                        else ActiveToolView(
+                            tool_call_id=tool.entity_id,
+                            tool_name=tool.tool_name,
+                            call_seq=tool.call_seq,
+                            status=tool.execution_status,
+                        )
+                    ),
+                    dwell=dwell,
+                    heartbeat=heartbeat,
+                    usage=usage,
+                    budgets=budgets,
+                    budget_health=budget_health,
+                    duration_ms=duration_ms,
+                    observability_status=task.observability_status,
+                    projection_watermark=metrics.get("watermark"),
+                    projection_lag_ms=int(metrics.get("lag_ms", 0)),
+                    lost_ranges=task_lost_ranges,
+                    last_evidence_at=(task.control.as_of if last_evidence_at is None else _as_utc(last_evidence_at)),
+                    updated_at=now,
+                )
+            )
+
+        async with self._session_factory() as session, session.begin():
+            if running_task_ids:
+                await session.execute(delete(AnsichActiveTaskReadModelRow).where(AnsichActiveTaskReadModelRow.task_id.not_in(running_task_ids)))
+            else:
+                await session.execute(delete(AnsichActiveTaskReadModelRow))
+            for view in views:
+                budget_status = "unknown"
+                for candidate in ("exceeded", "warning", "unknown", "within"):
+                    if any(belief.value == candidate for belief in view.budget_health):
+                        budget_status = candidate
+                        break
+                values = {
+                    "run_id": view.run_id,
+                    "source_kind": view.source_kind,
+                    "owner_id": view.owner_id,
+                    "thread_id": view.thread_id,
+                    "agent_id": view.agent_id,
+                    "control_value": view.control.value,
+                    "current_step_id": (None if view.current_step is None else view.current_step.step_id),
+                    "current_tool_call_id": (None if view.current_tool is None else view.current_tool.tool_call_id),
+                    "heartbeat_value": view.heartbeat.value,
+                    "budget_status": budget_status,
+                    "duration_ms": view.duration_ms,
+                    "observability_status": view.observability_status,
+                    "projection_watermark": view.projection_watermark,
+                    "projection_lag_ms": view.projection_lag_ms,
+                    "control_json": view.control.model_dump(mode="json"),
+                    "current_step_json": (None if view.current_step is None else view.current_step.model_dump(mode="json")),
+                    "current_tool_json": (None if view.current_tool is None else view.current_tool.model_dump(mode="json")),
+                    "dwell_json": view.dwell.model_dump(mode="json"),
+                    "heartbeat_json": view.heartbeat.model_dump(mode="json"),
+                    "usage_json": view.usage.model_dump(mode="json"),
+                    "budgets_json": view.budgets.model_dump(mode="json"),
+                    "budget_health_json": [item.model_dump(mode="json") for item in view.budget_health],
+                    "lost_ranges_json": [item.model_dump(mode="json") for item in view.lost_ranges],
+                    "last_evidence_at": view.last_evidence_at,
+                    "updated_at": view.updated_at,
+                }
+                row = await session.get(
+                    AnsichActiveTaskReadModelRow,
+                    view.task_id,
+                )
+                if row is None:
+                    session.add(
+                        AnsichActiveTaskReadModelRow(
+                            task_id=view.task_id,
+                            **values,
+                        )
+                    )
+                else:
+                    for key, value in values.items():
+                        setattr(row, key, value)
+
+    async def list_active_tasks(
+        self,
+        *,
+        limit: int = 100,
+        owner_id: str | None = None,
+        agent_id: str | None = None,
+        control: ControlValue | None = None,
+        heartbeat_status: str | None = None,
+        budget_status: str | None = None,
+        min_duration_ms: int | None = None,
+        max_duration_ms: int | None = None,
+        observability_status: str | None = None,
+        cursor: tuple[datetime, str] | None = None,
+    ) -> list[ActiveTaskView]:
+        if limit < 1:
+            raise ValueError("limit must be positive")
+        statement = select(AnsichActiveTaskReadModelRow)
+        if owner_id is not None:
+            statement = statement.where(AnsichActiveTaskReadModelRow.owner_id == owner_id)
+        if agent_id is not None:
+            statement = statement.where(AnsichActiveTaskReadModelRow.agent_id == agent_id)
+        if control is not None:
+            statement = statement.where(AnsichActiveTaskReadModelRow.control_value == control)
+        if heartbeat_status is not None:
+            statement = statement.where(AnsichActiveTaskReadModelRow.heartbeat_value == heartbeat_status)
+        if budget_status is not None:
+            statement = statement.where(AnsichActiveTaskReadModelRow.budget_status == budget_status)
+        if min_duration_ms is not None:
+            statement = statement.where(AnsichActiveTaskReadModelRow.duration_ms >= min_duration_ms)
+        if max_duration_ms is not None:
+            statement = statement.where(AnsichActiveTaskReadModelRow.duration_ms <= max_duration_ms)
+        if observability_status is not None:
+            statement = statement.where(AnsichActiveTaskReadModelRow.observability_status == observability_status)
+        if cursor is not None:
+            cursor_time, cursor_task_id = cursor
+            statement = statement.where(
+                or_(
+                    AnsichActiveTaskReadModelRow.last_evidence_at < cursor_time,
+                    and_(
+                        AnsichActiveTaskReadModelRow.last_evidence_at == cursor_time,
+                        AnsichActiveTaskReadModelRow.task_id > cursor_task_id,
+                    ),
+                )
+            )
+        statement = statement.order_by(
+            AnsichActiveTaskReadModelRow.last_evidence_at.desc(),
+            AnsichActiveTaskReadModelRow.task_id,
+        ).limit(limit)
+        async with self._session_factory() as session:
+            rows = list((await session.execute(statement)).scalars())
+        return [self._active_task_view(row) for row in rows]
+
+    @staticmethod
+    def _active_task_view(row: AnsichActiveTaskReadModelRow) -> ActiveTaskView:
+        def strict_model(model_type, value):
+            return model_type.model_validate_json(json.dumps(value))
+
+        return ActiveTaskView(
+            task_id=row.task_id,
+            run_id=row.run_id,
+            source_kind=row.source_kind,
+            owner_id=row.owner_id,
+            thread_id=row.thread_id,
+            agent_id=row.agent_id,
+            control=ControlBelief.model_validate(row.control_json),
+            current_step=(None if row.current_step_json is None else strict_model(ActiveStepView, row.current_step_json)),
+            current_tool=(None if row.current_tool_json is None else strict_model(ActiveToolView, row.current_tool_json)),
+            dwell=strict_model(DwellBelief, row.dwell_json),
+            heartbeat=strict_model(HeartbeatBelief, row.heartbeat_json),
+            usage=strict_model(TaskUsageView, row.usage_json),
+            budgets=strict_model(TaskBudgetsView, row.budgets_json),
+            budget_health=tuple(strict_model(BudgetHealthBelief, item) for item in row.budget_health_json),
+            duration_ms=row.duration_ms,
+            observability_status=row.observability_status,
+            projection_watermark=row.projection_watermark,
+            projection_lag_ms=row.projection_lag_ms,
+            lost_ranges=tuple(LostRange.model_validate(item) for item in row.lost_ranges_json),
+            last_evidence_at=_as_utc(row.last_evidence_at),
+            updated_at=_as_utc(row.updated_at),
+        )
 
     async def list_timeline(
         self,
@@ -1778,6 +2505,195 @@ class SqlAnsichBackend:
                 task_id=observation.task_id,
                 followup_observed=True,
             )
+
+    async def _project_heartbeat(
+        self,
+        session: AsyncSession,
+        observation: ObservationEnvelope,
+        *,
+        ingest_seq: int,
+    ) -> None:
+        if observation.payload is None:
+            raise ValueError("task.heartbeat requires inline projection payload")
+        if await session.get(AnsichTaskRow, observation.task_id) is None:
+            raise _ProjectionDependencyPending(f"heartbeat observation {observation.obs_id} is waiting for Task {observation.task_id}")
+        if await session.get(AnsichTaskHeartbeatRow, observation.obs_id) is not None:
+            return
+        session.add(
+            AnsichTaskHeartbeatRow(
+                heartbeat_obs_id=observation.obs_id,
+                task_id=observation.task_id,
+                occurred_at=observation.occurred_at,
+                producer_instance_id=observation.producer.instance_id,
+                ownership_epoch=str(observation.payload["ownership_epoch"]),
+                elapsed_ms=max(0, int(observation.payload["elapsed_ms"])),
+            )
+        )
+        elapsed_ms = max(0, int(observation.payload["elapsed_ms"]))
+        usage = await session.get(
+            AnsichTaskUsageRow,
+            (observation.task_id, "wall_time_ms", "local"),
+        )
+        if usage is None:
+            session.add(
+                AnsichTaskUsageRow(
+                    task_id=observation.task_id,
+                    dimension="wall_time_ms",
+                    aggregation_scope="local",
+                    value=elapsed_ms,
+                    as_of=observation.occurred_at,
+                    complete_through_ingest_seq=ingest_seq,
+                    updated_at=observation.recorded_at,
+                )
+            )
+        elif elapsed_ms >= usage.value:
+            usage.value = elapsed_ms
+            usage.as_of = observation.occurred_at
+            usage.complete_through_ingest_seq = max(
+                usage.complete_through_ingest_seq,
+                ingest_seq,
+            )
+            usage.updated_at = observation.recorded_at
+
+    async def _project_budget(
+        self,
+        session: AsyncSession,
+        observation: ObservationEnvelope,
+    ) -> None:
+        if observation.payload is None:
+            raise ValueError("budget.configured requires inline projection payload")
+        if await session.get(AnsichTaskRow, observation.task_id) is None:
+            raise _ProjectionDependencyPending(f"budget observation {observation.obs_id} is waiting for Task {observation.task_id}")
+        if await session.get(AnsichEntityRow, observation.obs_id) is None:
+            session.add(
+                AnsichEntityRow(
+                    entity_id=observation.obs_id,
+                    entity_type="task_budget",
+                    discovered_obs_id=observation.obs_id,
+                )
+            )
+            await session.flush()
+        if await session.get(AnsichTaskBudgetRow, observation.obs_id) is not None:
+            return
+        payload = observation.payload
+        session.add(
+            AnsichTaskBudgetRow(
+                entity_id=observation.obs_id,
+                task_id=observation.task_id,
+                dimension=str(payload["dimension"]),
+                aggregation_scope=str(payload["aggregation_scope"]),
+                warning_limit=(int(payload["warning_limit"]) if isinstance(payload.get("warning_limit"), int) else None),
+                hard_limit=(int(payload["hard_limit"]) if isinstance(payload.get("hard_limit"), int) else None),
+                enforcement=payload.get("enforcement") is True,
+                source_kind=str(payload["source_kind"]),
+                requested_value=(int(payload["requested_value"]) if isinstance(payload.get("requested_value"), int) else None),
+                effective_value=int(payload["effective_value"]),
+                configured_obs_id=observation.obs_id,
+            )
+        )
+
+    async def _project_usage(
+        self,
+        session: AsyncSession,
+        observation: ObservationEnvelope,
+        *,
+        ingest_seq: int,
+    ) -> None:
+        task = await session.get(AnsichTaskRow, observation.task_id)
+        if task is None:
+            raise _ProjectionDependencyPending(f"usage observation {observation.obs_id} is waiting for Task {observation.task_id}")
+
+        contributions = list(usage_contributions_for_observation(observation))
+        if observation.kind == "tool.started":
+            tool_call = await session.get(
+                AnsichToolCallRow,
+                observation.subject_id,
+            )
+            if tool_call is None:
+                raise _ProjectionDependencyPending(f"usage observation {observation.obs_id} is waiting for ToolCall {observation.subject_id}")
+            child_contribution = child_task_contribution_for_tool_started(
+                observation,
+                tool_name=tool_call.tool_name,
+            )
+            if child_contribution is not None:
+                contributions.append(child_contribution)
+
+        for contribution in contributions:
+            if contribution.dimension == "tool_calls_executed":
+                existing_tool_contribution = await session.scalar(
+                    select(AnsichUsageContributionRow.source_obs_id)
+                    .join(
+                        AnsichObservationRow,
+                        AnsichObservationRow.obs_id == AnsichUsageContributionRow.source_obs_id,
+                    )
+                    .where(
+                        AnsichUsageContributionRow.task_id == contribution.task_id,
+                        AnsichUsageContributionRow.source_task_id == contribution.source_task_id,
+                        AnsichUsageContributionRow.dimension == contribution.dimension,
+                        AnsichObservationRow.subject_id == observation.subject_id,
+                    )
+                    .limit(1)
+                )
+                if existing_tool_contribution is not None:
+                    continue
+
+            values = {
+                "task_id": contribution.task_id,
+                "source_task_id": contribution.source_task_id,
+                "dimension": contribution.dimension,
+                "source_obs_id": contribution.source_obs_id,
+                "delta": contribution.delta,
+                "as_of": contribution.as_of,
+            }
+            dialect_name = session.bind.dialect.name if session.bind is not None else ""
+            if dialect_name == "postgresql":
+                statement = postgresql_insert(AnsichUsageContributionRow).values(**values)
+            elif dialect_name == "sqlite":
+                statement = sqlite_insert(AnsichUsageContributionRow).values(**values)
+            else:
+                raise ValueError(f"unsupported Ansich SQL dialect: {dialect_name}")
+            inserted = (
+                await session.execute(
+                    statement.on_conflict_do_nothing(
+                        index_elements=[
+                            "task_id",
+                            "source_task_id",
+                            "dimension",
+                            "source_obs_id",
+                        ]
+                    ).returning(AnsichUsageContributionRow.source_obs_id)
+                )
+            ).scalar_one_or_none()
+            if inserted is None:
+                continue
+
+            usage = await session.get(
+                AnsichTaskUsageRow,
+                (contribution.task_id, contribution.dimension, "local"),
+            )
+            if usage is None:
+                session.add(
+                    AnsichTaskUsageRow(
+                        task_id=contribution.task_id,
+                        dimension=contribution.dimension,
+                        aggregation_scope="local",
+                        value=contribution.delta,
+                        as_of=contribution.as_of,
+                        complete_through_ingest_seq=ingest_seq,
+                        updated_at=observation.recorded_at,
+                    )
+                )
+            else:
+                if contribution.dimension == "wall_time_ms":
+                    usage.value = max(usage.value, contribution.delta)
+                else:
+                    usage.value += contribution.delta
+                usage.as_of = max(_as_utc(usage.as_of), contribution.as_of)
+                usage.complete_through_ingest_seq = max(
+                    usage.complete_through_ingest_seq,
+                    ingest_seq,
+                )
+                usage.updated_at = observation.recorded_at
 
     async def _project_step(self, session: AsyncSession, observation: ObservationEnvelope) -> bool:
         """Project logical decisions, physical LLM attempts, and request context.

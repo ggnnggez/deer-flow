@@ -1,5 +1,23 @@
 # Phase 5 — 活动任务、心跳与预算
 
+## 实现状态（2026-07-18）
+
+✅ 本地纵向切片已完成。Outer Run heartbeat 已接入 graph-independent monotonic
+timer、现有 Run ownership、terminal/cancellation 清理和 fail-open Collector；
+`heartbeat@1` 与 dwell assessor 只生成 rule Belief，不改写 hard Task control。
+Usage 已覆盖 token/attempt/Step/Tool/wall-time/child spawn，各贡献可幂等重放；活动
+Task 的 wall-time 使用 heartbeat elapsed，terminal 使用 monotonic duration，缺失
+provider token 维度不猜测。Task admission 会冻结实际 TokenBudgetMiddleware 与
+SubagentLimitMiddleware policy 的 requested/effective/enforcement/source。
+
+迁移 `0016_ansich_operations` 新增 heartbeat、usage contribution、budget 和
+`ansich_active_task_read_model`；SQLite upgrade/rebuild 与 PostgreSQL DDL 类型语义已有
+测试。管理员 API 已提供 active-task filters/cursor/ETag、local Usage 和 Budget health；
+Operator Lens 展示当前 Step/Tool、dwell、heartbeat、local Usage、overshoot、lag/loss，
+并实施 active 5 秒、idle 10 秒、hidden 暂停及 terminal detail 停止轮询。真实
+PostgreSQL 升级矩阵、关闭 Ansich 的基准对比和生产 paper drill 仍按总计划作为最终
+生产就绪门禁，不回填为本阶段的占位成功。
+
 ## 1. 交付目标
 
 本阶段形成第一版 Operator Lens。运维人员可以看到当前活动 Task、正在执行的 Step/ToolCall、状态停留时间、最后心跳、本地资源消耗、有效预算以及 Ansich 投影延迟。

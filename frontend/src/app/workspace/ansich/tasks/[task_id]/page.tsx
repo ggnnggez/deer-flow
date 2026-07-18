@@ -18,6 +18,7 @@ import { Skeleton } from "@/components/ui/skeleton";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import {
   AnsichContextPanel,
+  AnsichBudgetPanel,
   AnsichObservationTimeline,
   AnsichProjectionHealth,
   AnsichStepsPanel,
@@ -40,8 +41,9 @@ export default function AnsichTaskDetailPage() {
   const taskId = params.task_id;
   const isAdmin = user?.system_role === "admin";
   const taskQuery = useAnsichTask(taskId, isAdmin);
-  const timelineQuery = useAnsichTaskTimeline(taskId, isAdmin);
   const task = taskQuery.data?.task;
+  const taskIsRunning = task?.control.value === "running";
+  const timelineQuery = useAnsichTaskTimeline(taskId, isAdmin, taskIsRunning);
   const health =
     timelineQuery.data?.projection_status ??
     taskQuery.data?.projection_status ??
@@ -108,6 +110,7 @@ export default function AnsichTaskDetailPage() {
                     {t.ansich.timeline}
                   </TabsTrigger>
                   <TabsTrigger value="steps">{t.ansich.steps}</TabsTrigger>
+                  <TabsTrigger value="budgets">{t.ansich.budgets}</TabsTrigger>
                   <TabsTrigger value="context">
                     {t.ansich.contextAndLineage}
                   </TabsTrigger>
@@ -172,13 +175,18 @@ export default function AnsichTaskDetailPage() {
                 </TabsContent>
 
                 <TabsContent value="steps">
-                  <AnsichStepsPanel taskId={taskId} />
+                  <AnsichStepsPanel taskId={taskId} polling={taskIsRunning} />
+                </TabsContent>
+
+                <TabsContent value="budgets">
+                  <AnsichBudgetPanel taskId={taskId} polling={taskIsRunning} />
                 </TabsContent>
 
                 <TabsContent value="context">
                   <AnsichContextPanel
                     taskId={taskId}
                     compressionIds={compressionIds}
+                    polling={taskIsRunning}
                   />
                 </TabsContent>
               </Tabs>

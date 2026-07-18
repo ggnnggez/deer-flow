@@ -44,3 +44,31 @@ async def test_unknown_terminal_status_logs_warning_instead_of_leaving_task_sile
     assert task is not None
     assert task.control.value == "running"
     assert any("some-future-status" in record.getMessage() and "run-unknown-status" in record.getMessage() for record in caplog.records)
+
+
+@pytest.mark.asyncio
+async def test_terminal_wall_time_uses_monotonic_duration_and_never_goes_negative():
+    service = AnsichService.in_memory()
+    await service.start()
+    monotonic_values = iter((100.0, 99.0))
+    probe = TaskControlProbe(
+        service,
+        run_id="run-monotonic-wall-time",
+        thread_id="thread-monotonic-wall-time",
+        monotonic=lambda: next(monotonic_values),
+    )
+
+    try:
+        probe.created()
+        probe.started()
+        await probe.terminal("success")
+        observations = await service.list_observations(probe.task_id)
+        usage = await service.get_task_usage(probe.task_id)
+    finally:
+        await service.stop()
+
+    assert [(item.dimension, item.value) for item in usage.local] == [
+        ("wall_time_ms", 0),
+    ]
+    kinds = [item.kind for item in observations]
+    assert kinds.index("budget.consumed") < kinds.index("task.completed")

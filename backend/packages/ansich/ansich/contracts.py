@@ -34,8 +34,34 @@ ToolObservationKind = Literal[
     "tool.failed",
     "tool.unknown_terminal",
 ]
-ObservationKind = TaskLifecycleKind | StepObservationKind | LlmObservationKind | ContextObservationKind | ToolObservationKind | Literal["observability.degraded"]
+BudgetObservationKind = Literal["budget.configured", "budget.consumed"]
+UsageDimension = Literal[
+    "input_tokens",
+    "output_tokens",
+    "total_tokens",
+    "llm_attempts",
+    "steps",
+    "tool_calls_issued",
+    "tool_calls_executed",
+    "wall_time_ms",
+    "child_tasks_spawned",
+]
+ObservationKind = TaskLifecycleKind | StepObservationKind | LlmObservationKind | ContextObservationKind | ToolObservationKind | BudgetObservationKind | Literal["task.heartbeat", "observability.degraded"]
 ControlValue = Literal["unknown", "created", "running", "completed", "failed", "interrupted"]
+
+_USAGE_DIMENSIONS = frozenset(
+    {
+        "input_tokens",
+        "output_tokens",
+        "total_tokens",
+        "llm_attempts",
+        "steps",
+        "tool_calls_issued",
+        "tool_calls_executed",
+        "wall_time_ms",
+        "child_tasks_spawned",
+    }
+)
 
 _SECRET_FIELD_NAMES = frozenset(
     {
@@ -150,6 +176,45 @@ class ObservationEnvelope(BaseModel):
             raise ValueError("context snapshot observation subject_type must be context_snapshot")
         elif self.kind == "context.compressed" and self.subject_type != "context_compression":
             raise ValueError("context compression observation subject_type must be context_compression")
+        elif self.kind.startswith("budget.") and (self.subject_type != "task" or self.subject_id != self.task_id):
+            raise ValueError("budget observation subject must identify task_id")
+        if self.kind == "task.heartbeat":
+            payload = self.payload or {}
+            elapsed_ms = payload.get("elapsed_ms")
+            if not isinstance(elapsed_ms, int) or isinstance(elapsed_ms, bool) or elapsed_ms < 0:
+                raise ValueError("task.heartbeat elapsed_ms must be a non-negative integer")
+            for field_name in (
+                "worker_id",
+                "producer_instance_id",
+                "ownership_epoch",
+            ):
+                if not isinstance(payload.get(field_name), str) or not payload[field_name]:
+                    raise ValueError(f"task.heartbeat {field_name} must be non-empty")
+        if self.kind == "budget.configured":
+            payload = self.payload or {}
+            if payload.get("dimension") not in _USAGE_DIMENSIONS:
+                raise ValueError("budget.configured dimension is unsupported")
+            if payload.get("aggregation_scope") not in {"local", "inclusive"}:
+                raise ValueError("budget.configured aggregation_scope is unsupported")
+            if payload.get("source_kind") not in {
+                "release_default",
+                "runtime_override",
+                "shadow",
+            }:
+                raise ValueError("budget.configured source_kind is unsupported")
+            if not isinstance(payload.get("enforcement"), bool):
+                raise ValueError("budget.configured enforcement must be boolean")
+            for field_name in (
+                "warning_limit",
+                "hard_limit",
+                "requested_value",
+                "effective_value",
+            ):
+                value = payload.get(field_name)
+                if field_name != "effective_value" and value is None:
+                    continue
+                if not isinstance(value, int) or isinstance(value, bool) or value < 0:
+                    raise ValueError(f"budget.configured {field_name} must be a non-negative integer")
         if self.occurred_at.tzinfo is None or self.recorded_at.tzinfo is None:
             raise ValueError("observation timestamps must be timezone-aware")
         if (self.payload is None) == (self.payload_ref_id is None):
@@ -199,6 +264,124 @@ class ObservationEnvelope(BaseModel):
             source_event_id=source_event_id,
             correlation_id=source_id,
             payload=payload,
+        )
+
+    @classmethod
+    def task_heartbeat(
+        cls,
+        *,
+        task_id: str,
+        run_id: str,
+        occurred_at: datetime,
+        elapsed_ms: int,
+        worker_id: str,
+        ownership_epoch: str,
+        source_event_id: str,
+        producer_seq: int = 1,
+        producer_name: str = "task-heartbeat-probe",
+        producer_version: str = "1",
+        producer_instance_id: str = "local",
+    ) -> Self:
+        return cls(
+            kind="task.heartbeat",
+            occurred_at=occurred_at,
+            task_id=task_id,
+            subject_id=task_id,
+            producer=Producer(
+                name=producer_name,
+                version=producer_version,
+                instance_id=producer_instance_id,
+            ),
+            producer_seq=producer_seq,
+            source_event_id=source_event_id,
+            correlation_id=run_id,
+            payload={
+                "worker_id": worker_id,
+                "producer_instance_id": producer_instance_id,
+                "ownership_epoch": ownership_epoch,
+                "elapsed_ms": elapsed_ms,
+            },
+        )
+
+    @classmethod
+    def budget_consumed(
+        cls,
+        *,
+        task_id: str,
+        run_id: str,
+        occurred_at: datetime,
+        dimension: UsageDimension,
+        delta: int,
+        source_event_id: str,
+        producer_seq: int = 1,
+        producer_name: str = "budget-consumption-probe",
+        producer_version: str = "1",
+        producer_instance_id: str = "local",
+    ) -> Self:
+        if dimension not in _USAGE_DIMENSIONS:
+            raise ValueError(f"unsupported usage dimension: {dimension}")
+        if not isinstance(delta, int) or isinstance(delta, bool) or delta < 0:
+            raise ValueError("budget consumption delta must be a non-negative integer")
+        return cls(
+            kind="budget.consumed",
+            occurred_at=occurred_at,
+            task_id=task_id,
+            subject_id=task_id,
+            producer=Producer(
+                name=producer_name,
+                version=producer_version,
+                instance_id=producer_instance_id,
+            ),
+            producer_seq=producer_seq,
+            source_event_id=source_event_id,
+            correlation_id=run_id,
+            payload={"dimension": dimension, "delta": delta},
+        )
+
+    @classmethod
+    def budget_configured(
+        cls,
+        *,
+        task_id: str,
+        run_id: str,
+        occurred_at: datetime,
+        dimension: UsageDimension,
+        aggregation_scope: Literal["local", "inclusive"],
+        warning_limit: int | None,
+        hard_limit: int | None,
+        enforcement: bool,
+        source_kind: Literal["release_default", "runtime_override", "shadow"],
+        requested_value: int | None,
+        effective_value: int,
+        source_event_id: str,
+        producer_seq: int = 1,
+        producer_name: str = "budget-configuration-probe",
+        producer_version: str = "1",
+        producer_instance_id: str = "local",
+    ) -> Self:
+        return cls(
+            kind="budget.configured",
+            occurred_at=occurred_at,
+            task_id=task_id,
+            subject_id=task_id,
+            producer=Producer(
+                name=producer_name,
+                version=producer_version,
+                instance_id=producer_instance_id,
+            ),
+            producer_seq=producer_seq,
+            source_event_id=source_event_id,
+            correlation_id=run_id,
+            payload={
+                "dimension": dimension,
+                "aggregation_scope": aggregation_scope,
+                "warning_limit": warning_limit,
+                "hard_limit": hard_limit,
+                "enforcement": enforcement,
+                "source_kind": source_kind,
+                "requested_value": requested_value,
+                "effective_value": effective_value,
+            },
         )
 
 

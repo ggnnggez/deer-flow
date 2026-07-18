@@ -3,6 +3,7 @@ import { getBackendBaseURL } from "@/core/config";
 
 import type {
   AnsichContentPayloadResponse,
+  AnsichActiveTaskListResponse,
   AnsichContentLineageResponse,
   AnsichContextCompressionResponse,
   AnsichContextResponse,
@@ -10,7 +11,9 @@ import type {
   AnsichStepResponse,
   AnsichStepsResponse,
   AnsichTaskListResponse,
+  AnsichTaskBudgetsResponse,
   AnsichTaskResponse,
+  AnsichTaskUsageResponse,
   AnsichTimelineResponse,
   AnsichHealth,
   AnsichToolCallResponse,
@@ -67,6 +70,51 @@ export async function fetchAnsichTasks(
     await throwAnsichApiError(
       response,
       `Failed to load Ansich tasks: ${response.statusText}`,
+    );
+  }
+  return response.json();
+}
+
+export async function fetchAnsichActiveTasks(
+  limit = 100,
+): Promise<AnsichActiveTaskListResponse> {
+  const response = await fetch(
+    ansichUrl(`/operations/active-tasks?limit=${limit}`),
+  );
+  if (!response.ok) {
+    await throwAnsichApiError(
+      response,
+      `Failed to load active Ansich tasks: ${response.statusText}`,
+    );
+  }
+  return response.json();
+}
+
+export async function fetchAnsichTaskUsage(
+  taskId: string,
+): Promise<AnsichTaskUsageResponse> {
+  const response = await fetch(
+    ansichUrl(`/tasks/${encodeURIComponent(taskId)}/usage`),
+  );
+  if (!response.ok) {
+    await throwAnsichApiError(
+      response,
+      `Failed to load Ansich usage: ${response.statusText}`,
+    );
+  }
+  return response.json();
+}
+
+export async function fetchAnsichTaskBudgets(
+  taskId: string,
+): Promise<AnsichTaskBudgetsResponse> {
+  const response = await fetch(
+    ansichUrl(`/tasks/${encodeURIComponent(taskId)}/budgets`),
+  );
+  if (!response.ok) {
+    await throwAnsichApiError(
+      response,
+      `Failed to load Ansich budgets: ${response.statusText}`,
     );
   }
   return response.json();
