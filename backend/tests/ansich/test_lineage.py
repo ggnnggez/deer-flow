@@ -532,6 +532,7 @@ async def test_system_message_coalescing_records_ordered_source_edges() -> None:
     snapshot = await service.get_step_context((await service.list_steps(task_id))[0].step_id)
     assert snapshot is not None
     merged = next(item for item in snapshot.items if item.role == "system")
+    assert execution.content_derivations(merged.block_id) == ()
     lineage = await service.get_content_lineage(
         merged.block_id,
         direction="backward",

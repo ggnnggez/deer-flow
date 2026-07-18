@@ -490,7 +490,10 @@ def _record_captured_request(
         if resolution is not None and not resolution.should_emit:
             continue
         block = item.block
-        derivation_sources = execution.content_derivations(block.block_id)
+        derivation_sources = execution.content_derivations(
+            block.block_id,
+            producer_obs_id=(resolution.producer_obs_id if resolution is not None else None),
+        )
         provider_tool_call_id = item.metadata.get("tool_call_id")
         source_block_id = (
             execution.visible_tool_block_id(

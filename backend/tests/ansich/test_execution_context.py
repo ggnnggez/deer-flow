@@ -31,11 +31,13 @@ from deerflow.agents.middlewares.tool_error_handling_middleware import (
     ToolErrorHandlingMiddleware,
     build_subagent_runtime_middlewares,
 )
+from deerflow.ansich import execution as execution_module
 from deerflow.ansich import middleware as model_observer
 from deerflow.ansich import tool_middleware as tool_observer
 from deerflow.ansich.execution import (
     ANSICH_EXECUTION_CONTEXT_KEY,
     AnsichExecutionContext,
+    PendingContentDerivation,
     ToolCallRegistration,
     ToolInvocation,
 )
@@ -395,6 +397,62 @@ def test_content_occurrence_identity_is_deterministic_and_only_skips_after_durab
 
     assert durable.block_id == first.block_id
     assert durable.should_emit is False
+
+
+def test_pending_content_derivations_clear_after_the_derived_block_is_durable() -> None:
+    execution = AnsichExecutionContext(task_id=new_id())
+    derived_block_id = new_id()
+    producer_obs_id = new_id()
+    sources = (
+        PendingContentDerivation(
+            source_block_id=new_id(),
+            transform_kind="copied",
+            transform_version="1",
+        ),
+    )
+    execution.register_content_derivations(
+        derived_block_id=derived_block_id,
+        sources=sources,
+    )
+
+    assert (
+        execution.content_derivations(
+            derived_block_id,
+            producer_obs_id=producer_obs_id,
+        )
+        == sources
+    )
+
+    execution.mark_observations_durable((producer_obs_id,))
+
+    assert execution.content_derivations(derived_block_id) == ()
+
+
+def test_pending_content_derivations_have_a_hard_capacity(
+    monkeypatch,
+) -> None:
+    monkeypatch.setattr(
+        execution_module,
+        "_MAX_PENDING_CONTENT_DERIVATIONS",
+        2,
+    )
+    execution = AnsichExecutionContext(task_id=new_id())
+    derived_block_ids = [new_id(), new_id(), new_id()]
+    source = PendingContentDerivation(
+        source_block_id=new_id(),
+        transform_kind="copied",
+        transform_version="1",
+    )
+
+    for derived_block_id in derived_block_ids:
+        execution.register_content_derivations(
+            derived_block_id=derived_block_id,
+            sources=(source,),
+        )
+
+    assert execution.content_derivations(derived_block_ids[0]) == ()
+    assert execution.content_derivations(derived_block_ids[1]) == (source,)
+    assert execution.content_derivations(derived_block_ids[2]) == (source,)
 
 
 def test_attempt_adapter_strips_markers_without_an_active_execution_call() -> None:

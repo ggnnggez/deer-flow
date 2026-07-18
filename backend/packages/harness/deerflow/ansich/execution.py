@@ -18,6 +18,7 @@ OperationKind = Literal["title", "summarization", "memory", "goal", "other"]
 ANSICH_EXECUTION_CONTEXT_KEY = "__ansich_execution_context"
 _CONTENT_OCCURRENCE_NAMESPACE = "a63fb270-277c-5f30-83ad-37b338b53d68"
 _MAX_CONTEXT_STATE_CHAIN_DEPTH = 32
+_MAX_PENDING_CONTENT_DERIVATIONS = 1024
 
 
 def _deterministic_uuid4(value: str) -> str:
@@ -157,6 +158,7 @@ class AnsichExecutionContext:
             str,
             tuple[PendingContentDerivation, ...],
         ] = {}
+        self._content_derivation_observation_keys: dict[str, str] = {}
         for occurrence in content_occurrences:
             if occurrence.task_id != task_id:
                 raise ValueError("content occurrence belongs to a different task")
@@ -469,14 +471,32 @@ class AnsichExecutionContext:
         sources: tuple[PendingContentDerivation, ...],
     ) -> None:
         with self._lock:
+            self._pending_content_derivations.pop(derived_block_id, None)
             self._pending_content_derivations[derived_block_id] = sources
+            while len(self._pending_content_derivations) > _MAX_PENDING_CONTENT_DERIVATIONS:
+                oldest_block_id = next(iter(self._pending_content_derivations))
+                self._pending_content_derivations.pop(oldest_block_id, None)
+                self._forget_content_derivation_observations(oldest_block_id)
 
     def content_derivations(
         self,
         derived_block_id: str,
+        *,
+        producer_obs_id: str | None = None,
     ) -> tuple[PendingContentDerivation, ...]:
         with self._lock:
-            return self._pending_content_derivations.get(derived_block_id, ())
+            sources = self._pending_content_derivations.get(derived_block_id, ())
+            if sources and producer_obs_id is not None:
+                self._content_derivation_observation_keys[producer_obs_id] = derived_block_id
+            return sources
+
+    def _forget_content_derivation_observations(
+        self,
+        derived_block_id: str,
+    ) -> None:
+        for observation_id, registered_block_id in tuple(self._content_derivation_observation_keys.items()):
+            if registered_block_id == derived_block_id:
+                self._content_derivation_observation_keys.pop(observation_id, None)
 
     def context_summary_block_id(self, summary_text: str) -> str | None:
         content_hash = sha256(summary_text.encode("utf-8")).hexdigest()
@@ -489,6 +509,13 @@ class AnsichExecutionContext:
     def mark_observations_durable(self, observation_ids: tuple[str, ...]) -> None:
         with self._lock:
             for observation_id in observation_ids:
+                derived_block_id = self._content_derivation_observation_keys.pop(
+                    observation_id,
+                    None,
+                )
+                if derived_block_id is not None:
+                    self._pending_content_derivations.pop(derived_block_id, None)
+                    self._forget_content_derivation_observations(derived_block_id)
                 key = self._content_observation_keys.get(observation_id)
                 if key is not None:
                     self._content_occurrences[key].durable = True
