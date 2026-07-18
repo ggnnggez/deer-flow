@@ -6,7 +6,7 @@
 
 | 编号 | 摘要 | 状态 | 修复时间 | Commit |
 | ---- | ---- | ---- | -------- | ------ |
-| M1 | 带 `ansich_block_ref` 的块每次模型调用重复写入含正文的 `content.produced` | ⬜ 未修复 | — | — |
+| M1 | 带 `ansich_block_ref` 的块每次模型调用重复写入含正文的 `content.produced` | ✅ 已修复 | 2026-07-18 | `86221a51` |
 | M2 | 依赖未落地的投影 job 无限 250ms 重试,永不进入 failed、health 不降级 | ✅ 已修复 | 2026-07-18 | `d2dd2b67` |
 | M3 | BFS 在 `depth == max_depth` 层丢弃两端都在结果集内的边且不标记截断 | ✅ 已修复 | 2026-07-18 | `bbc26e84` |
 | L1 | freeze 的 `id()` 身份匹配对 trim 部分副本整体失败,整次压缩记录被放弃 | ⬜ 未修复 | — | — |
@@ -15,7 +15,7 @@
 
 ## M1. 带 `ansich_block_ref` 的块每次模型调用重复写入含正文的 `content.produced`
 
-- 状态:⬜ 未修复。
+- 状态:✅ 已修复(2026-07-18,commit `86221a51`)。按 TDD 修复:block_ref 项以 `block-ref:<block_ref>` 作为稳定来源身份进入 occurrence registry,保留既有 ContentBlock ID,并使用确定性 `obs_id` / `source_event_id` 与 durable 后 skip 语义。新增同一 block_ref 连续两个物理 attempt 仅写一条 `content.produced` 的回归测试,覆盖 coalesced 系统提示的主要写放大路径。以下为原始诊断记录。
 - 位置:`backend/packages/harness/deerflow/ansich/middleware.py::_record_captured_request` 的 block_ref 分支(`block_ref` 存在时跳过 `resolve_content_occurrence`,`resolution` 保持 `None`)。
 - 现状:无 registry 解析就没有 `should_emit` 去重 —— 每个物理 attempt 都会为 block_ref 项 emit 一条 `content.produced`,`obs_id=new_id()`、`source_event_id=f"attempt:{attempt_id}:content:{ordinal}"`(每 attempt 唯一,collector 的 source-event 去重失效),payload 经 `**block.model_dump()` 携带完整正文。受影响块:coalesced 系统提示(**每次模型调用都存在**,且通常是上下文里最大的块 —— 完整 system prompt + skills catalog)、压缩后的 durable-context data block、跨 checkpoint 复用的 summary 消息。ContentBlock / producer / derivation 投影本身幂等(重复行 no-op),blob 层对 canonical bytes 去重,但 observation journal 每次调用新增一行完整 payload(inline 或 externalize 到 `ansich_payloads`)加一个投影 job。方向与 Phase 2 H2(快照写放大治理)相反;`derivation_sources` 也随每条重复观察重复投递。
 - 方向:block_ref 项同样走确定性解析获得幂等 emit-once 语义 —— 例如用 `source_identity=f"block-ref:{block_ref}"` 调 `resolve_content_occurrence`(确定性 obs_id / source_event_id,durable 确认后 skip);或至少把 payload 正文换成 hash 引用。配一条"同一 block_ref 连续两个 attempt 只落一条观察"的回归测试。
