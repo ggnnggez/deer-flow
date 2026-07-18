@@ -471,7 +471,14 @@ def _record_captured_request(
         source_identity = _content_source_identity(item)
         resolution: ContentOccurrenceResolution | None = None
         block_ref = item.metadata.get(ANSICH_BLOCK_REF_KEY)
-        if source_identity is not None and not isinstance(block_ref, str):
+        if isinstance(block_ref, str):
+            source_identity = f"block-ref:{block_ref}"
+            resolution = execution.resolve_content_occurrence(
+                source_identity=source_identity,
+                content_hash=item.block.content_hash,
+                kind=item.block.kind,
+            )
+        elif source_identity is not None:
             resolution = execution.resolve_content_occurrence(
                 source_identity=source_identity,
                 content_hash=item.block.content_hash,

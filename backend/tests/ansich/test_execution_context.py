@@ -8,7 +8,13 @@ from unittest.mock import MagicMock
 
 import pytest
 from ansich import AnsichService, ContextStateItem, new_id
-from ansich.serialization import serialize_observed_content
+from ansich.serialization import (
+    ANSICH_BLOCK_REF_KEY,
+    ANSICH_CONTENT_KIND_KEY,
+    ANSICH_PRODUCER_KIND_KEY,
+    serialize_model_request,
+    serialize_observed_content,
+)
 from langchain.agents import create_agent
 from langchain.agents.middleware import AgentMiddleware
 from langchain_core.language_models import BaseChatModel
@@ -24,6 +30,7 @@ from deerflow.agents.middlewares.tool_error_handling_middleware import (
     ToolErrorHandlingMiddleware,
     build_subagent_runtime_middlewares,
 )
+from deerflow.ansich import middleware as model_observer
 from deerflow.ansich import tool_middleware as tool_observer
 from deerflow.ansich.execution import (
     ANSICH_EXECUTION_CONTEXT_KEY,
@@ -387,6 +394,47 @@ def test_content_occurrence_identity_is_deterministic_and_only_skips_after_durab
 
     assert durable.block_id == first.block_id
     assert durable.should_emit is False
+
+
+def test_durable_block_ref_emits_content_only_once_across_two_attempts(monkeypatch) -> None:
+    execution = AnsichExecutionContext(task_id=new_id())
+    call = execution.begin_call(actor_kind="lead_agent")
+    block_ref = new_id()
+    message = HumanMessage(
+        id="coalesced-system-message",
+        content="large coalesced system prompt",
+        additional_kwargs={
+            ANSICH_BLOCK_REF_KEY: block_ref,
+            ANSICH_CONTENT_KIND_KEY: "system_prompt",
+            ANSICH_PRODUCER_KIND_KEY: "system_message_coalescing",
+        },
+    )
+    captured_observations = []
+
+    def capture_batch(_execution, observations, *, batch_kind):
+        assert batch_kind == "context_snapshot"
+        captured_observations.extend(observations)
+
+    monkeypatch.setattr(model_observer, "_record_batch", capture_batch)
+
+    for attempt_index in range(2):
+        capture = serialize_model_request(
+            system_message=None,
+            messages=(message,),
+            tools=(),
+            response_format=None,
+            model_settings={},
+            model=None,
+        )
+        model_observer._record_captured_request(execution, call, capture)
+        if attempt_index == 0:
+            produced = next(observation for observation in captured_observations if observation.kind == "content.produced" and observation.subject_id == block_ref)
+            execution.mark_observations_durable((produced.obs_id,))
+
+    produced_for_ref = [observation for observation in captured_observations if observation.kind == "content.produced" and observation.subject_id == block_ref]
+    assert len(produced_for_ref) == 1
+    assert produced_for_ref[0].payload is not None
+    assert produced_for_ref[0].payload["source_identity"] == f"block-ref:{block_ref}"
 
 
 def test_equal_content_with_distinct_source_identity_keeps_distinct_occurrence_blocks() -> None:
