@@ -10,7 +10,7 @@
 | M2 | 依赖未落地的投影 job 无限 250ms 重试,永不进入 failed、health 不降级 | ✅ 已修复 | 2026-07-18 | `d2dd2b67` |
 | M3 | BFS 在 `depth == max_depth` 层丢弃两端都在结果集内的边且不标记截断 | ✅ 已修复 | 2026-07-18 | `bbc26e84` |
 | L1 | freeze 的 `id()` 身份匹配对 trim 部分副本整体失败,整次压缩记录被放弃 | ✅ 已修复 | 2026-07-18 | `ed1251ac` |
-| L2 | Ansich 关闭或无 execution context 时内部 marker 不在 provider 调用前剥离 | ✅ 已修复 | 2026-07-18 | `2d849557` |
+| L2 | Ansich 关闭或无 execution context 时内部 marker 不在 provider 调用前剥离 | ✅ 已修复 | 2026-07-18 | `2d849557`,`8be2b08c` |
 | L3 | `_pending_content_derivations` 任务级只增不减;前端压缩列表只取当前 timeline 页 | 🟡 部分完成 | 2026-07-18 | ① `ba80f53b`;② Phase 6 |
 
 ## M1. 带 `ansich_block_ref` 的块每次模型调用重复写入含正文的 `content.produced`
@@ -47,7 +47,7 @@
 
 ## L2. Ansich 关闭或无 execution context 时内部 marker 不剥离
 
-- 状态:✅ 已修复(2026-07-18,commit `2d849557`)。按 TDD 修复:coalescing、durable、dynamic、skill activation 与 view-image 五类注入只在 live Ansich execution context 存在时生成观察 marker;attempt adapter 即使没有 execution/current call 也先剥离已有 Ansich metadata。`view_image` 检查点仅保存 Gateway 防伪的中性内部标记,在模型请求副本上临时转换为观察 marker 并在 provider 前移除,不再保留持久化 Ansich marker 例外。coalescing 来源改用与 ContextSnapshot 相同的 serializer 按 list-content part 采集,每段拥有一致的 hash、source identity 与有序 `coalesced` 边。回归覆盖关闭 Ansich 的各注入点、view-image 请求级转换/防伪、无 active call 的兜底剥离及多段 system 内容谱系;`backend/AGENTS.md` 的 marker 契约已同步。以下为原始诊断记录。
+- 状态:✅ 已修复(2026-07-18,commits `2d849557`,`8be2b08c`)。按 TDD 修复:coalescing、durable、dynamic、skill activation 与 view-image 五类注入只在 live Ansich execution context 存在时生成观察 marker;attempt adapter 即使没有 execution/current call 也先剥离已有 Ansich metadata。`view_image` 检查点仅保存 Gateway 防伪的中性内部标记,在模型请求副本上临时转换为观察 marker 并在 provider 前移除,不再保留持久化 Ansich marker 例外。coalescing 来源改用与 ContextSnapshot 相同的 serializer 按 list-content part 采集,每段拥有一致的 hash、source identity 与有序 `coalesced` 边。完整套件发现 dynamic context 的 blocking-I/O 测试依赖 `_inject(state)` 单参数边界;兼容修复将 marker 装饰移到线程任务成功返回后,保持 timeout 不产生 late context event,并补 live execution 正向 marker 回归。回归覆盖关闭 Ansich 的各注入点、view-image 请求级转换/防伪、无 active call 的兜底剥离及多段 system 内容谱系;`backend/AGENTS.md` 的 marker 契约已同步。以下为原始诊断记录。
 - 位置:`backend/packages/harness/deerflow/ansich/middleware.py::AnsichAttemptMiddleware.wrap_model_call / awrap_model_call`(`execution is None or call is None` 时直接 `handler(request)`,跳过 `_request_without_ansich_metadata`);coalescing / durable / dynamic / skill-activation / view-image 中间件无条件写 `ansich_content_kind` / `ansich_producer_kind` / `ansich_block_ref`。
 - 现状:剥离仅在 execution + call 同时存在时发生。`ansich.enabled=false` 时 marker 留在 additional_kwargs 进入 provider adapter —— 主流 adapter 对 System/Human 消息忽略 additional_kwargs,实际泄漏风险低(marker 非敏感;外部伪造已由 Gateway strip 防住),但与设计文档"attempt adapter 在 provider 调用前移除内部 marker"的承诺不一致。附带两点:① `view_image` 的 marker 经 state 更新持久化进 checkpoint(其余注入均为请求级 override);② coalescing 观察者对 list-content 系统消息用 `_flatten_content` 整体 hash,与 serializer 按 part 的 hash 不一致,多段系统消息的 `coalesced` 源边会指向不出现在任何快照的展平块(谱系断点,纯字符串系统消息不受影响)。
 - 方向:marker 写入 gate 在 execution context 存在与否上,或 coalescing 等注入方自行在无 Ansich 时跳过 marker;`view_image` 改为请求级注入或接受并记录该例外;coalescing 观察者对多段内容按 part 采集。
