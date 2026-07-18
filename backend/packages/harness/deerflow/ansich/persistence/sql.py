@@ -2702,6 +2702,9 @@ class SqlAnsichBackend:
         raw_items = payload.get("items", [])
         if not isinstance(raw_items, list):
             raise ValueError("context.compressed items must be a list")
+        compression_status = payload.get("status", "complete")
+        if compression_status not in {"complete", "incomplete"}:
+            raise ValueError(f"invalid context compression status: {compression_status}")
         block_ids = {str(item["block_id"]) for item in raw_items if isinstance(item, dict) and isinstance(item.get("block_id"), str)}
         available_block_ids = set((await session.execute(select(AnsichContentBlockRow.entity_id).where(AnsichContentBlockRow.entity_id.in_(block_ids)))).scalars()) if block_ids else set()
         missing_block_ids = block_ids - available_block_ids
@@ -2733,7 +2736,7 @@ class SqlAnsichBackend:
                 algorithm=str(payload["algorithm"]),
                 algorithm_version=str(payload["algorithm_version"]),
                 source_obs_id=observation.obs_id,
-                status="complete",
+                status=cast(Literal["complete", "incomplete"], compression_status),
             )
             session.add(compression)
             await session.flush()

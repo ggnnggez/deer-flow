@@ -4,6 +4,7 @@ from collections import defaultdict, deque
 from collections.abc import Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime
+from typing import Literal
 from uuid import uuid4
 
 from ansich import ObservationEnvelope, Producer, new_id
@@ -35,6 +36,7 @@ class FrozenContextCompression:
     before_tokens: int
     before_visible_bytes: int
     preserved_visible_bytes: int
+    status: Literal["complete", "incomplete"]
 
 
 def freeze_context_compression(
@@ -149,10 +151,18 @@ def freeze_context_compression(
         if isinstance(message_ordinal, int):
             items_by_message_ordinal[message_ordinal].append(item)
 
+    inventory_complete = True
+
     def selected_items(
         selected_messages: Sequence[object],
     ) -> tuple[ContextSnapshotItemCapture, ...]:
-        selected_ordinals = _selected_message_ordinals(messages, selected_messages)
+        nonlocal inventory_complete
+        selected_ordinals, unmatched_count = _selected_message_ordinals(
+            messages,
+            selected_messages,
+        )
+        if unmatched_count:
+            inventory_complete = False
         return tuple(item for message_ordinal in selected_ordinals for item in items_by_message_ordinal.get(message_ordinal, ()))
 
     source_items = selected_items(source_messages)
@@ -170,6 +180,7 @@ def freeze_context_compression(
         before_tokens=before_tokens,
         before_visible_bytes=capture.visible_bytes + previous_summary_visible_bytes,
         preserved_visible_bytes=sum(item.block.visible_bytes for item in preserved_items),
+        status="complete" if inventory_complete else "incomplete",
     )
 
 
@@ -249,6 +260,7 @@ def record_context_compression(
             "after_visible_bytes": (summary_block.visible_bytes + frozen.preserved_visible_bytes),
             "algorithm": _ALGORITHM,
             "algorithm_version": _ALGORITHM_VERSION,
+            "status": frozen.status,
             "items": items,
         },
     )
@@ -275,17 +287,19 @@ def record_context_compression(
 def _selected_message_ordinals(
     messages: Sequence[object],
     selected_messages: Sequence[object],
-) -> tuple[int, ...]:
+) -> tuple[tuple[int, ...], int]:
     available: dict[int, deque[int]] = defaultdict(deque)
     for ordinal, message in enumerate(messages):
         available[id(message)].append(ordinal)
     selected: list[int] = []
+    unmatched_count = 0
     for message in selected_messages:
         ordinals = available.get(id(message))
         if not ordinals:
-            raise ValueError("compaction inventory message is not in the source context")
+            unmatched_count += 1
+            continue
         selected.append(ordinals.popleft())
-    return tuple(selected)
+    return tuple(selected), unmatched_count
 
 
 def _producer() -> Producer:

@@ -6,12 +6,16 @@ from unittest.mock import MagicMock
 
 import pytest
 from ansich import AnsichService, ObservationEnvelope, new_id
-from langchain_core.messages import AIMessage, HumanMessage
+from langchain_core.messages import AIMessage, HumanMessage, trim_messages
+from sqlalchemy import insert
+from sqlalchemy.dialects import postgresql, sqlite
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
 from deerflow.agents.middlewares.summarization_middleware import DeerFlowSummarizationMiddleware
 from deerflow.ansich import create_sql_ansich_service
+from deerflow.ansich.compression import freeze_context_compression, record_context_compression
 from deerflow.ansich.execution import ANSICH_EXECUTION_CONTEXT_KEY, AnsichExecutionContext
+from deerflow.ansich.persistence.models import AnsichContextCompressionRow
 from deerflow.persistence.base import Base
 
 
@@ -63,6 +67,114 @@ async def test_successful_compaction_records_exact_ordered_source_preserved_and_
     assert compression.payload["summary_operation_id"]
     assert compression.payload["summary_block_id"] in content_identity_by_block
     assert compression.causation_obs_id is not None
+
+
+@pytest.mark.anyio
+async def test_partial_list_content_trim_records_an_incomplete_compression_inventory(
+    tmp_path,
+) -> None:
+    engine = create_async_engine(f"sqlite+aiosqlite:///{tmp_path / 'ansich-partial-trim-compression.db'}")
+    session_factory = async_sessionmaker(engine, expire_on_commit=False)
+    async with engine.begin() as connection:
+        await connection.run_sync(Base.metadata.create_all)
+    service = create_sql_ansich_service(session_factory)
+    await service.start()
+    task_id = new_id()
+    service.record(
+        ObservationEnvelope.task_lifecycle(
+            kind="task.created",
+            task_id=task_id,
+            source_kind="deerflow_run",
+            source_id="run-partial-trim-compression",
+            occurred_at=datetime.now(UTC),
+            source_event_id="partial-trim-compression:task",
+        )
+    )
+    await service.flush_task(task_id)
+    execution = AnsichExecutionContext(task_id=task_id, service=service)
+    boundary = HumanMessage(
+        id="trim-boundary",
+        content=[
+            {"type": "text", "text": "one"},
+            {"type": "text", "text": "two"},
+            {"type": "text", "text": "three"},
+        ],
+    )
+    tail = AIMessage(id="trim-tail", content="answer")
+    messages = [boundary, tail]
+
+    def count_parts(value) -> int:
+        selected = value if isinstance(value, list) else [value]
+        return sum(len(message.content) if isinstance(message.content, list) else 1 for message in selected)
+
+    trimmed = trim_messages(
+        messages,
+        max_tokens=2,
+        token_counter=count_parts,
+        start_on="human",
+        strategy="last",
+        allow_partial=True,
+        include_system=True,
+    )
+    assert trimmed[0].id == boundary.id
+    assert trimmed[0] is not boundary
+
+    frozen = freeze_context_compression(
+        execution=execution,
+        messages=messages,
+        source_messages=trimmed,
+        preserved_messages=(),
+        removed_messages=messages,
+        before_tokens=count_parts(messages),
+        previous_summary=None,
+        runtime_context=None,
+    )
+    assert record_context_compression(
+        frozen,
+        summary_text="partial trim summary",
+        summary_call=None,
+        after_tokens=1,
+    )
+    await service.flush_task(task_id)
+    compression = await service.get_context_compression(frozen.compression_id)
+    replayed = await service.rebuild_projections()
+    rebuilt_compression = await service.get_context_compression(frozen.compression_id)
+    observations = await service.list_observations(task_id)
+    await service.stop()
+    await engine.dispose()
+
+    assert compression is not None
+    assert compression.status == "incomplete"
+    assert replayed > 0
+    assert rebuilt_compression is not None
+    assert rebuilt_compression.status == "incomplete"
+    source_items = [item for item in compression.items if item.disposition == "source"]
+    assert len(source_items) == 1
+    source_observation = next(observation for observation in observations if observation.subject_id == source_items[0].block.block_id)
+    assert source_observation.payload is not None
+    assert source_observation.payload["source_identity"] == ("message:trim-tail:occurrence:1:content:0")
+
+
+def test_incomplete_compression_status_insert_compiles_for_sqlite_and_postgres() -> None:
+    statement = insert(AnsichContextCompressionRow).values(
+        entity_id=new_id(),
+        task_id=new_id(),
+        operation_id=None,
+        summary_block_id=new_id(),
+        before_tokens=10,
+        after_tokens=3,
+        before_visible_bytes=40,
+        after_visible_bytes=12,
+        algorithm="test",
+        algorithm_version="1",
+        source_obs_id=new_id(),
+        status="incomplete",
+    )
+
+    for dialect in (sqlite.dialect(), postgresql.dialect()):
+        compiled = statement.compile(dialect=dialect)
+        assert compiled.params["status"] == "incomplete"
+        assert "status" in str(compiled).lower()
 
 
 @pytest.mark.anyio

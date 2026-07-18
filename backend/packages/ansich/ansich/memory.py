@@ -417,7 +417,7 @@ class InMemoryAnsichBackend:
             algorithm=str(payload["algorithm"]),
             algorithm_version=str(payload["algorithm_version"]),
             source_obs_id=observation.obs_id,
-            status=("complete" if len(items) == len(raw_items) else "incomplete"),
+            status=("complete" if payload.get("status", "complete") == "complete" and len(items) == len(raw_items) else "incomplete"),
             items=items,
         )
 

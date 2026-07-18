@@ -995,6 +995,10 @@ source. If a restored process sees summary text whose prior block reference is
 unavailable, it records the complete text as an `unknown_origin` summary block
 and does not manufacture earlier provenance. Ansich enqueue/projection failure
 remains fail-open for Agent execution.
+If `trim_messages(allow_partial=True)` creates a boundary-message copy that
+cannot be mapped to an exact source occurrence, freeze skips only that copied
+item and records the remaining inventory with `status=incomplete`; it must not
+discard the whole compression fact or claim the untrimmed original was shown.
 
 Every successful LLM response also emits assistant/tool-request ContentBlocks at
 response time, so a final answer does not depend on appearing in a later model

@@ -392,7 +392,9 @@ projects ordered `source`/`preserved`/`removed` memberships, a summary block,
 and `compressed` derivations only after summary generation succeeds. Consecutive
 compressions link the next summary to the previous summary block; an unresolved
 pre-existing summary is retained as a full `unknown_origin` block instead of
-receiving guessed edges. Successful LLM responses produce assistant/tool-request
+receiving guessed edges. A partial-trim boundary copy that cannot be matched by
+object identity is skipped while the remaining compression inventory is stored
+as `incomplete`; never substitute the full original occurrence. Successful LLM responses produce assistant/tool-request
 ContentBlocks immediately, including final answers that never enter a later
 request. Server-owned content-kind/producer markers distinguish memory, skill,
 durable/dynamic context, and vision injection from genuine user input; Gateway
