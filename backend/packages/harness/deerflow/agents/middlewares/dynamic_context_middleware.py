@@ -193,7 +193,6 @@ class DynamicContextMiddleware(AgentMiddleware):
         memory_content: str | None = None,
         *,
         reminder_date: str | None = None,
-        include_ansich_metadata: bool = False,
     ) -> list[SystemMessage | HumanMessage]:
         """Return messages using the ID-swap technique.
 
@@ -216,13 +215,6 @@ class DynamicContextMiddleware(AgentMiddleware):
             "hide_from_ui": True,
             _DYNAMIC_CONTEXT_REMINDER_KEY: True,
         }
-        if include_ansich_metadata:
-            reminder_kwargs.update(
-                {
-                    ANSICH_CONTENT_KIND_KEY: "middleware_injection",
-                    ANSICH_PRODUCER_KIND_KEY: "dynamic_context",
-                }
-            )
         if reminder_date is not None:
             reminder_kwargs[_REMINDER_DATE_KEY] = reminder_date
         messages.append(
@@ -241,14 +233,6 @@ class DynamicContextMiddleware(AgentMiddleware):
                     additional_kwargs={
                         "hide_from_ui": True,
                         _DYNAMIC_CONTEXT_REMINDER_KEY: True,
-                        **(
-                            {
-                                ANSICH_CONTENT_KIND_KEY: "memory",
-                                ANSICH_PRODUCER_KIND_KEY: "dynamic_context_memory",
-                            }
-                            if include_ansich_metadata
-                            else {}
-                        ),
                     },
                 )
             )
@@ -263,12 +247,7 @@ class DynamicContextMiddleware(AgentMiddleware):
         )
         return messages
 
-    def _inject(
-        self,
-        state,
-        *,
-        include_ansich_metadata: bool = False,
-    ) -> dict | None:
+    def _inject(self, state) -> dict | None:
         messages = list(state.get("messages", []))
         if not messages:
             return None
@@ -298,7 +277,6 @@ class DynamicContextMiddleware(AgentMiddleware):
                 date_reminder,
                 memory_block,
                 reminder_date=current_date,
-                include_ansich_metadata=include_ansich_metadata,
             )
             return {"messages": result_msgs}
 
@@ -315,17 +293,55 @@ class DynamicContextMiddleware(AgentMiddleware):
             messages[last_human_idx],
             self._build_date_update_reminder(),
             reminder_date=current_date,
-            include_ansich_metadata=include_ansich_metadata,
         )
         logger.info("DynamicContextMiddleware: midnight crossing detected — injected date update before current turn")
         return {"messages": result_msgs}
 
+    @staticmethod
+    def _with_ansich_metadata(update: dict | None) -> dict | None:
+        """Decorate only the current request's injected reminder messages."""
+
+        if update is None:
+            return None
+        messages = update.get("messages")
+        if not isinstance(messages, list):
+            return update
+        decorated = []
+        for message in messages:
+            additional_kwargs = getattr(message, "additional_kwargs", None)
+            if not isinstance(additional_kwargs, dict) or not additional_kwargs.get(_DYNAMIC_CONTEXT_REMINDER_KEY):
+                decorated.append(message)
+                continue
+            marker_values = None
+            if isinstance(message, SystemMessage):
+                marker_values = {
+                    ANSICH_CONTENT_KIND_KEY: "middleware_injection",
+                    ANSICH_PRODUCER_KIND_KEY: "dynamic_context",
+                }
+            elif isinstance(message, HumanMessage) and str(message.id or "").endswith("__memory"):
+                marker_values = {
+                    ANSICH_CONTENT_KIND_KEY: "memory",
+                    ANSICH_PRODUCER_KIND_KEY: "dynamic_context_memory",
+                }
+            decorated.append(
+                message
+                if marker_values is None
+                else message.model_copy(
+                    update={
+                        "additional_kwargs": {
+                            **additional_kwargs,
+                            **marker_values,
+                        }
+                    }
+                )
+            )
+        return {**update, "messages": decorated}
+
     @override
     def before_agent(self, state, runtime: Runtime) -> dict | None:
-        result = self._inject(
-            state,
-            include_ansich_metadata=(execution_context_from_runtime(runtime) is not None),
-        )
+        result = self._inject(state)
+        if execution_context_from_runtime(runtime) is not None:
+            result = self._with_ansich_metadata(result)
         self._record_effective_memory(state, result, runtime)
         return result
 
@@ -344,11 +360,7 @@ class DynamicContextMiddleware(AgentMiddleware):
         # rather than hanging. Frozen context already in state remains active.
         try:
             result = await asyncio.wait_for(
-                asyncio.to_thread(
-                    self._inject,
-                    state,
-                    include_ansich_metadata=(execution_context_from_runtime(runtime) is not None),
-                ),
+                asyncio.to_thread(self._inject, state),
                 timeout=_INJECT_TIMEOUT_SECONDS,
             )
         except TimeoutError:
@@ -358,6 +370,8 @@ class DynamicContextMiddleware(AgentMiddleware):
             )
             self._record_effective_memory(state, None, runtime)
             return None
+        if execution_context_from_runtime(runtime) is not None:
+            result = self._with_ansich_metadata(result)
         self._record_effective_memory(state, result, runtime)
         return result
 

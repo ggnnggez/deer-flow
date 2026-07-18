@@ -8,6 +8,7 @@ import hashlib
 from types import SimpleNamespace
 from unittest import mock
 
+from ansich import AnsichService, new_id
 from ansich.serialization import ANSICH_CONTENT_KIND_KEY, ANSICH_PRODUCER_KIND_KEY
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
 
@@ -15,6 +16,7 @@ from deerflow.agents.middlewares.dynamic_context_middleware import (
     _DYNAMIC_CONTEXT_REMINDER_KEY,
     DynamicContextMiddleware,
 )
+from deerflow.ansich.execution import ANSICH_EXECUTION_CONTEXT_KEY, AnsichExecutionContext
 from deerflow.runtime.context_keys import CURRENT_RUN_PRE_EXISTING_MESSAGE_IDS_KEY
 
 _SYSTEM_REMINDER_TAG = "<system-reminder>"
@@ -24,10 +26,12 @@ def _make_middleware(**kwargs) -> DynamicContextMiddleware:
     return DynamicContextMiddleware(**kwargs)
 
 
-def _fake_runtime(journal=None, *, pre_existing_message_ids=()):
+def _fake_runtime(journal=None, *, pre_existing_message_ids=(), execution=None):
     context = {"__run_journal": journal} if journal is not None else {}
     if pre_existing_message_ids:
         context[CURRENT_RUN_PRE_EXISTING_MESSAGE_IDS_KEY] = frozenset(pre_existing_message_ids)
+    if execution is not None:
+        context[ANSICH_EXECUTION_CONTEXT_KEY] = execution
     return SimpleNamespace(context=context)
 
 
@@ -119,6 +123,27 @@ def test_memory_included_when_present():
     assert ANSICH_PRODUCER_KIND_KEY not in msgs[1].additional_kwargs
 
     assert msgs[2].content == "Hi"
+
+
+def test_live_ansich_execution_decorates_only_the_request_update():
+    mw = _make_middleware()
+    state = {"messages": [HumanMessage(content="Hello", id="msg-1")]}
+    execution = AnsichExecutionContext(
+        task_id=new_id(),
+        service=AnsichService.in_memory(),
+    )
+
+    with mock.patch("deerflow.agents.lead_agent.prompt._get_memory_context", return_value=""), mock.patch("deerflow.agents.middlewares.dynamic_context_middleware.datetime") as mock_dt:
+        mock_dt.now.return_value.strftime.return_value = "2026-05-08, Friday"
+        result = mw.before_agent(
+            state,
+            _fake_runtime(execution=execution),
+        )
+
+    reminder = result["messages"][0]
+    assert reminder.additional_kwargs[ANSICH_CONTENT_KIND_KEY] == "middleware_injection"
+    assert reminder.additional_kwargs[ANSICH_PRODUCER_KIND_KEY] == "dynamic_context"
+    assert ANSICH_CONTENT_KIND_KEY not in state["messages"][0].additional_kwargs
 
 
 def test_first_run_records_exact_effective_memory():
