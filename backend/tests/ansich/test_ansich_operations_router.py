@@ -1,4 +1,4 @@
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from uuid import uuid4
 
 import pytest
@@ -20,6 +20,133 @@ def _admin_user() -> User:
         password_hash="x",
         system_role="admin",
     )
+
+
+@pytest.mark.anyio
+async def test_filtered_empty_active_read_does_not_refresh_ready_read_model(
+    tmp_path,
+):
+    engine = create_async_engine(f"sqlite+aiosqlite:///{tmp_path / 'ansich-active-read-no-write.db'}")
+    session_factory = async_sessionmaker(engine, expire_on_commit=False)
+    async with engine.begin() as connection:
+        await connection.run_sync(Base.metadata.create_all)
+    service = create_sql_ansich_service(
+        session_factory,
+        operations_assessment_interval_ms=60_000,
+    )
+    await service.start()
+    task_id = new_id()
+    observed_at = datetime.now(UTC) - timedelta(seconds=10)
+    service.record_batch(
+        (
+            ObservationEnvelope.task_lifecycle(
+                kind="task.created",
+                task_id=task_id,
+                source_kind="deerflow_run",
+                source_id="run-active-read-no-write",
+                occurred_at=observed_at,
+                source_event_id="run:run-active-read-no-write:task:created",
+                owner_id="owner-a",
+            ),
+            ObservationEnvelope.task_lifecycle(
+                kind="task.started",
+                task_id=task_id,
+                source_kind="deerflow_run",
+                source_id="run-active-read-no-write",
+                occurred_at=observed_at,
+                source_event_id="run:run-active-read-no-write:task:started",
+                owner_id="owner-a",
+            ),
+        )
+    )
+    await service.flush_task(task_id)
+    await service.assess_operations(now=observed_at + timedelta(seconds=1))
+    before = (await service.list_active_tasks())[0]
+
+    app = make_authed_test_app(user_factory=_admin_user)
+    app.state.ansich_service = service
+    app.include_router(ansich_router.router)
+    try:
+        async with AsyncClient(
+            transport=ASGITransport(app=app),
+            base_url="http://test",
+        ) as client:
+            response = await client.get("/api/ansich/operations/active-tasks?owner=no-match")
+        after = (await service.list_active_tasks())[0]
+    finally:
+        await service.stop()
+        await engine.dispose()
+
+    assert response.status_code == 200
+    assert response.json()["items"] == []
+    assert after.updated_at == before.updated_at
+
+
+@pytest.mark.anyio
+async def test_budget_read_does_not_materialize_missing_health(tmp_path):
+    engine = create_async_engine(f"sqlite+aiosqlite:///{tmp_path / 'ansich-budget-read-no-write.db'}")
+    session_factory = async_sessionmaker(engine, expire_on_commit=False)
+    async with engine.begin() as connection:
+        await connection.run_sync(Base.metadata.create_all)
+    service = create_sql_ansich_service(
+        session_factory,
+        operations_assessment_interval_ms=60_000,
+    )
+    await service.start()
+    task_id = new_id()
+    observed_at = datetime.now(UTC)
+    service.record_batch(
+        (
+            ObservationEnvelope.task_lifecycle(
+                kind="task.created",
+                task_id=task_id,
+                source_kind="deerflow_run",
+                source_id="run-budget-read-no-write",
+                occurred_at=observed_at,
+                source_event_id="run:run-budget-read-no-write:task:created",
+            ),
+            ObservationEnvelope.task_lifecycle(
+                kind="task.started",
+                task_id=task_id,
+                source_kind="deerflow_run",
+                source_id="run-budget-read-no-write",
+                occurred_at=observed_at,
+                source_event_id="run:run-budget-read-no-write:task:started",
+            ),
+            ObservationEnvelope.budget_configured(
+                task_id=task_id,
+                run_id="run-budget-read-no-write",
+                occurred_at=observed_at,
+                dimension="steps",
+                aggregation_scope="local",
+                warning_limit=1,
+                hard_limit=2,
+                enforcement=False,
+                source_kind="shadow",
+                requested_value=None,
+                effective_value=2,
+                source_event_id="run:run-budget-read-no-write:budget:steps",
+            ),
+        )
+    )
+    await service.flush_task(task_id)
+
+    app = make_authed_test_app(user_factory=_admin_user)
+    app.state.ansich_service = service
+    app.include_router(ansich_router.router)
+    try:
+        async with AsyncClient(
+            transport=ASGITransport(app=app),
+            base_url="http://test",
+        ) as client:
+            response = await client.get(f"/api/ansich/tasks/{task_id}/budgets")
+    finally:
+        await service.stop()
+        await engine.dispose()
+
+    assert response.status_code == 200
+    assert response.json()["budgets"]["budgets"][0]["dimension"] == "steps"
+    assert response.json()["health"] == []
 
 
 @pytest.mark.anyio
@@ -100,6 +227,7 @@ async def test_operator_endpoints_return_active_usage_budgets_and_etag(
         )
     )
     await service.flush_task(task_id)
+    await service.assess_operations(now=now)
 
     app = make_authed_test_app(user_factory=_admin_user)
     app.state.ansich_service = service

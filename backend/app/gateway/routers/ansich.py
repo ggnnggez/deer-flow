@@ -114,9 +114,6 @@ async def list_active_tasks(
     }
     try:
         tasks = await service.list_active_tasks(**query)
-        if not tasks and cursor is None:
-            await service.assess_operations()
-            tasks = await service.list_active_tasks(**query)
     except Exception as exc:
         raise HTTPException(
             status_code=503,
@@ -193,9 +190,6 @@ async def get_task_budgets(task_id: str, request: Request) -> dict:
             raise HTTPException(status_code=404, detail="Ansich Task not found")
         budgets = await service.get_task_budgets(task_id)
         health = await service.get_task_budget_health(task_id)
-        if budgets.budgets and not health:
-            await service.assess_operations()
-            health = await service.get_task_budget_health(task_id)
     except HTTPException:
         raise
     except Exception as exc:

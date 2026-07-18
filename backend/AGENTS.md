@@ -436,7 +436,9 @@ contributions, TaskBudget admission snapshots, rule Beliefs, and the materialize
 bounded polling read (filters/cursor/ETag); its ETag covers only items plus the
 next cursor, not volatile projection health. Read-model refreshes compare
 normalized content and neither write the row nor bump `updated_at` when it is
-unchanged. `GET /tasks/{task_id}/usage` returns
+unchanged. Operations active-task and Task-budget GET routes never invoke the
+assessor synchronously; they return the latest projection while the background
+assessment loop owns writes. `GET /tasks/{task_id}/usage` returns
 local dimensions and explicitly marks inclusive usage unavailable until Phase
 8; `GET /tasks/{task_id}/budgets` returns configured policy plus health Beliefs.
 The general `GET /tasks` read accepts `lifecycle_scope=all|active|terminal` and
