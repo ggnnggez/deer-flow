@@ -416,6 +416,8 @@ export const zhCN: Translations = {
     noSystemOperations: "尚未观测到内部模型操作。",
     noSteps: "尚未观测到 Agent 逻辑决策。",
     noContext: "当前没有可用的最终生效模型上下文。",
+    contextProjectionUnavailable:
+      "Ansich 存在失败的投影任务，最终生效上下文当前不可用。模型请求可能已经被记录，但在投影恢复成功前无法查询。",
     loadRaw: "读取原始载荷",
     loading: "读取中…",
     tokens: "估算 token",

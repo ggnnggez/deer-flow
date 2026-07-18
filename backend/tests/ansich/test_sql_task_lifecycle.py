@@ -11,7 +11,7 @@ from langchain_core.language_models import BaseChatModel
 from langchain_core.messages import AIMessage, HumanMessage
 from langchain_core.outputs import ChatGeneration, ChatResult
 from langchain_core.tools import tool
-from sqlalchemy import func, select, text
+from sqlalchemy import event, func, select, text
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
 from deerflow.ansich import create_sql_ansich_service
@@ -96,6 +96,58 @@ class _SqlToolThenFinalModel(_ObservedFinalModel):
             run_manager=run_manager,
             **kwargs,
         )
+
+
+@pytest.mark.anyio
+async def test_context_snapshot_projects_with_sqlite_foreign_keys_enabled(tmp_path):
+    engine = create_async_engine(f"sqlite+aiosqlite:///{tmp_path / 'ansich-context-foreign-keys.db'}")
+
+    @event.listens_for(engine.sync_engine, "connect")
+    def _enable_foreign_keys(dbapi_connection, _connection_record):
+        cursor = dbapi_connection.cursor()
+        cursor.execute("PRAGMA foreign_keys=ON")
+        cursor.close()
+
+    session_factory = async_sessionmaker(engine, expire_on_commit=False)
+    async with engine.begin() as connection:
+        await connection.run_sync(Base.metadata.create_all)
+    task_id = new_id()
+    service = create_sql_ansich_service(session_factory)
+    await service.start()
+    service.record(
+        ObservationEnvelope.task_lifecycle(
+            kind="task.created",
+            task_id=task_id,
+            source_kind="deerflow_run",
+            source_id="run-context-foreign-keys",
+            occurred_at=datetime.now(UTC),
+            source_event_id="run:context-foreign-keys:created",
+        )
+    )
+    await service.flush_task(task_id)
+    execution = AnsichExecutionContext(task_id=task_id, service=service)
+    agent = create_agent(
+        model=_ObservedFinalModel(),
+        tools=[],
+        middleware=[AnsichDecisionMiddleware(), AnsichAttemptMiddleware()],
+    )
+
+    try:
+        await agent.ainvoke(
+            {"messages": [HumanMessage(content="capture this request")]},
+            context={ANSICH_EXECUTION_CONTEXT_KEY: execution},
+        )
+        await service.flush_task(task_id)
+        step = (await service.list_steps(task_id))[0]
+        context = await service.get_step_context(step.step_id)
+        health = service.get_health()
+    finally:
+        await service.stop()
+        await engine.dispose()
+
+    assert context is not None
+    assert context.items[0].kind == "user_input"
+    assert health.failed_jobs == 0
 
 
 @pytest.mark.anyio
@@ -652,6 +704,114 @@ async def test_projection_failure_keeps_raw_observation_and_records_retry_eviden
     assert task.control.evidence_obs_ids == ()
     assert health.status == "degraded"
     assert health.failed_jobs == 1
+
+
+@pytest.mark.anyio
+async def test_projection_failure_health_survives_service_restart(tmp_path, monkeypatch):
+    engine = create_async_engine(f"sqlite+aiosqlite:///{tmp_path / 'ansich-projector-failure-restart.db'}")
+    session_factory = async_sessionmaker(engine, expire_on_commit=False)
+    async with engine.begin() as connection:
+        await connection.run_sync(Base.metadata.create_all)
+    failing_backend = SqlAnsichBackend(session_factory, projector_max_attempts=1)
+
+    async def fail_control_projection(*_args, **_kwargs) -> None:
+        raise RuntimeError("projector exploded")
+
+    monkeypatch.setattr(failing_backend, "_project_control", fail_control_projection)
+    service = AnsichService(failing_backend, flush_interval_ms=60_000)
+    await service.start()
+    task_id = new_id()
+    service.record(
+        ObservationEnvelope.task_lifecycle(
+            kind="task.created",
+            task_id=task_id,
+            source_kind="deerflow_run",
+            source_id="run-projector-failure-restart",
+            occurred_at=datetime(2026, 7, 17, 11, 30, tzinfo=UTC),
+            source_event_id="run:run-projector-failure-restart:task:created",
+        )
+    )
+
+    await service.flush_task(task_id)
+    await service.stop()
+
+    restarted = AnsichService(SqlAnsichBackend(session_factory, projector_max_attempts=1))
+    await restarted.start()
+    try:
+        health = restarted.get_health()
+    finally:
+        await restarted.stop()
+        await engine.dispose()
+
+    assert health.status == "degraded"
+    assert health.failed_jobs == 1
+
+
+@pytest.mark.anyio
+async def test_retry_failed_projection_restores_effective_step_context(tmp_path, monkeypatch):
+    engine = create_async_engine(f"sqlite+aiosqlite:///{tmp_path / 'ansich-context-retry.db'}")
+
+    @event.listens_for(engine.sync_engine, "connect")
+    def _enable_foreign_keys(dbapi_connection, _connection_record):
+        cursor = dbapi_connection.cursor()
+        cursor.execute("PRAGMA foreign_keys=ON")
+        cursor.close()
+
+    session_factory = async_sessionmaker(engine, expire_on_commit=False)
+    async with engine.begin() as connection:
+        await connection.run_sync(Base.metadata.create_all)
+    backend = SqlAnsichBackend(session_factory, projector_max_attempts=1)
+    project_context_snapshot = backend._project_context_snapshot
+
+    async def fail_context_projection(*_args, **_kwargs) -> None:
+        raise RuntimeError("snapshot projector exploded")
+
+    monkeypatch.setattr(backend, "_project_context_snapshot", fail_context_projection)
+    service = AnsichService(backend, flush_interval_ms=60_000)
+    await service.start()
+    task_id = new_id()
+    service.record(
+        ObservationEnvelope.task_lifecycle(
+            kind="task.created",
+            task_id=task_id,
+            source_kind="deerflow_run",
+            source_id="run-context-retry",
+            occurred_at=datetime(2026, 7, 17, 11, 45, tzinfo=UTC),
+            source_event_id="run:run-context-retry:task:created",
+        )
+    )
+    await service.flush_task(task_id)
+    execution = AnsichExecutionContext(task_id=task_id, service=service)
+    agent = create_agent(
+        model=_ObservedFinalModel(),
+        tools=[],
+        middleware=[AnsichDecisionMiddleware(), AnsichAttemptMiddleware()],
+    )
+
+    try:
+        await agent.ainvoke(
+            {"messages": [HumanMessage(content="recover this context")]},
+            context={ANSICH_EXECUTION_CONTEXT_KEY: execution},
+        )
+        await service.flush_task(task_id)
+        step_before_retry = (await service.list_steps(task_id))[0]
+        context_before_retry = await service.get_step_context(step_before_retry.step_id)
+
+        monkeypatch.setattr(backend, "_project_context_snapshot", project_context_snapshot)
+        retried = await service.retry_failed_projections(task_id=task_id)
+
+        step_after_retry = (await service.list_steps(task_id))[0]
+        context_after_retry = await service.get_step_context(step_after_retry.step_id)
+        health = service.get_health()
+    finally:
+        await service.stop()
+        await engine.dispose()
+
+    assert context_before_retry is None
+    assert retried == 1
+    assert step_after_retry.effective_context_snapshot_id is not None
+    assert context_after_retry is not None
+    assert health.failed_jobs == 0
 
 
 @pytest.mark.anyio

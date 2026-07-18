@@ -374,6 +374,16 @@ class AnsichService:
         async with projection_lock:
             return int(await rebuild())
 
+    async def retry_failed_projections(self, *, task_id: str | None = None) -> int:
+        retry_failed = getattr(self._backend, "retry_failed_projections", None)
+        if not callable(retry_failed):
+            return 0
+        projection_lock = self._projection_lock
+        if projection_lock is None:
+            return int(await retry_failed(task_id=task_id))
+        async with projection_lock:
+            return int(await retry_failed(task_id=task_id))
+
     async def stop(self) -> None:
         if not self._running:
             return

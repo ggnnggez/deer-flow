@@ -506,6 +506,104 @@ test("admin navigates from Ansich operations to evidence-backed Task detail", as
   await expect(page.getByText('"inspect me"')).toBeVisible();
 });
 
+test("context tab distinguishes failed projection from no observed context", async ({
+  page,
+}) => {
+  mockLangGraphAPI(page, { threads: [] });
+  const degradedHealth = { ...HEALTH, status: "degraded", failed_jobs: 1 };
+  await page.route("**/api/ansich/tasks?*", (route) =>
+    route.fulfill({
+      status: 200,
+      contentType: "application/json",
+      body: JSON.stringify({
+        items: [TASK],
+        next_cursor: null,
+        projection_status: degradedHealth,
+      }),
+    }),
+  );
+  await page.route(`**/api/ansich/tasks/${TASK_ID}`, (route) =>
+    route.fulfill({
+      status: 200,
+      contentType: "application/json",
+      body: JSON.stringify({
+        task: TASK,
+        projection_status: degradedHealth,
+      }),
+    }),
+  );
+  await page.route(`**/api/ansich/tasks/${TASK_ID}/timeline`, (route) =>
+    route.fulfill({
+      status: 200,
+      contentType: "application/json",
+      body: JSON.stringify({
+        items: [],
+        next_cursor: null,
+        projection_status: degradedHealth,
+      }),
+    }),
+  );
+  await page.route(`**/api/ansich/tasks/${TASK_ID}/steps`, (route) =>
+    route.fulfill({
+      status: 200,
+      contentType: "application/json",
+      body: JSON.stringify({
+        items: [
+          {
+            step_id: STEP_ID,
+            task_id: TASK_ID,
+            step_seq: 1,
+            actor_kind: "lead_agent",
+            status: "closed",
+            result: "final_answer",
+            started_obs_id: "09b3076b-e600-4761-9fe7-228486a35e6d",
+            closed_obs_id: "20fc41b9-cb32-4dfd-b3ce-a8412964cba2",
+            effective_attempt_no: 1,
+            effective_context_snapshot_id: null,
+            issued_tools: [],
+            tool_calls: [],
+            attempts: [
+              {
+                attempt_id: "57d838c5-60d3-4925-a2e7-a8dd35dd40b3",
+                task_id: TASK_ID,
+                step_id: STEP_ID,
+                actor_kind: "lead_agent",
+                operation_id: null,
+                operation_kind: null,
+                attempt_no: 1,
+                status: "success",
+                request_obs_id: "5f65d20a-f8a0-4ae0-8198-27b4549dc9c9",
+                response_obs_id: "366c52fe-5579-469e-b2e5-314b8c0626a6",
+                failure_obs_id: null,
+                provider_model: "test-model",
+                latency_ms: 8,
+                context_snapshot_id: null,
+                effective: true,
+              },
+            ],
+          },
+        ],
+        system_operations: [],
+        projection_status: degradedHealth,
+      }),
+    }),
+  );
+
+  await page.goto("/workspace/chats/new");
+  await page.getByRole("link", { name: "Ansich" }).click();
+  await page.getByRole("link", { name: new RegExp(TASK_ID) }).click();
+  await page.getByRole("tab", { name: "Context & lineage" }).click();
+
+  await expect(
+    page.getByText(
+      "Effective context is unavailable because Ansich has failed projection jobs. The request may have been recorded but is not queryable until projection recovery succeeds.",
+    ),
+  ).toBeVisible();
+  await expect(
+    page.getByText("No effective model context is available yet."),
+  ).toHaveCount(0);
+});
+
 test("operations page preserves storage-unavailable detail from a 503", async ({
   page,
 }) => {

@@ -111,8 +111,19 @@ export function AnsichContextPanel({
   if (stepsQuery.isPending) return <Skeleton className="h-48 w-full" />;
   if (stepsQuery.error)
     return <InlineError message={stepsQuery.error.message} />;
-  if (eligibleSteps.length === 0)
+  if (
+    eligibleSteps.length === 0 &&
+    (stepsQuery.data?.projection_status.failed_jobs ?? 0) > 0
+  ) {
+    return (
+      <ProjectionUnavailableState
+        message={t.ansich.contextProjectionUnavailable}
+      />
+    );
+  }
+  if (eligibleSteps.length === 0) {
     return <EmptyState message={t.ansich.noContext} />;
+  }
 
   return (
     <div className="space-y-4">
@@ -466,6 +477,14 @@ function ContextItem({ item }: { item: AnsichContextItem }) {
 function EmptyState({ message }: { message: string }) {
   return (
     <div className="text-muted-foreground rounded-lg border border-dashed p-8 text-center text-sm">
+      {message}
+    </div>
+  );
+}
+
+function ProjectionUnavailableState({ message }: { message: string }) {
+  return (
+    <div className="rounded-lg border border-amber-500/40 bg-amber-500/10 p-5 text-sm text-amber-800 dark:text-amber-300">
       {message}
     </div>
   );

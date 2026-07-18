@@ -345,6 +345,7 @@ export interface Translations {
     noSystemOperations: string;
     noSteps: string;
     noContext: string;
+    contextProjectionUnavailable: string;
     loadRaw: string;
     loading: string;
     tokens: string;

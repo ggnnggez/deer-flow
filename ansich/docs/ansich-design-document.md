@@ -920,6 +920,17 @@ LOCKED`, while SQLite remains single-Gateway-worker as required by DeerFlow.
 Poison jobs retry up to a configured limit, then become failed projection jobs,
 mark the Task degraded, and allow unrelated jobs to proceed.
 
+Failed jobs remain durable and their count must survive a service restart.
+`AnsichService.retry_failed_projections(task_id=...)` is the explicit,
+non-destructive recovery operation: it resets matching failed jobs to pending
+without deleting raw Observations or prior projection-error evidence, then
+replays them under the normal projector lock. A late successful
+ContextSnapshot projection must repair both its LLM attempt and the effective
+snapshot pointer of an already-closed Step. SQLite tests for typed projection
+ordering enable `PRAGMA foreign_keys=ON`, matching the Gateway connection; a
+typed child row may not rely on an implicit ORM flush to persist its
+`ansich_entities` parent first.
+
 ### 9.6 Shutdown
 
 Shutdown order is: stop new records, stop heartbeat, drain Collector/Writer,

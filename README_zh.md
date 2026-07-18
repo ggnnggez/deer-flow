@@ -474,6 +474,10 @@ DINGTALK_CLIENT_SECRET=your_client_secret
 
 > 没有命令前缀的消息会被当作普通聊天处理。DeerFlow 会自动创建 thread，并以对话方式回复。
 
+#### Ansich 运行观测（实验性）
+
+Ansich 是内嵌于 Gateway、优先面向开发和运维人员的观测模块，用于检查 Agent Task、逻辑 Step 与 LLM attempt、模型可见上下文、ToolCall 责任链、上下文压缩和 ContentBlock 谱系。在 `config.yaml` 中设置 `ansich.enabled: true`、重启 Gateway 后，可由管理员访问 `/workspace/ansich/operations`。Ansich 采集保持 fail-open：写入或投影失败只会降低观测完整性，不会改变 Agent 的运行结果。界面会把失败的投影任务与真正不存在最终生效上下文的情况明确区分。
+
 #### LangSmith 链路追踪
 
 DeerFlow 内置了 [LangSmith](https://smith.langchain.com) 集成，用于可观测性。启用后，所有 LLM 调用、agent 运行和工具执行都会被追踪，并在 LangSmith 仪表盘中展示。

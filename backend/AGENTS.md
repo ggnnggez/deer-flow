@@ -346,6 +346,14 @@ commits Observation plus `task-structural@1`/`task-control@1` jobs, and a
 separate leased projector loop builds Task, Scope, Relation, Transition, Belief,
 and Task-summary projections. Projection failures never roll back the raw
 Observation; they create projection-error rows and degrade Ansich health.
+SQLite production connections enforce foreign keys, so typed child projections
+must flush their `ansich_entities` parent before an autoflush can insert the
+child row; Ansich SQL tests that cover this path must enable
+`PRAGMA foreign_keys=ON`. Persisted failed-job counts are restored when the
+service starts. `AnsichService.retry_failed_projections(task_id=...)` is the
+non-destructive recovery boundary: it requeues durable failed jobs, preserves
+their error evidence, and late ContextSnapshot success repairs both the LLM
+attempt and an already-closed Step's effective snapshot pointer.
 Phase 2 model probes separate logical decisions from adapter attempts: retry
 adds an attempt under the same Step, while title/summarization/memory/goal and
 other internal calls are system operations and never consume `step_seq`. The

@@ -2,7 +2,7 @@
 
 ## 实现状态（2026-07-17）
 
-Phase 4 已完成代码实现与本地校验，等待提交。当前落地包括：
+Phase 4 已完成代码实现、提交与投影恢复加固。当前落地包括：
 
 - Ansich core 中的纯 BFS 谱系遍历，默认上限为 8 层/500 节点，硬上限为 32 层/2,000 节点；repository 每层批量读取节点和边。
 - `derived -> source` 双向索引、typed block producer、`source_role`/`ordinal`，以及 raw Tool result → model-visible Tool result → provider request block 的可查询链路。
@@ -12,10 +12,13 @@ Phase 4 已完成代码实现与本地校验，等待提交。当前落地包括
 - 连续压缩复用上一次成功记录的 summary block；对于进程恢复后只能看到 summary 文本、无法解析原记录的情况，保存完整 `unknown_origin` summary block，不伪造来源边。
 - 新增 metadata-only、admin-only 的 snapshot、compression、lineage、possible-exposure API，以及 Operations 的点击后加载局部图、压缩明细和表格 fallback。
 - Alembic revision `0014_ansich_context_lineage` 包含升级回填和降级路径。
+- SQLite 外键开启时，ContextWindow 会先显式持久化 typed Entity 父记录，避免查询触发的 autoflush 先插入子记录；对应回归测试使用与 Gateway 一致的 `PRAGMA foreign_keys=ON`。
+- 失败 Job 计数在服务重启后从数据库恢复；`AnsichService.retry_failed_projections(task_id=...)` 可以无损重排失败 Job，并在快照延迟成功时同时修复 attempt 与已关闭 Step 的 effective snapshot 指针。
+- Context & Lineage 在存在失败投影 Job 时显示“投影不可用”提示，不再用“尚无上下文”的普通空状态掩盖 degraded 状态。
 
 实现对第 6 节作了一项保持 Phase 2 H2 语义的物理调整：ContextSnapshot 的完整 inventory 仍由可复用 `ContextState` checkpoint/delta 物化，不重新复制一份完整 `ansich_context_snapshot_items`。Phase 4 新增最小的 `ansich_context_snapshot_block_memberships(snapshot_id, ordinal, content_block_id)` 反向索引表；它只复制 exposure 查询所需的关系键，避免破坏 ContextState 去重，同时让 SQLite/PostgreSQL 都能通过 typed join 查询 block → snapshot。
 
-本地验证记录：backend ruff check/format 通过；`tests/ansich` 139 项通过；migration、summarization、context middleware 与 Gateway 边界相关回归 323 项通过；frontend lint/typecheck 与 653 项单测通过；production build 通过；Ansich Playwright 2 项通过。Next/Turbopack build 仍会报告仓库既有 mock artifact route 的 NFT tracing warning，但不影响编译或测试结果。
+本地验证记录：backend ruff check/format 通过；投影恢复加固后的 `tests/ansich` 142 项通过（其中 SQL lifecycle 22 项）；此前 migration、summarization、context middleware 与 Gateway 边界相关回归 323 项通过；frontend lint/typecheck 与 653 项单测通过；production build 通过；Ansich Playwright 3 项通过。Next/Turbopack build 仍会报告仓库既有 mock artifact route 的 NFT tracing warning，但不影响编译或测试结果。
 
 ## 1. 交付目标
 

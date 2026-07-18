@@ -562,6 +562,10 @@ logging:
 
 When enabled, every Gateway HTTP response includes `X-Trace-Id`, logs include `trace_id`, and Langfuse traces created by that request include `metadata.deerflow_trace_id` with the same value.
 
+#### Ansich Operations (Experimental)
+
+Ansich is an embedded, developer/operator-first observability module for inspecting Agent Tasks, logical Steps and LLM attempts, model-visible context, ToolCall accountability, context compression, and ContentBlock lineage. Enable `ansich.enabled: true` in `config.yaml`, restart the Gateway, and open the admin-only `/workspace/ansich/operations` page. Collection is fail-open: an Ansich write or projection failure degrades observability without changing the Agent run result. The UI reports failed projection jobs separately from a genuinely empty effective context.
+
 #### LangSmith Tracing
 
 DeerFlow has built-in [LangSmith](https://smith.langchain.com) integration for observability. When enabled, all LLM calls, agent runs, and tool executions are traced and visible in the LangSmith dashboard.

@@ -431,6 +431,8 @@ export const enUS: Translations = {
     noSystemOperations: "No internal model operations were observed.",
     noSteps: "No logical Agent decisions were observed.",
     noContext: "No effective model context is available yet.",
+    contextProjectionUnavailable:
+      "Effective context is unavailable because Ansich has failed projection jobs. The request may have been recorded but is not queryable until projection recovery succeeds.",
     loadRaw: "Load raw payload",
     loading: "Loading…",
     tokens: "tokens",

@@ -193,6 +193,9 @@ class SqlAnsichBackend:
         }
 
     async def initialize_metrics(self) -> None:
+        async with self._session_factory() as session:
+            failed_jobs = await session.scalar(select(func.count()).select_from(AnsichProjectionJobRow).where(AnsichProjectionJobRow.status == "failed"))
+        self._failed_jobs = int(failed_jobs or 0)
         await self._refresh_context_metrics()
 
     async def persist_and_project(self, observations: list[ObservationEnvelope]) -> int:
@@ -502,6 +505,41 @@ class SqlAnsichBackend:
             if processed == 0:
                 await self._refresh_context_metrics()
                 return replayed
+
+    async def retry_failed_projections(self, *, task_id: str | None = None) -> int:
+        """Requeue failed durable jobs and settle them without deleting projections."""
+
+        async with self._session_factory() as session, session.begin():
+            failed_job_ids = select(AnsichProjectionJobRow.job_id).where(AnsichProjectionJobRow.status == "failed")
+            if task_id is not None:
+                failed_job_ids = failed_job_ids.join(
+                    AnsichObservationRow,
+                    AnsichObservationRow.obs_id == AnsichProjectionJobRow.obs_id,
+                ).where(AnsichObservationRow.task_id == task_id)
+            job_ids = tuple((await session.execute(failed_job_ids)).scalars())
+            if job_ids:
+                await session.execute(
+                    update(AnsichProjectionJobRow)
+                    .where(AnsichProjectionJobRow.job_id.in_(job_ids))
+                    .values(
+                        status="pending",
+                        attempts=0,
+                        available_at=datetime.now(UTC),
+                        lease_owner=None,
+                        lease_expires_at=None,
+                        last_error=None,
+                    )
+                )
+        if not job_ids:
+            return 0
+
+        while await self.project_pending(limit=200):
+            pass
+        async with self._session_factory() as session:
+            failed_count = await session.scalar(select(func.count()).select_from(AnsichProjectionJobRow).where(AnsichProjectionJobRow.status == "failed"))
+        self._failed_jobs = int(failed_count or 0)
+        await self._refresh_context_metrics()
+        return len(job_ids)
 
     async def _claim_projection_job(
         self,
@@ -2383,6 +2421,7 @@ class SqlAnsichBackend:
                     discovered_obs_id=observation.obs_id,
                 )
             )
+            await session.flush()
             window = AnsichContextWindowRow(
                 entity_id=window_id,
                 task_id=observation.task_id,
@@ -2431,7 +2470,11 @@ class SqlAnsichBackend:
             await session.flush()
 
         if state_id is not None:
-            attempt.context_snapshot_id = snapshot.entity_id
+            await self._link_attempt_context_snapshot(
+                session,
+                attempt=attempt,
+                snapshot_id=snapshot.entity_id,
+            )
             if state is not None and state.created_obs_id is not None:
                 try:
                     items = await self._materialize_context_state(
@@ -2503,7 +2546,25 @@ class SqlAnsichBackend:
                         content_block_id=block_id,
                     )
                 )
-        attempt.context_snapshot_id = snapshot.entity_id
+        await self._link_attempt_context_snapshot(
+            session,
+            attempt=attempt,
+            snapshot_id=snapshot.entity_id,
+        )
+
+    @staticmethod
+    async def _link_attempt_context_snapshot(
+        session: AsyncSession,
+        *,
+        attempt: AnsichLlmAttemptRow,
+        snapshot_id: str,
+    ) -> None:
+        attempt.context_snapshot_id = snapshot_id
+        if attempt.step_id is None:
+            return
+        step = await session.get(AnsichStepRow, attempt.step_id)
+        if step is not None and step.effective_attempt_no == attempt.attempt_no:
+            step.effective_context_snapshot_id = snapshot_id
 
     async def _project_context_compression(
         self,
