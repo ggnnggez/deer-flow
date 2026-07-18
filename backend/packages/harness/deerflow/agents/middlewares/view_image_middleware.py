@@ -3,15 +3,18 @@
 import asyncio
 import base64
 import logging
+from collections.abc import Awaitable, Callable
 from pathlib import Path
 from typing import override
 
 from ansich.serialization import ANSICH_CONTENT_KIND_KEY, ANSICH_PRODUCER_KIND_KEY
 from langchain.agents.middleware import AgentMiddleware
+from langchain.agents.middleware.types import ModelCallResult, ModelRequest, ModelResponse
 from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
 from langgraph.runtime import Runtime
 
 from deerflow.agents.thread_state import ThreadState
+from deerflow.ansich.middleware import execution_context_from_runtime
 
 logger = logging.getLogger(__name__)
 
@@ -19,6 +22,7 @@ logger = logging.getLogger(__name__)
 # enforces this at write time; the middleware re-checks at read time in
 # case the file grew on disk between view and injection.
 _MAX_IMAGE_BYTES = 20 * 1024 * 1024
+_VIEW_IMAGE_CONTEXT_KEY = "view_image_context"
 
 
 class ViewImageMiddlewareState(ThreadState):
@@ -40,6 +44,46 @@ class ViewImageMiddleware(AgentMiddleware[ViewImageMiddlewareState]):
     """
 
     state_schema = ViewImageMiddlewareState
+
+    @staticmethod
+    def _image_context_message(image_content: list[str | dict]) -> HumanMessage:
+        """Build the lightweight checkpoint message without Ansich metadata."""
+
+        return HumanMessage(
+            content=image_content,
+            additional_kwargs={
+                "hide_from_ui": True,
+                _VIEW_IMAGE_CONTEXT_KEY: True,
+            },
+        )
+
+    @staticmethod
+    def _prepare_model_request(request: ModelRequest) -> ModelRequest:
+        """Move the checkpoint marker to request-scoped observation metadata."""
+
+        include_ansich_metadata = execution_context_from_runtime(getattr(request, "runtime", None)) is not None
+
+        def prepare(message):
+            additional_kwargs = getattr(message, "additional_kwargs", None)
+            if not isinstance(additional_kwargs, dict) or _VIEW_IMAGE_CONTEXT_KEY not in additional_kwargs:
+                return message
+            prepared_kwargs = dict(additional_kwargs)
+            is_view_image_context = prepared_kwargs.pop(_VIEW_IMAGE_CONTEXT_KEY, None) is True
+            if is_view_image_context and include_ansich_metadata:
+                prepared_kwargs.update(
+                    {
+                        ANSICH_CONTENT_KIND_KEY: "middleware_injection",
+                        ANSICH_PRODUCER_KIND_KEY: "vision_conversion",
+                    }
+                )
+            return message.model_copy(
+                update={"additional_kwargs": prepared_kwargs},
+            )
+
+        return request.override(
+            system_message=(None if request.system_message is None else prepare(request.system_message)),
+            messages=[prepare(message) for message in request.messages],
+        )
 
     def _get_last_assistant_message(self, messages: list) -> AIMessage | None:
         """Get the last assistant message from the message list.
@@ -230,14 +274,7 @@ class ViewImageMiddleware(AgentMiddleware[ViewImageMiddlewareState]):
         # Create a new human message with mixed content (text + images). This is
         # internal context for the model only, so hide it from the chat UI and IM
         # channels (matches the other middleware-injected context messages).
-        human_msg = HumanMessage(
-            content=image_content,
-            additional_kwargs={
-                "hide_from_ui": True,
-                ANSICH_CONTENT_KIND_KEY: "middleware_injection",
-                ANSICH_PRODUCER_KIND_KEY: "vision_conversion",
-            },
-        )
+        human_msg = self._image_context_message(image_content)
 
         logger.debug("Injecting image details message with images before LLM call")
 
@@ -281,13 +318,22 @@ class ViewImageMiddleware(AgentMiddleware[ViewImageMiddlewareState]):
         # Image reads + base64 encoding can be slow (up to 20MB), so offload
         # the blocking work to a thread rather than stalling the event loop.
         image_content = await asyncio.to_thread(self._create_image_details_message, state)
-        human_msg = HumanMessage(
-            content=image_content,
-            additional_kwargs={
-                "hide_from_ui": True,
-                ANSICH_CONTENT_KIND_KEY: "middleware_injection",
-                ANSICH_PRODUCER_KIND_KEY: "vision_conversion",
-            },
-        )
+        human_msg = self._image_context_message(image_content)
         logger.debug("Injecting image details message with images before LLM call")
         return {"messages": [human_msg]}
+
+    @override
+    def wrap_model_call(
+        self,
+        request: ModelRequest,
+        handler: Callable[[ModelRequest], ModelResponse],
+    ) -> ModelCallResult:
+        return handler(self._prepare_model_request(request))
+
+    @override
+    async def awrap_model_call(
+        self,
+        request: ModelRequest,
+        handler: Callable[[ModelRequest], Awaitable[ModelResponse]],
+    ) -> ModelCallResult:
+        return await handler(self._prepare_model_request(request))

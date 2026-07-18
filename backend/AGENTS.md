@@ -397,9 +397,13 @@ object identity is skipped while the remaining compression inventory is stored
 as `incomplete`; never substitute the full original occurrence. Successful LLM responses produce assistant/tool-request
 ContentBlocks immediately, including final answers that never enter a later
 request. Server-owned content-kind/producer markers distinguish memory, skill,
-durable/dynamic context, and vision injection from genuine user input; Gateway
-removes externally supplied marker values and the attempt adapter strips the
-internal markers before provider invocation. System-message coalescing records
+durable/dynamic context, and vision injection from genuine user input. Injectors
+add those markers only when a live Ansich execution context exists; `view_image`
+keeps only a neutral server marker in checkpoint state and converts it to Ansich
+metadata on the model-request copy. Gateway removes externally supplied values
+for both marker classes, the vision request adapter removes its neutral marker,
+and the attempt adapter strips Ansich metadata before provider invocation even
+when no active attempt call is available. System-message coalescing records
 the exact ordered input blocks and `coalesced` edges. Durable summary rendering
 links its composite request block back to the durable summary block, so exposure
 can traverse raw Tool result -> summary -> later request without claiming model

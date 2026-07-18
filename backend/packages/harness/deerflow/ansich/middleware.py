@@ -125,9 +125,9 @@ class AnsichAttemptMiddleware(AgentMiddleware):
     ) -> ModelCallResult:
         execution = _execution_context(request)
         call = execution.current_call() if execution is not None else None
-        if execution is None or call is None:
-            return handler(request)
         provider_request = _request_without_ansich_metadata(request)
+        if execution is None or call is None:
+            return handler(provider_request)
         try:
             attempt_id, attempt_no, request_obs_id = _record_request(execution, call, request)
         except Exception:
@@ -165,9 +165,9 @@ class AnsichAttemptMiddleware(AgentMiddleware):
     ) -> ModelCallResult:
         execution = _execution_context(request)
         call = execution.current_call() if execution is not None else None
-        if execution is None or call is None:
-            return await handler(request)
         provider_request = _request_without_ansich_metadata(request)
+        if execution is None or call is None:
+            return await handler(provider_request)
         try:
             attempt_id, attempt_no, request_obs_id = _record_request(execution, call, request)
         except Exception:

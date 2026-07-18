@@ -14,7 +14,6 @@ so tests must build requests with the same split to exercise the real code path.
 from unittest.mock import MagicMock
 
 import pytest
-from ansich.serialization import ANSICH_CONTENT_KIND_KEY, ANSICH_PRODUCER_KIND_KEY
 from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, SystemMessage
 
 from deerflow.agents.middlewares.system_message_coalescing_middleware import (
@@ -178,7 +177,7 @@ class TestCoalesceRequest:
         assert [m.id for m in non_system] == ["u1", "a1", "u2"]
 
     def test_merged_kwargs_combine_all_parts(self):
-        """additional_kwargs from all parts are merged into the result."""
+        """Without an Ansich execution, no observation markers are injected."""
         prompt = SystemMessage(
             content="prompt",
             id="sys-1",
@@ -197,8 +196,6 @@ class TestCoalesceRequest:
             "source": "prompt",
             "hide_from_ui": True,
             "dynamic_context_reminder": True,
-            ANSICH_CONTENT_KIND_KEY: "system_prompt",
-            ANSICH_PRODUCER_KIND_KEY: "system_message_coalescing",
         }
 
     def test_merged_kwargs_later_parts_override(self):

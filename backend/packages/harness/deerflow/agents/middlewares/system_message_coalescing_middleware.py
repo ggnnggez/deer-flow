@@ -38,6 +38,8 @@ from ansich.serialization import (
     ANSICH_BLOCK_REF_KEY,
     ANSICH_CONTENT_KIND_KEY,
     ANSICH_PRODUCER_KIND_KEY,
+    context_snapshot_item_source_identity,
+    serialize_model_request,
     serialize_observed_content,
 )
 from langchain.agents import AgentState
@@ -75,7 +77,11 @@ def _flatten_content(content) -> str:
     return str(content)
 
 
-def _coalesce_request(request: ModelRequest) -> ModelRequest | None:
+def _coalesce_request(
+    request: ModelRequest,
+    *,
+    include_ansich_metadata: bool = False,
+) -> ModelRequest | None:
     """Merge ``request.system_message`` and in-``messages`` SystemMessages into one.
 
     On langchain >= 1.2.15 the static system prompt lives in the separate
@@ -101,8 +107,9 @@ def _coalesce_request(request: ModelRequest) -> ModelRequest | None:
     merged_kwargs: dict = {}
     for part in parts:
         merged_kwargs.update(part.additional_kwargs or {})
-    merged_kwargs[ANSICH_CONTENT_KIND_KEY] = "system_prompt"
-    merged_kwargs[ANSICH_PRODUCER_KIND_KEY] = "system_message_coalescing"
+    if include_ansich_metadata:
+        merged_kwargs[ANSICH_CONTENT_KIND_KEY] = "system_prompt"
+        merged_kwargs[ANSICH_PRODUCER_KIND_KEY] = "system_message_coalescing"
     merged = SystemMessage(
         content="\n\n".join(_flatten_content(part.content) for part in parts),
         id=first.id,
@@ -153,24 +160,21 @@ def _observe_coalescing(
     )
     observations: list[ObservationEnvelope] = []
     sources: list[PendingContentDerivation] = []
-    occurrence_counts: dict[str, int] = {}
-    for ordinal, part in enumerate(parts):
-        part_id = str(part.id) if part.id else None
-        occurrence_seq = 1
-        if part_id is not None:
-            occurrence_seq = occurrence_counts.get(part_id, 0) + 1
-            occurrence_counts[part_id] = occurrence_seq
-        capture = serialize_observed_content(
-            kind="system_prompt",
-            body=_flatten_content(part.content),
-            path=f"system-coalescing:source:{ordinal}",
-            known_secrets=known_secrets,
-        )
-        source_identity = f"message:{part_id}:occurrence:{occurrence_seq}:content:0" if part_id is not None else (f"system-coalescing:source:{ordinal}:{capture.block.content_hash}")
+    source_capture = serialize_model_request(
+        system_message=parts[0],
+        messages=parts[1:],
+        tools=(),
+        response_format=None,
+        model_settings={},
+        model=None,
+        known_secrets=known_secrets,
+    )
+    for ordinal, item in enumerate(source_capture.items):
+        source_identity = context_snapshot_item_source_identity(item) or (f"system-coalescing:source:{ordinal}:{item.block.content_hash}")
         resolution = execution.resolve_content_occurrence(
             source_identity=source_identity,
-            content_hash=capture.block.content_hash,
-            kind=capture.block.kind,
+            content_hash=item.block.content_hash,
+            kind=item.block.kind,
         )
         sources.append(
             PendingContentDerivation(
@@ -182,7 +186,7 @@ def _observe_coalescing(
         )
         if not resolution.should_emit:
             continue
-        producer_kind = part.additional_kwargs.get(ANSICH_PRODUCER_KIND_KEY)
+        producer_kind = item.metadata.get("producer_kind")
         observations.append(
             ObservationEnvelope(
                 obs_id=resolution.producer_obs_id,
@@ -202,7 +206,7 @@ def _observe_coalescing(
                 payload={
                     "source_identity": source_identity,
                     "producer_kind": (producer_kind if isinstance(producer_kind, str) else "system_prompt"),
-                    **capture.block.model_copy(update={"block_id": resolution.block_id}).model_dump(mode="json"),
+                    **item.block.model_copy(update={"block_id": resolution.block_id}).model_dump(mode="json"),
                 },
             )
         )
@@ -248,7 +252,10 @@ class SystemMessageCoalescingMiddleware(AgentMiddleware[AgentState]):
 
     @staticmethod
     def _maybe_coalesce(request: ModelRequest) -> ModelRequest:
-        coalesced = _coalesce_request(request)
+        coalesced = _coalesce_request(
+            request,
+            include_ansich_metadata=(execution_context_from_runtime(getattr(request, "runtime", None)) is not None),
+        )
         if coalesced is None:
             return request
         try:

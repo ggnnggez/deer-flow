@@ -35,6 +35,7 @@ from app.gateway.internal_auth import (
 )
 from app.gateway.utils import sanitize_log_param
 from deerflow.agents.middlewares.dynamic_context_middleware import _DYNAMIC_CONTEXT_REMINDER_KEY, _REMINDER_DATE_KEY
+from deerflow.agents.middlewares.view_image_middleware import _VIEW_IMAGE_CONTEXT_KEY
 from deerflow.config.app_config import get_app_config
 from deerflow.runtime import (
     END_SENTINEL,
@@ -67,6 +68,7 @@ _SERVER_OWNED_DYNAMIC_CONTEXT_KEYS = frozenset(
     {
         _DYNAMIC_CONTEXT_REMINDER_KEY,
         _REMINDER_DATE_KEY,
+        _VIEW_IMAGE_CONTEXT_KEY,
         ANSICH_CONTENT_KIND_KEY,
         ANSICH_PRODUCER_KIND_KEY,
         ANSICH_BLOCK_REF_KEY,

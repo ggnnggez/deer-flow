@@ -3,6 +3,7 @@ import hashlib
 from pathlib import Path
 from types import SimpleNamespace
 
+from ansich.serialization import ANSICH_CONTENT_KIND_KEY, ANSICH_PRODUCER_KIND_KEY
 from langchain.agents.middleware.types import ModelRequest
 from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
 
@@ -135,6 +136,8 @@ def test_skill_activation_middleware_injects_hidden_human_context_for_model_call
     activation_msg, user_msg = captured["messages"]
     assert is_slash_skill_activation_reminder(activation_msg)
     assert activation_msg.additional_kwargs["hide_from_ui"] is True
+    assert ANSICH_CONTENT_KIND_KEY not in activation_msg.additional_kwargs
+    assert ANSICH_PRODUCER_KIND_KEY not in activation_msg.additional_kwargs
     assert "Use pandas." in activation_msg.content
     assert "<user_request>\nanalyze uploads/foo.csv\n</user_request>" in activation_msg.content
     assert user_msg.content == original.content

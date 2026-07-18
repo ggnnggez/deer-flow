@@ -17,6 +17,7 @@ from ansich.serialization import (
 )
 from langchain.agents import create_agent
 from langchain.agents.middleware import AgentMiddleware
+from langchain.agents.middleware.types import ModelRequest
 from langchain_core.language_models import BaseChatModel
 from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
 from langchain_core.outputs import ChatGeneration, ChatResult
@@ -394,6 +395,33 @@ def test_content_occurrence_identity_is_deterministic_and_only_skips_after_durab
 
     assert durable.block_id == first.block_id
     assert durable.should_emit is False
+
+
+def test_attempt_adapter_strips_markers_without_an_active_execution_call() -> None:
+    message = HumanMessage(
+        content="internal context",
+        additional_kwargs={
+            "hide_from_ui": True,
+            ANSICH_BLOCK_REF_KEY: new_id(),
+            ANSICH_CONTENT_KIND_KEY: "middleware_injection",
+            ANSICH_PRODUCER_KIND_KEY: "test",
+        },
+    )
+    request = ModelRequest(
+        model=object(),
+        messages=[message],
+        state={"messages": [message]},
+        runtime=SimpleNamespace(context={}),
+    )
+    captured = {}
+
+    AnsichAttemptMiddleware().wrap_model_call(
+        request,
+        lambda provider_request: captured.setdefault("message", provider_request.messages[0]),
+    )
+
+    provider_kwargs = captured["message"].additional_kwargs
+    assert provider_kwargs == {"hide_from_ui": True}
 
 
 def test_durable_block_ref_emits_content_only_once_across_two_attempts(monkeypatch) -> None:

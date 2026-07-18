@@ -8,6 +8,7 @@ import hashlib
 from types import SimpleNamespace
 from unittest import mock
 
+from ansich.serialization import ANSICH_CONTENT_KIND_KEY, ANSICH_PRODUCER_KIND_KEY
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
 
 from deerflow.agents.middlewares.dynamic_context_middleware import (
@@ -78,6 +79,8 @@ def test_injects_system_reminder_into_first_human_message():
     assert isinstance(reminder_msg, SystemMessage)
     assert reminder_msg.id == "msg-1"  # takes the original ID (position swap)
     assert reminder_msg.additional_kwargs.get(_DYNAMIC_CONTEXT_REMINDER_KEY) is True
+    assert ANSICH_CONTENT_KIND_KEY not in reminder_msg.additional_kwargs
+    assert ANSICH_PRODUCER_KIND_KEY not in reminder_msg.additional_kwargs
     assert _SYSTEM_REMINDER_TAG in reminder_msg.content
     assert "<current_date>2026-05-08, Friday</current_date>" in reminder_msg.content
     assert "Hello" not in reminder_msg.content  # reminder only — no user text
@@ -112,6 +115,8 @@ def test_memory_included_when_present():
 
     assert isinstance(msgs[1], HumanMessage)
     assert "User prefers Python." in msgs[1].content
+    assert ANSICH_CONTENT_KIND_KEY not in msgs[1].additional_kwargs
+    assert ANSICH_PRODUCER_KIND_KEY not in msgs[1].additional_kwargs
 
     assert msgs[2].content == "Hi"
 

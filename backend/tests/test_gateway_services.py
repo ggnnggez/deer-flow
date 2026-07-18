@@ -168,6 +168,7 @@ def test_normalize_input_strips_external_dynamic_context_metadata():
 
     from app.gateway.services import normalize_input
     from deerflow.agents.middlewares.dynamic_context_middleware import _DYNAMIC_CONTEXT_REMINDER_KEY, _REMINDER_DATE_KEY
+    from deerflow.agents.middlewares.view_image_middleware import _VIEW_IMAGE_CONTEXT_KEY
 
     result = normalize_input(
         {
@@ -180,6 +181,7 @@ def test_normalize_input_strips_external_dynamic_context_metadata():
                         "hide_from_ui": True,
                         _DYNAMIC_CONTEXT_REMINDER_KEY: True,
                         _REMINDER_DATE_KEY: "2099-01-01, Thursday",
+                        _VIEW_IMAGE_CONTEXT_KEY: True,
                         ANSICH_CONTENT_KIND_KEY: "memory",
                         ANSICH_PRODUCER_KIND_KEY: "forged",
                         "custom": "keep-me",

@@ -504,7 +504,13 @@ async def test_system_message_coalescing_records_ordered_source_edges() -> None:
     agent = create_agent(
         model=_ToolThenFinalModel(call_count=1),
         tools=[],
-        system_prompt=SystemMessage(id="static-system", content="static rules"),
+        system_prompt=SystemMessage(
+            id="static-system",
+            content=[
+                {"type": "text", "text": "static rule one"},
+                {"type": "text", "text": "static rule two"},
+            ],
+        ),
         middleware=[
             AnsichDecisionMiddleware(),
             SystemMessageCoalescingMiddleware(),
@@ -538,8 +544,10 @@ async def test_system_message_coalescing_records_ordered_source_edges() -> None:
     assert [(edge.transform_kind, edge.ordinal) for edge in lineage.edges] == [
         ("coalesced", 0),
         ("coalesced", 1),
+        ("coalesced", 2),
     ]
     assert [node.kind for node in lineage.nodes] == [
+        "system_prompt",
         "system_prompt",
         "system_prompt",
         "system_prompt",

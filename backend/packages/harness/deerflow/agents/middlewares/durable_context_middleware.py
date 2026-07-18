@@ -265,13 +265,25 @@ class DurableContextMiddleware(AgentMiddleware[AgentState]):
         )
         if not data_block:
             return request
+        execution = execution_context_from_runtime(getattr(request, "runtime", None))
         data_kwargs = {
             "hide_from_ui": True,
             _DURABLE_CONTEXT_DATA_KEY: True,
-            ANSICH_CONTENT_KIND_KEY: "middleware_injection",
-            ANSICH_PRODUCER_KIND_KEY: "durable_context",
         }
-        execution = execution_context_from_runtime(getattr(request, "runtime", None))
+        authority_kwargs = {}
+        if execution is not None:
+            data_kwargs.update(
+                {
+                    ANSICH_CONTENT_KIND_KEY: "middleware_injection",
+                    ANSICH_PRODUCER_KIND_KEY: "durable_context",
+                }
+            )
+            authority_kwargs.update(
+                {
+                    ANSICH_CONTENT_KIND_KEY: "middleware_injection",
+                    ANSICH_PRODUCER_KIND_KEY: "durable_context_authority",
+                }
+            )
         summary_block_id = execution.context_summary_block_id(summary_text) if execution is not None and isinstance(summary_text, str) else None
         if execution is not None and summary_block_id is not None:
             identity = "\0".join(
@@ -306,10 +318,7 @@ class DurableContextMiddleware(AgentMiddleware[AgentState]):
             [
                 SystemMessage(
                     content=_AUTHORITY_CONTRACT,
-                    additional_kwargs={
-                        ANSICH_CONTENT_KIND_KEY: "middleware_injection",
-                        ANSICH_PRODUCER_KIND_KEY: "durable_context_authority",
-                    },
+                    additional_kwargs=authority_kwargs,
                 ),
                 HumanMessage(
                     content=data_block,

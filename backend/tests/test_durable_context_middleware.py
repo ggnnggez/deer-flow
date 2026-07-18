@@ -2,6 +2,7 @@ from types import SimpleNamespace
 from typing import Annotated
 
 from _agent_e2e_helpers import FakeToolCallingModel
+from ansich.serialization import ANSICH_CONTENT_KIND_KEY, ANSICH_PRODUCER_KIND_KEY
 from langchain.agents import create_agent
 from langchain.tools import InjectedToolCallId
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage, ToolMessage
@@ -864,6 +865,9 @@ class TestDurableContextInjection:
         data = [message for message in model.received[-1] if isinstance(message, HumanMessage) and message.additional_kwargs.get("durable_context_data")]
         assert authority, "durable context authority message not injected"
         assert data, "durable context data message not injected"
+        for message in (*authority, *data):
+            assert ANSICH_CONTENT_KIND_KEY not in message.additional_kwargs
+            assert ANSICH_PRODUCER_KIND_KEY not in message.additional_kwargs
         assert "EARLIER_WORK_SUMMARY" in data[0].content
         assert "research auth" in data[0].content
         assert "EARLIER_WORK_SUMMARY" not in authority[0].content

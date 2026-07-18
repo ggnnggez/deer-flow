@@ -18,6 +18,7 @@ from langchain.agents.middleware import AgentMiddleware
 from langchain.agents.middleware.types import ModelRequest, ModelResponse
 from langchain_core.messages import AIMessage, HumanMessage
 
+from deerflow.ansich.middleware import execution_context_from_runtime
 from deerflow.runtime.secret_context import (
     _SECRETS_BINDING_AUDIT_KEY,
     _SLASH_SKILL_ACTIVATION_RUN_KEY,
@@ -342,7 +343,11 @@ Follow this skill before choosing a general workflow. Load supporting resources 
         # (computed once there, threaded through here) rather than recomputed.
         if run_context is not None:
             run_context[_SLASH_SKILL_ACTIVATION_RUN_KEY] = run_key
-        activation_msg = self._make_activation_message(target, self._build_activation_reminder(activation))
+        activation_msg = self._make_activation_message(
+            target,
+            self._build_activation_reminder(activation),
+            include_ansich_metadata=(execution_context_from_runtime(getattr(request, "runtime", None)) is not None),
+        )
         messages = list(request.messages)
         messages.insert(target_index, activation_msg)
         return request.override(messages=messages), activation
@@ -544,14 +549,24 @@ Follow this skill before choosing a general workflow. Load supporting resources 
             logger.debug("Failed to record skill secret binding audit event", exc_info=True)
 
     @staticmethod
-    def _make_activation_message(target: HumanMessage, activation_content: str) -> HumanMessage:
+    def _make_activation_message(
+        target: HumanMessage,
+        activation_content: str,
+        *,
+        include_ansich_metadata: bool = False,
+    ) -> HumanMessage:
         stable_id = target.id or str(uuid.uuid4())
         additional_kwargs = {
             "hide_from_ui": True,
             _SLASH_SKILL_ACTIVATION_KEY: True,
-            ANSICH_CONTENT_KIND_KEY: "skill_instruction",
-            ANSICH_PRODUCER_KIND_KEY: "skill_activation",
         }
+        if include_ansich_metadata:
+            additional_kwargs.update(
+                {
+                    ANSICH_CONTENT_KIND_KEY: "skill_instruction",
+                    ANSICH_PRODUCER_KIND_KEY: "skill_activation",
+                }
+            )
         if target.id:
             additional_kwargs[_SLASH_SKILL_ACTIVATION_TARGET_ID_KEY] = target.id
         return HumanMessage(

@@ -41,6 +41,7 @@ from langchain.agents.middleware import AgentMiddleware
 from langchain_core.messages import HumanMessage, SystemMessage
 from langgraph.runtime import Runtime
 
+from deerflow.ansich.middleware import execution_context_from_runtime
 from deerflow.runtime.context_keys import CURRENT_RUN_PRE_EXISTING_MESSAGE_IDS_KEY
 
 if TYPE_CHECKING:
@@ -192,6 +193,7 @@ class DynamicContextMiddleware(AgentMiddleware):
         memory_content: str | None = None,
         *,
         reminder_date: str | None = None,
+        include_ansich_metadata: bool = False,
     ) -> list[SystemMessage | HumanMessage]:
         """Return messages using the ID-swap technique.
 
@@ -213,9 +215,14 @@ class DynamicContextMiddleware(AgentMiddleware):
         reminder_kwargs = {
             "hide_from_ui": True,
             _DYNAMIC_CONTEXT_REMINDER_KEY: True,
-            ANSICH_CONTENT_KIND_KEY: "middleware_injection",
-            ANSICH_PRODUCER_KIND_KEY: "dynamic_context",
         }
+        if include_ansich_metadata:
+            reminder_kwargs.update(
+                {
+                    ANSICH_CONTENT_KIND_KEY: "middleware_injection",
+                    ANSICH_PRODUCER_KIND_KEY: "dynamic_context",
+                }
+            )
         if reminder_date is not None:
             reminder_kwargs[_REMINDER_DATE_KEY] = reminder_date
         messages.append(
@@ -234,8 +241,14 @@ class DynamicContextMiddleware(AgentMiddleware):
                     additional_kwargs={
                         "hide_from_ui": True,
                         _DYNAMIC_CONTEXT_REMINDER_KEY: True,
-                        ANSICH_CONTENT_KIND_KEY: "memory",
-                        ANSICH_PRODUCER_KIND_KEY: "dynamic_context_memory",
+                        **(
+                            {
+                                ANSICH_CONTENT_KIND_KEY: "memory",
+                                ANSICH_PRODUCER_KIND_KEY: "dynamic_context_memory",
+                            }
+                            if include_ansich_metadata
+                            else {}
+                        ),
                     },
                 )
             )
@@ -250,7 +263,12 @@ class DynamicContextMiddleware(AgentMiddleware):
         )
         return messages
 
-    def _inject(self, state) -> dict | None:
+    def _inject(
+        self,
+        state,
+        *,
+        include_ansich_metadata: bool = False,
+    ) -> dict | None:
         messages = list(state.get("messages", []))
         if not messages:
             return None
@@ -275,7 +293,13 @@ class DynamicContextMiddleware(AgentMiddleware):
                 memory_block is not None,
                 messages[first_idx].id,
             )
-            result_msgs = self._make_reminder_and_user_messages(messages[first_idx], date_reminder, memory_block, reminder_date=current_date)
+            result_msgs = self._make_reminder_and_user_messages(
+                messages[first_idx],
+                date_reminder,
+                memory_block,
+                reminder_date=current_date,
+                include_ansich_metadata=include_ansich_metadata,
+            )
             return {"messages": result_msgs}
 
         if last_date == current_date:
@@ -287,13 +311,21 @@ class DynamicContextMiddleware(AgentMiddleware):
         if last_human_idx is None:
             return None
 
-        result_msgs = self._make_reminder_and_user_messages(messages[last_human_idx], self._build_date_update_reminder(), reminder_date=current_date)
+        result_msgs = self._make_reminder_and_user_messages(
+            messages[last_human_idx],
+            self._build_date_update_reminder(),
+            reminder_date=current_date,
+            include_ansich_metadata=include_ansich_metadata,
+        )
         logger.info("DynamicContextMiddleware: midnight crossing detected — injected date update before current turn")
         return {"messages": result_msgs}
 
     @override
     def before_agent(self, state, runtime: Runtime) -> dict | None:
-        result = self._inject(state)
+        result = self._inject(
+            state,
+            include_ansich_metadata=(execution_context_from_runtime(runtime) is not None),
+        )
         self._record_effective_memory(state, result, runtime)
         return result
 
@@ -312,7 +344,11 @@ class DynamicContextMiddleware(AgentMiddleware):
         # rather than hanging. Frozen context already in state remains active.
         try:
             result = await asyncio.wait_for(
-                asyncio.to_thread(self._inject, state),
+                asyncio.to_thread(
+                    self._inject,
+                    state,
+                    include_ansich_metadata=(execution_context_from_runtime(runtime) is not None),
+                ),
                 timeout=_INJECT_TIMEOUT_SECONDS,
             )
         except TimeoutError:

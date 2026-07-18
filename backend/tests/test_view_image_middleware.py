@@ -23,9 +23,16 @@ from types import SimpleNamespace
 from unittest.mock import MagicMock
 
 import pytest
+from ansich import AnsichService, new_id
+from ansich.serialization import ANSICH_CONTENT_KIND_KEY, ANSICH_PRODUCER_KIND_KEY
+from langchain.agents.middleware.types import ModelRequest
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage, ToolMessage
 
-from deerflow.agents.middlewares.view_image_middleware import ViewImageMiddleware
+from deerflow.agents.middlewares.view_image_middleware import (
+    _VIEW_IMAGE_CONTEXT_KEY,
+    ViewImageMiddleware,
+)
+from deerflow.ansich.execution import ANSICH_EXECUTION_CONTEXT_KEY, AnsichExecutionContext
 
 
 def _view_image_call(call_id: str = "call_1", path: str = "/mnt/user-data/uploads/img.png") -> dict:
@@ -420,6 +427,64 @@ class TestInjectImageMessage:
         # Internal injection: must be hidden from the chat UI (and IM channels),
         # like the other middleware-injected context messages.
         assert injected.additional_kwargs.get("hide_from_ui") is True
+        assert injected.additional_kwargs.get(_VIEW_IMAGE_CONTEXT_KEY) is True
+        assert ANSICH_CONTENT_KIND_KEY not in injected.additional_kwargs
+        assert ANSICH_PRODUCER_KIND_KEY not in injected.additional_kwargs
+
+
+class TestRequestScopedObservationMetadata:
+    @staticmethod
+    def _request(message: HumanMessage, *, runtime=None) -> ModelRequest:
+        return ModelRequest(
+            model=object(),
+            messages=[message],
+            state={"messages": [message]},
+            runtime=runtime,
+        )
+
+    def test_internal_checkpoint_marker_is_removed_without_ansich(self):
+        middleware = ViewImageMiddleware()
+        message = HumanMessage(
+            content="viewed image",
+            additional_kwargs={"hide_from_ui": True, _VIEW_IMAGE_CONTEXT_KEY: True},
+        )
+        captured = {}
+
+        middleware.wrap_model_call(
+            self._request(message),
+            lambda request: captured.setdefault("message", request.messages[0]),
+        )
+
+        assert _VIEW_IMAGE_CONTEXT_KEY not in captured["message"].additional_kwargs
+        assert ANSICH_CONTENT_KIND_KEY not in captured["message"].additional_kwargs
+        assert ANSICH_PRODUCER_KIND_KEY not in captured["message"].additional_kwargs
+
+    def test_ansich_markers_exist_only_on_the_model_request_copy(self):
+        middleware = ViewImageMiddleware()
+        persisted = HumanMessage(
+            content="viewed image",
+            additional_kwargs={"hide_from_ui": True, _VIEW_IMAGE_CONTEXT_KEY: True},
+        )
+        execution = AnsichExecutionContext(
+            task_id=new_id(),
+            service=AnsichService.in_memory(),
+        )
+        runtime = SimpleNamespace(
+            context={ANSICH_EXECUTION_CONTEXT_KEY: execution},
+        )
+        captured = {}
+
+        middleware.wrap_model_call(
+            self._request(persisted, runtime=runtime),
+            lambda request: captured.setdefault("message", request.messages[0]),
+        )
+
+        request_message = captured["message"]
+        assert _VIEW_IMAGE_CONTEXT_KEY not in request_message.additional_kwargs
+        assert request_message.additional_kwargs[ANSICH_CONTENT_KIND_KEY] == "middleware_injection"
+        assert request_message.additional_kwargs[ANSICH_PRODUCER_KIND_KEY] == "vision_conversion"
+        assert _VIEW_IMAGE_CONTEXT_KEY in persisted.additional_kwargs
+        assert ANSICH_CONTENT_KIND_KEY not in persisted.additional_kwargs
 
 
 class TestBeforeModel:
