@@ -9,7 +9,7 @@
 | M1 | assessor job 逐观察入队且每个 job 全量重扫历史,长任务评估成本 O(n²) | ⬜ 未修复 | — | — |
 | L1 | 周期性 heartbeat/dwell 告警对账每秒全量加载该任务全部 episode + evidence | ⬜ 未修复 | — | — |
 | L2 | operator action 卡在 `requested` 时同 Idempotency-Key 永久 409,无超时回收 | ⬜ 未修复 | — | — |
-| L3 | 绝对预算评估中 heartbeat elapsed 无条件覆盖 wall_time 贡献和,终态边界可能低估 | ⬜ 未修复 | — | — |
+| L3 | 绝对预算评估中 heartbeat elapsed 无条件覆盖 wall_time 贡献和,终态边界可能低估 | ✅ 已修复 | 2026-07-19 | `b910ba82` |
 | L4 | `observability_degradation` / `projection_failure` 告警类型已声明但无生产者 | ⬜ 未修复 | — | — |
 
 ## M1. assessor job 逐观察入队且每个 job 全量重扫历史
@@ -38,7 +38,7 @@
 
 ## L3. 绝对预算评估中 heartbeat elapsed 无条件覆盖 wall_time 贡献和
 
-- 状态:⬜ 未修复。
+- 状态:✅ 已于 2026-07-19 修复(commit `b910ba82`)。绝对限制 assessor 现在对 contribution 求和与最大 heartbeat elapsed 取 `max`,同时合并两路 `as_of` 与 evidence；新增 SQLite 回归覆盖“硬限在最后一个心跳间隔内突破、terminal 后 absolute-limit signal 仍为 runaway 且 health 保留两路证据”。
 - 位置:`sql.py::_assess_absolute_limits_at`(先由 contribution 行求和得到 `wall_time_ms`,随后 `values[wall_time_key] = heartbeat.elapsed_ms` 无条件覆盖)。
 - 现状:terminal 的 `budget.consumed` wall_time delta(完整 monotonic 时长)已进入 contribution 求和,但只要存在任一 heartbeat 行,该值就被最大 heartbeat elapsed **替换**而非取 max。心跳在 terminal 前停止,最后一个间隔(默认最多 10 秒)不被心跳覆盖 —— 若 wall_time 硬限恰在该窗口内被突破,terminal 后的评估会把已经 breach 的事实读回 `within`,与 usage 投影(`max` 语义)不一致,也与"terminal 后 absolute breach 事实保留"意图相悖。触发窗口窄(breach 落在最后一个心跳间隔内),但属于语义错误而非性能问题。
 - 方向:改为 `values[wall_time_key] = max(contribution_sum, heartbeat.elapsed_ms)`(evidence 合并两者);配"wall_time breach 发生在最后一个心跳间隔内,terminal 后评估仍为 exceeded"的回归测试。

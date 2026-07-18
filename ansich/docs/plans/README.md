@@ -16,7 +16,7 @@
 - Phase 3 代码评审的跟进项登记在 [phase-3-review-followups.md](phase-3-review-followups.md)；M2（transform 显式元数据）与 M3（队列字节水位）均已完成，Phase 5 前置项已清；L1 观察开销基准按既定归属留到 Phase 12 验收前，不阻塞 Phase 5。
 - Phase 4 代码评审的跟进项登记在 [phase-4-review-followups.md](phase-4-review-followups.md)；M1/M2/M3、L1/L2 与 L3①/② 均已完成；L3② 的前端压缩列表独立 API 已作为 Phase 6 首批 UI/API 工作落地。
 - Phase 5 代码评审的跟进项登记在 [phase-5-review-followups.md](phase-5-review-followups.md)；M1/M2/M3 与搭车项 L1/L2 均已修复，Phase 6 开工前置项已清；L3（usage 贡献契约收紧）留到 Phase 8 前。
-- Phase 6 代码评审的跟进项登记在 [phase-6-review-followups.md](phase-6-review-followups.md)；其中 L3（wall_time 覆盖语义）建议立即修复，M1（assessor job 合并）与 L1（对账读放大）需在 Phase 7 前完成，L4（未生产的告警类型）需在 Phase 7 前决策归属，L2（孤儿 requested action 回收）留到 Phase 11 前。
+- Phase 6 代码评审的跟进项登记在 [phase-6-review-followups.md](phase-6-review-followups.md)；L3（wall_time 覆盖语义）已由 `b910ba82` 修复；M1（assessor job 合并）与 L1（对账读放大）仍需在 Phase 7 前完成，L4（未生产的告警类型）需在 Phase 7 前决策归属，L2（孤儿 requested action 回收）留到 Phase 11 前。
 
 ## 固定实现边界
 
