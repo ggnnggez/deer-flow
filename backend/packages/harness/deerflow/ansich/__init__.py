@@ -31,6 +31,7 @@ def create_sql_ansich_service(
     projector_poll_interval_ms: int = 250,
     projector_lease_seconds: int = 30,
     projector_max_attempts: int = 5,
+    projector_dependency_timeout_seconds: int = 300,
     inline_payload_max_bytes: int = 65_536,
 ) -> AnsichService:
     return AnsichService(
@@ -38,6 +39,7 @@ def create_sql_ansich_service(
             session_factory,
             projector_lease_seconds=projector_lease_seconds,
             projector_max_attempts=projector_max_attempts,
+            projector_dependency_timeout_seconds=projector_dependency_timeout_seconds,
             inline_payload_max_bytes=inline_payload_max_bytes,
         ),
         queue_capacity=queue_capacity,
@@ -68,6 +70,7 @@ def create_embedded_ansich_service(config, session_factory):
         projector_poll_interval_ms=config.projector_poll_interval_ms,
         projector_lease_seconds=config.projector_lease_seconds,
         projector_max_attempts=config.projector_max_attempts,
+        projector_dependency_timeout_seconds=config.projector_dependency_timeout_seconds,
         inline_payload_max_bytes=config.inline_payload_max_bytes,
     )
 

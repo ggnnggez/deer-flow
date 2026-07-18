@@ -2,8 +2,11 @@ import asyncio
 import hashlib
 import json
 from datetime import UTC, datetime
+from pathlib import Path
 
 import pytest
+from alembic import command as alembic_command
+from alembic.config import Config as AlembicConfig
 from ansich import AnsichService, ContextStateItem, ObservationEnvelope, Producer, new_id
 from ansich.context_state import build_context_state_delta, context_state_hash
 from langchain.agents import create_agent
@@ -11,7 +14,8 @@ from langchain_core.language_models import BaseChatModel
 from langchain_core.messages import AIMessage, HumanMessage
 from langchain_core.outputs import ChatGeneration, ChatResult
 from langchain_core.tools import tool
-from sqlalchemy import event, func, select, text
+from sqlalchemy import create_engine, event, func, inspect, select, text
+from sqlalchemy.dialects import postgresql, sqlite
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
 from deerflow.ansich import create_sql_ansich_service
@@ -745,6 +749,106 @@ async def test_projection_failure_health_survives_service_restart(tmp_path, monk
 
     assert health.status == "degraded"
     assert health.failed_jobs == 1
+
+
+def test_dependency_pending_deadline_uses_timezone_aware_sql_on_supported_dialects() -> None:
+    column_type = AnsichProjectionJobRow.__table__.c.dependency_pending_since.type
+
+    assert column_type.compile(dialect=sqlite.dialect()) == "DATETIME"
+    assert column_type.compile(dialect=postgresql.dialect()) == "TIMESTAMP WITH TIME ZONE"
+
+
+def test_projection_dependency_deadline_migration_upgrades_sqlite(tmp_path) -> None:
+    backend_root = Path(__file__).resolve().parents[2]
+    config = AlembicConfig(str(backend_root / "packages" / "harness" / "deerflow" / "persistence" / "migrations" / "alembic.ini"))
+    database_path = tmp_path / "ansich-dependency-migration.db"
+    config.set_main_option("sqlalchemy.url", f"sqlite+aiosqlite:///{database_path}")
+    # The Alembic env only applies process-wide logging.fileConfig when this
+    # remains set; the integration test must not disable loggers used later.
+    config.config_file_name = None
+
+    alembic_command.upgrade(config, "head")
+
+    engine = create_engine(f"sqlite:///{database_path}")
+    try:
+        column_names = {column["name"] for column in inspect(engine).get_columns("ansich_projection_jobs")}
+        with engine.connect() as connection:
+            revision = connection.scalar(text("SELECT version_num FROM alembic_version"))
+    finally:
+        engine.dispose()
+
+    assert "dependency_pending_since" in column_names
+    assert revision == "0015_ansich_projection_deadline"
+    assert len(revision) <= 32
+
+
+@pytest.mark.anyio
+async def test_dependency_pending_job_eventually_fails_health_and_can_be_retried(tmp_path):
+    engine = create_async_engine(f"sqlite+aiosqlite:///{tmp_path / 'ansich-dependency-timeout.db'}")
+    session_factory = async_sessionmaker(engine, expire_on_commit=False)
+    async with engine.begin() as connection:
+        await connection.run_sync(Base.metadata.create_all)
+    backend = SqlAnsichBackend(
+        session_factory,
+        projector_dependency_timeout_seconds=0,
+    )
+    service = AnsichService(backend, flush_interval_ms=60_000)
+    await service.start()
+    task_id = new_id()
+    step_id = new_id()
+    producer = Producer(name="dependency-timeout-test", version="1", instance_id="test")
+    observed_at = datetime.now(UTC)
+    service.record(
+        ObservationEnvelope(
+            kind="step.started",
+            occurred_at=observed_at,
+            task_id=task_id,
+            step_id=step_id,
+            subject_type="step",
+            subject_id=step_id,
+            producer=producer,
+            producer_seq=1,
+            source_event_id="dependency-timeout:step:started",
+            correlation_id=task_id,
+            payload={"step_seq": 1, "actor_kind": "lead_agent"},
+        )
+    )
+
+    try:
+        await service.flush_task(task_id)
+        health_after_timeout = service.get_health()
+        async with session_factory() as session:
+            failed_job = await session.scalar(select(AnsichProjectionJobRow).where(AnsichProjectionJobRow.projector_name == "task-step"))
+            error_count = await session.scalar(select(func.count()).select_from(AnsichProjectionErrorRow))
+
+        service.record(
+            ObservationEnvelope.task_lifecycle(
+                kind="task.created",
+                task_id=task_id,
+                source_kind="deerflow_run",
+                source_id="run-dependency-timeout",
+                occurred_at=observed_at,
+                source_event_id="dependency-timeout:task:created",
+            )
+        )
+        await service.flush_task(task_id)
+        retried = await service.retry_failed_projections(task_id=task_id)
+        steps = await service.list_steps(task_id)
+        health_after_retry = service.get_health()
+    finally:
+        await service.stop()
+        await engine.dispose()
+
+    assert failed_job is not None
+    assert failed_job.status == "failed"
+    assert failed_job.dependency_pending_since is not None
+    assert "Ansich task is not projected" in (failed_job.last_error or "")
+    assert error_count == 1
+    assert health_after_timeout.status == "degraded"
+    assert health_after_timeout.failed_jobs == 1
+    assert retried == 1
+    assert [step.step_id for step in steps] == [step_id]
+    assert health_after_retry.failed_jobs == 0
 
 
 @pytest.mark.anyio

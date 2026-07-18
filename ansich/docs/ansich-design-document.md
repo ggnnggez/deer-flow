@@ -919,6 +919,10 @@ LOCKED`, while SQLite remains single-Gateway-worker as required by DeerFlow.
 
 Poison jobs retry up to a configured limit, then become failed projection jobs,
 mark the Task degraded, and allow unrelated jobs to proceed.
+Replay-safe missing dependencies use a separate persisted first-pending time:
+they do not consume the poison-job attempt budget, but become failed after the
+configured dependency deadline so health cannot remain falsely healthy while a
+job polls forever.
 
 Failed jobs remain durable and their count must survive a service restart.
 `AnsichService.retry_failed_projections(task_id=...)` is the explicit,

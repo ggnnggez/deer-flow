@@ -173,11 +173,13 @@ class SqlAnsichBackend:
         *,
         projector_lease_seconds: int = 30,
         projector_max_attempts: int = 5,
+        projector_dependency_timeout_seconds: int = 300,
         inline_payload_max_bytes: int = 65_536,
     ) -> None:
         self._session_factory = session_factory
         self._projector_lease_seconds = projector_lease_seconds
         self._projector_max_attempts = projector_max_attempts
+        self._projector_dependency_timeout = timedelta(seconds=projector_dependency_timeout_seconds)
         self._inline_payload_max_bytes = inline_payload_max_bytes
         self._lease_owner = str(uuid4())
         self._watermark: int | None = None
@@ -385,6 +387,7 @@ class SqlAnsichBackend:
                     if job is None:
                         raise RuntimeError("claimed Ansich projection job disappeared")
                     job.status = "completed"
+                    job.dependency_pending_since = None
                     job.lease_owner = None
                     job.lease_expires_at = None
                     job.last_error = None
@@ -490,6 +493,7 @@ class SqlAnsichBackend:
                     status="pending",
                     attempts=0,
                     available_at=datetime.now(UTC),
+                    dependency_pending_since=None,
                     lease_owner=None,
                     lease_expires_at=None,
                     last_error=None,
@@ -525,6 +529,7 @@ class SqlAnsichBackend:
                         status="pending",
                         attempts=0,
                         available_at=datetime.now(UTC),
+                        dependency_pending_since=None,
                         lease_owner=None,
                         lease_expires_at=None,
                         last_error=None,
@@ -591,13 +596,28 @@ class SqlAnsichBackend:
                 return
             message = str(exc)[:4_000]
             if isinstance(exc, _ProjectionDependencyPending):
-                job.status = "pending"
+                now = datetime.now(UTC)
+                pending_since = now if job.dependency_pending_since is None else _as_utc(job.dependency_pending_since)
+                job.dependency_pending_since = pending_since
+                job.status = "failed" if now - pending_since >= self._projector_dependency_timeout else "pending"
                 job.attempts = max(0, job.attempts - 1)
-                job.available_at = datetime.now(UTC) + timedelta(milliseconds=250)
+                job.available_at = now + timedelta(milliseconds=250)
                 job.lease_owner = None
                 job.lease_expires_at = None
                 job.last_error = message
+                if job.status == "failed":
+                    self._failed_jobs += 1
+                    session.add(
+                        AnsichProjectionErrorRow(
+                            error_id=new_id(),
+                            job_id=job_id,
+                            attempt=attempt,
+                            error_type=type(exc).__name__,
+                            message=message,
+                        )
+                    )
                 return
+            job.dependency_pending_since = None
             job.status = "failed" if attempt >= self._projector_max_attempts else "pending"
             if job.status == "failed":
                 self._failed_jobs += 1

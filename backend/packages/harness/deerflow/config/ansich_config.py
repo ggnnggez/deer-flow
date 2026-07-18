@@ -12,6 +12,11 @@ class AnsichConfig(BaseModel):
     projector_poll_interval_ms: int = Field(default=250, ge=1, description="Polling interval for pending projection jobs.")
     projector_lease_seconds: int = Field(default=30, ge=1, description="Lease duration for a claimed projection job.")
     projector_max_attempts: int = Field(default=5, ge=1, description="Maximum projection attempts before a job is marked failed.")
+    projector_dependency_timeout_seconds: int = Field(
+        default=300,
+        ge=1,
+        description="Maximum time a projection job may wait for a replay-safe dependency before it is marked failed.",
+    )
     inline_payload_max_bytes: int = Field(
         default=65_536,
         ge=1,

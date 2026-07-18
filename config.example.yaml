@@ -1665,6 +1665,9 @@ ansich:
   projector_poll_interval_ms: 250
   projector_lease_seconds: 30
   projector_max_attempts: 5
+  # A missing replay-safe projection dependency becomes a visible failed job
+  # after this deadline; operators can retry it after repairing the dependency.
+  projector_dependency_timeout_seconds: 300
   # Canonical JSON payloads larger than this move to ansich_payloads and are
   # available only through the admin raw-payload endpoint.
   inline_payload_max_bytes: 65536

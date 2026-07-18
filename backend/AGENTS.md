@@ -346,6 +346,10 @@ commits Observation plus `task-structural@1`/`task-control@1` jobs, and a
 separate leased projector loop builds Task, Scope, Relation, Transition, Belief,
 and Task-summary projections. Projection failures never roll back the raw
 Observation; they create projection-error rows and degrade Ansich health.
+Replay-safe dependency waits have their own durable first-seen timestamp and
+`projector_dependency_timeout_seconds` deadline; they do not consume ordinary
+projector attempts, but cross the deadline into the same durable failed-job and
+operator retry path instead of polling forever.
 SQLite production connections enforce foreign keys, so typed child projections
 must flush their `ansich_entities` parent before an autoflush can insert the
 child row; Ansich SQL tests that cover this path must enable
@@ -739,6 +743,7 @@ This invokes `alembic revision --autogenerate` against the live ORM models. Revi
 - `migrations/versions/0012_ansich_attempt_metadata.py` — split LLM usage and provider response metadata columns
 - `migrations/versions/0013_ansich_tool_accountability.py` — typed ToolCall intent/execution/visible-result projections, derivations, and issued/executed counters
 - `migrations/versions/0014_ansich_context_lineage.py` — typed ContentBlock producers, exact ordered context-compression inventories, bidirectional derivation indexes, and materialized snapshot-block reverse memberships
+- `migrations/versions/0015_ansich_projection_deadline.py` — durable first-seen time for dependency-pending projection jobs and their bounded failure deadline
 - `persistence/bootstrap.py` — `bootstrap_schema(engine, backend=...)`, the three-branch decision + locking
 - Tests: `tests/test_persistence_bootstrap.py` (branches), `tests/test_persistence_bootstrap_concurrency.py` (concurrency), `tests/test_persistence_bootstrap_regression.py` (issue #3682), `tests/test_persistence_migrations_env.py` (filter), `tests/blocking_io/test_persistence_bootstrap.py` (asyncio.to_thread anchor)
 
