@@ -3,11 +3,22 @@ from types import SimpleNamespace
 
 import pytest
 from ansich import AnsichService, ObservationEnvelope, Producer, new_id
+from sqlalchemy.dialects import postgresql, sqlite
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
 from deerflow.ansich import create_sql_ansich_service
+from deerflow.ansich.persistence.sql import _periodic_budget_rows_statement
 from deerflow.ansich.probes import create_task_control_probe
 from deerflow.persistence.base import Base
+
+
+def test_periodic_budget_assessment_filters_running_tasks_for_all_dialects():
+    statement = _periodic_budget_rows_statement()
+
+    for dialect in (sqlite.dialect(), postgresql.dialect()):
+        compiled = " ".join(str(statement.compile(dialect=dialect)).upper().split())
+        assert "JOIN ANSICH_TASK_SUMMARIES" in compiled
+        assert "ANSICH_TASK_SUMMARIES.CONTROL_VALUE =" in compiled
 
 
 @pytest.mark.anyio
@@ -136,14 +147,20 @@ async def test_sql_budget_health_retains_terminal_overshoot_and_evidence(tmp_pat
             )
         )
         await service.flush_task(task_id)
-        await service.assess_operations(now=observed_at + timedelta(seconds=3))
-        health = await service.get_task_budget_health(task_id)
+        terminal_health = await service.get_task_budget_health(task_id)
+        periodic_changes = await service.assess_operations(now=observed_at + timedelta(seconds=3))
+        health_after_periodic_assessment = await service.get_task_budget_health(task_id)
+        await service.rebuild_projections()
+        rebuilt_terminal_health = await service.get_task_budget_health(task_id)
     finally:
         await service.stop()
         await engine.dispose()
 
-    assert len(health) == 1
-    belief = health[0]
+    assert periodic_changes == 0
+    assert health_after_periodic_assessment == terminal_health
+    assert rebuilt_terminal_health == terminal_health
+    assert len(terminal_health) == 1
+    belief = terminal_health[0]
     assert belief.value == "exceeded"
     assert belief.usage_value == 107
     assert belief.overshoot == 7
@@ -171,6 +188,14 @@ async def test_task_scoped_collector_loss_makes_budget_health_unknown(tmp_path):
                 source_id="run-budget-loss",
                 occurred_at=observed_at,
                 source_event_id="run:run-budget-loss:task:created",
+            ),
+            ObservationEnvelope.task_lifecycle(
+                kind="task.started",
+                task_id=task_id,
+                source_kind="deerflow_run",
+                source_id="run-budget-loss",
+                occurred_at=observed_at,
+                source_event_id="run:run-budget-loss:task:started",
             ),
             ObservationEnvelope.budget_configured(
                 task_id=task_id,

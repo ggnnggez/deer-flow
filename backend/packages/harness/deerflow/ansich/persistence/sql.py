@@ -200,6 +200,17 @@ def _projector_priority_expression():
     return case(priority_by_name, value=AnsichProjectionJobRow.projector_name, else_=len(priority_by_name))
 
 
+def _periodic_budget_rows_statement():
+    return (
+        select(AnsichTaskBudgetRow)
+        .join(
+            AnsichTaskSummaryRow,
+            AnsichTaskSummaryRow.task_id == AnsichTaskBudgetRow.task_id,
+        )
+        .where(AnsichTaskSummaryRow.control_value == "running")
+    )
+
+
 def _as_utc(value: datetime) -> datetime:
     if value.tzinfo is None:
         return value.replace(tzinfo=UTC)
@@ -1100,126 +1111,145 @@ class SqlAnsichBackend:
                     current.resolver_name = belief.selected_by.name
                     current.resolver_version = belief.selected_by.version
                 changed += 1
-            budget_rows = list((await session.execute(select(AnsichTaskBudgetRow))).scalars())
-            for budget_row in budget_rows:
-                usage_row = await session.get(
-                    AnsichTaskUsageRow,
-                    (
-                        budget_row.task_id,
-                        budget_row.dimension,
-                        budget_row.aggregation_scope,
-                    ),
-                )
-                budget = TaskBudgetView(
-                    entity_id=budget_row.entity_id,
-                    task_id=budget_row.task_id,
-                    dimension=budget_row.dimension,
-                    aggregation_scope=budget_row.aggregation_scope,
-                    warning_limit=budget_row.warning_limit,
-                    hard_limit=budget_row.hard_limit,
-                    enforcement=budget_row.enforcement,
-                    source_kind=cast(BudgetSourceKind, budget_row.source_kind),
-                    requested_value=budget_row.requested_value,
-                    effective_value=budget_row.effective_value,
-                    configured_obs_id=budget_row.configured_obs_id,
-                )
-                usage = None
-                usage_evidence: tuple[str, ...] = ()
-                if usage_row is not None:
-                    usage = TaskUsageValue(
-                        dimension=usage_row.dimension,
-                        aggregation_scope=usage_row.aggregation_scope,
-                        value=usage_row.value,
-                        as_of=_as_utc(usage_row.as_of),
-                        complete_through_ingest_seq=(usage_row.complete_through_ingest_seq),
-                    )
-                    usage_evidence = tuple(
-                        (
-                            await session.execute(
-                                select(AnsichUsageContributionRow.source_obs_id)
-                                .where(
-                                    AnsichUsageContributionRow.task_id == budget_row.task_id,
-                                    AnsichUsageContributionRow.dimension == budget_row.dimension,
-                                )
-                                .order_by(
-                                    AnsichUsageContributionRow.as_of,
-                                    AnsichUsageContributionRow.source_obs_id,
-                                )
-                            )
-                        ).scalars()
-                    )
-                belief = assess_budget_health(
-                    budget,
-                    usage,
-                    now=asserted_at,
-                    usage_complete=(not global_loss and budget_row.task_id not in incomplete_tasks),
-                    usage_evidence_obs_ids=usage_evidence,
-                )
-                field_name = f"budget_health:{belief.dimension}:{belief.aggregation_scope}"
-                value_json = {
-                    "value": belief.value,
-                    "dimension": belief.dimension,
-                    "aggregation_scope": belief.aggregation_scope,
-                    "usage_value": belief.usage_value,
-                    "warning_limit": belief.warning_limit,
-                    "hard_limit": belief.hard_limit,
-                    "overshoot": belief.overshoot,
-                    "as_of_known": belief.as_of is not None,
-                }
-                current = await session.get(
-                    AnsichCurrentBeliefRow,
-                    (budget_row.task_id, field_name),
-                )
-                current_assertion = None
-                current_evidence = ()
-                if current is not None:
-                    current_assertion = await session.get(
-                        AnsichBeliefAssertionRow,
-                        current.assertion_id,
-                    )
-                    current_evidence = tuple((await session.execute(select(AnsichBeliefEvidenceRow.obs_id).where(AnsichBeliefEvidenceRow.assertion_id == current.assertion_id).order_by(AnsichBeliefEvidenceRow.ordinal))).scalars())
-                if current_assertion is not None and current_assertion.value_json == value_json and current_evidence == belief.evidence_obs_ids and current is not None and current.resolver_version == belief.selected_by.version:
-                    continue
-                assertion = AnsichBeliefAssertionRow(
-                    assertion_id=new_id(),
-                    subject_id=budget_row.task_id,
-                    field_name=field_name,
-                    value_json=value_json,
-                    as_of=belief.as_of or asserted_at,
-                    asserted_at=belief.asserted_at,
-                    source_name=belief.source.name,
-                    source_version=belief.source.version,
-                    fidelity_class=belief.fidelity_class,
-                )
-                session.add(assertion)
-                for ordinal, obs_id in enumerate(belief.evidence_obs_ids):
-                    session.add(
-                        AnsichBeliefEvidenceRow(
-                            assertion_id=assertion.assertion_id,
-                            obs_id=obs_id,
-                            evidence_role="supporting",
-                            ordinal=ordinal,
-                        )
-                    )
-                if current is None:
-                    session.add(
-                        AnsichCurrentBeliefRow(
-                            subject_id=budget_row.task_id,
-                            field_name=field_name,
-                            assertion_id=assertion.assertion_id,
-                            resolver_name=belief.selected_by.name,
-                            resolver_version=belief.selected_by.version,
-                        )
-                    )
-                else:
-                    current.assertion_id = assertion.assertion_id
-                    current.resolver_name = belief.selected_by.name
-                    current.resolver_version = belief.selected_by.version
-                changed += 1
+            budget_rows = list((await session.execute(_periodic_budget_rows_statement())).scalars())
+            changed += await self._assess_budget_rows(
+                session,
+                budget_rows=budget_rows,
+                asserted_at=asserted_at,
+                incomplete_tasks=incomplete_tasks,
+                global_loss=global_loss,
+            )
         await self._refresh_active_task_read_model(
             now=asserted_at,
             lost_ranges=lost_ranges,
         )
+        return changed
+
+    async def _assess_budget_rows(
+        self,
+        session: AsyncSession,
+        *,
+        budget_rows: list[AnsichTaskBudgetRow],
+        asserted_at: datetime,
+        incomplete_tasks: frozenset[str],
+        global_loss: bool,
+    ) -> int:
+        changed = 0
+        for budget_row in budget_rows:
+            usage_row = await session.get(
+                AnsichTaskUsageRow,
+                (
+                    budget_row.task_id,
+                    budget_row.dimension,
+                    budget_row.aggregation_scope,
+                ),
+            )
+            budget = TaskBudgetView(
+                entity_id=budget_row.entity_id,
+                task_id=budget_row.task_id,
+                dimension=budget_row.dimension,
+                aggregation_scope=budget_row.aggregation_scope,
+                warning_limit=budget_row.warning_limit,
+                hard_limit=budget_row.hard_limit,
+                enforcement=budget_row.enforcement,
+                source_kind=cast(BudgetSourceKind, budget_row.source_kind),
+                requested_value=budget_row.requested_value,
+                effective_value=budget_row.effective_value,
+                configured_obs_id=budget_row.configured_obs_id,
+            )
+            usage = None
+            usage_evidence: tuple[str, ...] = ()
+            if usage_row is not None:
+                usage = TaskUsageValue(
+                    dimension=usage_row.dimension,
+                    aggregation_scope=usage_row.aggregation_scope,
+                    value=usage_row.value,
+                    as_of=_as_utc(usage_row.as_of),
+                    complete_through_ingest_seq=usage_row.complete_through_ingest_seq,
+                )
+                usage_evidence = tuple(
+                    (
+                        await session.execute(
+                            select(AnsichUsageContributionRow.source_obs_id)
+                            .where(
+                                AnsichUsageContributionRow.task_id == budget_row.task_id,
+                                AnsichUsageContributionRow.dimension == budget_row.dimension,
+                            )
+                            .order_by(
+                                AnsichUsageContributionRow.as_of,
+                                AnsichUsageContributionRow.source_obs_id,
+                            )
+                        )
+                    ).scalars()
+                )
+            belief = assess_budget_health(
+                budget,
+                usage,
+                now=asserted_at,
+                usage_complete=(not global_loss and budget_row.task_id not in incomplete_tasks),
+                usage_evidence_obs_ids=usage_evidence,
+            )
+            field_name = f"budget_health:{belief.dimension}:{belief.aggregation_scope}"
+            value_json = {
+                "value": belief.value,
+                "dimension": belief.dimension,
+                "aggregation_scope": belief.aggregation_scope,
+                "usage_value": belief.usage_value,
+                "warning_limit": belief.warning_limit,
+                "hard_limit": belief.hard_limit,
+                "overshoot": belief.overshoot,
+                "as_of_known": belief.as_of is not None,
+            }
+            current = await session.get(
+                AnsichCurrentBeliefRow,
+                (budget_row.task_id, field_name),
+            )
+            current_assertion = None
+            current_evidence: tuple[str, ...] = ()
+            if current is not None:
+                current_assertion = await session.get(
+                    AnsichBeliefAssertionRow,
+                    current.assertion_id,
+                )
+                current_evidence = tuple((await session.execute(select(AnsichBeliefEvidenceRow.obs_id).where(AnsichBeliefEvidenceRow.assertion_id == current.assertion_id).order_by(AnsichBeliefEvidenceRow.ordinal))).scalars())
+            if current_assertion is not None and current_assertion.value_json == value_json and current_evidence == belief.evidence_obs_ids and current is not None and current.resolver_version == belief.selected_by.version:
+                continue
+            assertion = AnsichBeliefAssertionRow(
+                assertion_id=new_id(),
+                subject_id=budget_row.task_id,
+                field_name=field_name,
+                value_json=value_json,
+                as_of=belief.as_of or asserted_at,
+                asserted_at=belief.asserted_at,
+                source_name=belief.source.name,
+                source_version=belief.source.version,
+                fidelity_class=belief.fidelity_class,
+            )
+            session.add(assertion)
+            for ordinal, obs_id in enumerate(belief.evidence_obs_ids):
+                session.add(
+                    AnsichBeliefEvidenceRow(
+                        assertion_id=assertion.assertion_id,
+                        obs_id=obs_id,
+                        evidence_role="supporting",
+                        ordinal=ordinal,
+                    )
+                )
+            if current is None:
+                session.add(
+                    AnsichCurrentBeliefRow(
+                        subject_id=budget_row.task_id,
+                        field_name=field_name,
+                        assertion_id=assertion.assertion_id,
+                        resolver_name=belief.selected_by.name,
+                        resolver_version=belief.selected_by.version,
+                    )
+                )
+            else:
+                current.assertion_id = assertion.assertion_id
+                current.resolver_name = belief.selected_by.name
+                current.resolver_version = belief.selected_by.version
+            changed += 1
         return changed
 
     async def get_task_heartbeat_belief(
@@ -2510,6 +2540,14 @@ class SqlAnsichBackend:
                 session,
                 task_id=observation.task_id,
                 followup_observed=True,
+            )
+            budget_rows = list((await session.execute(select(AnsichTaskBudgetRow).where(AnsichTaskBudgetRow.task_id == observation.task_id))).scalars())
+            await self._assess_budget_rows(
+                session,
+                budget_rows=budget_rows,
+                asserted_at=observation.recorded_at,
+                incomplete_tasks=frozenset(),
+                global_loss=False,
             )
 
     async def _project_heartbeat(

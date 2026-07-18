@@ -442,6 +442,9 @@ non-polling Operations history source and includes completed, failed, and
 interrupted Tasks.
 Collector loss makes affected budget health unknown. Active wall time comes
 from heartbeat elapsed and terminal wall time from the Task monotonic clock.
+Periodic budget assessment joins Task summaries and scans only running Tasks;
+the terminal control projection performs one final budget assessment so an
+absolute breach remains queryable without rescanning historical Tasks.
 Unknown heartbeat/dwell/budget values are rule assessments with evidence and
 policy-hash resolver versions; none may overwrite hard control state.
 
