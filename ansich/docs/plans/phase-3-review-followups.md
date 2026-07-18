@@ -8,7 +8,7 @@
 | ---- | ---- | ---- | -------- | ------ |
 | M1 | `resolve_tool_call` 回退匹配可能把证据错绑到其他 ToolCall | ✅ 已修复 | 2026-07-17 | `8044ecfc` |
 | M2 | transform 分类靠字符串嗅探,与上游中间件措辞硬耦合 | ✅ 已修复 | 2026-07-17 | `6c655ddb` |
-| M3 | Collector 队列按条数而非字节 bound,大 artifact 内存上限不受控 | ⬜ 未修复 | — | — |
+| M3 | Collector 队列按条数而非字节 bound,大 artifact 内存上限不受控 | ✅ 已修复 | 2026-07-18 | `7c4ec498` |
 | L1 | 观察开销(canonical JSON + sha256 + 锁内 delta)基准缺位 | ⬜ 未修复 | — | — |
 | L2 | 已推送迁移 0007/0009 被原位修改(行为等价,记录留档) | ℹ️ 无需修复 | — | `6177d53d` |
 
@@ -30,7 +30,7 @@
 
 ## M3. Collector 队列按条数而非字节 bound
 
-- 状态:⬜ 未修复。
+- 状态:✅ 已修复(2026-07-18,commit `7c4ec498`)。按 TDD 修复:Collector 新增 `queue_byte_capacity`(默认 64 MiB),按 Observation 规范 JSON 的 UTF-8 字节计费,与条数容量共同执行批量全收/全拒;超限返回 `queue_bytes_full` 并进入既有 lost-range/degraded 路径。health 与 Operations UI 暴露当前字节、字节容量和最高水位;无法序列化的非规范 payload 返回 `serialization_failed` 而不向 Agent 抛错。容量注入测试覆盖 count 未满时的字节拒绝、flush 后当前水位归零及高水位保留。以下为原始诊断记录。
 - 位置:`backend/packages/ansich/ansich/service.py`(`queue_capacity` 条数语义)+ `tool_middleware.py::_result_body`(携带 `message.artifact`)+ `serialization.py` bytes 分支(base64 内联)。
 - 现状:单条在途观测可达 MB 级(如 base64 图片 artifact),`queue_capacity=10000` 条的内存上限不受字节控制;落库端有 `inline_payload_max_bytes` 的 blob offload,但在途队列是完整 Python 对象。
 - 方向:capture 侧对超大 body 截断为摘要(保留 `content_hash`、`byte_length`、截断标记,raw 完整性经由 blob 层已不可得时如实标注),或为队列增加字节水位并纳入 health;两者择一并配容量注入测试。
