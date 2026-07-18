@@ -147,6 +147,17 @@ async def traverse_content_lineage(
                 unseen_set.add(neighbor)
 
         if depth >= max_depth:
+            known_block_ids = visited | unresolved
+            for edge in level_edges:
+                if edge.derived_block_id in known_block_ids and edge.source_block_id in known_block_ids:
+                    edges_by_key.setdefault(
+                        (
+                            edge.derived_block_id,
+                            edge.source_block_id,
+                            edge.transform_kind,
+                        ),
+                        edge,
+                    )
             if unseen_neighbors:
                 truncated = True
                 truncation_reason = "max_depth"

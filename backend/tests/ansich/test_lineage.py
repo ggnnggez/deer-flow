@@ -656,6 +656,62 @@ async def test_bfs_preserves_diamond_edges_and_defends_against_a_cycle() -> None
 
 
 @pytest.mark.anyio
+async def test_bfs_keeps_cross_edges_discovered_at_the_max_depth_boundary() -> None:
+    root_id, left_id, right_id, shared_id = (new_id() for _ in range(4))
+    blocks = {
+        block_id: ContentBlockView(
+            block_id=block_id,
+            kind="assistant_output",
+            content_hash=block_id.replace("-", "")[:64],
+            byte_size=1,
+            token_estimate=1,
+            payload_status="available",
+        )
+        for block_id in (root_id, left_id, right_id, shared_id)
+    }
+    producer_obs_id = new_id()
+    edge_pairs = (
+        (root_id, left_id),
+        (root_id, right_id),
+        (left_id, shared_id),
+        (right_id, shared_id),
+        (shared_id, right_id),
+    )
+    edges = [
+        ContentDerivationView(
+            derived_block_id=derived,
+            source_block_id=source,
+            transform_kind="copied",
+            transform_version="1",
+            established_obs_id=producer_obs_id,
+        )
+        for derived, source in edge_pairs
+    ]
+
+    async def get_blocks(block_ids: tuple[str, ...]):
+        return [blocks[block_id] for block_id in block_ids if block_id in blocks]
+
+    async def get_edges(block_ids: tuple[str, ...], direction: str):
+        assert direction == "backward"
+        return [edge for edge in edges if edge.derived_block_id in block_ids]
+
+    lineage = await traverse_content_lineage(
+        root_id,
+        direction="backward",
+        max_depth=2,
+        max_nodes=500,
+        get_blocks=get_blocks,
+        get_derivations=get_edges,  # type: ignore[arg-type]
+    )
+
+    assert lineage is not None
+    assert {node.block_id for node in lineage.nodes} == set(blocks)
+    assert {(edge.derived_block_id, edge.source_block_id) for edge in lineage.edges} == set(edge_pairs)
+    assert lineage.truncated is False
+    assert lineage.truncation_reason is None
+
+
+@pytest.mark.anyio
 async def test_bfs_reports_depth_truncation_instead_of_silently_cutting_the_graph() -> None:
     root_id, parent_id, grandparent_id = (new_id() for _ in range(3))
     blocks = {
