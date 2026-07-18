@@ -7,9 +7,9 @@
 | 编号 | 摘要 | 状态 | 修复时间 | Commit |
 | ---- | ---- | ---- | -------- | ------ |
 | M1 | `assess_operations` 每秒无过滤扫描全部历史 budget 行,开销随任务总量线性增长 | ✅ 已修复 | 2026-07-18 | `a3ccd8f1` |
-| M2 | heartbeat belief 去重键含每秒变化的 `age_ms`,断言表按 running 任务每秒 +1 行 | ⬜ 未修复 | — | — |
+| M2 | heartbeat belief 去重键含每秒变化的 `age_ms`,断言表按 running 任务每秒 +1 行 | ✅ 已修复 | 2026-07-18 | `b6819263` |
 | M3 | Operations 页面用 active list 替换全部 Task 列表,历史 Task 失去 UI 入口 | ✅ 已修复 | 2026-07-18 | `bb9b1126` |
-| L1 | read model 每周期无条件重写 `updated_at`,ETag/304 机制几乎永不命中 | ⬜ 未修复 | — | — |
+| L1 | read model 每周期无条件重写 `updated_at`,ETag/304 机制几乎永不命中 | ✅ 已修复 | 2026-07-18 | `b6819263` |
 | L2 | 两个管理员 GET 在空结果时同步触发全量 assessment(读端点做重写工作) | ⬜ 未修复 | — | — |
 | L3 | token 维度的 `budget.consumed` 未被排除,存在与 `llm.responded` usage 双计的潜在路径 | ⬜ 未修复 | — | — |
 
@@ -23,7 +23,7 @@
 
 ## M2. heartbeat belief 断言按 running 任务每秒 +1 行
 
-- 状态:⬜ 未修复。
+- 状态:✅ 已修复(2026-07-18,commit `b6819263`)。heartbeat assertion 的 `value_json` 只保存分类状态,去重比较稳定的 value、ordered evidence 与 resolver version;`age_ms` 在读取当前 belief/刷新 active read model 时按 `now - as_of` 计算。同一 evidence 下连续 fresh 评估不追加 assertion/evidence,跨 stale 阈值与新 heartbeat 恢复才追加。SQLite 回归同时核对 changed count、append-only assertion 数量/value_json、实时 read-model age 与 hard control 不变。以下保留原始诊断记录。
 - 位置:`sql.py::assess_operations` 的 heartbeat dedup 比较(`current_assertion.value_json == {"value": belief.value, "age_ms": belief.age_ms}`)+ `ansich/operations.py::assess_heartbeat`(`age_ms` 由 `now - occurred_at` 计算)。
 - 现状:`age_ms` 每个评估周期都随 `now` 前进而变化,dedup 恒不命中——每个有 heartbeat 的 running 任务,每秒新增一条 `AnsichBeliefAssertionRow` + 一条 evidence 行(仅 `unknown` 状态因 `age_ms=None` 稳定不膨胀)。一个跑 24 小时的任务约产生 8.6 万条断言;断言表是 append-only,不会自动收缩。这不是正确性问题(current belief 指针正确),而是无上限的存储/写入膨胀,并把有意义的 fresh↔stale 转变淹没在噪声断言里。
 - 方向:dedup 只比较 `value` + evidence + resolver version;`age_ms` 移出 `value_json`,仅在 read model(`heartbeat_json`)里呈现实时 age。这样断言只在 fresh↔stale↔unknown 转变时产生,与"重新收到 heartbeat 后生成新 assertion fresh"的计划语义一致。配"同一状态连续两次评估不新增断言、状态转变才新增"的回归测试。
@@ -40,7 +40,7 @@
 
 ## L1. read model 每周期无条件重写,ETag/304 几乎永不命中
 
-- 状态:⬜ 未修复。
+- 状态:✅ 已修复(2026-07-18,commit `b6819263`)。active read-model refresh 先比较除 `updated_at` 外的规范化内容(datetime 统一为 UTC),完全未变时不赋值、不发 UPDATE、不 bump `updated_at`;路由 ETag 只覆盖 `items + next_cursor`,不再受 `projection_status` 波动影响。SQLite SQL 监听回归证明相同内容零 UPDATE,管理员路由回归证明 projection lag 单独变化仍命中 304。以下保留原始诊断记录。
 - 位置:`sql.py::_refresh_active_task_read_model`(对既有行无条件 `setattr` 全部字段并置 `updated_at=now`)+ `app/gateway/routers/ansich.py::list_active_tasks`(ETag 计算包含 `projection_status` 与 `updated_at`)。
 - 现状:即使任务内容完全未变,read model 行的 `updated_at` 也每秒被 bump;响应体里的 `projection_status`(lag 等)也随时间变化。因此 If-None-Match 几乎永远不等于新 ETag,304 分支形同虚设,前端"未变化时保留已有对象"实际只靠 TanStack 的 structural sharing 兜底。计划 §7 的 ETag 意图未真正达成。每秒对每个 running 任务的一次无效 UPDATE 也是纯粹的写放大(量级小)。
 - 方向:refresh 时先比较序列化内容,未变则既不写行也不 bump `updated_at`;ETag 只覆盖 `items` + `next_cursor`(`projection_status` 移出 ETag 或放响应头)。配"内容未变时 304 命中"的路由测试。
