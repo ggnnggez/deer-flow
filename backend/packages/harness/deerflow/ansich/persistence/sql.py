@@ -1393,9 +1393,18 @@ class SqlAnsichBackend:
                 cast(UsageDimension, "wall_time_ms"),
                 cast(AggregationScope, "local"),
             )
-            values[wall_time_key] = heartbeat.elapsed_ms
-            as_of[wall_time_key] = _as_utc(heartbeat.occurred_at)
-            evidence[wall_time_key] = [heartbeat.heartbeat_obs_id]
+            heartbeat_as_of = _as_utc(heartbeat.occurred_at)
+            values[wall_time_key] = max(
+                values.get(wall_time_key, 0),
+                heartbeat.elapsed_ms,
+            )
+            as_of[wall_time_key] = max(
+                as_of.get(wall_time_key, heartbeat_as_of),
+                heartbeat_as_of,
+            )
+            wall_time_evidence = evidence.setdefault(wall_time_key, [])
+            if heartbeat.heartbeat_obs_id not in wall_time_evidence:
+                wall_time_evidence.append(heartbeat.heartbeat_obs_id)
 
         usage = tuple(
             TaskUsageValue(

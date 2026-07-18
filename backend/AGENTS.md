@@ -467,7 +467,10 @@ attempt limits, and durable errors; failed jobs contribute to the shared
 Ansich health count and are requeued through `retry_failed_projections` without
 blocking the DeerFlow runtime. Evaluations read only evidence at or below their
 watermark, and no-evidence results use the watermark event time as `as_of`, not
-the later processing time. The wall-clock loop scans running Tasks and appends
+the later processing time. Absolute wall-time assessment takes the maximum of
+the accumulated terminal contribution and the latest heartbeat elapsed value,
+and retains both evidence paths, so the final interval after heartbeats stop
+cannot erase a terminal breach. The wall-clock loop scans running Tasks and appends
 heartbeat/dwell assertions only on categorical transitions; age and duration
 remain dynamic read-model fields. Alert episodes use stable condition keys,
 retain ordered Observation evidence, resolve operational episodes on terminal

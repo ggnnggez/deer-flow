@@ -430,6 +430,110 @@ async def test_sql_absolute_budget_breach_marks_runaway_and_opens_alert(
 
 
 @pytest.mark.anyio
+async def test_sql_terminal_wall_time_breach_keeps_final_interval_after_last_heartbeat(
+    tmp_path,
+) -> None:
+    engine = create_async_engine(f"sqlite+aiosqlite:///{tmp_path / 'ansich-phase6-terminal-wall-time.db'}")
+    session_factory = async_sessionmaker(engine, expire_on_commit=False)
+    async with engine.begin() as connection:
+        await connection.run_sync(Base.metadata.create_all)
+    service = create_sql_ansich_service(
+        session_factory,
+        operations_assessment_interval_ms=60_000,
+    )
+    await service.start()
+    task_id = new_id()
+    started_at = datetime(2026, 7, 18, 17, 30, tzinfo=UTC)
+    configured = ObservationEnvelope.budget_configured(
+        task_id=task_id,
+        run_id="run-phase6-terminal-wall-time",
+        occurred_at=started_at,
+        dimension="wall_time_ms",
+        aggregation_scope="local",
+        warning_limit=8_000,
+        hard_limit=9_500,
+        enforcement=True,
+        source_kind="release_default",
+        requested_value=None,
+        effective_value=9_500,
+        source_event_id="run:phase6-terminal-wall-time:budget:configured",
+    )
+    heartbeat = ObservationEnvelope.task_heartbeat(
+        task_id=task_id,
+        run_id="run-phase6-terminal-wall-time",
+        occurred_at=started_at + timedelta(seconds=9),
+        producer_instance_id="phase6-test",
+        worker_id="worker-phase6-test",
+        ownership_epoch="epoch-1",
+        elapsed_ms=9_000,
+        source_event_id="run:phase6-terminal-wall-time:heartbeat:last",
+    )
+    terminal_wall_time = ObservationEnvelope.budget_consumed(
+        task_id=task_id,
+        run_id="run-phase6-terminal-wall-time",
+        occurred_at=started_at + timedelta(seconds=10),
+        dimension="wall_time_ms",
+        delta=10_000,
+        source_event_id="run:phase6-terminal-wall-time:budget:terminal",
+    )
+
+    try:
+        service.record_batch(
+            (
+                ObservationEnvelope.task_lifecycle(
+                    kind="task.created",
+                    task_id=task_id,
+                    source_kind="deerflow_run",
+                    source_id="run-phase6-terminal-wall-time",
+                    occurred_at=started_at,
+                    source_event_id="run:phase6-terminal-wall-time:task:created",
+                ),
+                ObservationEnvelope.task_lifecycle(
+                    kind="task.started",
+                    task_id=task_id,
+                    source_kind="deerflow_run",
+                    source_id="run-phase6-terminal-wall-time",
+                    occurred_at=started_at,
+                    source_event_id="run:phase6-terminal-wall-time:task:started",
+                ),
+                configured,
+                heartbeat,
+                terminal_wall_time,
+                ObservationEnvelope.task_lifecycle(
+                    kind="task.completed",
+                    task_id=task_id,
+                    source_kind="deerflow_run",
+                    source_id="run-phase6-terminal-wall-time",
+                    occurred_at=started_at + timedelta(seconds=10),
+                    source_event_id="run:phase6-terminal-wall-time:task:completed",
+                ),
+            )
+        )
+        await service.flush_task(task_id)
+        await service.assess_operations(now=datetime.now(UTC) + timedelta(seconds=1))
+        health = await service.get_task_budget_health(task_id)
+        absolute_signal = await service.get_current_belief(
+            task_id,
+            "behavior_signal:absolute-limit",
+        )
+    finally:
+        await service.stop()
+        await engine.dispose()
+
+    assert len(health) == 1
+    assert health[0].value == "exceeded"
+    assert health[0].usage_value == 10_000
+    assert health[0].overshoot == 500
+    assert absolute_signal is not None
+    assert absolute_signal.value["value"] == "runaway"
+    assert health[0].evidence_obs_ids == (
+        configured.obs_id,
+        terminal_wall_time.obs_id,
+        heartbeat.obs_id,
+    )
+
+
+@pytest.mark.anyio
 async def test_sql_wall_clock_assessment_opens_and_resolves_liveness_alerts(
     tmp_path,
 ) -> None:
