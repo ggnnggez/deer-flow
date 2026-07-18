@@ -465,9 +465,14 @@ argument-changing Tool frequency is an operational Alert only and must never
 promote `Task.behavior` to runaway. Assessor jobs have independent leases,
 attempt limits, and durable errors; failed jobs contribute to the shared
 Ansich health count and are requeued through `retry_failed_projections` without
-blocking the DeerFlow runtime. Evaluations read only evidence at or below their
-watermark, and no-evidence results use the watermark event time as `as_of`, not
-the later processing time. Absolute wall-time assessment takes the maximum of
+blocking the DeerFlow runtime. Claiming coalesces currently claimable jobs with
+the same subject/assessor/version into one evaluation at their highest evidence
+watermark; absorbed lower jobs complete without an attempt, while retry backoff
+and version boundaries remain intact. Action-repetition loads ordered
+Step/Tool inputs with one batch outer join instead of one Tool query per Step.
+Evaluations read only evidence at or below their watermark, and no-evidence
+results use the watermark event time as `as_of`, not the later processing time.
+Absolute wall-time assessment takes the maximum of
 the accumulated terminal contribution and the latest heartbeat elapsed value,
 and retains both evidence paths, so the final interval after heartbeats stop
 cannot erase a terminal breach. The wall-clock loop scans running Tasks and appends
@@ -475,6 +480,13 @@ heartbeat/dwell assertions only on categorical transitions; age and duration
 remain dynamic read-model fields. Alert episodes use stable condition keys,
 retain ordered Observation evidence, resolve operational episodes on terminal
 Tasks, and never delete their source facts.
+
+Periodic Alert reconciliation queries only unresolved episodes plus the maximum
+episode number for each stable Alert key. Historical resolved episode evidence
+is not loaded during unchanged heartbeat/dwell scans; an existing episode's
+ordered evidence is fetched only when a confirm/resolve candidate must be
+compared and persisted. This keeps recurrence numbering exact without making
+the one-second operations loop scale with all historical episodes.
 
 Alert list/detail and acknowledge/dismiss routes are admin-only;
 acknowledge/dismiss require the current `workflow_version`. Task interrupt and

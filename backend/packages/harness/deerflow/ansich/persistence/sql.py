@@ -110,6 +110,7 @@ from sqlalchemy import and_, case, delete, func, or_, select, update
 from sqlalchemy.dialects.postgresql import insert as postgresql_insert
 from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
+from sqlalchemy.orm import aliased
 
 from deerflow.ansich.persistence.models import (
     AnsichActiveTaskReadModelRow,
@@ -281,6 +282,84 @@ def _assessors_after_projection(
 def _projector_priority_expression():
     priority_by_name = {name: index for index, (name, _) in enumerate(_PROJECTORS)}
     return case(priority_by_name, value=AnsichProjectionJobRow.projector_name, else_=len(priority_by_name))
+
+
+def _action_repetition_rows_statement(
+    *,
+    task_id: str,
+    evidence_watermark: int,
+):
+    closed_observation = aliased(
+        AnsichObservationRow,
+        name="closed_observation",
+    )
+    issued_observation = aliased(
+        AnsichObservationRow,
+        name="issued_observation",
+    )
+    return (
+        select(
+            AnsichStepRow,
+            closed_observation,
+            AnsichToolCallRow,
+            issued_observation,
+        )
+        .join(
+            closed_observation,
+            closed_observation.obs_id == AnsichStepRow.closed_obs_id,
+        )
+        .outerjoin(
+            AnsichToolCallRow,
+            AnsichToolCallRow.step_id == AnsichStepRow.entity_id,
+        )
+        .outerjoin(
+            issued_observation,
+            and_(
+                issued_observation.obs_id == AnsichToolCallRow.issued_obs_id,
+                issued_observation.ingest_seq <= evidence_watermark,
+            ),
+        )
+        .where(
+            AnsichStepRow.task_id == task_id,
+            AnsichStepRow.actor_kind != "system_operation",
+            closed_observation.ingest_seq <= evidence_watermark,
+        )
+        .order_by(
+            AnsichStepRow.step_seq,
+            AnsichToolCallRow.call_seq,
+            AnsichToolCallRow.entity_id,
+        )
+    )
+
+
+def _reconciliation_alert_rows_statement(*, task_id: str):
+    latest_episode_by_key = (
+        select(
+            AnsichAlertRow.alert_key.label("alert_key"),
+            func.max(AnsichAlertRow.episode).label("max_episode"),
+        )
+        .where(AnsichAlertRow.subject_id == task_id)
+        .group_by(AnsichAlertRow.alert_key)
+        .subquery("latest_alert_episode")
+    )
+    return (
+        select(AnsichAlertRow)
+        .join(
+            latest_episode_by_key,
+            latest_episode_by_key.c.alert_key == AnsichAlertRow.alert_key,
+        )
+        .where(
+            AnsichAlertRow.subject_id == task_id,
+            or_(
+                AnsichAlertRow.workflow_state != "resolved",
+                AnsichAlertRow.episode == latest_episode_by_key.c.max_episode,
+            ),
+        )
+        .order_by(
+            AnsichAlertRow.alert_key,
+            AnsichAlertRow.episode,
+        )
+    )
 
 
 def _periodic_budget_rows_statement():
@@ -994,17 +1073,18 @@ class SqlAnsichBackend:
     ) -> tuple[str, str, str, int, int] | None:
         now = datetime.now(UTC)
         async with self._session_factory() as session, session.begin():
-            job = await session.scalar(
+            claimable = or_(
+                AnsichAssessorJobRow.status == "pending",
+                and_(
+                    AnsichAssessorJobRow.status == "processing",
+                    AnsichAssessorJobRow.lease_expires_at <= now,
+                ),
+            )
+            seed = await session.scalar(
                 select(AnsichAssessorJobRow)
                 .where(
                     AnsichAssessorJobRow.available_at <= now,
-                    or_(
-                        AnsichAssessorJobRow.status == "pending",
-                        and_(
-                            AnsichAssessorJobRow.status == "processing",
-                            AnsichAssessorJobRow.lease_expires_at <= now,
-                        ),
-                    ),
+                    claimable,
                 )
                 .order_by(
                     AnsichAssessorJobRow.evidence_watermark,
@@ -1014,8 +1094,35 @@ class SqlAnsichBackend:
                 .limit(1)
                 .with_for_update(skip_locked=True)
             )
-            if job is None:
+            if seed is None:
                 return None
+            grouped_jobs = list(
+                (
+                    await session.execute(
+                        select(AnsichAssessorJobRow)
+                        .where(
+                            AnsichAssessorJobRow.subject_id == seed.subject_id,
+                            AnsichAssessorJobRow.assessor_name == seed.assessor_name,
+                            AnsichAssessorJobRow.assessor_version == seed.assessor_version,
+                            AnsichAssessorJobRow.available_at <= now,
+                            claimable,
+                        )
+                        .order_by(
+                            AnsichAssessorJobRow.evidence_watermark.desc(),
+                            AnsichAssessorJobRow.job_id.desc(),
+                        )
+                        .with_for_update(skip_locked=True)
+                    )
+                ).scalars()
+            )
+            if not grouped_jobs:
+                return None
+            job = grouped_jobs[0]
+            for absorbed in grouped_jobs[1:]:
+                absorbed.status = "completed"
+                absorbed.lease_owner = None
+                absorbed.lease_expires_at = None
+                absorbed.last_error = None
             job.status = "processing"
             job.attempts += 1
             job.lease_owner = self._lease_owner
@@ -1180,58 +1287,46 @@ class SqlAnsichBackend:
         evidence_watermark: int,
         now: datetime,
     ) -> Assessment:
-        step_rows = list(
+        rows = list(
             (
                 await session.execute(
-                    select(AnsichStepRow, AnsichObservationRow)
-                    .join(
-                        AnsichObservationRow,
-                        AnsichObservationRow.obs_id == AnsichStepRow.closed_obs_id,
+                    _action_repetition_rows_statement(
+                        task_id=task_id,
+                        evidence_watermark=evidence_watermark,
                     )
-                    .where(
-                        AnsichStepRow.task_id == task_id,
-                        AnsichStepRow.actor_kind != "system_operation",
-                        AnsichObservationRow.ingest_seq <= evidence_watermark,
-                    )
-                    .order_by(AnsichStepRow.step_seq)
                 )
             ).all()
         )
-        steps = []
-        for step, closed_observation in step_rows:
-            tool_rows = list(
-                (
-                    await session.execute(
-                        select(AnsichToolCallRow, AnsichObservationRow)
-                        .join(
-                            AnsichObservationRow,
-                            AnsichObservationRow.obs_id == AnsichToolCallRow.issued_obs_id,
-                        )
-                        .where(
-                            AnsichToolCallRow.step_id == step.entity_id,
-                            AnsichObservationRow.ingest_seq <= evidence_watermark,
-                        )
-                        .order_by(
-                            AnsichToolCallRow.call_seq,
-                            AnsichToolCallRow.entity_id,
-                        )
-                    )
-                ).all()
-            )
-            tools = tuple(
+        step_inputs: dict[
+            str,
+            tuple[
+                AnsichStepRow,
+                AnsichObservationRow,
+                list[ToolAction],
+            ],
+        ] = {}
+        for step, closed_observation, tool, issued_observation in rows:
+            step_input = step_inputs.get(step.entity_id)
+            if step_input is None:
+                step_input = (step, closed_observation, [])
+                step_inputs[step.entity_id] = step_input
+            if tool is None or issued_observation is None:
+                continue
+            step_input[2].append(
                 ToolAction(
                     tool_name=tool.tool_name,
                     args=({} if tool.args_preview_json is None else tool.args_preview_json),
                     evidence_obs_id=issued_observation.obs_id,
                 )
-                for tool, issued_observation in tool_rows
             )
+        steps = []
+        for step, closed_observation, tools in step_inputs.values():
             steps.append(
                 build_step_action(
                     step_id=step.entity_id,
                     step_seq=step.step_seq,
                     occurred_at=_as_utc(closed_observation.occurred_at),
-                    tools=tools,
+                    tools=tuple(tools),
                 )
             )
         assessment = assess_action_repetition(
@@ -1656,7 +1751,56 @@ class SqlAnsichBackend:
         _, did_change = await self._persist_assessment(session, assessment)
         return int(did_change)
 
-    async def _load_alert_episodes(
+    @staticmethod
+    def _alert_episode_from_row(
+        row: AnsichAlertRow,
+        *,
+        evidence: tuple[EvidenceRef, ...] = (),
+    ) -> AlertEpisode:
+        return AlertEpisode.model_validate(
+            {
+                "alert_id": row.entity_id,
+                "alert_key": row.alert_key,
+                "episode": row.episode,
+                "alert_type": row.alert_type,
+                "subject_id": row.subject_id,
+                "rule": NamedVersion(
+                    name=row.rule_name,
+                    version=row.rule_version,
+                ),
+                "rule_config_hash": row.rule_config_hash,
+                "stable_condition_key": row.stable_condition_key,
+                "source_assertion_id": row.source_assertion_id,
+                "opened_at": _as_utc(row.opened_at),
+                "as_of": _as_utc(row.as_of),
+                "updated_at": _as_utc(row.updated_at),
+                "resolved_at": (None if row.resolved_at is None else _as_utc(row.resolved_at)),
+                "resolution_reason": row.resolution_reason,
+                "workflow_state": row.workflow_state,
+                "workflow_version": row.workflow_version,
+                "dismissal_reason": row.dismissal_reason,
+                "severity": row.severity,
+                "shadow": row.shadow,
+                "evidence": evidence,
+            }
+        )
+
+    async def _load_alert_evidence(
+        self,
+        session: AsyncSession,
+        *,
+        alert_id: str,
+    ) -> tuple[EvidenceRef, ...]:
+        rows = list((await session.execute(select(AnsichAlertEvidenceRow).where(AnsichAlertEvidenceRow.alert_id == alert_id).order_by(AnsichAlertEvidenceRow.ordinal))).scalars())
+        return tuple(
+            EvidenceRef(
+                obs_id=row.obs_id,
+                role=row.role,
+            )
+            for row in rows
+        )
+
+    async def _load_reconciliation_alert_episodes(
         self,
         session: AsyncSession,
         *,
@@ -1665,54 +1809,13 @@ class SqlAnsichBackend:
         rows = list(
             (
                 await session.execute(
-                    select(AnsichAlertRow)
-                    .where(AnsichAlertRow.subject_id == task_id)
-                    .order_by(
-                        AnsichAlertRow.alert_key,
-                        AnsichAlertRow.episode,
+                    _reconciliation_alert_rows_statement(
+                        task_id=task_id,
                     )
                 )
             ).scalars()
         )
-        episodes = []
-        for row in rows:
-            evidence_rows = list((await session.execute(select(AnsichAlertEvidenceRow).where(AnsichAlertEvidenceRow.alert_id == row.entity_id).order_by(AnsichAlertEvidenceRow.ordinal))).scalars())
-            episodes.append(
-                AlertEpisode.model_validate(
-                    {
-                        "alert_id": row.entity_id,
-                        "alert_key": row.alert_key,
-                        "episode": row.episode,
-                        "alert_type": row.alert_type,
-                        "subject_id": row.subject_id,
-                        "rule": NamedVersion(
-                            name=row.rule_name,
-                            version=row.rule_version,
-                        ),
-                        "rule_config_hash": row.rule_config_hash,
-                        "stable_condition_key": row.stable_condition_key,
-                        "source_assertion_id": row.source_assertion_id,
-                        "opened_at": _as_utc(row.opened_at),
-                        "as_of": _as_utc(row.as_of),
-                        "updated_at": _as_utc(row.updated_at),
-                        "resolved_at": (None if row.resolved_at is None else _as_utc(row.resolved_at)),
-                        "resolution_reason": row.resolution_reason,
-                        "workflow_state": row.workflow_state,
-                        "workflow_version": row.workflow_version,
-                        "dismissal_reason": row.dismissal_reason,
-                        "severity": row.severity,
-                        "shadow": row.shadow,
-                        "evidence": tuple(
-                            EvidenceRef(
-                                obs_id=evidence.obs_id,
-                                role=evidence.role,
-                            )
-                            for evidence in evidence_rows
-                        ),
-                    }
-                )
-            )
-        return tuple(episodes)
+        return tuple(self._alert_episode_from_row(row) for row in rows)
 
     async def _reconcile_alerts_for_assessment(
         self,
@@ -1738,7 +1841,7 @@ class SqlAnsichBackend:
             "interrupted",
         }:
             return 0
-        episodes = await self._load_alert_episodes(
+        episodes = await self._load_reconciliation_alert_episodes(
             session,
             task_id=assessment.subject_id,
         )
@@ -1753,17 +1856,31 @@ class SqlAnsichBackend:
         for reconciliation in reconciliations:
             if reconciliation.change == "noop" or reconciliation.alert is None:
                 continue
-            previous = by_id.get(reconciliation.alert.alert_id)
+            candidate = reconciliation.alert
+            previous = by_id.get(candidate.alert_id)
+            hydrated_previous = previous
+            if previous is not None:
+                hydrated_previous = previous.model_copy(
+                    update={
+                        "evidence": await self._load_alert_evidence(
+                            session,
+                            alert_id=previous.alert_id,
+                        )
+                    }
+                )
+                if reconciliation.change == "resolved":
+                    candidate = candidate.model_copy(update={"evidence": hydrated_previous.evidence})
+                    reconciliation = reconciliation.model_copy(update={"alert": candidate})
             if previous is not None and self._same_alert_projection(
-                previous,
-                reconciliation.alert,
+                hydrated_previous,
+                candidate,
             ):
                 continue
             await self._persist_alert_episode(
                 session,
                 reconciliation=reconciliation,
             )
-            by_id[reconciliation.alert.alert_id] = reconciliation.alert
+            by_id[candidate.alert_id] = candidate
             changed += 1
         return changed
 
@@ -1891,7 +2008,7 @@ class SqlAnsichBackend:
         task_id: str,
         now: datetime,
     ) -> int:
-        episodes = await self._load_alert_episodes(
+        episodes = await self._load_reconciliation_alert_episodes(
             session,
             task_id=task_id,
         )
@@ -1899,6 +2016,14 @@ class SqlAnsichBackend:
         for episode in episodes:
             if episode.workflow_state == "resolved" or episode.resolved_at is not None:
                 continue
+            episode = episode.model_copy(
+                update={
+                    "evidence": await self._load_alert_evidence(
+                        session,
+                        alert_id=episode.alert_id,
+                    )
+                }
+            )
             resolved = resolve_alert_episode(
                 episode,
                 now=now,
@@ -2217,11 +2342,13 @@ class SqlAnsichBackend:
             alert_row = await session.scalar(select(AnsichAlertRow).where(AnsichAlertRow.entity_id == alert_id).with_for_update())
             if alert_row is None:
                 return None
-            episodes = await self._load_alert_episodes(
-                session,
-                task_id=alert_row.subject_id,
+            current = self._alert_episode_from_row(
+                alert_row,
+                evidence=await self._load_alert_evidence(
+                    session,
+                    alert_id=alert_id,
+                ),
             )
-            current = next(episode for episode in episodes if episode.alert_id == alert_id)
             if action == "acknowledge":
                 updated = acknowledge_alert(
                     current,

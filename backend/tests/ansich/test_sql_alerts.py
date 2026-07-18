@@ -7,8 +7,8 @@ from alembic import command as alembic_command
 from alembic.config import Config as AlembicConfig
 from ansich import AnsichService, ObservationEnvelope, Producer, new_id
 from ansich.alerts import AlertWorkflowConflict
-from sqlalchemy import create_engine, inspect, select, text
-from sqlalchemy.dialects import postgresql
+from sqlalchemy import create_engine, event, func, inspect, select, text
+from sqlalchemy.dialects import postgresql, sqlite
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 from sqlalchemy.schema import CreateTable
 
@@ -25,7 +25,11 @@ from deerflow.ansich.persistence.models import (
     AnsichObservationRow,
     AnsichOperatorActionRow,
 )
-from deerflow.ansich.persistence.sql import SqlAnsichBackend
+from deerflow.ansich.persistence.sql import (
+    SqlAnsichBackend,
+    _action_repetition_rows_statement,
+    _reconciliation_alert_rows_statement,
+)
 from deerflow.persistence.base import Base
 
 
@@ -239,6 +243,153 @@ async def test_sql_assessor_job_projects_exact_repetition_belief_and_alert(
         "acknowledge",
         "dismiss",
     ]
+
+
+@pytest.mark.anyio
+async def test_sql_assessor_jobs_coalesce_to_highest_pending_watermark(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    engine = create_async_engine(f"sqlite+aiosqlite:///{tmp_path / 'ansich-phase6-assessor-coalescing.db'}")
+    session_factory = async_sessionmaker(engine, expire_on_commit=False)
+    async with engine.begin() as connection:
+        await connection.run_sync(Base.metadata.create_all)
+    backend = SqlAnsichBackend(
+        session_factory,
+        exact_repetition_window=3,
+    )
+    service = AnsichService(
+        backend,
+        flush_interval_ms=60_000,
+        operations_assessment_interval_ms=60_000,
+    )
+    await service.start()
+    task_id = new_id()
+    started_at = datetime(2026, 7, 18, 16, 45, tzinfo=UTC)
+    evaluated_watermarks: list[int] = []
+    assessment_statements: list[str] = []
+    original = backend._assess_action_repetition_at
+
+    async def count_assessment(*args, evidence_watermark: int, **kwargs):
+        evaluated_watermarks.append(evidence_watermark)
+        return await original(
+            *args,
+            evidence_watermark=evidence_watermark,
+            **kwargs,
+        )
+
+    def capture_assessment_sql(
+        _connection,
+        _cursor,
+        statement,
+        _parameters,
+        _context,
+        _executemany,
+    ) -> None:
+        assessment_statements.append(" ".join(statement.lower().split()))
+
+    try:
+        service.record_batch(
+            (
+                ObservationEnvelope.task_lifecycle(
+                    kind="task.created",
+                    task_id=task_id,
+                    source_kind="deerflow_run",
+                    source_id="run-phase6-assessor-coalescing",
+                    occurred_at=started_at,
+                    source_event_id="run:phase6-assessor-coalescing:task:created",
+                ),
+                ObservationEnvelope.task_lifecycle(
+                    kind="task.started",
+                    task_id=task_id,
+                    source_kind="deerflow_run",
+                    source_id="run-phase6-assessor-coalescing",
+                    occurred_at=started_at,
+                    source_event_id="run:phase6-assessor-coalescing:task:started",
+                ),
+            )
+        )
+        await service.flush_task(task_id)
+        issued_obs_ids = tuple(
+            [
+                await _record_action_step(
+                    service,
+                    task_id=task_id,
+                    step_seq=step_seq,
+                    args={"query": "same"},
+                    observed_at=started_at + timedelta(seconds=step_seq),
+                )
+                for step_seq in range(1, 4)
+            ]
+        )
+        async with session_factory() as session:
+            pending_count = int(
+                await session.scalar(
+                    select(func.count())
+                    .select_from(AnsichAssessorJobRow)
+                    .where(
+                        AnsichAssessorJobRow.subject_id == task_id,
+                        AnsichAssessorJobRow.assessor_name == "action-repetition",
+                        AnsichAssessorJobRow.status == "pending",
+                    )
+                )
+                or 0
+            )
+            highest_watermark = await session.scalar(
+                select(func.max(AnsichAssessorJobRow.evidence_watermark)).where(
+                    AnsichAssessorJobRow.subject_id == task_id,
+                    AnsichAssessorJobRow.assessor_name == "action-repetition",
+                )
+            )
+        monkeypatch.setattr(
+            backend,
+            "_assess_action_repetition_at",
+            count_assessment,
+        )
+
+        event.listen(
+            engine.sync_engine,
+            "before_cursor_execute",
+            capture_assessment_sql,
+        )
+        try:
+            await service.assess_operations(now=started_at + timedelta(seconds=5))
+        finally:
+            event.remove(
+                engine.sync_engine,
+                "before_cursor_execute",
+                capture_assessment_sql,
+            )
+        signal = await service.get_current_belief(
+            task_id,
+            "behavior_signal:action-repetition",
+        )
+        async with session_factory() as session:
+            jobs = list(
+                (
+                    await session.execute(
+                        select(AnsichAssessorJobRow).where(
+                            AnsichAssessorJobRow.subject_id == task_id,
+                            AnsichAssessorJobRow.assessor_name == "action-repetition",
+                        )
+                    )
+                ).scalars()
+            )
+    finally:
+        await service.stop()
+        await engine.dispose()
+
+    assert pending_count > 1
+    assert highest_watermark is not None
+    assert evaluated_watermarks == [highest_watermark]
+    assert jobs
+    assert all(job.status == "completed" for job in jobs)
+    assert sum(job.attempts for job in jobs) == 1
+    assert signal is not None
+    assert signal.value["value"] == "runaway"
+    assert signal.evidence_obs_ids == issued_obs_ids
+    step_tool_joins = [statement for statement in assessment_statements if "from ansich_steps" in statement and "join ansich_tool_calls" in statement]
+    assert len(step_tool_joins) == 1
 
 
 @pytest.mark.anyio
@@ -653,6 +804,126 @@ async def test_sql_wall_clock_assessment_opens_and_resolves_liveness_alerts(
 
 
 @pytest.mark.anyio
+async def test_periodic_alert_reconciliation_skips_historical_episode_evidence(
+    tmp_path,
+) -> None:
+    engine = create_async_engine(f"sqlite+aiosqlite:///{tmp_path / 'ansich-phase6-alert-reconciliation.db'}")
+    session_factory = async_sessionmaker(engine, expire_on_commit=False)
+    async with engine.begin() as connection:
+        await connection.run_sync(Base.metadata.create_all)
+    service = create_sql_ansich_service(
+        session_factory,
+        heartbeat_stale_after_seconds=2,
+        operations_assessment_interval_ms=60_000,
+    )
+    await service.start()
+    task_id = new_id()
+    started_at = datetime(2026, 7, 18, 17, 45, tzinfo=UTC)
+    reconciliation_statements: list[str] = []
+
+    def capture_reconciliation_sql(
+        _connection,
+        _cursor,
+        statement,
+        _parameters,
+        _context,
+        _executemany,
+    ) -> None:
+        reconciliation_statements.append(" ".join(statement.lower().split()))
+
+    try:
+        service.record_batch(
+            (
+                ObservationEnvelope.task_lifecycle(
+                    kind="task.created",
+                    task_id=task_id,
+                    source_kind="deerflow_run",
+                    source_id="run-phase6-alert-reconciliation",
+                    occurred_at=started_at,
+                    source_event_id="run:phase6-alert-reconciliation:task:created",
+                ),
+                ObservationEnvelope.task_lifecycle(
+                    kind="task.started",
+                    task_id=task_id,
+                    source_kind="deerflow_run",
+                    source_id="run-phase6-alert-reconciliation",
+                    occurred_at=started_at,
+                    source_event_id="run:phase6-alert-reconciliation:task:started",
+                ),
+            )
+        )
+        await service.flush_task(task_id)
+        await service.assess_operations(now=started_at + timedelta(seconds=1))
+
+        for heartbeat_index, elapsed_seconds in enumerate(
+            (2, 6, 10),
+            start=1,
+        ):
+            service.record(
+                ObservationEnvelope.task_heartbeat(
+                    task_id=task_id,
+                    run_id="run-phase6-alert-reconciliation",
+                    occurred_at=started_at + timedelta(seconds=elapsed_seconds),
+                    elapsed_ms=elapsed_seconds * 1_000,
+                    worker_id="worker-phase6",
+                    ownership_epoch="epoch-1",
+                    producer_seq=heartbeat_index,
+                    source_event_id=(f"run:phase6-alert-reconciliation:heartbeat:{heartbeat_index}"),
+                )
+            )
+            await service.flush_task(task_id)
+            await service.assess_operations(
+                now=started_at + timedelta(seconds=elapsed_seconds),
+            )
+            if heartbeat_index < 3:
+                await service.assess_operations(
+                    now=started_at + timedelta(seconds=elapsed_seconds + 3),
+                )
+
+        async with session_factory() as session:
+            historical_episodes = list(
+                (
+                    await session.execute(
+                        select(AnsichAlertRow)
+                        .where(
+                            AnsichAlertRow.subject_id == task_id,
+                            AnsichAlertRow.alert_type == "heartbeat_missing",
+                        )
+                        .order_by(AnsichAlertRow.episode)
+                    )
+                ).scalars()
+            )
+
+        event.listen(
+            engine.sync_engine,
+            "before_cursor_execute",
+            capture_reconciliation_sql,
+        )
+        try:
+            stable_changes = await service.assess_operations(
+                now=started_at + timedelta(seconds=11),
+            )
+        finally:
+            event.remove(
+                engine.sync_engine,
+                "before_cursor_execute",
+                capture_reconciliation_sql,
+            )
+    finally:
+        await service.stop()
+        await engine.dispose()
+
+    assert [episode.episode for episode in historical_episodes] == [1, 2]
+    assert all(episode.workflow_state == "resolved" for episode in historical_episodes)
+    assert stable_changes == 0
+    alert_episode_queries = [statement for statement in reconciliation_statements if "from ansich_alerts" in statement]
+    alert_evidence_queries = [statement for statement in reconciliation_statements if "from ansich_alert_evidence" in statement]
+    assert len(alert_episode_queries) == 1
+    assert "max(ansich_alerts.episode)" in alert_episode_queries[0]
+    assert alert_evidence_queries == []
+
+
+@pytest.mark.anyio
 async def test_failed_assessor_jobs_degrade_health_and_can_be_retried(
     tmp_path,
     monkeypatch,
@@ -835,6 +1106,36 @@ def test_phase6_alert_models_compile_with_postgresql_semantics() -> None:
     assertion_columns = AnsichBeliefAssertionRow.__table__.c
     assert str(assertion_columns.config_hash.type) == "VARCHAR(64)"
     assert str(assertion_columns.authority_class.type) == "VARCHAR(32)"
+
+
+def test_assessment_channel_batch_queries_compile_portably() -> None:
+    for dialect in (sqlite.dialect(), postgresql.dialect()):
+        action_sql = " ".join(
+            str(
+                _action_repetition_rows_statement(
+                    task_id="task-portable",
+                    evidence_watermark=42,
+                ).compile(dialect=dialect)
+            )
+            .upper()
+            .split()
+        )
+        alert_sql = " ".join(
+            str(
+                _reconciliation_alert_rows_statement(
+                    task_id="task-portable",
+                ).compile(dialect=dialect)
+            )
+            .upper()
+            .split()
+        )
+
+        assert "FROM ANSICH_STEPS" in action_sql
+        assert "LEFT OUTER JOIN ANSICH_TOOL_CALLS" in action_sql
+        assert "LEFT OUTER JOIN ANSICH_OBSERVATIONS AS ISSUED_OBSERVATION" in action_sql
+        assert "MAX(ANSICH_ALERTS.EPISODE)" in alert_sql
+        assert "GROUP BY ANSICH_ALERTS.ALERT_KEY" in alert_sql
+        assert "ANSICH_ALERTS.WORKFLOW_STATE !=" in alert_sql
 
 
 def test_phase6_alert_migration_upgrades_sqlite_and_backfills_assertions(
