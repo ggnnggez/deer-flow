@@ -1,5 +1,13 @@
 # Phase 6 — 失控告警与干预
 
+## 实现状态（2026-07-18）
+
+🟡 开发中。首批 UI/API 工作已完成 Phase 4 跟进项 L3②（commit
+`0508a066`）：Task-scoped、cursor-paged、metadata-only 的上下文压缩摘要查询
+替代 bounded timeline 派生，Context & Lineage 支持显式继续分页，完整 membership
+仍按单条记录 lazy load。Assessor、Resolver、Alert episode、调度、Operator action
+与告警 UI 尚待本阶段后续切片实现。
+
 ## 1. 交付目标
 
 本阶段实现第一个完整的“Observation → Assessor → Belief Assertion → Resolver → Alert → Operator action”闭环。系统可以基于绝对预算突破和完全相同的动作签名重复判断 runaway；普通 Tool 高频只能产生 frequency Alert，不能自动把 Task 标记为 runaway。
@@ -106,8 +114,8 @@ Operations 页面加入 Alerts 区域；Task Overview 显示当前 behavior Beli
 
 Phase 6 前端首批工作同时清理 Phase 4 跟进项 L3②：新增按 Task 查询
 `ansich_context_compressions` 的独立 API，并让压缩列表改用该 API，不再从
-ContextSnapshot 响应间接拼装压缩记录。它属于本阶段 UI/API 迭代，不是
-Phase 6 开工门禁。
+bounded timeline 间接拼装压缩记录。该项已由 commit `0508a066` 完成；它属于
+本阶段 UI/API 迭代，不是 Phase 6 开工门禁。
 
 - `runaway`：exact repetition 或绝对规则支持；
 - `high tool frequency`：仅运维信号；

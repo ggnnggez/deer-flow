@@ -11,7 +11,7 @@
 | M3 | BFS 在 `depth == max_depth` 层丢弃两端都在结果集内的边且不标记截断 | ✅ 已修复 | 2026-07-18 | `bbc26e84` |
 | L1 | freeze 的 `id()` 身份匹配对 trim 部分副本整体失败,整次压缩记录被放弃 | ✅ 已修复 | 2026-07-18 | `ed1251ac` |
 | L2 | Ansich 关闭或无 execution context 时内部 marker 不在 provider 调用前剥离 | ✅ 已修复 | 2026-07-18 | `2d849557`,`8be2b08c` |
-| L3 | `_pending_content_derivations` 任务级只增不减;前端压缩列表只取当前 timeline 页 | 🟡 部分完成 | 2026-07-18 | ① `ba80f53b`;② Phase 6 |
+| L3 | `_pending_content_derivations` 任务级只增不减;前端压缩列表只取当前 timeline 页 | ✅ 已修复 | 2026-07-18 | ① `ba80f53b`;② `0508a066` |
 
 ## M1. 带 `ansich_block_ref` 的块每次模型调用重复写入含正文的 `content.produced`
 
@@ -55,7 +55,7 @@
 
 ## L3. 两处小的资源/完整性遗留
 
-- 状态:🟡 部分完成。① ✅ 已修复(2026-07-18,commit `ba80f53b`):读取 pending derivation 写入 `content.produced` 时绑定其确定性 producer observation ID,持久化 listener 确认该观察 durable 后同步清除 derivation 与反向绑定;collector 持续拒绝、无法收到 durable 确认时,任务级 registry 仍以最近 1024 个 derived block 为硬上限并淘汰最旧项。单元回归覆盖 durable 清理和容量淘汰,真实 coalescing → collector flush → lineage 链路验证清理不丢已落库边。② ⬜ 按既定归属留到 Phase 6 UI,不阻塞 Phase 5。以下为原始诊断记录。
+- 状态:✅ 已修复。① (2026-07-18,commit `ba80f53b`)读取 pending derivation 写入 `content.produced` 时绑定其确定性 producer observation ID,持久化 listener 确认该观察 durable 后同步清除 derivation 与反向绑定;collector 持续拒绝、无法收到 durable 确认时,任务级 registry 仍以最近 1024 个 derived block 为硬上限并淘汰最旧项。单元回归覆盖 durable 清理和容量淘汰,真实 coalescing → collector flush → lineage 链路验证清理不丢已落库边。② (2026-07-18,commit `0508a066`)新增 Task-scoped、cursor-paged、metadata-only 的压缩摘要 API,SQLite 实际查询及 SQLite/PostgreSQL 方言编译均有覆盖;Context & Lineage 改用独立无限查询和显式“加载更多”,不再依赖 bounded timeline,完整 membership 仍由点击后 lazy detail 读取。浏览器回归覆盖 timeline 无压缩事件但独立 API 两页均可发现的场景。以下为原始诊断记录。
 - 现状:
   1. `AnsichExecutionContext._pending_content_derivations` 只增不减:dynamic reminder 跨日变化、durable data block 内容变化都会产生新的 `derived_block_id` 条目,任务级生命周期内无清理路径。量级小(每模型调用至多几条),长任务缓慢累积。
   2. 前端 Task 详情页 `compressionIds` 只从**当前** timeline 分页提取(`page.tsx` 过滤 `context.compressed`),分页窗口外的压缩不会出现在 Context & Lineage 面板;长任务多次压缩时列表不完整,且无"更多"提示。

@@ -13,7 +13,7 @@
 - Phase 1 代码评审的跟进项登记在 [phase-1-review-followups.md](phase-1-review-followups.md)，各项带有修复状态、归属阶段与对应 commit；Phase 2 的实施前提 F4（projector 显式优先级）已修复。
 - Phase 2 代码评审的跟进项登记在 [phase-2-review-followups.md](phase-2-review-followups.md)；H2（上下文快照写放大与谱系完整性）的剩余压缩 inventory 与 derived-from 边已随 Phase 4 commit `a596a310` 落地，现已完成。
 - Phase 3 代码评审的跟进项登记在 [phase-3-review-followups.md](phase-3-review-followups.md)；M2（transform 显式元数据）与 M3（队列字节水位）均已完成，Phase 5 前置项已清；L1 观察开销基准按既定归属留到 Phase 12 验收前，不阻塞 Phase 5。
-- Phase 4 代码评审的跟进项登记在 [phase-4-review-followups.md](phase-4-review-followups.md)；M1/M2/M3、L1/L2 与 L3① 均已完成，Phase 5 前置项已清；L3② 前端压缩列表独立 API 按既定归属留到 Phase 6 UI。
+- Phase 4 代码评审的跟进项登记在 [phase-4-review-followups.md](phase-4-review-followups.md)；M1/M2/M3、L1/L2 与 L3①/② 均已完成；L3② 的前端压缩列表独立 API 已作为 Phase 6 首批 UI/API 工作落地。
 - Phase 5 代码评审的跟进项登记在 [phase-5-review-followups.md](phase-5-review-followups.md)；M1/M2/M3 与搭车项 L1/L2 均已修复，Phase 6 开工前置项已清；L3（usage 贡献契约收紧）留到 Phase 8 前。
 
 ## 固定实现边界
