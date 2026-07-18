@@ -104,6 +104,11 @@ poison assessor job 走 Phase 1 projection error；Phase 11 完成租约和隔�
 
 Operations 页面加入 Alerts 区域；Task Overview 显示当前 behavior Belief。UI 在证据中清楚区分：
 
+Phase 6 前端首批工作同时清理 Phase 4 跟进项 L3②：新增按 Task 查询
+`ansich_context_compressions` 的独立 API，并让压缩列表改用该 API，不再从
+ContextSnapshot 响应间接拼装压缩记录。它属于本阶段 UI/API 迭代，不是
+Phase 6 开工门禁。
+
 - `runaway`：exact repetition 或绝对规则支持；
 - `high tool frequency`：仅运维信号；
 - `heartbeat missing`：liveness rule，不是 hard failed；

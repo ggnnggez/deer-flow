@@ -10,7 +10,7 @@
 | M2 | heartbeat belief 去重键含每秒变化的 `age_ms`,断言表按 running 任务每秒 +1 行 | ✅ 已修复 | 2026-07-18 | `b6819263` |
 | M3 | Operations 页面用 active list 替换全部 Task 列表,历史 Task 失去 UI 入口 | ✅ 已修复 | 2026-07-18 | `bb9b1126` |
 | L1 | read model 每周期无条件重写 `updated_at`,ETag/304 机制几乎永不命中 | ✅ 已修复 | 2026-07-18 | `b6819263` |
-| L2 | 两个管理员 GET 在空结果时同步触发全量 assessment(读端点做重写工作) | ⬜ 未修复 | — | — |
+| L2 | 两个管理员 GET 在空结果时同步触发全量 assessment(读端点做重写工作) | ✅ 已修复 | 2026-07-18 | `b3bf19aa` |
 | L3 | token 维度的 `budget.consumed` 未被排除,存在与 `llm.responded` usage 双计的潜在路径 | ⬜ 未修复 | — | — |
 
 ## M1. `assess_operations` 每秒无过滤扫描全部历史 budget 行
@@ -48,7 +48,7 @@
 
 ## L2. 管理员 GET 在空结果时同步触发全量 assessment
 
-- 状态:⬜ 未修复。
+- 状态:✅ 已修复(2026-07-18,commit `b3bf19aa`)。`GET /operations/active-tasks` 与 `GET /tasks/{task_id}/budgets` 均已移除同步 `assess_operations`;读端点只返回最新 read model/belief 投影,写入由既有后台 assessor 周期负责。选择完全移除而非进程内冷启动标志,避免 projector loop 先刷新空库后新 Task 落地造成 readiness 竞态。HTTP 回归覆盖空筛选不改变 active row `updated_at`、budget health 未物化时 GET 如实返回空数组。以下保留原始诊断记录。
 - 位置:`routers/ansich.py::list_active_tasks`(`if not tasks and cursor is None: await service.assess_operations()`)与 `::get_task_budgets`(`if budgets.budgets and not health: await service.assess_operations()`)。
 - 现状:读端点在冷启动/空结果时同步执行一次完整 `assess_operations`——含 M1 的全量 budget 扫描和整个 read model 重建。后台 assessor 周期只有 1 秒,懒触发的收益只是首个请求少等最多 1 秒;代价是 GET 延迟在 M1 恶化时不可控,且读路径产生写副作用(assertion/read model 写入)。
 - 方向:随 M1 修复后重新评估;建议懒触发仅保留"read model 从未刷新过"(服务刚启动)一种情形,或完全移除依赖后台周期。
