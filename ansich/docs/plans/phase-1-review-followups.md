@@ -14,7 +14,7 @@
 | F2 | `_lost_ranges` 无上限内存增长 | ⬜ 未修复 | — | — |
 | F3 | 多 Gateway 实例写入竞态产生假丢失 | ⬜ 未修复 | — | — |
 | F4 | projector 执行顺序依赖字母序巧合 | ✅ 已修复 | 2026-07-17 | `66b426ed` |
-| F5 | `list_tasks` N+1 查询,前端轮询放大 | ⬜ 未修复 | — | — |
+| F5 | `list_tasks` N+1 查询,前端轮询放大 | ✅ 已修复 | 2026-07-18 | `059aded1` |
 | F6 | 每请求多次 `get_health()`(次要) | ⬜ 未修复 | — | — |
 | F7 | `rebuild_projections` 与后台 projector 并发认领,重建结果不确定 | ✅ 已修复 | 2026-07-17 | `58b1e92c` |
 
@@ -54,7 +54,7 @@
 
 ## F5. `list_tasks` N+1 查询,前端轮询放大
 
-- 状态:⬜ 未修复。
+- 状态:✅ 已修复(2026-07-18,commit `059aded1`)。按 TDD 修复:先在 CTE 中按稳定 `(last_evidence_at DESC,task_id)` 游标筛选/分页 TaskSummary,再一次 outer join current belief、assertion 与有序 evidence,在 Python 中按 Task 聚合证据;`limit` 因而不受 evidence fan-out 影响。缺失个别 assertion/current 行时用 summary 投影构造 degraded TaskView,不再缩短页面。SQLite 回归实测 3 条满页只执行 1 条查询;SQLite/PostgreSQL 方言均验证 `LIMIT` 位于 join 前的 CTE。以下为原始诊断记录。
 - 位置:`sql.py::list_tasks`(先查 summary 拿 id,再逐个 `get_task`,每个新开 session、3-4 条查询);router 允许 `limit=500`,前端 Operations 页每 5 秒轮询 `limit=100`。
 - 现状:admin-only 且默认禁用,当前可接受;但 Phase 5(活动任务、心跳)会提高列表读取频率与字段量,届时线性放大。
 - 方向:改为 summary/assertion/evidence 的 join 一次取回(TaskView 所需字段已全部在投影表中);顺带处理 `get_task` 对个别 id 返回 `None` 时页长短于 limit 的游标边缘情况。
