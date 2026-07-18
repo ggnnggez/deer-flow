@@ -7,7 +7,7 @@
 | 编号 | 摘要 | 状态 | 修复时间 | Commit |
 | ---- | ---- | ---- | -------- | ------ |
 | H1 | Timeline 轮询端点泄漏原始内容体,绕过带日志的 raw 通道 | ✅ 已修复 | 2026-07-17 | `c64d8ea2` |
-| H2 | 上下文快照物理全量重录，产生 O(N²) 写放大和投影队列风险 | 🟡 A-C 与 D 存储基础完成；压缩谱系留在 Phase 4 | 2026-07-17 | `6177d53d` |
+| H2 | 上下文快照物理全量重录，产生 O(N²) 写放大和投影队列风险 | ✅ 已完成 | 2026-07-18 | `a596a310` |
 | M1 | 新增 `inline_payload_max_bytes` 未 bump `config_version` | ✅ 已修复 | 2026-07-17 | `6177d53d` |
 | M2 | 模型实例上的 `_ansich_call_class` 元数据无读取方 | ✅ 已修复 | 2026-07-17 | `6177d53d` |
 | M3 | raw-payload 端点缺 `Cache-Control: no-store` | ✅ 已修复 | 2026-07-17 | `6177d53d` |
@@ -28,7 +28,7 @@
 
 ## H2. 上下文快照物理全量重录，产生 O(N²) 写放大和投影队列风险
 
-- 状态：🟡 分阶段修复。阶段 A、B、C 以及阶段 D 的 ContextState/Delta/物化存储基础已落地；常见 append-only 对话不再重复写历史 occurrence 和完整 snapshot inventory。阶段 D 的 `context.compressed` source/preserved/removed inventory 与 `derived_from` 边仍按原归属留在 Phase 4，不能用前后文本 diff 代替。该剩余项不阻塞 Phase 3，因为 Phase 3 前置条件是阶段 A 的长上下文队列与投影风险治理。
+- 状态：✅ 已完成(2026-07-18,commit `a596a310`)。阶段 A、B、C 与阶段 D 的 ContextState/Delta/物化存储基础均已落地；Phase 4 又完成压缩 source/preserved/removed inventory、summary ContentBlock 与有序 `compressed` derived-from 边，常见 append-only 对话不再重复写历史 occurrence 和完整 snapshot inventory，且压缩 provenance 不依赖前后文本 diff 猜测。以下保留原始诊断与分阶段方案。
 - 位置：`deerflow/ansich/middleware.py::_record_captured_request`、`ansich/serialization.py::serialize_model_request` / `_block`、`ansich/service.py::AnsichService.record`、`sql.py::persist_and_project` / `_project_context_snapshot`。
 
 ### H2.1 当前全量重录机制
@@ -137,7 +137,7 @@ registry 命中但 hash 改变表示内容发生了变换或 source identity 被
 
 归属：Phase 4 上下文谱系与压缩的完整方案。
 
-状态：🟡 存储基础已完成。attempt-specific ContextSnapshot 已改为引用可复用 immutable ContextState；ordered append/remove/replace/reorder delta、确定性物化、最大链深 32 的 checkpoint、父状态/内容块晚到修复和 replay/rebuild 测试已落地。压缩 source/preserved/removed inventory 与 summary `derived_from` 边仍是 Phase 4 工作，不在本轮冒充完成。
+状态：✅ 已完成。attempt-specific ContextSnapshot 已改为引用可复用 immutable ContextState；ordered append/remove/replace/reorder delta、确定性物化、最大链深 32 的 checkpoint、父状态/内容块晚到修复和 replay/rebuild 测试均已落地。Phase 4 commit `a596a310` 已补齐压缩 source/preserved/removed inventory、summary ContentBlock、连续压缩衔接与有序 `compressed` derived-from 边。
 
 1. 将可复用的不可变 `ContextState` 与“某次 attempt 捕获了它”的 `ContextSnapshot` 分开。当前 `ansich_context_snapshots.request_obs_id` 唯一且保存 `attempt_no`，不能直接让不同 attempts 共用同一 snapshot row。
 2. `ContextState` 支持 `parent_state_id + ordered delta`，delta 至少表达 append/remove/replace/reorder，并记录产生变化的 Observation/transform；系统仍需提供确定性的 full materialization。

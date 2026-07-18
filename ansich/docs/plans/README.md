@@ -2,16 +2,18 @@
 
 本目录把 [Ansich v0.2 设计](../ansich-design-document.md) 拆成十二个可独立执行、可独立验收的阶段。阶段按顺序交付，每个阶段都必须形成一条可运行的纵向切片，而不是只提交数据表、只提交探针或只提交页面。
 
-## 当前实施状态（2026-07-17）
+## 当前实施状态（2026-07-18）
 
 - Phase 1 已形成可运行纵向切片：嵌入式启动、Run→Task 生命周期、严格 Observation 契约、有界 fail-open Collector、Observation/job 原子写入、独立 leased projector、Task/Scope/Belief 投影、重放、管理员 API，以及 dev/op 工作区列表和详情页均已实现。
 - SQLite、Gateway、Run worker、API、前端类型/lint、前端全量单测，以及管理员列表→Task 详情和 503 的真实浏览器 E2E 已经验证；Phase 1 尚未标记最终完成，因为 PostgreSQL 集成矩阵、关闭 Ansich 的基准对比和生产环境 paper drill 仍待执行。
 - Phase 2 已形成可运行的本地纵向切片：逻辑 Step 与 adapter attempt 分层、内部 LLM system operation、有序模型输入快照、payload 分层、SQL 投影/API，以及 Operations 的 Timeline/Steps/Context 页面均已实现。SQLite、相关后端回归、前端全量单测和真实浏览器 E2E 已验证；PostgreSQL 迁移矩阵、关闭 Ansich 的性能基准和生产 paper drill 完成前不标记最终完成。
 - Phase 3 已形成可运行的本地纵向切片：Tool intent、raw callable boundary、模型可见结果和 unknown/denied authorization attachment point 分离；Task terminal reconciliation、重启恢复、typed SQL 投影、issued/executed usage、管理员 API 以及四段责任链页面均已实现。SQLite migration/rebuild、后端 Ansich 回归、前端类型/lint 和 raw/visible 权限边界已验证；PostgreSQL 迁移矩阵与生产负载演练仍属于后续生产就绪门禁。
-- Phase 4–12 尚未开始实现；页面不得提前显示压缩谱系、进度百分比、预算或语义判断的占位数据。
+- Phase 4 已形成可运行的本地纵向切片：typed producer/derivation 表、纯 BFS 谱系遍历、压缩前冻结的 source/preserved/removed inventory、summary block 与 `compressed` 边、snapshot 反向 membership、metadata-only 的 lineage/exposure/snapshot/compression API 以及 Context & Lineage 页面均已实现（详见 [04-context-lineage-and-compression.md](04-context-lineage-and-compression.md) 的实现状态）。PostgreSQL 迁移矩阵、关闭 Ansich 的基准对比和生产 paper drill 完成前不标记最终完成。
+- Phase 5–12 尚未开始实现；页面不得提前显示进度百分比、预算或语义判断的占位数据。
 - Phase 1 代码评审的跟进项登记在 [phase-1-review-followups.md](phase-1-review-followups.md)，各项带有修复状态、归属阶段与对应 commit；Phase 2 的实施前提 F4（projector 显式优先级）已修复。
-- Phase 2 代码评审的跟进项登记在 [phase-2-review-followups.md](phase-2-review-followups.md)；其中 H2（上下文快照写放大与 hash 去重）的存储基础已随 Phase 3 落地，压缩谱系部分仍是 Phase 4 实施时必须吸收的输入。
-- Phase 3 代码评审的跟进项登记在 [phase-3-review-followups.md](phase-3-review-followups.md)；其中 M2（transform 显式元数据）需在 Phase 4 前完成，M3（队列字节水位）需在 Phase 5 前完成。
+- Phase 2 代码评审的跟进项登记在 [phase-2-review-followups.md](phase-2-review-followups.md)；H2（上下文快照写放大与谱系完整性）的剩余压缩 inventory 与 derived-from 边已随 Phase 4 commit `a596a310` 落地，现已完成。
+- Phase 3 代码评审的跟进项登记在 [phase-3-review-followups.md](phase-3-review-followups.md)；M2（transform 显式元数据）与 M3（队列字节水位）均已完成，Phase 5 前置项已清；L1 观察开销基准按既定归属留到 Phase 12 验收前，不阻塞 Phase 5。
+- Phase 4 代码评审的跟进项登记在 [phase-4-review-followups.md](phase-4-review-followups.md)；M1/M2/M3、L1/L2 与 L3① 均已完成，Phase 5 前置项已清；L3② 前端压缩列表独立 API 按既定归属留到 Phase 6 UI。
 
 ## 固定实现边界
 
