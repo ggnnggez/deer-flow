@@ -150,6 +150,90 @@ def _as_utc(value: datetime) -> datetime:
     return value.astimezone(UTC)
 
 
+def _list_task_views_statement(
+    *,
+    limit: int,
+    control: ControlValue | None,
+    from_time: datetime | None,
+    to_time: datetime | None,
+    cursor: tuple[datetime, str] | None,
+):
+    page_statement = select(
+        AnsichTaskSummaryRow.task_id,
+        AnsichTaskSummaryRow.source_kind,
+        AnsichTaskSummaryRow.source_id,
+        AnsichTaskSummaryRow.control_value,
+        AnsichTaskSummaryRow.control_as_of,
+        AnsichTaskSummaryRow.last_evidence_at,
+        AnsichTaskSummaryRow.assertion_id,
+        AnsichTaskSummaryRow.observability_status,
+        AnsichTaskSummaryRow.tool_calls_issued,
+        AnsichTaskSummaryRow.tool_calls_executed,
+    )
+    if control is not None:
+        page_statement = page_statement.where(AnsichTaskSummaryRow.control_value == control)
+    if from_time is not None:
+        page_statement = page_statement.where(AnsichTaskSummaryRow.last_evidence_at >= from_time)
+    if to_time is not None:
+        page_statement = page_statement.where(AnsichTaskSummaryRow.last_evidence_at <= to_time)
+    if cursor is not None:
+        cursor_time, cursor_task_id = cursor
+        page_statement = page_statement.where(
+            or_(
+                AnsichTaskSummaryRow.last_evidence_at < cursor_time,
+                and_(
+                    AnsichTaskSummaryRow.last_evidence_at == cursor_time,
+                    AnsichTaskSummaryRow.task_id > cursor_task_id,
+                ),
+            )
+        )
+    page = (
+        page_statement.order_by(
+            AnsichTaskSummaryRow.last_evidence_at.desc(),
+            AnsichTaskSummaryRow.task_id,
+        )
+        .limit(limit)
+        .cte("ansich_task_page")
+    )
+    return (
+        select(
+            page,
+            AnsichCurrentBeliefRow.resolver_name.label("resolver_name"),
+            AnsichCurrentBeliefRow.resolver_version.label("resolver_version"),
+            AnsichBeliefAssertionRow.value_json.label("assertion_value_json"),
+            AnsichBeliefAssertionRow.as_of.label("assertion_as_of"),
+            AnsichBeliefAssertionRow.asserted_at.label("assertion_asserted_at"),
+            AnsichBeliefAssertionRow.source_name.label("assertion_source_name"),
+            AnsichBeliefAssertionRow.source_version.label("assertion_source_version"),
+            AnsichBeliefEvidenceRow.obs_id.label("evidence_obs_id"),
+            AnsichBeliefEvidenceRow.ordinal.label("evidence_ordinal"),
+        )
+        .select_from(page)
+        .outerjoin(
+            AnsichCurrentBeliefRow,
+            and_(
+                AnsichCurrentBeliefRow.subject_id == page.c.task_id,
+                AnsichCurrentBeliefRow.field_name == "control",
+                AnsichCurrentBeliefRow.assertion_id == page.c.assertion_id,
+            ),
+        )
+        .outerjoin(
+            AnsichBeliefAssertionRow,
+            AnsichBeliefAssertionRow.assertion_id == page.c.assertion_id,
+        )
+        .outerjoin(
+            AnsichBeliefEvidenceRow,
+            AnsichBeliefEvidenceRow.assertion_id == page.c.assertion_id,
+        )
+        .order_by(
+            page.c.last_evidence_at.desc(),
+            page.c.task_id,
+            AnsichBeliefEvidenceRow.ordinal,
+            AnsichBeliefEvidenceRow.obs_id,
+        )
+    )
+
+
 def _canonical_content_bytes(body: object) -> tuple[str, bytes]:
     if isinstance(body, str):
         return "text/plain; charset=utf-8", body.encode("utf-8")
@@ -707,39 +791,55 @@ class SqlAnsichBackend:
         cursor: tuple[datetime, str] | None = None,
     ) -> list[TaskView]:
         async with self._session_factory() as session:
-            statement = select(AnsichTaskSummaryRow.task_id)
-            if control is not None:
-                statement = statement.where(AnsichTaskSummaryRow.control_value == control)
-            if from_time is not None:
-                statement = statement.where(AnsichTaskSummaryRow.last_evidence_at >= from_time)
-            if to_time is not None:
-                statement = statement.where(AnsichTaskSummaryRow.last_evidence_at <= to_time)
-            if cursor is not None:
-                cursor_time, cursor_task_id = cursor
-                statement = statement.where(
-                    or_(
-                        AnsichTaskSummaryRow.last_evidence_at < cursor_time,
-                        and_(
-                            AnsichTaskSummaryRow.last_evidence_at == cursor_time,
-                            AnsichTaskSummaryRow.task_id > cursor_task_id,
-                        ),
+            rows = (
+                await session.execute(
+                    _list_task_views_statement(
+                        limit=limit,
+                        control=control,
+                        from_time=from_time,
+                        to_time=to_time,
+                        cursor=cursor,
                     )
                 )
-            task_ids = list(
-                (
-                    await session.execute(
-                        statement.order_by(
-                            AnsichTaskSummaryRow.last_evidence_at.desc(),
-                            AnsichTaskSummaryRow.task_id,
-                        ).limit(limit)
-                    )
-                ).scalars()
-            )
+            ).all()
+        row_by_task_id = {}
+        evidence_by_task_id: dict[str, list[str]] = {}
+        for row in rows:
+            if row.task_id not in row_by_task_id:
+                row_by_task_id[row.task_id] = row
+                evidence_by_task_id[row.task_id] = []
+            if row.evidence_obs_id is not None:
+                evidence_by_task_id[row.task_id].append(row.evidence_obs_id)
+
         tasks: list[TaskView] = []
-        for task_id in task_ids:
-            task = await self.get_task(task_id)
-            if task is not None:
-                tasks.append(task)
+        for task_id, row in row_by_task_id.items():
+            assertion_value = row.assertion_value_json
+            control_value = assertion_value.get("value", row.control_value) if isinstance(assertion_value, dict) else row.control_value
+            tasks.append(
+                TaskView(
+                    task_id=task_id,
+                    source_kind=row.source_kind,
+                    source_id=row.source_id,
+                    control=ControlBelief(
+                        value=cast(str, control_value),
+                        as_of=_as_utc(row.assertion_as_of or row.control_as_of),
+                        asserted_at=_as_utc(row.assertion_asserted_at or row.last_evidence_at),
+                        source=NamedVersion(
+                            name=row.assertion_source_name or "task-control",
+                            version=row.assertion_source_version or "1",
+                        ),
+                        fidelity_class="hard",
+                        selected_by=NamedVersion(
+                            name=row.resolver_name or "control-state",
+                            version=row.resolver_version or "1",
+                        ),
+                        evidence_obs_ids=tuple(evidence_by_task_id[task_id]),
+                    ),
+                    observability_status=(row.observability_status if row.assertion_value_json is not None and row.resolver_name is not None else "degraded"),
+                    tool_calls_issued=row.tool_calls_issued,
+                    tool_calls_executed=row.tool_calls_executed,
+                )
+            )
         return tasks
 
     async def list_observations(self, task_id: str) -> list[ObservationEnvelope]:

@@ -14,7 +14,7 @@ from langchain_core.language_models import BaseChatModel
 from langchain_core.messages import AIMessage, HumanMessage
 from langchain_core.outputs import ChatGeneration, ChatResult
 from langchain_core.tools import tool
-from sqlalchemy import create_engine, event, func, inspect, select, text
+from sqlalchemy import create_engine, delete, event, func, inspect, select, text
 from sqlalchemy.dialects import postgresql, sqlite
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
@@ -35,8 +35,9 @@ from deerflow.ansich.persistence.models import (
     AnsichProjectionJobRow,
     AnsichRelationRow,
     AnsichScopeRow,
+    AnsichTaskSummaryRow,
 )
-from deerflow.ansich.persistence.sql import SqlAnsichBackend
+from deerflow.ansich.persistence.sql import SqlAnsichBackend, _list_task_views_statement
 from deerflow.ansich.tool_middleware import AnsichRawToolMiddleware, AnsichVisibleToolMiddleware
 from deerflow.persistence.base import Base
 
@@ -708,6 +709,75 @@ async def test_projection_failure_keeps_raw_observation_and_records_retry_eviden
     assert task.control.evidence_obs_ids == ()
     assert health.status == "degraded"
     assert health.failed_jobs == 1
+
+
+@pytest.mark.anyio
+async def test_list_tasks_uses_one_joined_query_and_keeps_page_length_with_a_missing_assertion(
+    tmp_path,
+):
+    engine = create_async_engine(f"sqlite+aiosqlite:///{tmp_path / 'ansich-task-list-query.db'}")
+    session_factory = async_sessionmaker(engine, expire_on_commit=False)
+    async with engine.begin() as connection:
+        await connection.run_sync(Base.metadata.create_all)
+    backend = SqlAnsichBackend(session_factory)
+    service = AnsichService(backend, flush_interval_ms=60_000)
+    await service.start()
+    task_ids = [new_id() for _ in range(3)]
+    observed_at = datetime(2026, 7, 17, 11, 10, tzinfo=UTC)
+
+    for index, task_id in enumerate(task_ids):
+        service.record(
+            ObservationEnvelope.task_lifecycle(
+                kind="task.created",
+                task_id=task_id,
+                source_kind="deerflow_run",
+                source_id=f"run-list-query-{index}",
+                occurred_at=observed_at,
+                source_event_id=f"run:run-list-query-{index}:task:created",
+            )
+        )
+        await service.flush_task(task_id)
+    await service.stop()
+
+    async with session_factory() as session, session.begin():
+        missing_assertion_id = await session.scalar(select(AnsichTaskSummaryRow.assertion_id).where(AnsichTaskSummaryRow.task_id == task_ids[1]))
+        assert missing_assertion_id is not None
+        await session.execute(delete(AnsichBeliefAssertionRow).where(AnsichBeliefAssertionRow.assertion_id == missing_assertion_id))
+
+    select_count = 0
+
+    def count_selects(_connection, _cursor, statement, _parameters, _context, _executemany):
+        nonlocal select_count
+        if statement.lstrip().upper().startswith(("SELECT", "WITH")):
+            select_count += 1
+
+    event.listen(engine.sync_engine, "before_cursor_execute", count_selects)
+    try:
+        tasks = await backend.list_tasks(limit=3)
+    finally:
+        event.remove(engine.sync_engine, "before_cursor_execute", count_selects)
+        await engine.dispose()
+
+    assert len(tasks) == 3
+    assert {task.task_id for task in tasks} == set(task_ids)
+    assert next(task for task in tasks if task.task_id == task_ids[1]).observability_status == "degraded"
+    assert select_count == 1
+
+
+def test_list_tasks_page_cte_compiles_before_joins_for_sqlite_and_postgres() -> None:
+    statement = _list_task_views_statement(
+        limit=100,
+        control="running",
+        from_time=datetime(2026, 7, 17, 10, 0, tzinfo=UTC),
+        to_time=datetime(2026, 7, 17, 12, 0, tzinfo=UTC),
+        cursor=(datetime(2026, 7, 17, 11, 0, tzinfo=UTC), new_id()),
+    )
+
+    for dialect in (sqlite.dialect(), postgresql.dialect()):
+        compiled = " ".join(str(statement.compile(dialect=dialect)).upper().split())
+        assert compiled.startswith("WITH ANSICH_TASK_PAGE AS")
+        assert compiled.index(" LIMIT ") < compiled.index(" LEFT OUTER JOIN ")
+        assert compiled.count(" LEFT OUTER JOIN ") == 3
 
 
 @pytest.mark.anyio

@@ -374,6 +374,10 @@ count/byte capacity plus both high-watermarks, and snapshot
 accepted/dropped/item/byte/incomplete/missing counts. Queue byte accounting uses
 the canonical serialized Observation envelope size, so large tool artifacts and
 base64 payloads cannot bypass the in-process memory bound.
+The polled Operations Task list uses one portable CTE + outer-join query over
+TaskSummary/current assertion/ordered evidence; pagination happens before
+evidence fan-out, and an isolated missing assertion yields a degraded row rather
+than a short page.
 Phase 3 Tool probes record intent before tool middleware, raw execution inside
 `ToolErrorHandlingMiddleware`, and the final model-visible result outside output
 budget/sanitization. Ansich IDs plus `(step_id, call_seq)` are authoritative;

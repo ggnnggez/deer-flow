@@ -1040,6 +1040,11 @@ Filters include control/behavior belief, AgentRelease, time range, Alert, and
 observability health. Every response includes projection status, lag, failed
 jobs, and lost ranges.
 
+The Operations Task list pages `TaskSummary` rows in a CTE before joining the
+current assertion and ordered evidence. This keeps the query count constant,
+prevents evidence fan-out from changing page size, and lets an isolated missing
+assertion remain visible as a degraded Task instead of shortening the page.
+
 ### 11.2 Developer endpoints
 
 ```text
