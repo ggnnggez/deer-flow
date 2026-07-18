@@ -370,7 +370,10 @@ typed `incomplete` gaps that late observations can repair instead of poisoning a
 projection job. Canonical bytes are deduplicated in `ansich_content_blobs` (large
 payloads externalize through `ansich_payloads`) and load only through the logged,
 `Cache-Control: no-store` admin raw-payload route. Ansich health includes queue
-high-watermark and snapshot accepted/dropped/item/byte/incomplete/missing counts.
+count/byte capacity plus both high-watermarks, and snapshot
+accepted/dropped/item/byte/incomplete/missing counts. Queue byte accounting uses
+the canonical serialized Observation envelope size, so large tool artifacts and
+base64 payloads cannot bypass the in-process memory bound.
 Phase 3 Tool probes record intent before tool middleware, raw execution inside
 `ToolErrorHandlingMiddleware`, and the final model-visible result outside output
 budget/sanitization. Ansich IDs plus `(step_id, call_seq)` are authoritative;

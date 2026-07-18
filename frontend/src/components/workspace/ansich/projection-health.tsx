@@ -34,6 +34,14 @@ export function AnsichProjectionHealth({ health }: { health: AnsichHealth }) {
           value={String(health.queue_high_watermark)}
         />
         <HealthMetric
+          label={t.ansich.queueBytes}
+          value={`${formatBytes(health.queue_bytes)}/${formatBytes(health.queue_byte_capacity)}`}
+        />
+        <HealthMetric
+          label={t.ansich.queueByteHighWatermark}
+          value={formatBytes(health.queue_byte_high_watermark)}
+        />
+        <HealthMetric
           label={t.ansich.watermark}
           value={health.watermark === null ? "—" : String(health.watermark)}
         />
@@ -70,6 +78,18 @@ export function AnsichProjectionHealth({ health }: { health: AnsichHealth }) {
       </CardContent>
     </Card>
   );
+}
+
+function formatBytes(bytes: number): string {
+  if (bytes < 1024) return `${bytes} B`;
+  const units = ["KiB", "MiB", "GiB"];
+  let value = bytes / 1024;
+  let unit = units[0];
+  for (let index = 1; index < units.length && value >= 1024; index += 1) {
+    value /= 1024;
+    unit = units[index];
+  }
+  return `${value >= 10 || Number.isInteger(value) ? value.toFixed(0) : value.toFixed(1)} ${unit}`;
 }
 
 function HealthMetric({ label, value }: { label: string; value: string }) {

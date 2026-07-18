@@ -17,6 +17,13 @@ from ansich.step import ContentBlockPayloadView, ContentOccurrenceView, ContextS
 from ansich.tool import ToolCallView
 
 
+def _serialized_observation_size(observation: ObservationEnvelope) -> int:
+    try:
+        return len(observation.model_dump_json().encode("utf-8"))
+    except Exception:
+        return -1
+
+
 class AnsichService:
     """Small public interface around collection, projection, and Task queries."""
 
@@ -25,6 +32,7 @@ class AnsichService:
         backend: AnsichBackend,
         *,
         queue_capacity: int = 10_000,
+        queue_byte_capacity: int = 64 * 1024 * 1024,
         batch_size: int = 100,
         flush_interval_ms: int = 100,
         terminal_flush_timeout_ms: int = 2_000,
@@ -33,6 +41,8 @@ class AnsichService:
     ) -> None:
         if queue_capacity < 1:
             raise ValueError("queue_capacity must be positive")
+        if queue_byte_capacity < 1:
+            raise ValueError("queue_byte_capacity must be positive")
         if batch_size < 1:
             raise ValueError("batch_size must be positive")
         if flush_interval_ms < 1:
@@ -42,11 +52,13 @@ class AnsichService:
         if projector_poll_interval_ms < 1:
             raise ValueError("projector_poll_interval_ms must be positive")
         self._capacity = queue_capacity
+        self._byte_capacity = queue_byte_capacity
         self._batch_size = batch_size
         self._flush_interval_seconds = flush_interval_ms / 1000
         self._terminal_flush_timeout_seconds = terminal_flush_timeout_ms / 1000
         self._projector_poll_interval_seconds = projector_poll_interval_ms / 1000
-        self._queue: deque[tuple[int, ObservationEnvelope]] = deque()
+        self._queue: deque[tuple[int, ObservationEnvelope, int]] = deque()
+        self._queue_bytes = 0
         self._lock = Lock()
         self._running = False
         self._backend = backend
@@ -55,6 +67,7 @@ class AnsichService:
         self._accepted_count = 0
         self._dropped_count = 0
         self._queue_high_watermark = 0
+        self._queue_byte_high_watermark = 0
         self._snapshot_request_count = 0
         self._snapshot_observations_accepted = 0
         self._snapshot_observations_dropped = 0
@@ -74,6 +87,7 @@ class AnsichService:
         cls,
         *,
         queue_capacity: int = 10_000,
+        queue_byte_capacity: int = 64 * 1024 * 1024,
         batch_size: int = 100,
         flush_interval_ms: int = 100,
         terminal_flush_timeout_ms: int = 2_000,
@@ -82,6 +96,7 @@ class AnsichService:
         return cls(
             InMemoryAnsichBackend(),
             queue_capacity=queue_capacity,
+            queue_byte_capacity=queue_byte_capacity,
             batch_size=batch_size,
             flush_interval_ms=flush_interval_ms,
             terminal_flush_timeout_ms=terminal_flush_timeout_ms,
@@ -116,6 +131,8 @@ class AnsichService:
         batch = tuple(observations)
         if not batch:
             return ()
+        observation_sizes = tuple(_serialized_observation_size(observation) if isinstance(observation, ObservationEnvelope) else 0 for observation in batch)
+        batch_bytes = sum(max(0, observation_size) for observation_size in observation_sizes)
         with self._lock:
             first_sequence = self._record_sequence + 1
             self._record_sequence += len(batch)
@@ -125,12 +142,16 @@ class AnsichService:
             reason = None
             if any(not isinstance(observation, ObservationEnvelope) for observation in batch):
                 reason = "validation_failed"
+            elif any(observation_size < 0 for observation_size in observation_sizes):
+                reason = "serialization_failed"
             elif self._unavailable_reason is not None:
                 reason = self._unavailable_reason
             elif not self._running:
                 reason = "service_not_running"
             elif len(self._queue) + len(batch) > self._capacity:
                 reason = "queue_full"
+            elif self._queue_bytes + batch_bytes > self._byte_capacity:
+                reason = "queue_bytes_full"
             if reason is not None:
                 self._record_batch_loss(sequences, batch)
                 if batch_kind == "context_snapshot":
@@ -143,10 +164,20 @@ class AnsichService:
                     )
                     for observation in batch
                 )
-            for sequence, observation in zip(sequences, batch, strict=True):
-                self._queue.append((sequence, observation))
+            for sequence, observation, observation_size in zip(
+                sequences,
+                batch,
+                observation_sizes,
+                strict=True,
+            ):
+                self._queue.append((sequence, observation, observation_size))
+            self._queue_bytes += batch_bytes
             self._accepted_count += len(batch)
             self._queue_high_watermark = max(self._queue_high_watermark, len(self._queue))
+            self._queue_byte_high_watermark = max(
+                self._queue_byte_high_watermark,
+                self._queue_bytes,
+            )
             if batch_kind == "context_snapshot":
                 self._snapshot_observations_accepted += len(batch)
             loop = self._loop
@@ -158,9 +189,11 @@ class AnsichService:
                 with self._lock:
                     sequence_set = set(sequences)
                     retained = deque(item for item in self._queue if item[0] not in sequence_set)
+                    removed_bytes = sum(item[2] for item in self._queue if item[0] in sequence_set)
                     removed_count = len(self._queue) - len(retained)
                     if removed_count:
                         self._queue = retained
+                        self._queue_bytes -= removed_bytes
                         self._accepted_count -= removed_count
                         self._record_batch_loss(sequences, batch)
                         if batch_kind == "context_snapshot":
@@ -179,6 +212,8 @@ class AnsichService:
                 status=status,
                 queue_depth=len(self._queue),
                 queue_capacity=self._capacity,
+                queue_bytes=self._queue_bytes,
+                queue_byte_capacity=self._byte_capacity,
                 accepted_count=self._accepted_count,
                 dropped_count=self._dropped_count,
                 lost_ranges=tuple(self._lost_ranges),
@@ -189,6 +224,7 @@ class AnsichService:
                 range_known=True,
                 storage_available=self._unavailable_reason is None,
                 queue_high_watermark=self._queue_high_watermark,
+                queue_byte_high_watermark=self._queue_byte_high_watermark,
                 snapshot_request_count=self._snapshot_request_count,
                 snapshot_observations_accepted=self._snapshot_observations_accepted,
                 snapshot_observations_dropped=self._snapshot_observations_dropped,
@@ -451,14 +487,17 @@ class AnsichService:
 
     def _take_task_items(self, task_id: str) -> list[tuple[int, ObservationEnvelope]]:
         selected: list[tuple[int, ObservationEnvelope]] = []
-        retained: deque[tuple[int, ObservationEnvelope]] = deque()
+        retained: deque[tuple[int, ObservationEnvelope, int]] = deque()
+        retained_bytes = 0
         while self._queue:
-            sequence, observation = self._queue.popleft()
+            sequence, observation, observation_size = self._queue.popleft()
             if observation.task_id == task_id:
                 selected.append((sequence, observation))
             else:
-                retained.append((sequence, observation))
+                retained.append((sequence, observation, observation_size))
+                retained_bytes += observation_size
         self._queue = retained
+        self._queue_bytes = retained_bytes
         return selected
 
     async def _writer_loop(self) -> None:
@@ -494,7 +533,9 @@ class AnsichService:
 
     async def _flush_batch(self) -> FlushResult:
         with self._lock:
-            selected = [self._queue.popleft() for _ in range(min(len(self._queue), self._batch_size))]
+            queued = [self._queue.popleft() for _ in range(min(len(self._queue), self._batch_size))]
+            self._queue_bytes -= sum(item[2] for item in queued)
+            selected = [(sequence, observation) for sequence, observation, _ in queued]
         return await self._persist_items(selected)
 
     async def _persist_items(self, selected: list[tuple[int, ObservationEnvelope]]) -> FlushResult:

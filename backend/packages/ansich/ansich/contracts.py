@@ -234,6 +234,8 @@ class AnsichHealth(BaseModel):
     status: Literal["healthy", "degraded", "failed", "stopped"]
     queue_depth: int
     queue_capacity: int
+    queue_bytes: int = 0
+    queue_byte_capacity: int = 0
     accepted_count: int
     dropped_count: int
     lost_ranges: tuple[LostRange, ...]
@@ -244,6 +246,7 @@ class AnsichHealth(BaseModel):
     range_known: bool = True
     storage_available: bool = True
     queue_high_watermark: int = 0
+    queue_byte_high_watermark: int = 0
     snapshot_request_count: int = 0
     snapshot_observations_accepted: int = 0
     snapshot_observations_dropped: int = 0

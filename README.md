@@ -564,7 +564,7 @@ When enabled, every Gateway HTTP response includes `X-Trace-Id`, logs include `t
 
 #### Ansich Operations (Experimental)
 
-Ansich is an embedded, developer/operator-first observability module for inspecting Agent Tasks, logical Steps and LLM attempts, model-visible context, ToolCall accountability, context compression, and ContentBlock lineage. Enable `ansich.enabled: true` in `config.yaml`, restart the Gateway, and open the admin-only `/workspace/ansich/operations` page. Collection is fail-open: an Ansich write or projection failure degrades observability without changing the Agent run result. The UI reports failed projection jobs separately from a genuinely empty effective context.
+Ansich is an embedded, developer/operator-first observability module for inspecting Agent Tasks, logical Steps and LLM attempts, model-visible context, ToolCall accountability, context compression, and ContentBlock lineage. Enable `ansich.enabled: true` in `config.yaml`, restart the Gateway, and open the admin-only `/workspace/ansich/operations` page. Collection is fail-open: an Ansich write or projection failure degrades observability without changing the Agent run result. The collector queue is bounded by both `ansich.queue_capacity` and `ansich.queue_byte_capacity`; current usage and high-watermarks are visible in Operations. The UI reports failed projection jobs separately from a genuinely empty effective context.
 
 #### LangSmith Tracing
 

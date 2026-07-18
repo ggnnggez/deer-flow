@@ -914,6 +914,9 @@ payload reference, that reference must also be valid in the same transaction.
 
 Collection and projection use at-least-once delivery with deduplication and
 idempotency. Each Gateway worker has a unique producer instance and writer.
+The in-process collector queue is bounded by both Observation count and
+canonical serialized envelope bytes; health exposes current bytes, byte
+capacity, and the byte high-watermark alongside the count metrics.
 Projectors claim database jobs with leases; PostgreSQL may use `FOR UPDATE SKIP
 LOCKED`, while SQLite remains single-Gateway-worker as required by DeerFlow.
 

@@ -449,6 +449,8 @@ export const enUS: Translations = {
     failedJobs: "Failed jobs",
     queue: "Queue",
     queueHighWatermark: "Queue high-watermark",
+    queueBytes: "Queue bytes",
+    queueByteHighWatermark: "Queue byte high-watermark",
     snapshotRequests: "Snapshot requests",
     snapshotItems: "Snapshot items",
     contextAndLineage: "Context & lineage",

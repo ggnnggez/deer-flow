@@ -14,6 +14,8 @@ const HEALTH = {
   status: "healthy",
   queue_depth: 0,
   queue_capacity: 10_000,
+  queue_bytes: 1024,
+  queue_byte_capacity: 67_108_864,
   accepted_count: 3,
   dropped_count: 0,
   lost_ranges: [],
@@ -24,6 +26,7 @@ const HEALTH = {
   range_known: true,
   storage_available: true,
   queue_high_watermark: 2,
+  queue_byte_high_watermark: 2048,
   snapshot_request_count: 1,
   snapshot_observations_accepted: 3,
   snapshot_observations_dropped: 0,
@@ -479,6 +482,7 @@ test("admin navigates from Ansich operations to evidence-backed Task detail", as
   await page.waitForURL("**/workspace/ansich/operations");
   await expect(page.getByRole("heading", { name: "Operations" })).toBeVisible();
   await expect(page.getByText("Healthy", { exact: true })).toBeVisible();
+  await expect(page.getByText("Queue bytes", { exact: true })).toBeVisible();
   await page.getByRole("link", { name: new RegExp(TASK_ID) }).click();
 
   await page.waitForURL(`**/workspace/ansich/tasks/${TASK_ID}`);

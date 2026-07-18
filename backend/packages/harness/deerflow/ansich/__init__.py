@@ -25,6 +25,7 @@ def create_sql_ansich_service(
     session_factory: async_sessionmaker[AsyncSession],
     *,
     queue_capacity: int = 10_000,
+    queue_byte_capacity: int = 64 * 1024 * 1024,
     batch_size: int = 100,
     flush_interval_ms: int = 100,
     terminal_flush_timeout_ms: int = 2_000,
@@ -43,6 +44,7 @@ def create_sql_ansich_service(
             inline_payload_max_bytes=inline_payload_max_bytes,
         ),
         queue_capacity=queue_capacity,
+        queue_byte_capacity=queue_byte_capacity,
         batch_size=batch_size,
         flush_interval_ms=flush_interval_ms,
         terminal_flush_timeout_ms=terminal_flush_timeout_ms,
@@ -57,6 +59,7 @@ def create_embedded_ansich_service(config, session_factory):
         return AnsichService(
             _UnavailableBackend(),
             queue_capacity=config.queue_capacity,
+            queue_byte_capacity=config.queue_byte_capacity,
             batch_size=config.batch_size,
             flush_interval_ms=config.flush_interval_ms,
             unavailable_reason="storage_unavailable",
@@ -64,6 +67,7 @@ def create_embedded_ansich_service(config, session_factory):
     return create_sql_ansich_service(
         session_factory,
         queue_capacity=config.queue_capacity,
+        queue_byte_capacity=config.queue_byte_capacity,
         batch_size=config.batch_size,
         flush_interval_ms=config.flush_interval_ms,
         terminal_flush_timeout_ms=config.terminal_flush_timeout_ms,

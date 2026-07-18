@@ -1659,6 +1659,8 @@ database:
 ansich:
   enabled: false
   queue_capacity: 10000
+  # Canonical serialized bytes allowed in the in-process observation queue.
+  queue_byte_capacity: 67108864
   batch_size: 100
   flush_interval_ms: 100
   terminal_flush_timeout_ms: 2000

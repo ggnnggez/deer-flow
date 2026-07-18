@@ -87,7 +87,8 @@ must never collapse a missing ContentBlock into an apparently shorter complete
 request. If no Step has an effective snapshot while projection health reports
 failed jobs, the Context tab renders an explicit projection-unavailable warning
 instead of the ordinary no-context empty state; the wording remains cautious
-because projection health is process-wide. Projection health also renders queue high-watermark and snapshot
+because projection health is process-wide. Projection health also renders queue
+count/byte capacity and both high-watermarks, plus snapshot
 request/item/incomplete/missing counters. Raw ContentBlock bodies are fetched
 lazily after an explicit admin click and must never be placed in the polling
 response or TanStack query cache pre-emptively. Tool raw and model-visible

@@ -362,6 +362,8 @@ export interface Translations {
     failedJobs: string;
     queue: string;
     queueHighWatermark: string;
+    queueBytes: string;
+    queueByteHighWatermark: string;
     snapshotRequests: string;
     snapshotItems: string;
     contextAndLineage: string;

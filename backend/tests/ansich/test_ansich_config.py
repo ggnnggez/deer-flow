@@ -12,6 +12,7 @@ def test_ansich_is_disabled_by_default_with_bounded_runtime_settings():
 
     assert config.enabled is False
     assert config.queue_capacity == 10_000
+    assert config.queue_byte_capacity == 64 * 1024 * 1024
     assert config.batch_size == 100
     assert config.flush_interval_ms == 100
     assert config.terminal_flush_timeout_ms == 2_000

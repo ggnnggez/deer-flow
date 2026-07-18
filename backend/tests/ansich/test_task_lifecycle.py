@@ -217,6 +217,85 @@ async def test_full_queue_is_fail_open_and_visible_as_a_known_lost_range():
 
 
 @pytest.mark.anyio
+async def test_queue_byte_capacity_rejects_an_observation_before_count_capacity():
+    task_id = new_id()
+    observed_at = datetime(2026, 7, 17, 11, 15, tzinfo=UTC)
+    first = ObservationEnvelope.task_lifecycle(
+        kind="task.created",
+        task_id=task_id,
+        source_kind="deerflow_run",
+        source_id="run-byte-overflow",
+        occurred_at=observed_at,
+        source_event_id="run:run-byte-overflow:task:created",
+        producer_seq=1,
+    )
+    first_size = len(first.model_dump_json().encode("utf-8"))
+    service = AnsichService.in_memory(
+        queue_capacity=10,
+        queue_byte_capacity=first_size,
+    )
+    await service.start()
+
+    try:
+        accepted = service.record(first)
+        dropped = service.record(
+            ObservationEnvelope.task_lifecycle(
+                kind="task.started",
+                task_id=task_id,
+                source_kind="deerflow_run",
+                source_id="run-byte-overflow",
+                occurred_at=observed_at + timedelta(seconds=1),
+                source_event_id="run:run-byte-overflow:task:started",
+                producer_seq=2,
+            )
+        )
+        health = service.get_health()
+        await service.flush_task(task_id)
+        health_after_flush = service.get_health()
+    finally:
+        await service.stop()
+
+    assert accepted.accepted is True
+    assert dropped.accepted is False
+    assert dropped.reason == "queue_bytes_full"
+    assert health.queue_depth == 1
+    assert health.queue_bytes == first_size
+    assert health.queue_byte_capacity == first_size
+    assert health.queue_byte_high_watermark == first_size
+    assert health.status == "degraded"
+    assert health_after_flush.queue_depth == 0
+    assert health_after_flush.queue_bytes == 0
+    assert health_after_flush.queue_byte_high_watermark == first_size
+
+
+@pytest.mark.anyio
+async def test_queue_byte_accounting_serialization_failure_remains_fail_open():
+    task_id = new_id()
+    observation = ObservationEnvelope.task_lifecycle(
+        kind="task.created",
+        task_id=task_id,
+        source_kind="deerflow_run",
+        source_id="run-byte-serialization-failure",
+        occurred_at=datetime(2026, 7, 17, 11, 20, tzinfo=UTC),
+        source_event_id="run:run-byte-serialization-failure:task:created",
+    ).model_copy(update={"payload": {"invalid_utf8": b"\xff"}})
+    service = AnsichService.in_memory()
+    await service.start()
+
+    try:
+        receipt = service.record(observation)
+        health = service.get_health()
+    finally:
+        await service.stop()
+
+    assert receipt.accepted is False
+    assert receipt.reason == "serialization_failed"
+    assert health.status == "degraded"
+    assert health.queue_depth == 0
+    assert health.queue_bytes == 0
+
+
+@pytest.mark.anyio
 async def test_context_snapshot_batch_is_accepted_or_dropped_atomically():
     service = AnsichService.in_memory(queue_capacity=2)
     await service.start()

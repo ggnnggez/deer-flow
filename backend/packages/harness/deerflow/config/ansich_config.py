@@ -6,6 +6,11 @@ class AnsichConfig(BaseModel):
 
     enabled: bool = Field(default=False, description="Enable embedded Ansich collection and developer/operator APIs.")
     queue_capacity: int = Field(default=10_000, ge=1, description="Maximum in-process observations waiting for persistence.")
+    queue_byte_capacity: int = Field(
+        default=64 * 1024 * 1024,
+        ge=1,
+        description="Maximum canonical serialized bytes held in the in-process observation queue.",
+    )
     batch_size: int = Field(default=100, ge=1, description="Maximum observations written in one storage batch.")
     flush_interval_ms: int = Field(default=100, ge=1, description="Maximum delay before the writer flushes a partial batch.")
     terminal_flush_timeout_ms: int = Field(default=2_000, ge=1, description="Maximum terminal Task flush wait; timeout never fails the DeerFlow Run.")

@@ -102,6 +102,8 @@ export interface AnsichHealth {
   status: "healthy" | "degraded" | "failed" | "stopped";
   queue_depth: number;
   queue_capacity: number;
+  queue_bytes: number;
+  queue_byte_capacity: number;
   accepted_count: number;
   dropped_count: number;
   lost_ranges: AnsichLostRange[];
@@ -112,6 +114,7 @@ export interface AnsichHealth {
   range_known: boolean;
   storage_available: boolean;
   queue_high_watermark: number;
+  queue_byte_high_watermark: number;
   snapshot_request_count: number;
   snapshot_observations_accepted: number;
   snapshot_observations_dropped: number;

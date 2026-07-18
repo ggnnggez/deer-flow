@@ -434,6 +434,8 @@ export const zhCN: Translations = {
     failedJobs: "失败任务",
     queue: "队列",
     queueHighWatermark: "队列最高水位",
+    queueBytes: "队列字节",
+    queueByteHighWatermark: "队列字节最高水位",
     snapshotRequests: "快照请求",
     snapshotItems: "快照条目",
     contextAndLineage: "上下文与谱系",
