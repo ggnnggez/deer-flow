@@ -54,15 +54,15 @@ def assess_tool_frequency(
     lower_bound = now - timedelta(seconds=window_seconds)
     grouped: dict[str, list[ToolOccurrence]] = defaultdict(list)
     for occurrence in occurrences:
-        if lower_bound <= occurrence.occurred_at <= now:
-            grouped[occurrence.tool_name].append(occurrence)
+        grouped[occurrence.tool_name].append(occurrence)
 
     assessments: list[Assessment] = []
     for tool_name in sorted(grouped):
-        items = sorted(
+        all_items = sorted(
             grouped[tool_name],
             key=lambda item: (item.occurred_at, item.evidence_obs_id),
         )
+        items = [item for item in all_items if lower_bound <= item.occurred_at <= now]
         config_hash = canonical_config_hash(
             {
                 "tool_name": tool_name,
@@ -82,7 +82,7 @@ def assess_tool_frequency(
                     "threshold": threshold,
                     "shadow": False,
                 },
-                as_of=items[-1].occurred_at,
+                as_of=items[-1].occurred_at if items else now,
                 asserted_at=now,
                 assessor=NamedVersion(
                     name=TOOL_FREQUENCY_ASSESSOR.name,

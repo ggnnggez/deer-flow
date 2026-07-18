@@ -1,6 +1,7 @@
 import { describe, expect, it } from "@rstest/core";
 
 import {
+  getAlertPresentationCategory,
   countMissingContextItems,
   countLostObservations,
   getBudgetPresentation,
@@ -78,5 +79,16 @@ describe("Ansich presentation", () => {
         { value: "exceeded", usage_value: 107, overshoot: 7 },
       ),
     ).toEqual({ status: "exceeded", percent: 107, overshoot: 7 });
+  });
+
+  it("keeps runaway, operational, liveness, and observability alerts distinct", () => {
+    expect(getAlertPresentationCategory("exact_repetition")).toBe("runaway");
+    expect(getAlertPresentationCategory("budget_exceeded")).toBe("runaway");
+    expect(getAlertPresentationCategory("tool_frequency")).toBe("operational");
+    expect(getAlertPresentationCategory("long_dwell")).toBe("operational");
+    expect(getAlertPresentationCategory("heartbeat_missing")).toBe("liveness");
+    expect(getAlertPresentationCategory("projection_failure")).toBe(
+      "observability",
+    );
   });
 });

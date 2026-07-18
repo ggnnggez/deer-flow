@@ -1,4 +1,29 @@
-import type { AnsichLostRange } from "./types";
+import type { AnsichAlertType, AnsichLostRange } from "./types";
+
+export type AnsichAlertPresentationCategory =
+  | "runaway"
+  | "operational"
+  | "liveness"
+  | "observability";
+
+export function getAlertPresentationCategory(
+  alertType: AnsichAlertType,
+): AnsichAlertPresentationCategory {
+  switch (alertType) {
+    case "budget_warning":
+    case "budget_exceeded":
+    case "exact_repetition":
+      return "runaway";
+    case "tool_frequency":
+    case "long_dwell":
+      return "operational";
+    case "heartbeat_missing":
+      return "liveness";
+    case "observability_degradation":
+    case "projection_failure":
+      return "observability";
+  }
+}
 
 export interface BudgetPresentation {
   status: "unconfigured" | "unknown" | "within" | "warning" | "exceeded";

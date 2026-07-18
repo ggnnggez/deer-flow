@@ -7,6 +7,7 @@ from datetime import UTC, datetime
 from threading import Lock
 from weakref import ReferenceType, WeakMethod, ref
 
+from ansich.alerts.views import AlertDetailView, AlertSummaryView, BeliefAssertionView
 from ansich.backend import AnsichBackend
 from ansich.budget import BudgetHealthBelief, TaskBudgetsView
 from ansich.compression import ContextCompressionSummaryView, ContextCompressionView
@@ -16,6 +17,7 @@ from ansich.heartbeat import TaskHeartbeatView
 from ansich.lineage import ContentLineageView, LineageDirection, PossibleExposureView, find_possible_exposures, traverse_content_lineage
 from ansich.memory import InMemoryAnsichBackend
 from ansich.operations import ActiveTaskView, HeartbeatBelief
+from ansich.operator import OperatorActionView, TaskActionTarget
 from ansich.step import ContentBlockPayloadView, ContentOccurrenceView, ContextSnapshotView, LlmAttemptView, StepView
 from ansich.tool import ToolCallView
 from ansich.usage import TaskUsageView
@@ -288,6 +290,16 @@ class AnsichService:
     async def get_task(self, task_id: str) -> TaskView | None:
         return await self._backend.get_task(task_id)
 
+    async def get_current_belief(
+        self,
+        subject_id: str,
+        field_name: str,
+    ) -> BeliefAssertionView | None:
+        get_current_belief = getattr(self._backend, "get_current_belief", None)
+        if not callable(get_current_belief):
+            return None
+        return await get_current_belief(subject_id, field_name)
+
     async def get_task_by_source(self, source_kind: str, source_id: str) -> TaskView | None:
         return await self._backend.get_task_by_source(source_kind, source_id)
 
@@ -314,6 +326,169 @@ class AnsichService:
 
     async def list_observations(self, task_id: str) -> list[ObservationEnvelope]:
         return await self._backend.list_observations(task_id)
+
+    async def list_alerts(
+        self,
+        *,
+        limit: int = 100,
+        alert_type: str | None = None,
+        workflow_state: str | None = None,
+        task_id: str | None = None,
+        severity: str | None = None,
+        shadow: bool | None = None,
+        from_time: datetime | None = None,
+        to_time: datetime | None = None,
+        cursor: tuple[datetime, str] | None = None,
+    ) -> list[AlertSummaryView]:
+        if limit < 1:
+            raise ValueError("limit must be positive")
+        list_alerts = getattr(self._backend, "list_alerts", None)
+        if not callable(list_alerts):
+            return []
+        return list(
+            await list_alerts(
+                limit=limit,
+                alert_type=alert_type,
+                workflow_state=workflow_state,
+                task_id=task_id,
+                severity=severity,
+                shadow=shadow,
+                from_time=from_time,
+                to_time=to_time,
+                cursor=cursor,
+            )
+        )
+
+    async def get_alert_detail(
+        self,
+        alert_id: str,
+    ) -> AlertDetailView | None:
+        get_detail = getattr(self._backend, "get_alert_detail", None)
+        if not callable(get_detail):
+            return None
+        return await get_detail(alert_id)
+
+    async def acknowledge_alert(
+        self,
+        alert_id: str,
+        *,
+        expected_workflow_version: int,
+        operator_id: str,
+        occurred_at: datetime | None = None,
+    ) -> AlertSummaryView | None:
+        return await self._change_alert_workflow(
+            alert_id,
+            action="acknowledge",
+            expected_workflow_version=expected_workflow_version,
+            operator_id=operator_id,
+            reason=None,
+            occurred_at=occurred_at,
+        )
+
+    async def dismiss_alert(
+        self,
+        alert_id: str,
+        *,
+        expected_workflow_version: int,
+        operator_id: str,
+        reason: str,
+        occurred_at: datetime | None = None,
+    ) -> AlertSummaryView | None:
+        return await self._change_alert_workflow(
+            alert_id,
+            action="dismiss",
+            expected_workflow_version=expected_workflow_version,
+            operator_id=operator_id,
+            reason=reason,
+            occurred_at=occurred_at,
+        )
+
+    async def _change_alert_workflow(
+        self,
+        alert_id: str,
+        *,
+        action: str,
+        expected_workflow_version: int,
+        operator_id: str,
+        reason: str | None,
+        occurred_at: datetime | None,
+    ) -> AlertSummaryView | None:
+        change = getattr(self._backend, "change_alert_workflow", None)
+        if not callable(change):
+            return None
+        return await change(
+            alert_id,
+            action=action,
+            expected_workflow_version=expected_workflow_version,
+            operator_id=operator_id,
+            reason=reason,
+            occurred_at=(datetime.now(UTC) if occurred_at is None else occurred_at),
+        )
+
+    async def get_task_action_target(
+        self,
+        task_id: str,
+    ) -> TaskActionTarget | None:
+        get_target = getattr(self._backend, "get_task_action_target", None)
+        if not callable(get_target):
+            return None
+        return await get_target(task_id)
+
+    async def get_operator_action(
+        self,
+        *,
+        task_id: str,
+        action_type: str,
+        idempotency_key: str,
+    ) -> OperatorActionView | None:
+        get_action = getattr(self._backend, "get_operator_action", None)
+        if not callable(get_action):
+            return None
+        return await get_action(
+            task_id=task_id,
+            action_type=action_type,
+            idempotency_key=idempotency_key,
+        )
+
+    async def begin_operator_action(
+        self,
+        *,
+        task_id: str,
+        action_type: str,
+        idempotency_key: str,
+        operator_id: str,
+        occurred_at: datetime | None = None,
+    ) -> tuple[OperatorActionView, bool]:
+        begin = getattr(self._backend, "begin_operator_action", None)
+        if not callable(begin):
+            raise RuntimeError("Ansich operator action audit is unavailable")
+        return await begin(
+            task_id=task_id,
+            action_type=action_type,
+            idempotency_key=idempotency_key,
+            operator_id=operator_id,
+            occurred_at=(datetime.now(UTC) if occurred_at is None else occurred_at),
+        )
+
+    async def finish_operator_action(
+        self,
+        action_id: str,
+        *,
+        succeeded: bool,
+        operator_id: str,
+        result: dict[str, object],
+        occurred_at: datetime | None = None,
+    ) -> OperatorActionView | None:
+        finish = getattr(self._backend, "finish_operator_action", None)
+        if not callable(finish):
+            raise RuntimeError("Ansich operator action audit is unavailable")
+        return await finish(
+            action_id,
+            succeeded=succeeded,
+            operator_id=operator_id,
+            result=result,
+            occurred_at=(datetime.now(UTC) if occurred_at is None else occurred_at),
+        )
 
     async def get_task_usage(self, task_id: str) -> TaskUsageView:
         return await self._backend.get_task_usage(task_id)

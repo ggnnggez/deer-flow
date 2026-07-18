@@ -46,6 +46,7 @@ export default function AnsichTaskDetailPage() {
   const isAdmin = user?.system_role === "admin";
   const taskQuery = useAnsichTask(taskId, isAdmin);
   const task = taskQuery.data?.task;
+  const behavior = taskQuery.data?.behavior;
   const taskIsRunning = task?.control.value === "running";
   const timelineQuery = useAnsichTaskTimeline(taskId, isAdmin, taskIsRunning);
   const compressionsQuery = useAnsichTaskCompressions(
@@ -130,7 +131,7 @@ export default function AnsichTaskDetailPage() {
                   </TabsTrigger>
                 </TabsList>
 
-                <TabsContent value="overview">
+                <TabsContent value="overview" className="space-y-4">
                   <Card>
                     <CardHeader>
                       <CardTitle>{t.ansich.currentBelief}</CardTitle>
@@ -176,6 +177,56 @@ export default function AnsichTaskDetailPage() {
                       </div>
                     </CardContent>
                   </Card>
+                  <Card>
+                    <CardHeader>
+                      <CardTitle>{t.ansich.currentBehavior}</CardTitle>
+                      <CardDescription>
+                        {behavior
+                          ? `${t.ansich.asOf}: ${formatAnsichTimestamp(behavior.as_of, locale)}`
+                          : t.ansich.evidenceInsufficient}
+                      </CardDescription>
+                    </CardHeader>
+                    {behavior ? (
+                      <CardContent className="space-y-4 text-sm">
+                        <div className="grid gap-5 sm:grid-cols-2">
+                          <BeliefField
+                            label={t.ansich.source}
+                            value={`${behavior.assessor.name}@${behavior.assessor.version}`}
+                            mono
+                          />
+                          <BeliefField
+                            label={t.ansich.configHash}
+                            value={behavior.config_hash}
+                            mono
+                          />
+                        </div>
+                        <pre className="bg-muted/60 overflow-x-auto rounded-md p-3 text-xs">
+                          {JSON.stringify(behavior.value, null, 2)}
+                        </pre>
+                        <div>
+                          <div className="text-muted-foreground mb-2 text-xs">
+                            {t.ansich.evidence}
+                          </div>
+                          <div className="flex flex-wrap gap-2">
+                            {behavior.evidence_obs_ids.length ? (
+                              behavior.evidence_obs_ids.map((obsId) => (
+                                <code
+                                  key={obsId}
+                                  className="bg-muted rounded px-2 py-1 text-xs"
+                                >
+                                  {obsId}
+                                </code>
+                              ))
+                            ) : (
+                              <span className="text-muted-foreground text-xs">
+                                {t.ansich.evidenceInsufficient}
+                              </span>
+                            )}
+                          </div>
+                        </div>
+                      </CardContent>
+                    ) : null}
+                  </Card>
                 </TabsContent>
 
                 <TabsContent value="timeline" className="space-y-3">
@@ -202,7 +253,9 @@ export default function AnsichTaskDetailPage() {
                     compressionIds={compressionIds}
                     compressionError={compressionsQuery.error?.message ?? null}
                     compressionHasNextPage={compressionsQuery.hasNextPage}
-                    compressionLoadingMore={compressionsQuery.isFetchingNextPage}
+                    compressionLoadingMore={
+                      compressionsQuery.isFetchingNextPage
+                    }
                     onLoadMoreCompressions={() =>
                       void compressionsQuery.fetchNextPage()
                     }

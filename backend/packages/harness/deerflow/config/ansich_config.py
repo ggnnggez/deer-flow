@@ -3,6 +3,14 @@ from typing import Self
 from pydantic import BaseModel, Field, model_validator
 
 
+class AnsichAssessorConfig(BaseModel):
+    """Versioned rule thresholds consumed by durable assessor jobs."""
+
+    exact_repetition_window: int = Field(default=5, ge=2)
+    tool_frequency_window_seconds: int = Field(default=300, ge=1)
+    tool_frequency_threshold: int = Field(default=30, ge=1)
+
+
 class AnsichConfig(BaseModel):
     """Restart-required configuration for the embedded Ansich service."""
 
@@ -43,6 +51,10 @@ class AnsichConfig(BaseModel):
         default=120,
         ge=1,
         description="Dwell threshold used by the operator-facing Task assessor.",
+    )
+    assessors: AnsichAssessorConfig = Field(
+        default_factory=AnsichAssessorConfig,
+        description="Versioned runaway and frequency assessor thresholds.",
     )
 
     @model_validator(mode="after")

@@ -1,8 +1,9 @@
 from __future__ import annotations
 
 from datetime import datetime
-from typing import Protocol
+from typing import Literal, Protocol
 
+from ansich.alerts.views import AlertDetailView, AlertSummaryView, BeliefAssertionView
 from ansich.budget import BudgetHealthBelief, TaskBudgetsView
 from ansich.compression import ContextCompressionSummaryView, ContextCompressionView
 from ansich.context_state import ContextStateView
@@ -10,6 +11,7 @@ from ansich.contracts import ControlValue, LostRange, ObservationEnvelope, TaskL
 from ansich.heartbeat import TaskHeartbeatView
 from ansich.lineage import ContentBlockView, LineageDirection, PossibleExposureItemView
 from ansich.operations import ActiveTaskView, HeartbeatBelief
+from ansich.operator import OperatorActionView, TaskActionTarget
 from ansich.step import ContentBlockPayloadView, ContentOccurrenceView, ContextSnapshotView, LlmAttemptView, StepView
 from ansich.tool import ContentDerivationView, ToolCallView
 from ansich.usage import TaskUsageView
@@ -19,6 +21,12 @@ class AnsichBackend(Protocol):
     async def persist_and_project(self, observations: list[ObservationEnvelope]) -> int: ...
 
     async def get_task(self, task_id: str) -> TaskView | None: ...
+
+    async def get_current_belief(
+        self,
+        subject_id: str,
+        field_name: str,
+    ) -> BeliefAssertionView | None: ...
 
     async def get_task_by_source(self, source_kind: str, source_id: str) -> TaskView | None: ...
 
@@ -34,6 +42,69 @@ class AnsichBackend(Protocol):
     ) -> list[TaskView]: ...
 
     async def list_observations(self, task_id: str) -> list[ObservationEnvelope]: ...
+
+    async def list_alerts(
+        self,
+        *,
+        limit: int,
+        alert_type: str | None = None,
+        workflow_state: str | None = None,
+        task_id: str | None = None,
+        severity: str | None = None,
+        shadow: bool | None = None,
+        from_time: datetime | None = None,
+        to_time: datetime | None = None,
+        cursor: tuple[datetime, str] | None = None,
+    ) -> list[AlertSummaryView]: ...
+
+    async def get_alert_detail(
+        self,
+        alert_id: str,
+    ) -> AlertDetailView | None: ...
+
+    async def change_alert_workflow(
+        self,
+        alert_id: str,
+        *,
+        action: Literal["acknowledge", "dismiss"],
+        expected_workflow_version: int,
+        operator_id: str,
+        reason: str | None,
+        occurred_at: datetime,
+    ) -> AlertSummaryView | None: ...
+
+    async def get_task_action_target(
+        self,
+        task_id: str,
+    ) -> TaskActionTarget | None: ...
+
+    async def get_operator_action(
+        self,
+        *,
+        task_id: str,
+        action_type: Literal["interrupt", "rollback"],
+        idempotency_key: str,
+    ) -> OperatorActionView | None: ...
+
+    async def begin_operator_action(
+        self,
+        *,
+        task_id: str,
+        action_type: Literal["interrupt", "rollback"],
+        idempotency_key: str,
+        operator_id: str,
+        occurred_at: datetime,
+    ) -> tuple[OperatorActionView, bool]: ...
+
+    async def finish_operator_action(
+        self,
+        action_id: str,
+        *,
+        succeeded: bool,
+        operator_id: str,
+        result: dict[str, object],
+        occurred_at: datetime,
+    ) -> OperatorActionView | None: ...
 
     async def get_task_usage(self, task_id: str) -> TaskUsageView: ...
 

@@ -1,6 +1,16 @@
-import { useInfiniteQuery, useQuery } from "@tanstack/react-query";
+import {
+  useInfiniteQuery,
+  useMutation,
+  useQuery,
+  useQueryClient,
+} from "@tanstack/react-query";
 
 import {
+  acknowledgeAnsichAlert,
+  dismissAnsichAlert,
+  executeAnsichTaskAction,
+  fetchAnsichAlert,
+  fetchAnsichAlerts,
   fetchAnsichStepContext,
   fetchAnsichActiveTasks,
   fetchAnsichTaskCompressions,
@@ -13,6 +23,7 @@ import {
 } from "./api";
 import type {
   AnsichActiveTaskListResponse,
+  AnsichAlertListResponse,
   AnsichContextCompressionListResponse,
   AnsichTaskLifecycleScope,
   AnsichTaskListResponse,
@@ -63,6 +74,85 @@ export function useAnsichActiveTasks(limit = 100, enabled = true) {
     refetchInterval: (query) =>
       activeTasksRefreshInterval(query.state.data, pageIsVisible()),
     refetchIntervalInBackground: false,
+  });
+}
+
+export function useAnsichAlerts(limit = 100, enabled = true) {
+  return useInfiniteQuery<
+    AnsichAlertListResponse,
+    Error,
+    { pages: AnsichAlertListResponse[]; pageParams: Array<string | undefined> },
+    readonly ["ansich", "operations", "alerts", { limit: number }],
+    string | undefined
+  >({
+    queryKey: ["ansich", "operations", "alerts", { limit }] as const,
+    queryFn: ({ pageParam }) => fetchAnsichAlerts(limit, { cursor: pageParam }),
+    initialPageParam: undefined,
+    getNextPageParam: (lastPage) => lastPage.next_cursor ?? undefined,
+    enabled,
+    retry: false,
+    refetchInterval: () => (pageIsVisible() ? REFRESH_INTERVAL_MS : false),
+    refetchIntervalInBackground: false,
+  });
+}
+
+export function useAnsichAlert(alertId: string | null, enabled = true) {
+  return useQuery({
+    queryKey: ["ansich", "operations", "alerts", alertId],
+    queryFn: () => fetchAnsichAlert(alertId ?? ""),
+    enabled: enabled && Boolean(alertId),
+    retry: false,
+  });
+}
+
+export function useAnsichAlertWorkflow() {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: (input: {
+      alertId: string;
+      workflowVersion: number;
+      action: "acknowledge" | "dismiss";
+      reason?: string;
+    }) =>
+      input.action === "acknowledge"
+        ? acknowledgeAnsichAlert(input.alertId, input.workflowVersion)
+        : dismissAnsichAlert(
+            input.alertId,
+            input.workflowVersion,
+            input.reason ?? "",
+          ),
+    onSettled: async (_data, _error, input) => {
+      await Promise.all([
+        queryClient.invalidateQueries({
+          queryKey: ["ansich", "operations", "alerts"],
+        }),
+        queryClient.invalidateQueries({
+          queryKey: ["ansich", "operations", "alerts", input.alertId],
+        }),
+      ]);
+    },
+  });
+}
+
+export function useAnsichTaskAction() {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: (input: {
+      taskId: string;
+      action: "interrupt" | "rollback";
+      idempotencyKey: string;
+    }) =>
+      executeAnsichTaskAction(input.taskId, input.action, input.idempotencyKey),
+    onSettled: async (_data, _error, input) => {
+      await Promise.all([
+        queryClient.invalidateQueries({
+          queryKey: ["ansich", "operations"],
+        }),
+        queryClient.invalidateQueries({
+          queryKey: ["ansich", "tasks", input.taskId],
+        }),
+      ]);
+    },
   });
 }
 

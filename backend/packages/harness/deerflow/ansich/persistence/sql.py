@@ -33,6 +33,42 @@ from ansich import (
     ToolResultView,
     new_id,
 )
+from ansich.alerts.episodes import (
+    AlertEpisode,
+    AlertReconciliation,
+    acknowledge_alert,
+    alert_conditions_from_assessment,
+    dismiss_alert,
+    reconcile_alert_conditions,
+    resolve_alert_episode,
+)
+from ansich.alerts.views import (
+    AlertDetailView,
+    AlertSummaryView,
+    AlertWorkflowEventView,
+    BeliefAssertionView,
+)
+from ansich.assessment.absolute_limit import (
+    ABSOLUTE_LIMIT_ASSESSOR,
+    AbsoluteLimitAssessmentResult,
+    assess_absolute_limits,
+)
+from ansich.assessment.action_repetition import (
+    ACTION_REPETITION_ASSESSOR,
+    ToolAction,
+    assess_action_repetition,
+    build_step_action,
+)
+from ansich.assessment.base import Assessment, EvidenceRef, canonical_config_hash
+from ansich.assessment.tool_frequency import (
+    TOOL_FREQUENCY_ASSESSOR,
+    ToolOccurrence,
+    assess_tool_frequency,
+)
+from ansich.belief.resolver import (
+    BeliefAssertion,
+    resolve_current_belief,
+)
 from ansich.budget import (
     BudgetHealthBelief,
     BudgetSourceKind,
@@ -42,7 +78,13 @@ from ansich.budget import (
 )
 from ansich.compression import CompressionDisposition
 from ansich.context_state import context_state_hash, materialize_context_state
-from ansich.contracts import ControlValue, LostRange, TaskLifecycleScope, control_values_for_lifecycle_scope
+from ansich.contracts import (
+    ControlValue,
+    LostRange,
+    TaskLifecycleScope,
+    UsageDimension,
+    control_values_for_lifecycle_scope,
+)
 from ansich.control import should_select_control_candidate
 from ansich.heartbeat import TaskHeartbeatView
 from ansich.lineage import LineageDirection
@@ -55,8 +97,10 @@ from ansich.operations import (
     assess_dwell,
     assess_heartbeat,
 )
+from ansich.operator import OperatorActionView, TaskActionTarget
 from ansich.tool import ContentDerivationSourceRole, ToolTransformKind
 from ansich.usage import (
+    AggregationScope,
     TaskUsageValue,
     TaskUsageView,
     child_task_contribution_for_tool_started,
@@ -69,6 +113,12 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from deerflow.ansich.persistence.models import (
     AnsichActiveTaskReadModelRow,
+    AnsichAlertEvidenceRow,
+    AnsichAlertReadModelRow,
+    AnsichAlertRow,
+    AnsichAlertWorkflowEventRow,
+    AnsichAssessorErrorRow,
+    AnsichAssessorJobRow,
     AnsichBeliefAssertionRow,
     AnsichBeliefEvidenceRow,
     AnsichBlockProducerRow,
@@ -91,6 +141,7 @@ from deerflow.ansich.persistence.models import (
     AnsichEntityRow,
     AnsichLlmAttemptRow,
     AnsichObservationRow,
+    AnsichOperatorActionRow,
     AnsichPayloadRow,
     AnsichProjectionErrorRow,
     AnsichProjectionJobRow,
@@ -166,6 +217,11 @@ _PROJECTOR_KINDS = {
     "task-budget": frozenset({"budget.configured"}),
     "task-heartbeat": frozenset({"task.heartbeat"}),
 }
+_ASSESSOR_VERSIONS = {
+    ACTION_REPETITION_ASSESSOR.name: ACTION_REPETITION_ASSESSOR.version,
+    TOOL_FREQUENCY_ASSESSOR.name: TOOL_FREQUENCY_ASSESSOR.version,
+    ABSOLUTE_LIMIT_ASSESSOR.name: ABSOLUTE_LIMIT_ASSESSOR.version,
+}
 _USAGE_DIMENSION_ORDER = {
     "input_tokens": 0,
     "output_tokens": 1,
@@ -194,6 +250,32 @@ class _ProjectionDependencyPending(RuntimeError):
 
 def _projectors_for_kind(kind: str) -> tuple[tuple[str, str], ...]:
     return tuple(registration for registration in _PROJECTORS if kind in _PROJECTOR_KINDS.get(registration[0], ()))
+
+
+def _assessors_after_projection(
+    projector_name: str,
+    observation_kind: str,
+) -> tuple[tuple[str, str], ...]:
+    names: set[str] = set()
+    if projector_name == "task-step" and observation_kind in {
+        "tool.issued",
+        "step.closed",
+    }:
+        names.update(
+            {
+                ACTION_REPETITION_ASSESSOR.name,
+                TOOL_FREQUENCY_ASSESSOR.name,
+            }
+        )
+    if projector_name in {"task-usage", "task-budget", "task-heartbeat"}:
+        names.add(ABSOLUTE_LIMIT_ASSESSOR.name)
+    if projector_name == "task-control" and observation_kind in {
+        "task.completed",
+        "task.failed",
+        "task.interrupted",
+    }:
+        names.update(_ASSESSOR_VERSIONS)
+    return tuple((name, _ASSESSOR_VERSIONS[name]) for name in sorted(names))
 
 
 def _projector_priority_expression():
@@ -373,6 +455,9 @@ class SqlAnsichBackend:
         inline_payload_max_bytes: int = 65_536,
         heartbeat_stale_after_seconds: int = 30,
         long_dwell_seconds: int = 120,
+        exact_repetition_window: int = 5,
+        tool_frequency_window_seconds: int = 300,
+        tool_frequency_threshold: int = 30,
     ) -> None:
         self._session_factory = session_factory
         self._projector_lease_seconds = projector_lease_seconds
@@ -381,6 +466,15 @@ class SqlAnsichBackend:
         self._inline_payload_max_bytes = inline_payload_max_bytes
         self._heartbeat_stale_after_seconds = heartbeat_stale_after_seconds
         self._long_dwell_seconds = long_dwell_seconds
+        if exact_repetition_window < 2:
+            raise ValueError("exact_repetition_window must be at least two")
+        if tool_frequency_window_seconds < 1:
+            raise ValueError("tool_frequency_window_seconds must be positive")
+        if tool_frequency_threshold < 1:
+            raise ValueError("tool_frequency_threshold must be positive")
+        self._exact_repetition_window = exact_repetition_window
+        self._tool_frequency_window_seconds = tool_frequency_window_seconds
+        self._tool_frequency_threshold = tool_frequency_threshold
         self._lease_owner = str(uuid4())
         self._watermark: int | None = None
         self._failed_jobs = 0
@@ -395,9 +489,7 @@ class SqlAnsichBackend:
         }
 
     async def initialize_metrics(self) -> None:
-        async with self._session_factory() as session:
-            failed_jobs = await session.scalar(select(func.count()).select_from(AnsichProjectionJobRow).where(AnsichProjectionJobRow.status == "failed"))
-        self._failed_jobs = int(failed_jobs or 0)
+        await self._refresh_failed_job_count()
         await self._refresh_context_metrics()
 
     async def persist_and_project(self, observations: list[ObservationEnvelope]) -> int:
@@ -593,6 +685,29 @@ class SqlAnsichBackend:
                         )
                     else:
                         raise ValueError(f"unknown Ansich projector: {projector_name}")
+                    for assessor_name, assessor_version in _assessors_after_projection(
+                        projector_name,
+                        observation.kind,
+                    ):
+                        existing_assessor_job = await session.scalar(
+                            select(AnsichAssessorJobRow.job_id).where(
+                                AnsichAssessorJobRow.subject_id == observation.task_id,
+                                AnsichAssessorJobRow.assessor_name == assessor_name,
+                                AnsichAssessorJobRow.assessor_version == assessor_version,
+                                AnsichAssessorJobRow.evidence_watermark == ingest_seq,
+                            )
+                        )
+                        if existing_assessor_job is None:
+                            session.add(
+                                AnsichAssessorJobRow(
+                                    job_id=new_id(),
+                                    subject_id=observation.task_id,
+                                    assessor_name=assessor_name,
+                                    assessor_version=assessor_version,
+                                    evidence_watermark=ingest_seq,
+                                    status="pending",
+                                )
+                            )
                     job = await session.get(AnsichProjectionJobRow, job_id)
                     if job is None:
                         raise RuntimeError("claimed Ansich projection job disappeared")
@@ -666,6 +781,13 @@ class SqlAnsichBackend:
 
         async with self._session_factory() as session, session.begin():
             for model in (
+                AnsichAlertReadModelRow,
+                AnsichAlertWorkflowEventRow,
+                AnsichAlertEvidenceRow,
+                AnsichAlertRow,
+                AnsichOperatorActionRow,
+                AnsichAssessorErrorRow,
+                AnsichAssessorJobRow,
                 AnsichTaskHeartbeatRow,
                 AnsichActiveTaskReadModelRow,
                 AnsichTaskBudgetRow,
@@ -722,6 +844,7 @@ class SqlAnsichBackend:
             processed = await self.project_pending(limit=200)
             replayed += processed
             if processed == 0:
+                await self.assess_operations()
                 await self._refresh_context_metrics()
                 return replayed
 
@@ -736,6 +859,10 @@ class SqlAnsichBackend:
                     AnsichObservationRow.obs_id == AnsichProjectionJobRow.obs_id,
                 ).where(AnsichObservationRow.task_id == task_id)
             job_ids = tuple((await session.execute(failed_job_ids)).scalars())
+            failed_assessor_job_ids = select(AnsichAssessorJobRow.job_id).where(AnsichAssessorJobRow.status == "failed")
+            if task_id is not None:
+                failed_assessor_job_ids = failed_assessor_job_ids.where(AnsichAssessorJobRow.subject_id == task_id)
+            assessor_job_ids = tuple((await session.execute(failed_assessor_job_ids)).scalars())
             if job_ids:
                 await session.execute(
                     update(AnsichProjectionJobRow)
@@ -750,16 +877,28 @@ class SqlAnsichBackend:
                         last_error=None,
                     )
                 )
-        if not job_ids:
+            if assessor_job_ids:
+                await session.execute(
+                    update(AnsichAssessorJobRow)
+                    .where(AnsichAssessorJobRow.job_id.in_(assessor_job_ids))
+                    .values(
+                        status="pending",
+                        attempts=0,
+                        available_at=datetime.now(UTC),
+                        lease_owner=None,
+                        lease_expires_at=None,
+                        last_error=None,
+                    )
+                )
+        if not job_ids and not assessor_job_ids:
             return 0
 
         while await self.project_pending(limit=200):
             pass
-        async with self._session_factory() as session:
-            failed_count = await session.scalar(select(func.count()).select_from(AnsichProjectionJobRow).where(AnsichProjectionJobRow.status == "failed"))
-        self._failed_jobs = int(failed_count or 0)
+        await self.assess_operations()
+        await self._refresh_failed_job_count()
         await self._refresh_context_metrics()
-        return len(job_ids)
+        return len(job_ids) + len(assessor_job_ids)
 
     async def _claim_projection_job(
         self,
@@ -850,6 +989,922 @@ class SqlAnsichBackend:
                 )
             )
 
+    async def _claim_assessor_job(
+        self,
+    ) -> tuple[str, str, str, int, int] | None:
+        now = datetime.now(UTC)
+        async with self._session_factory() as session, session.begin():
+            job = await session.scalar(
+                select(AnsichAssessorJobRow)
+                .where(
+                    AnsichAssessorJobRow.available_at <= now,
+                    or_(
+                        AnsichAssessorJobRow.status == "pending",
+                        and_(
+                            AnsichAssessorJobRow.status == "processing",
+                            AnsichAssessorJobRow.lease_expires_at <= now,
+                        ),
+                    ),
+                )
+                .order_by(
+                    AnsichAssessorJobRow.evidence_watermark,
+                    AnsichAssessorJobRow.assessor_name,
+                    AnsichAssessorJobRow.job_id,
+                )
+                .limit(1)
+                .with_for_update(skip_locked=True)
+            )
+            if job is None:
+                return None
+            job.status = "processing"
+            job.attempts += 1
+            job.lease_owner = self._lease_owner
+            job.lease_expires_at = now + timedelta(seconds=self._projector_lease_seconds)
+            return (
+                job.job_id,
+                job.subject_id,
+                job.assessor_name,
+                job.evidence_watermark,
+                job.attempts,
+            )
+
+    async def _record_assessor_error(
+        self,
+        job_id: str,
+        attempt: int,
+        exc: Exception,
+    ) -> None:
+        async with self._session_factory() as session, session.begin():
+            job = await session.get(AnsichAssessorJobRow, job_id)
+            if job is None:
+                return
+            message = str(exc)[:4_000]
+            job.status = "failed" if attempt >= self._projector_max_attempts else "pending"
+            job.available_at = datetime.now(UTC) + timedelta(milliseconds=250)
+            job.lease_owner = None
+            job.lease_expires_at = None
+            job.last_error = message
+            session.add(
+                AnsichAssessorErrorRow(
+                    error_id=new_id(),
+                    job_id=job_id,
+                    attempt=attempt,
+                    error_type=type(exc).__name__,
+                    message=message,
+                )
+            )
+        await self._refresh_failed_job_count()
+
+    async def _refresh_failed_job_count(self) -> None:
+        async with self._session_factory() as session:
+            projection_failures = await session.scalar(select(func.count()).select_from(AnsichProjectionJobRow).where(AnsichProjectionJobRow.status == "failed"))
+            assessor_failures = await session.scalar(select(func.count()).select_from(AnsichAssessorJobRow).where(AnsichAssessorJobRow.status == "failed"))
+        self._failed_jobs = int(projection_failures or 0) + int(assessor_failures or 0)
+
+    async def _process_assessor_jobs(
+        self,
+        *,
+        now: datetime,
+        incomplete_tasks: frozenset[str],
+        global_loss: bool,
+        limit: int = 500,
+    ) -> int:
+        changed = 0
+        for _ in range(limit):
+            claim = await self._claim_assessor_job()
+            if claim is None:
+                break
+            job_id, task_id, assessor_name, evidence_watermark, attempt = claim
+            try:
+                async with self._session_factory() as session, session.begin():
+                    if assessor_name == ACTION_REPETITION_ASSESSOR.name:
+                        assessment = await self._assess_action_repetition_at(
+                            session,
+                            task_id=task_id,
+                            evidence_watermark=evidence_watermark,
+                            now=now,
+                        )
+                        signal = assessment.model_copy(update={"field_name": "behavior_signal:action-repetition"})
+                        assertion, assertion_changed = await self._persist_assessment(session, signal)
+                        changed += int(assertion_changed)
+                        changed += await self._reconcile_alerts_for_assessment(
+                            session,
+                            assessment=assessment,
+                            source_assertion_id=assertion.assertion_id,
+                            now=now,
+                        )
+                        changed += await self._refresh_behavior_belief(
+                            session,
+                            task_id=task_id,
+                            now=now,
+                        )
+                    elif assessor_name == TOOL_FREQUENCY_ASSESSOR.name:
+                        assessments = await self._assess_tool_frequency_at(
+                            session,
+                            task_id=task_id,
+                            evidence_watermark=evidence_watermark,
+                            now=now,
+                        )
+                        for assessment in assessments:
+                            assertion, assertion_changed = await self._persist_assessment(
+                                session,
+                                assessment,
+                            )
+                            changed += int(assertion_changed)
+                            changed += await self._reconcile_alerts_for_assessment(
+                                session,
+                                assessment=assessment,
+                                source_assertion_id=assertion.assertion_id,
+                                now=now,
+                            )
+                    elif assessor_name == ABSOLUTE_LIMIT_ASSESSOR.name:
+                        result = await self._assess_absolute_limits_at(
+                            session,
+                            task_id=task_id,
+                            evidence_watermark=evidence_watermark,
+                            now=now,
+                            usage_complete=(not global_loss and task_id not in incomplete_tasks),
+                        )
+                        for assessment in result.budget_health:
+                            assertion, assertion_changed = await self._persist_assessment(
+                                session,
+                                assessment,
+                            )
+                            changed += int(assertion_changed)
+                            changed += await self._reconcile_alerts_for_assessment(
+                                session,
+                                assessment=assessment,
+                                source_assertion_id=assertion.assertion_id,
+                                now=now,
+                            )
+                        signal = result.behavior.model_copy(update={"field_name": "behavior_signal:absolute-limit"})
+                        _, signal_changed = await self._persist_assessment(
+                            session,
+                            signal,
+                        )
+                        changed += int(signal_changed)
+                        changed += await self._refresh_behavior_belief(
+                            session,
+                            task_id=task_id,
+                            now=now,
+                        )
+                    else:
+                        raise ValueError(f"unknown Ansich assessor: {assessor_name}")
+                    summary = await session.get(AnsichTaskSummaryRow, task_id)
+                    if summary is not None and summary.control_value in {
+                        "completed",
+                        "failed",
+                        "interrupted",
+                    }:
+                        changed += await self._resolve_terminal_alerts(
+                            session,
+                            task_id=task_id,
+                            now=now,
+                        )
+                    job = await session.get(AnsichAssessorJobRow, job_id)
+                    if job is None:
+                        raise RuntimeError("claimed Ansich assessor job disappeared")
+                    job.status = "completed"
+                    job.lease_owner = None
+                    job.lease_expires_at = None
+                    job.last_error = None
+            except Exception as exc:
+                await self._record_assessor_error(job_id, attempt, exc)
+        return changed
+
+    async def _assess_action_repetition_at(
+        self,
+        session: AsyncSession,
+        *,
+        task_id: str,
+        evidence_watermark: int,
+        now: datetime,
+    ) -> Assessment:
+        step_rows = list(
+            (
+                await session.execute(
+                    select(AnsichStepRow, AnsichObservationRow)
+                    .join(
+                        AnsichObservationRow,
+                        AnsichObservationRow.obs_id == AnsichStepRow.closed_obs_id,
+                    )
+                    .where(
+                        AnsichStepRow.task_id == task_id,
+                        AnsichStepRow.actor_kind != "system_operation",
+                        AnsichObservationRow.ingest_seq <= evidence_watermark,
+                    )
+                    .order_by(AnsichStepRow.step_seq)
+                )
+            ).all()
+        )
+        steps = []
+        for step, closed_observation in step_rows:
+            tool_rows = list(
+                (
+                    await session.execute(
+                        select(AnsichToolCallRow, AnsichObservationRow)
+                        .join(
+                            AnsichObservationRow,
+                            AnsichObservationRow.obs_id == AnsichToolCallRow.issued_obs_id,
+                        )
+                        .where(
+                            AnsichToolCallRow.step_id == step.entity_id,
+                            AnsichObservationRow.ingest_seq <= evidence_watermark,
+                        )
+                        .order_by(
+                            AnsichToolCallRow.call_seq,
+                            AnsichToolCallRow.entity_id,
+                        )
+                    )
+                ).all()
+            )
+            tools = tuple(
+                ToolAction(
+                    tool_name=tool.tool_name,
+                    args=({} if tool.args_preview_json is None else tool.args_preview_json),
+                    evidence_obs_id=issued_observation.obs_id,
+                )
+                for tool, issued_observation in tool_rows
+            )
+            steps.append(
+                build_step_action(
+                    step_id=step.entity_id,
+                    step_seq=step.step_seq,
+                    occurred_at=_as_utc(closed_observation.occurred_at),
+                    tools=tools,
+                )
+            )
+        assessment = assess_action_repetition(
+            task_id=task_id,
+            steps=steps,
+            now=now,
+            exact_repetition_window=self._exact_repetition_window,
+        )
+        if steps:
+            return assessment
+        watermark_occurred_at = await session.scalar(select(AnsichObservationRow.occurred_at).where(AnsichObservationRow.ingest_seq == evidence_watermark))
+        return assessment.model_copy(update={"as_of": (now if watermark_occurred_at is None else _as_utc(watermark_occurred_at))})
+
+    async def _assess_tool_frequency_at(
+        self,
+        session: AsyncSession,
+        *,
+        task_id: str,
+        evidence_watermark: int,
+        now: datetime,
+    ) -> tuple[Assessment, ...]:
+        rows = list(
+            (
+                await session.execute(
+                    select(AnsichToolCallRow, AnsichObservationRow)
+                    .join(
+                        AnsichObservationRow,
+                        AnsichObservationRow.obs_id == AnsichToolCallRow.issued_obs_id,
+                    )
+                    .where(
+                        AnsichToolCallRow.task_id == task_id,
+                        AnsichObservationRow.ingest_seq <= evidence_watermark,
+                    )
+                    .order_by(
+                        AnsichObservationRow.occurred_at,
+                        AnsichObservationRow.obs_id,
+                    )
+                )
+            ).all()
+        )
+        watermark_occurred_at = await session.scalar(select(AnsichObservationRow.occurred_at).where(AnsichObservationRow.ingest_seq == evidence_watermark))
+        evaluated_at = now if watermark_occurred_at is None else _as_utc(watermark_occurred_at)
+        assessments = assess_tool_frequency(
+            task_id=task_id,
+            occurrences=tuple(
+                ToolOccurrence(
+                    tool_name=tool.tool_name,
+                    occurred_at=_as_utc(observation.occurred_at),
+                    evidence_obs_id=observation.obs_id,
+                )
+                for tool, observation in rows
+            ),
+            now=evaluated_at,
+            window_seconds=self._tool_frequency_window_seconds,
+            threshold=self._tool_frequency_threshold,
+        )
+        return tuple(assessment.model_copy(update={"asserted_at": now}) for assessment in assessments)
+
+    async def _assess_absolute_limits_at(
+        self,
+        session: AsyncSession,
+        *,
+        task_id: str,
+        evidence_watermark: int,
+        now: datetime,
+        usage_complete: bool,
+    ) -> AbsoluteLimitAssessmentResult:
+        configured_rows = list(
+            (
+                await session.execute(
+                    select(AnsichTaskBudgetRow, AnsichObservationRow)
+                    .join(
+                        AnsichObservationRow,
+                        AnsichObservationRow.obs_id == AnsichTaskBudgetRow.configured_obs_id,
+                    )
+                    .where(
+                        AnsichTaskBudgetRow.task_id == task_id,
+                        AnsichObservationRow.ingest_seq <= evidence_watermark,
+                    )
+                    .order_by(AnsichObservationRow.ingest_seq)
+                )
+            ).all()
+        )
+        effective_budget_rows: dict[tuple[str, str], AnsichTaskBudgetRow] = {}
+        for budget_row, _ in configured_rows:
+            effective_budget_rows[(budget_row.dimension, budget_row.aggregation_scope)] = budget_row
+        budgets = tuple(
+            TaskBudgetView(
+                entity_id=row.entity_id,
+                task_id=row.task_id,
+                dimension=cast(UsageDimension, row.dimension),
+                aggregation_scope=cast(AggregationScope, row.aggregation_scope),
+                warning_limit=row.warning_limit,
+                hard_limit=row.hard_limit,
+                enforcement=row.enforcement,
+                source_kind=cast(BudgetSourceKind, row.source_kind),
+                requested_value=row.requested_value,
+                effective_value=row.effective_value,
+                configured_obs_id=row.configured_obs_id,
+            )
+            for row in effective_budget_rows.values()
+        )
+        contribution_rows = list(
+            (
+                await session.execute(
+                    select(AnsichUsageContributionRow, AnsichObservationRow)
+                    .join(
+                        AnsichObservationRow,
+                        AnsichObservationRow.obs_id == AnsichUsageContributionRow.source_obs_id,
+                    )
+                    .where(
+                        AnsichUsageContributionRow.task_id == task_id,
+                        AnsichObservationRow.ingest_seq <= evidence_watermark,
+                    )
+                    .order_by(
+                        AnsichUsageContributionRow.as_of,
+                        AnsichUsageContributionRow.source_obs_id,
+                    )
+                )
+            ).all()
+        )
+        values: dict[tuple[UsageDimension, AggregationScope], int] = {}
+        as_of: dict[tuple[UsageDimension, AggregationScope], datetime] = {}
+        evidence: dict[tuple[UsageDimension, AggregationScope], list[str]] = {}
+        for contribution, _ in contribution_rows:
+            key = (
+                cast(UsageDimension, contribution.dimension),
+                cast(AggregationScope, "local"),
+            )
+            values[key] = values.get(key, 0) + contribution.delta
+            as_of[key] = max(
+                as_of.get(key, _as_utc(contribution.as_of)),
+                _as_utc(contribution.as_of),
+            )
+            evidence.setdefault(key, []).append(contribution.source_obs_id)
+
+        heartbeat_rows = list(
+            (
+                await session.execute(
+                    select(AnsichTaskHeartbeatRow, AnsichObservationRow)
+                    .join(
+                        AnsichObservationRow,
+                        AnsichObservationRow.obs_id == AnsichTaskHeartbeatRow.heartbeat_obs_id,
+                    )
+                    .where(
+                        AnsichTaskHeartbeatRow.task_id == task_id,
+                        AnsichObservationRow.ingest_seq <= evidence_watermark,
+                    )
+                    .order_by(
+                        AnsichTaskHeartbeatRow.elapsed_ms.desc(),
+                        AnsichObservationRow.ingest_seq.desc(),
+                    )
+                )
+            ).all()
+        )
+        if heartbeat_rows:
+            heartbeat, _ = heartbeat_rows[0]
+            wall_time_key = (
+                cast(UsageDimension, "wall_time_ms"),
+                cast(AggregationScope, "local"),
+            )
+            values[wall_time_key] = heartbeat.elapsed_ms
+            as_of[wall_time_key] = _as_utc(heartbeat.occurred_at)
+            evidence[wall_time_key] = [heartbeat.heartbeat_obs_id]
+
+        usage = tuple(
+            TaskUsageValue(
+                dimension=dimension,
+                aggregation_scope=scope,
+                value=value,
+                as_of=as_of[(dimension, scope)],
+                complete_through_ingest_seq=evidence_watermark,
+            )
+            for (dimension, scope), value in values.items()
+        )
+        watermark_occurred_at = await session.scalar(select(AnsichObservationRow.occurred_at).where(AnsichObservationRow.ingest_seq == evidence_watermark))
+        evaluated_at = now if watermark_occurred_at is None else _as_utc(watermark_occurred_at)
+        result = assess_absolute_limits(
+            task_id=task_id,
+            budgets=budgets,
+            usage=usage,
+            now=evaluated_at,
+            usage_complete=usage_complete,
+            usage_evidence={key: tuple(obs_ids) for key, obs_ids in evidence.items()},
+        )
+        return AbsoluteLimitAssessmentResult(
+            budget_health=tuple(assessment.model_copy(update={"asserted_at": now}) for assessment in result.budget_health),
+            behavior=result.behavior.model_copy(update={"asserted_at": now}),
+        )
+
+    async def _persist_assessment(
+        self,
+        session: AsyncSession,
+        assessment: Assessment,
+    ) -> tuple[AnsichBeliefAssertionRow, bool]:
+        existing_rows = list(
+            (
+                await session.execute(
+                    select(AnsichBeliefAssertionRow)
+                    .where(
+                        AnsichBeliefAssertionRow.subject_id == assessment.subject_id,
+                        AnsichBeliefAssertionRow.field_name == assessment.field_name,
+                        AnsichBeliefAssertionRow.assessor_name == assessment.assessor.name,
+                        AnsichBeliefAssertionRow.assessor_version == assessment.assessor.version,
+                        AnsichBeliefAssertionRow.config_hash == assessment.config_hash,
+                    )
+                    .order_by(
+                        AnsichBeliefAssertionRow.as_of.desc(),
+                        AnsichBeliefAssertionRow.asserted_at.desc(),
+                        AnsichBeliefAssertionRow.assertion_id.desc(),
+                    )
+                )
+            ).scalars()
+        )
+        expected_evidence = tuple((item.obs_id, item.role) for item in assessment.evidence)
+        for existing in existing_rows:
+            evidence = tuple(
+                (
+                    await session.execute(
+                        select(
+                            AnsichBeliefEvidenceRow.obs_id,
+                            AnsichBeliefEvidenceRow.evidence_role,
+                        )
+                        .where(AnsichBeliefEvidenceRow.assertion_id == existing.assertion_id)
+                        .order_by(AnsichBeliefEvidenceRow.ordinal)
+                    )
+                ).all()
+            )
+            if (
+                existing.value_json == assessment.value
+                and evidence == expected_evidence
+                and _as_utc(existing.as_of) == assessment.as_of
+                and existing.authority_class == assessment.authority_class
+                and existing.fidelity_class == assessment.fidelity_class
+                and existing.confidence == assessment.confidence
+            ):
+                return existing, False
+
+        assertion = AnsichBeliefAssertionRow(
+            assertion_id=new_id(),
+            subject_id=assessment.subject_id,
+            field_name=assessment.field_name,
+            value_json=assessment.value,
+            as_of=assessment.as_of,
+            asserted_at=assessment.asserted_at,
+            source_name=assessment.assessor.name,
+            source_version=assessment.assessor.version,
+            assessor_name=assessment.assessor.name,
+            assessor_version=assessment.assessor.version,
+            config_hash=assessment.config_hash,
+            authority_class=assessment.authority_class,
+            fidelity_class=assessment.fidelity_class,
+            confidence=assessment.confidence,
+        )
+        session.add(assertion)
+        for ordinal, evidence in enumerate(assessment.evidence):
+            session.add(
+                AnsichBeliefEvidenceRow(
+                    assertion_id=assertion.assertion_id,
+                    obs_id=evidence.obs_id,
+                    evidence_role=evidence.role,
+                    ordinal=ordinal,
+                )
+            )
+        await session.flush()
+        await self._resolve_current_assessment(
+            session,
+            subject_id=assessment.subject_id,
+            field_name=assessment.field_name,
+        )
+        return assertion, True
+
+    async def _resolve_current_assessment(
+        self,
+        session: AsyncSession,
+        *,
+        subject_id: str,
+        field_name: str,
+    ) -> None:
+        assertion_rows = list(
+            (
+                await session.execute(
+                    select(AnsichBeliefAssertionRow).where(
+                        AnsichBeliefAssertionRow.subject_id == subject_id,
+                        AnsichBeliefAssertionRow.field_name == field_name,
+                    )
+                )
+            ).scalars()
+        )
+        assertions = []
+        for row in assertion_rows:
+            evidence_rows = list((await session.execute(select(AnsichBeliefEvidenceRow).where(AnsichBeliefEvidenceRow.assertion_id == row.assertion_id).order_by(AnsichBeliefEvidenceRow.ordinal))).scalars())
+            assertions.append(
+                BeliefAssertion.model_validate(
+                    {
+                        "assertion_id": row.assertion_id,
+                        "subject_id": row.subject_id,
+                        "field_name": row.field_name,
+                        "value": row.value_json,
+                        "as_of": _as_utc(row.as_of),
+                        "asserted_at": _as_utc(row.asserted_at),
+                        "assessor": NamedVersion(
+                            name=row.assessor_name,
+                            version=row.assessor_version,
+                        ),
+                        "config_hash": row.config_hash,
+                        "authority_class": row.authority_class,
+                        "fidelity_class": row.fidelity_class,
+                        "confidence": row.confidence,
+                        "evidence": tuple(
+                            EvidenceRef(
+                                obs_id=evidence.obs_id,
+                                role=evidence.evidence_role,
+                            )
+                            for evidence in evidence_rows
+                        ),
+                    }
+                )
+            )
+        resolved = resolve_current_belief(assertions)
+        current = await session.get(
+            AnsichCurrentBeliefRow,
+            (subject_id, field_name),
+        )
+        if current is None:
+            session.add(
+                AnsichCurrentBeliefRow(
+                    subject_id=subject_id,
+                    field_name=field_name,
+                    assertion_id=resolved.selected.assertion_id,
+                    resolver_name=resolved.resolver.name,
+                    resolver_version=resolved.resolver.version,
+                )
+            )
+        else:
+            current.assertion_id = resolved.selected.assertion_id
+            current.resolver_name = resolved.resolver.name
+            current.resolver_version = resolved.resolver.version
+
+    async def _refresh_behavior_belief(
+        self,
+        session: AsyncSession,
+        *,
+        task_id: str,
+        now: datetime,
+    ) -> int:
+        signal_rows = list(
+            (
+                await session.execute(
+                    select(
+                        AnsichCurrentBeliefRow,
+                        AnsichBeliefAssertionRow,
+                    )
+                    .join(
+                        AnsichBeliefAssertionRow,
+                        AnsichBeliefAssertionRow.assertion_id == AnsichCurrentBeliefRow.assertion_id,
+                    )
+                    .where(
+                        AnsichCurrentBeliefRow.subject_id == task_id,
+                        AnsichCurrentBeliefRow.field_name.like("behavior_signal:%"),
+                    )
+                    .order_by(AnsichCurrentBeliefRow.field_name)
+                )
+            ).all()
+        )
+        active = [(current, assertion) for current, assertion in signal_rows if assertion.value_json.get("value") == "runaway"]
+        evidence: list[EvidenceRef] = []
+        seen_obs_ids: set[str] = set()
+        for _, assertion in active:
+            evidence_rows = list((await session.execute(select(AnsichBeliefEvidenceRow).where(AnsichBeliefEvidenceRow.assertion_id == assertion.assertion_id).order_by(AnsichBeliefEvidenceRow.ordinal))).scalars())
+            for item in evidence_rows:
+                if item.obs_id in seen_obs_ids:
+                    continue
+                seen_obs_ids.add(item.obs_id)
+                evidence.append(
+                    EvidenceRef(
+                        obs_id=item.obs_id,
+                        role=item.evidence_role,
+                    )
+                )
+        assessment = Assessment(
+            subject_id=task_id,
+            field_name="behavior",
+            value={
+                "value": "runaway" if active else "unassessed",
+                "reason": ("runaway_signal_present" if active else "no_runaway_signal"),
+                "signals": [
+                    {
+                        "field_name": current.field_name,
+                        "assessor_name": assertion.assessor_name,
+                        "assertion_id": assertion.assertion_id,
+                        "reason": assertion.value_json.get("reason"),
+                        "shadow": bool(assertion.value_json.get("shadow", False)),
+                    }
+                    for current, assertion in active
+                ],
+                "shadow": bool(active) and all(bool(assertion.value_json.get("shadow", False)) for _, assertion in active),
+            },
+            as_of=max(
+                (_as_utc(assertion.as_of) for _, assertion in signal_rows),
+                default=now,
+            ),
+            asserted_at=now,
+            assessor=NamedVersion(
+                name="behavior-aggregate",
+                version="1.0.0",
+            ),
+            config_hash=canonical_config_hash({"policy": "any-current-runaway-signal", "version": 1}),
+            authority_class="configured_rule",
+            fidelity_class="rule",
+            evidence=tuple(evidence),
+        )
+        _, did_change = await self._persist_assessment(session, assessment)
+        return int(did_change)
+
+    async def _load_alert_episodes(
+        self,
+        session: AsyncSession,
+        *,
+        task_id: str,
+    ) -> tuple[AlertEpisode, ...]:
+        rows = list(
+            (
+                await session.execute(
+                    select(AnsichAlertRow)
+                    .where(AnsichAlertRow.subject_id == task_id)
+                    .order_by(
+                        AnsichAlertRow.alert_key,
+                        AnsichAlertRow.episode,
+                    )
+                )
+            ).scalars()
+        )
+        episodes = []
+        for row in rows:
+            evidence_rows = list((await session.execute(select(AnsichAlertEvidenceRow).where(AnsichAlertEvidenceRow.alert_id == row.entity_id).order_by(AnsichAlertEvidenceRow.ordinal))).scalars())
+            episodes.append(
+                AlertEpisode.model_validate(
+                    {
+                        "alert_id": row.entity_id,
+                        "alert_key": row.alert_key,
+                        "episode": row.episode,
+                        "alert_type": row.alert_type,
+                        "subject_id": row.subject_id,
+                        "rule": NamedVersion(
+                            name=row.rule_name,
+                            version=row.rule_version,
+                        ),
+                        "rule_config_hash": row.rule_config_hash,
+                        "stable_condition_key": row.stable_condition_key,
+                        "source_assertion_id": row.source_assertion_id,
+                        "opened_at": _as_utc(row.opened_at),
+                        "as_of": _as_utc(row.as_of),
+                        "updated_at": _as_utc(row.updated_at),
+                        "resolved_at": (None if row.resolved_at is None else _as_utc(row.resolved_at)),
+                        "resolution_reason": row.resolution_reason,
+                        "workflow_state": row.workflow_state,
+                        "workflow_version": row.workflow_version,
+                        "dismissal_reason": row.dismissal_reason,
+                        "severity": row.severity,
+                        "shadow": row.shadow,
+                        "evidence": tuple(
+                            EvidenceRef(
+                                obs_id=evidence.obs_id,
+                                role=evidence.role,
+                            )
+                            for evidence in evidence_rows
+                        ),
+                    }
+                )
+            )
+        return tuple(episodes)
+
+    async def _reconcile_alerts_for_assessment(
+        self,
+        session: AsyncSession,
+        *,
+        assessment: Assessment,
+        source_assertion_id: str,
+        now: datetime,
+    ) -> int:
+        conditions = alert_conditions_from_assessment(
+            assessment,
+            source_assertion_id=source_assertion_id,
+        )
+        if not conditions:
+            return 0
+        summary = await session.get(
+            AnsichTaskSummaryRow,
+            assessment.subject_id,
+        )
+        if summary is not None and summary.control_value in {
+            "completed",
+            "failed",
+            "interrupted",
+        }:
+            return 0
+        episodes = await self._load_alert_episodes(
+            session,
+            task_id=assessment.subject_id,
+        )
+        reconciliations = reconcile_alert_conditions(
+            episodes,
+            conditions,
+            now=now,
+            alert_id_factory=new_id,
+        )
+        changed = 0
+        by_id = {episode.alert_id: episode for episode in episodes}
+        for reconciliation in reconciliations:
+            if reconciliation.change == "noop" or reconciliation.alert is None:
+                continue
+            previous = by_id.get(reconciliation.alert.alert_id)
+            if previous is not None and self._same_alert_projection(
+                previous,
+                reconciliation.alert,
+            ):
+                continue
+            await self._persist_alert_episode(
+                session,
+                reconciliation=reconciliation,
+            )
+            by_id[reconciliation.alert.alert_id] = reconciliation.alert
+            changed += 1
+        return changed
+
+    @staticmethod
+    def _same_alert_projection(
+        current: AlertEpisode,
+        candidate: AlertEpisode,
+    ) -> bool:
+        return current.model_copy(update={"updated_at": candidate.updated_at}) == candidate
+
+    async def _persist_alert_episode(
+        self,
+        session: AsyncSession,
+        *,
+        reconciliation: AlertReconciliation,
+    ) -> None:
+        alert = reconciliation.alert
+        if alert is None:
+            return
+        row = await session.get(AnsichAlertRow, alert.alert_id)
+        if row is None:
+            if not alert.evidence:
+                raise ValueError("new Alert episode requires Observation evidence")
+            session.add(
+                AnsichEntityRow(
+                    entity_id=alert.alert_id,
+                    entity_type="alert",
+                    discovered_obs_id=alert.evidence[0].obs_id,
+                )
+            )
+            row = AnsichAlertRow(
+                entity_id=alert.alert_id,
+                alert_key=alert.alert_key,
+                episode=alert.episode,
+                alert_type=alert.alert_type,
+                subject_id=alert.subject_id,
+                source_assertion_id=alert.source_assertion_id,
+                rule_name=alert.rule.name,
+                rule_version=alert.rule.version,
+                rule_config_hash=alert.rule_config_hash,
+                stable_condition_key=alert.stable_condition_key,
+                severity=alert.severity,
+                shadow=alert.shadow,
+                opened_at=alert.opened_at,
+                as_of=alert.as_of,
+                updated_at=alert.updated_at,
+                resolved_at=alert.resolved_at,
+                resolution_reason=alert.resolution_reason,
+                workflow_state=alert.workflow_state,
+                workflow_version=alert.workflow_version,
+                dismissal_reason=alert.dismissal_reason,
+            )
+            session.add(row)
+        else:
+            row.source_assertion_id = alert.source_assertion_id
+            row.rule_name = alert.rule.name
+            row.rule_version = alert.rule.version
+            row.rule_config_hash = alert.rule_config_hash
+            row.stable_condition_key = alert.stable_condition_key
+            row.severity = alert.severity
+            row.shadow = alert.shadow
+            row.as_of = alert.as_of
+            row.updated_at = alert.updated_at
+            row.resolved_at = alert.resolved_at
+            row.resolution_reason = alert.resolution_reason
+            row.workflow_state = alert.workflow_state
+            row.workflow_version = alert.workflow_version
+            row.dismissal_reason = alert.dismissal_reason
+            await session.execute(delete(AnsichAlertEvidenceRow).where(AnsichAlertEvidenceRow.alert_id == alert.alert_id))
+        for ordinal, evidence in enumerate(alert.evidence):
+            session.add(
+                AnsichAlertEvidenceRow(
+                    alert_id=alert.alert_id,
+                    obs_id=evidence.obs_id,
+                    role=evidence.role,
+                    ordinal=ordinal,
+                )
+            )
+        read_model = await session.get(
+            AnsichAlertReadModelRow,
+            alert.alert_id,
+        )
+        summary_json = {
+            "episode": alert.episode,
+            "rule_name": alert.rule.name,
+            "rule_version": alert.rule.version,
+            "rule_config_hash": alert.rule_config_hash,
+            "stable_condition_key": alert.stable_condition_key,
+            "source_assertion_id": alert.source_assertion_id,
+            "resolution_reason": alert.resolution_reason,
+            "dismissal_reason": alert.dismissal_reason,
+        }
+        if read_model is None:
+            session.add(
+                AnsichAlertReadModelRow(
+                    alert_id=alert.alert_id,
+                    subject_id=alert.subject_id,
+                    alert_type=alert.alert_type,
+                    severity=alert.severity,
+                    workflow_state=alert.workflow_state,
+                    shadow=alert.shadow,
+                    opened_at=alert.opened_at,
+                    as_of=alert.as_of,
+                    updated_at=alert.updated_at,
+                    resolved_at=alert.resolved_at,
+                    summary_json=summary_json,
+                    evidence_count=len(alert.evidence),
+                )
+            )
+        else:
+            read_model.alert_type = alert.alert_type
+            read_model.severity = alert.severity
+            read_model.workflow_state = alert.workflow_state
+            read_model.shadow = alert.shadow
+            read_model.as_of = alert.as_of
+            read_model.updated_at = alert.updated_at
+            read_model.resolved_at = alert.resolved_at
+            read_model.summary_json = summary_json
+            read_model.evidence_count = len(alert.evidence)
+
+    async def _resolve_terminal_alerts(
+        self,
+        session: AsyncSession,
+        *,
+        task_id: str,
+        now: datetime,
+    ) -> int:
+        episodes = await self._load_alert_episodes(
+            session,
+            task_id=task_id,
+        )
+        changed = 0
+        for episode in episodes:
+            if episode.workflow_state == "resolved" or episode.resolved_at is not None:
+                continue
+            resolved = resolve_alert_episode(
+                episode,
+                now=now,
+                reason="task_terminal",
+            )
+            await self._persist_alert_episode(
+                session,
+                reconciliation=AlertReconciliation(
+                    change="resolved",
+                    alert=resolved,
+                ),
+            )
+            changed += 1
+        return changed
+
     async def get_task(self, task_id: str) -> TaskView | None:
         async with self._session_factory() as session:
             task = await session.get(AnsichTaskRow, task_id)
@@ -899,6 +1954,26 @@ class SqlAnsichBackend:
                 ),
                 **usage,
             )
+
+    async def get_current_belief(
+        self,
+        subject_id: str,
+        field_name: str,
+    ) -> BeliefAssertionView | None:
+        async with self._session_factory() as session:
+            current = await session.get(
+                AnsichCurrentBeliefRow,
+                (subject_id, field_name),
+            )
+            if current is None:
+                return None
+            assertion = await session.get(
+                AnsichBeliefAssertionRow,
+                current.assertion_id,
+            )
+            if assertion is None:
+                return None
+            return await self._belief_assertion_view(session, assertion)
 
     async def get_task_by_source(self, source_kind: str, source_id: str) -> TaskView | None:
         async with self._session_factory() as session:
@@ -979,6 +2054,569 @@ class SqlAnsichBackend:
         async with self._session_factory() as session:
             rows = list((await session.execute(select(AnsichObservationRow).where(AnsichObservationRow.task_id == task_id).order_by(AnsichObservationRow.ingest_seq))).scalars())
         return [self._observation_from_row(row) for row in rows]
+
+    async def list_alerts(
+        self,
+        *,
+        limit: int,
+        alert_type: str | None = None,
+        workflow_state: str | None = None,
+        task_id: str | None = None,
+        severity: str | None = None,
+        shadow: bool | None = None,
+        from_time: datetime | None = None,
+        to_time: datetime | None = None,
+        cursor: tuple[datetime, str] | None = None,
+    ) -> list[AlertSummaryView]:
+        statement = select(AnsichAlertRow, AnsichAlertReadModelRow).join(
+            AnsichAlertReadModelRow,
+            AnsichAlertReadModelRow.alert_id == AnsichAlertRow.entity_id,
+        )
+        if alert_type is not None:
+            statement = statement.where(AnsichAlertRow.alert_type == alert_type)
+        if workflow_state is not None:
+            statement = statement.where(AnsichAlertRow.workflow_state == workflow_state)
+        if task_id is not None:
+            statement = statement.where(AnsichAlertRow.subject_id == task_id)
+        if severity is not None:
+            statement = statement.where(AnsichAlertRow.severity == severity)
+        if shadow is not None:
+            statement = statement.where(AnsichAlertRow.shadow == shadow)
+        if from_time is not None:
+            statement = statement.where(AnsichAlertRow.updated_at >= from_time)
+        if to_time is not None:
+            statement = statement.where(AnsichAlertRow.updated_at <= to_time)
+        if cursor is not None:
+            cursor_time, cursor_alert_id = cursor
+            statement = statement.where(
+                or_(
+                    AnsichAlertRow.updated_at < cursor_time,
+                    and_(
+                        AnsichAlertRow.updated_at == cursor_time,
+                        AnsichAlertRow.entity_id > cursor_alert_id,
+                    ),
+                )
+            )
+        statement = statement.order_by(
+            AnsichAlertRow.updated_at.desc(),
+            AnsichAlertRow.entity_id,
+        ).limit(limit)
+        async with self._session_factory() as session:
+            rows = list((await session.execute(statement)).all())
+        return [self._alert_summary_view(alert, read_model.evidence_count) for alert, read_model in rows]
+
+    async def get_alert_detail(
+        self,
+        alert_id: str,
+    ) -> AlertDetailView | None:
+        async with self._session_factory() as session:
+            alert = await session.get(AnsichAlertRow, alert_id)
+            if alert is None:
+                return None
+            read_model = await session.get(AnsichAlertReadModelRow, alert_id)
+            source_assertion = await session.get(
+                AnsichBeliefAssertionRow,
+                alert.source_assertion_id,
+            )
+            if read_model is None or source_assertion is None:
+                return None
+            source_belief = await self._belief_assertion_view(
+                session,
+                source_assertion,
+            )
+            alert_evidence = list((await session.execute(select(AnsichAlertEvidenceRow).where(AnsichAlertEvidenceRow.alert_id == alert_id).order_by(AnsichAlertEvidenceRow.ordinal))).scalars())
+            observation_rows = list((await session.execute(select(AnsichObservationRow).where(AnsichObservationRow.obs_id.in_([item.obs_id for item in alert_evidence])))).scalars())
+            observations_by_id = {observation.obs_id: observation for observation in observation_rows}
+            evidence = tuple(self._observation_from_row(observations_by_id[item.obs_id]) for item in alert_evidence if item.obs_id in observations_by_id)
+            current_rows = list(
+                (
+                    await session.execute(
+                        select(AnsichBeliefAssertionRow)
+                        .join(
+                            AnsichCurrentBeliefRow,
+                            AnsichCurrentBeliefRow.assertion_id == AnsichBeliefAssertionRow.assertion_id,
+                        )
+                        .where(AnsichCurrentBeliefRow.subject_id == alert.subject_id)
+                        .order_by(AnsichCurrentBeliefRow.field_name)
+                    )
+                ).scalars()
+            )
+            current_beliefs = tuple([await self._belief_assertion_view(session, row) for row in current_rows])
+            workflow_rows = list(
+                (
+                    await session.execute(
+                        select(AnsichAlertWorkflowEventRow)
+                        .where(AnsichAlertWorkflowEventRow.alert_id == alert_id)
+                        .order_by(
+                            AnsichAlertWorkflowEventRow.workflow_version,
+                            AnsichAlertWorkflowEventRow.event_id,
+                        )
+                    )
+                ).scalars()
+            )
+            summary = await session.get(
+                AnsichTaskSummaryRow,
+                alert.subject_id,
+            )
+        actions: list[str] = []
+        if alert.workflow_state not in {"resolved", "dismissed"}:
+            if alert.workflow_state == "open":
+                actions.append("acknowledge")
+            actions.append("dismiss")
+        if summary is not None and summary.control_value == "running":
+            actions.extend(("interrupt", "rollback"))
+        return AlertDetailView.model_validate(
+            {
+                "alert": self._alert_summary_view(
+                    alert,
+                    read_model.evidence_count,
+                ),
+                "source_belief": source_belief,
+                "evidence": evidence,
+                "current_beliefs": current_beliefs,
+                "workflow_history": tuple(
+                    AlertWorkflowEventView.model_validate(
+                        {
+                            "event_id": row.event_id,
+                            "obs_id": row.obs_id,
+                            "action": row.action,
+                            "from_state": row.from_state,
+                            "to_state": row.to_state,
+                            "workflow_version": row.workflow_version,
+                            "reason": row.reason,
+                            "operator_id": row.operator_id,
+                            "occurred_at": _as_utc(row.occurred_at),
+                        }
+                    )
+                    for row in workflow_rows
+                ),
+                "available_actions": tuple(actions),
+            }
+        )
+
+    async def change_alert_workflow(
+        self,
+        alert_id: str,
+        *,
+        action: Literal["acknowledge", "dismiss"],
+        expected_workflow_version: int,
+        operator_id: str,
+        reason: str | None,
+        occurred_at: datetime,
+    ) -> AlertSummaryView | None:
+        async with self._session_factory() as session, session.begin():
+            alert_row = await session.scalar(select(AnsichAlertRow).where(AnsichAlertRow.entity_id == alert_id).with_for_update())
+            if alert_row is None:
+                return None
+            episodes = await self._load_alert_episodes(
+                session,
+                task_id=alert_row.subject_id,
+            )
+            current = next(episode for episode in episodes if episode.alert_id == alert_id)
+            if action == "acknowledge":
+                updated = acknowledge_alert(
+                    current,
+                    expected_workflow_version=expected_workflow_version,
+                    now=occurred_at,
+                )
+                observation_kind = "operator.alert_acknowledged"
+            else:
+                updated = dismiss_alert(
+                    current,
+                    expected_workflow_version=expected_workflow_version,
+                    now=occurred_at,
+                    reason=reason or "",
+                )
+                observation_kind = "operator.alert_dismissed"
+            observation = ObservationEnvelope(
+                kind=observation_kind,
+                occurred_at=occurred_at,
+                recorded_at=occurred_at,
+                task_id=current.subject_id,
+                subject_type="alert",
+                subject_id=current.alert_id,
+                producer=Producer(
+                    name="ansich-operator-workflow",
+                    version="1",
+                    instance_id=operator_id,
+                ),
+                producer_seq=updated.workflow_version,
+                source_event_id=(f"alert:{alert_id}:{action}:workflow:{updated.workflow_version}"),
+                correlation_id=current.subject_id,
+                payload={
+                    "action": action,
+                    "expected_workflow_version": expected_workflow_version,
+                    "workflow_version": updated.workflow_version,
+                    "operator_id": operator_id,
+                    "reason": reason,
+                },
+            )
+            session.add(
+                AnsichObservationRow(
+                    obs_id=observation.obs_id,
+                    schema_version=observation.schema_version,
+                    kind=observation.kind,
+                    occurred_at=observation.occurred_at,
+                    recorded_at=observation.recorded_at,
+                    task_id=observation.task_id,
+                    step_id=None,
+                    subject_type=observation.subject_type,
+                    subject_id=observation.subject_id,
+                    fidelity_class=observation.fidelity_class,
+                    producer_name=observation.producer.name,
+                    producer_version=observation.producer.version,
+                    producer_instance_id=observation.producer.instance_id,
+                    producer_seq=observation.producer_seq,
+                    source_event_id=observation.source_event_id,
+                    correlation_id=observation.correlation_id,
+                    causation_obs_id=None,
+                    payload_json=observation.payload,
+                    payload_ref_id=None,
+                )
+            )
+            await session.flush()
+            await self._persist_alert_episode(
+                session,
+                reconciliation=AlertReconciliation(
+                    change="confirmed",
+                    alert=updated,
+                ),
+            )
+            session.add(
+                AnsichAlertWorkflowEventRow(
+                    event_id=new_id(),
+                    alert_id=alert_id,
+                    obs_id=observation.obs_id,
+                    action=action,
+                    from_state=current.workflow_state,
+                    to_state=updated.workflow_state,
+                    workflow_version=updated.workflow_version,
+                    reason=reason,
+                    operator_id=operator_id,
+                    occurred_at=occurred_at,
+                )
+            )
+            return self._alert_summary_view(
+                alert_row,
+                len(updated.evidence),
+            ).model_copy(
+                update={
+                    "workflow_state": updated.workflow_state,
+                    "workflow_version": updated.workflow_version,
+                    "updated_at": updated.updated_at,
+                    "dismissal_reason": updated.dismissal_reason,
+                }
+            )
+
+    async def get_task_action_target(
+        self,
+        task_id: str,
+    ) -> TaskActionTarget | None:
+        async with self._session_factory() as session:
+            task = await session.get(AnsichTaskRow, task_id)
+            summary = await session.get(AnsichTaskSummaryRow, task_id)
+            if task is None or summary is None:
+                return None
+            thread_id = await session.scalar(
+                select(AnsichScopeRow.scope_value)
+                .join(
+                    AnsichRelationRow,
+                    AnsichRelationRow.object_id == AnsichScopeRow.entity_id,
+                )
+                .where(
+                    AnsichRelationRow.subject_id == task_id,
+                    AnsichRelationRow.predicate == "within_scope",
+                    AnsichScopeRow.scope_kind == "thread",
+                )
+                .limit(1)
+            )
+        return TaskActionTarget(
+            task_id=task_id,
+            source_kind=task.source_kind,
+            run_id=task.source_id,
+            thread_id=thread_id,
+            control_value=summary.control_value,
+        )
+
+    async def get_operator_action(
+        self,
+        *,
+        task_id: str,
+        action_type: Literal["interrupt", "rollback"],
+        idempotency_key: str,
+    ) -> OperatorActionView | None:
+        async with self._session_factory() as session:
+            row = await session.scalar(
+                select(AnsichOperatorActionRow).where(
+                    AnsichOperatorActionRow.task_id == task_id,
+                    AnsichOperatorActionRow.action_type == action_type,
+                    AnsichOperatorActionRow.idempotency_key == idempotency_key,
+                )
+            )
+        return None if row is None else self._operator_action_view(row)
+
+    async def begin_operator_action(
+        self,
+        *,
+        task_id: str,
+        action_type: Literal["interrupt", "rollback"],
+        idempotency_key: str,
+        operator_id: str,
+        occurred_at: datetime,
+    ) -> tuple[OperatorActionView, bool]:
+        async with self._session_factory() as session, session.begin():
+            action_id = new_id()
+            values = {
+                "action_id": action_id,
+                "task_id": task_id,
+                "action_type": action_type,
+                "idempotency_key": idempotency_key,
+                "status": "requested",
+                "requested_obs_id": None,
+                "terminal_obs_id": None,
+                "result_json": None,
+                "created_at": occurred_at,
+                "updated_at": occurred_at,
+            }
+            if session.bind is not None and session.bind.dialect.name == "postgresql":
+                statement = postgresql_insert(AnsichOperatorActionRow).values(**values)
+            else:
+                statement = sqlite_insert(AnsichOperatorActionRow).values(**values)
+            inserted_action_id = (
+                await session.execute(
+                    statement.on_conflict_do_nothing(
+                        index_elements=[
+                            "task_id",
+                            "action_type",
+                            "idempotency_key",
+                        ]
+                    ).returning(AnsichOperatorActionRow.action_id)
+                )
+            ).scalar_one_or_none()
+            if inserted_action_id is None:
+                existing = await session.scalar(
+                    select(AnsichOperatorActionRow).where(
+                        AnsichOperatorActionRow.task_id == task_id,
+                        AnsichOperatorActionRow.action_type == action_type,
+                        AnsichOperatorActionRow.idempotency_key == idempotency_key,
+                    )
+                )
+                if existing is None:
+                    raise RuntimeError("operator action idempotency conflict did not expose the winning row")
+                return self._operator_action_view(existing), False
+            observation = self._operator_action_observation(
+                task_id=task_id,
+                action_id=inserted_action_id,
+                action_type=action_type,
+                status="requested",
+                idempotency_key=idempotency_key,
+                operator_id=operator_id,
+                occurred_at=occurred_at,
+                result=None,
+            )
+            self._add_observation_row(session, observation)
+            await session.execute(update(AnsichOperatorActionRow).where(AnsichOperatorActionRow.action_id == inserted_action_id).values(requested_obs_id=observation.obs_id))
+            await session.flush()
+            return (
+                OperatorActionView(
+                    action_id=inserted_action_id,
+                    task_id=task_id,
+                    action_type=action_type,
+                    idempotency_key=idempotency_key,
+                    status="requested",
+                    requested_obs_id=observation.obs_id,
+                    terminal_obs_id=None,
+                    result=None,
+                    created_at=occurred_at,
+                    updated_at=occurred_at,
+                ),
+                True,
+            )
+
+    async def finish_operator_action(
+        self,
+        action_id: str,
+        *,
+        succeeded: bool,
+        operator_id: str,
+        result: dict[str, object],
+        occurred_at: datetime,
+    ) -> OperatorActionView | None:
+        async with self._session_factory() as session, session.begin():
+            row = await session.scalar(select(AnsichOperatorActionRow).where(AnsichOperatorActionRow.action_id == action_id).with_for_update())
+            if row is None:
+                return None
+            if row.status in {"succeeded", "failed"}:
+                return self._operator_action_view(row)
+            status = "succeeded" if succeeded else "failed"
+            observation = self._operator_action_observation(
+                task_id=row.task_id,
+                action_id=row.action_id,
+                action_type=cast(
+                    Literal["interrupt", "rollback"],
+                    row.action_type,
+                ),
+                status=status,
+                idempotency_key=row.idempotency_key,
+                operator_id=operator_id,
+                occurred_at=occurred_at,
+                result=result,
+            )
+            self._add_observation_row(session, observation)
+            row.status = status
+            row.terminal_obs_id = observation.obs_id
+            row.result_json = result
+            row.updated_at = occurred_at
+            await session.flush()
+            return self._operator_action_view(row)
+
+    @staticmethod
+    def _operator_action_observation(
+        *,
+        task_id: str,
+        action_id: str,
+        action_type: Literal["interrupt", "rollback"],
+        status: Literal["requested", "succeeded", "failed"],
+        idempotency_key: str,
+        operator_id: str,
+        occurred_at: datetime,
+        result: dict[str, object] | None,
+    ) -> ObservationEnvelope:
+        kind_by_status = {
+            "requested": "operator.action_requested",
+            "succeeded": "operator.action_succeeded",
+            "failed": "operator.action_failed",
+        }
+        idempotency_hash = hashlib.sha256(idempotency_key.encode("utf-8")).hexdigest()
+        return ObservationEnvelope(
+            kind=kind_by_status[status],
+            occurred_at=occurred_at,
+            recorded_at=occurred_at,
+            task_id=task_id,
+            subject_type="task",
+            subject_id=task_id,
+            producer=Producer(
+                name="ansich-operator-action",
+                version="1",
+                instance_id=operator_id,
+            ),
+            source_event_id=(f"operator-action:{action_id}:{status}:{idempotency_hash[:16]}"),
+            correlation_id=action_id,
+            payload={
+                "action_id": action_id,
+                "action_type": action_type,
+                "status": status,
+                "idempotency_hash": idempotency_hash,
+                "operator_id": operator_id,
+                "result": result,
+            },
+        )
+
+    @staticmethod
+    def _add_observation_row(
+        session: AsyncSession,
+        observation: ObservationEnvelope,
+    ) -> None:
+        session.add(
+            AnsichObservationRow(
+                obs_id=observation.obs_id,
+                schema_version=observation.schema_version,
+                kind=observation.kind,
+                occurred_at=observation.occurred_at,
+                recorded_at=observation.recorded_at,
+                task_id=observation.task_id,
+                step_id=observation.step_id,
+                subject_type=observation.subject_type,
+                subject_id=observation.subject_id,
+                fidelity_class=observation.fidelity_class,
+                producer_name=observation.producer.name,
+                producer_version=observation.producer.version,
+                producer_instance_id=observation.producer.instance_id,
+                producer_seq=observation.producer_seq,
+                source_event_id=observation.source_event_id,
+                correlation_id=observation.correlation_id,
+                causation_obs_id=observation.causation_obs_id,
+                payload_json=observation.payload,
+                payload_ref_id=observation.payload_ref_id,
+            )
+        )
+
+    @staticmethod
+    def _operator_action_view(
+        row: AnsichOperatorActionRow,
+    ) -> OperatorActionView:
+        return OperatorActionView.model_validate(
+            {
+                "action_id": row.action_id,
+                "task_id": row.task_id,
+                "action_type": row.action_type,
+                "idempotency_key": row.idempotency_key,
+                "status": row.status,
+                "requested_obs_id": row.requested_obs_id,
+                "terminal_obs_id": row.terminal_obs_id,
+                "result": row.result_json,
+                "created_at": _as_utc(row.created_at),
+                "updated_at": _as_utc(row.updated_at),
+            }
+        )
+
+    @staticmethod
+    def _alert_summary_view(
+        alert: AnsichAlertRow,
+        evidence_count: int,
+    ) -> AlertSummaryView:
+        return AlertSummaryView.model_validate(
+            {
+                "alert_id": alert.entity_id,
+                "subject_id": alert.subject_id,
+                "alert_type": alert.alert_type,
+                "episode": alert.episode,
+                "severity": alert.severity,
+                "workflow_state": alert.workflow_state,
+                "workflow_version": alert.workflow_version,
+                "shadow": alert.shadow,
+                "opened_at": _as_utc(alert.opened_at),
+                "as_of": _as_utc(alert.as_of),
+                "updated_at": _as_utc(alert.updated_at),
+                "resolved_at": (None if alert.resolved_at is None else _as_utc(alert.resolved_at)),
+                "rule": NamedVersion(
+                    name=alert.rule_name,
+                    version=alert.rule_version,
+                ),
+                "rule_config_hash": alert.rule_config_hash,
+                "stable_condition_key": alert.stable_condition_key,
+                "source_assertion_id": alert.source_assertion_id,
+                "resolution_reason": alert.resolution_reason,
+                "dismissal_reason": alert.dismissal_reason,
+                "evidence_count": evidence_count,
+            }
+        )
+
+    @staticmethod
+    async def _belief_assertion_view(
+        session: AsyncSession,
+        assertion: AnsichBeliefAssertionRow,
+    ) -> BeliefAssertionView:
+        evidence_obs_ids = tuple((await session.execute(select(AnsichBeliefEvidenceRow.obs_id).where(AnsichBeliefEvidenceRow.assertion_id == assertion.assertion_id).order_by(AnsichBeliefEvidenceRow.ordinal))).scalars())
+        return BeliefAssertionView.model_validate(
+            {
+                "assertion_id": assertion.assertion_id,
+                "subject_id": assertion.subject_id,
+                "field_name": assertion.field_name,
+                "value": assertion.value_json,
+                "as_of": _as_utc(assertion.as_of),
+                "asserted_at": _as_utc(assertion.asserted_at),
+                "assessor": NamedVersion(
+                    name=assertion.assessor_name,
+                    version=assertion.assessor_version,
+                ),
+                "config_hash": assertion.config_hash,
+                "authority_class": assertion.authority_class,
+                "fidelity_class": assertion.fidelity_class,
+                "confidence": assertion.confidence,
+                "evidence_obs_ids": evidence_obs_ids,
+            }
+        )
 
     async def get_task_usage(self, task_id: str) -> TaskUsageView:
         async with self._session_factory() as session:
@@ -1068,6 +2706,14 @@ class SqlAnsichBackend:
     ) -> int:
         asserted_at = datetime.now(UTC) if now is None else now
         incomplete_tasks = frozenset(incomplete_task_ids)
+        await self._process_assessor_jobs(
+            now=asserted_at,
+            incomplete_tasks=incomplete_tasks,
+            global_loss=global_loss,
+        )
+        # Preserve the Phase 5 return contract: this count reports periodic
+        # operational Belief transitions, not event-driven assessor or Alert
+        # projection churn.
         changed = 0
         async with self._session_factory() as session, session.begin():
             task_ids = tuple((await session.execute(select(AnsichTaskSummaryRow.task_id).where(AnsichTaskSummaryRow.control_value == "running"))).scalars())
@@ -1108,44 +2754,84 @@ class SqlAnsichBackend:
                         current.assertion_id,
                     )
                     current_evidence = tuple((await session.execute(select(AnsichBeliefEvidenceRow.obs_id).where(AnsichBeliefEvidenceRow.assertion_id == current.assertion_id).order_by(AnsichBeliefEvidenceRow.ordinal))).scalars())
-                if current_assertion is not None and current_assertion.value_json == {"value": belief.value} and current_evidence == belief.evidence_obs_ids and current is not None and current.resolver_version == belief.selected_by.version:
-                    continue
-                assertion = AnsichBeliefAssertionRow(
-                    assertion_id=new_id(),
+                heartbeat_unchanged = (
+                    current_assertion is not None and current_assertion.value_json == {"value": belief.value} and current_evidence == belief.evidence_obs_ids and current is not None and current.resolver_version == belief.selected_by.version
+                )
+                if heartbeat_unchanged:
+                    assertion = current_assertion
+                else:
+                    assertion = AnsichBeliefAssertionRow(
+                        assertion_id=new_id(),
+                        subject_id=task_id,
+                        field_name="heartbeat",
+                        value_json={"value": belief.value},
+                        as_of=belief.as_of or asserted_at,
+                        asserted_at=belief.asserted_at,
+                        source_name=belief.source.name,
+                        source_version=belief.source.version,
+                        assessor_name=belief.source.name,
+                        assessor_version=belief.source.version,
+                        config_hash=canonical_config_hash(
+                            {
+                                "stale_after_seconds": self._heartbeat_stale_after_seconds,
+                            }
+                        ),
+                        authority_class="configured_rule",
+                        fidelity_class=belief.fidelity_class,
+                        confidence=None,
+                    )
+                    session.add(assertion)
+                    for ordinal, obs_id in enumerate(belief.evidence_obs_ids):
+                        session.add(
+                            AnsichBeliefEvidenceRow(
+                                assertion_id=assertion.assertion_id,
+                                obs_id=obs_id,
+                                evidence_role="supporting",
+                                ordinal=ordinal,
+                            )
+                        )
+                    if current is None:
+                        session.add(
+                            AnsichCurrentBeliefRow(
+                                subject_id=task_id,
+                                field_name="heartbeat",
+                                assertion_id=assertion.assertion_id,
+                                resolver_name=belief.selected_by.name,
+                                resolver_version=belief.selected_by.version,
+                            )
+                        )
+                    else:
+                        current.assertion_id = assertion.assertion_id
+                        current.resolver_name = belief.selected_by.name
+                        current.resolver_version = belief.selected_by.version
+                    changed += 1
+                heartbeat_assessment = Assessment(
                     subject_id=task_id,
                     field_name="heartbeat",
-                    value_json={"value": belief.value},
+                    value={"value": belief.value},
                     as_of=belief.as_of or asserted_at,
                     asserted_at=belief.asserted_at,
-                    source_name=belief.source.name,
-                    source_version=belief.source.version,
+                    assessor=belief.source,
+                    config_hash=canonical_config_hash(
+                        {
+                            "stale_after_seconds": self._heartbeat_stale_after_seconds,
+                        }
+                    ),
+                    authority_class="configured_rule",
                     fidelity_class=belief.fidelity_class,
+                    evidence=tuple(EvidenceRef(obs_id=obs_id) for obs_id in belief.evidence_obs_ids),
                 )
-                session.add(assertion)
-                for ordinal, obs_id in enumerate(belief.evidence_obs_ids):
-                    session.add(
-                        AnsichBeliefEvidenceRow(
-                            assertion_id=assertion.assertion_id,
-                            obs_id=obs_id,
-                            evidence_role="supporting",
-                            ordinal=ordinal,
-                        )
-                    )
-                if current is None:
-                    session.add(
-                        AnsichCurrentBeliefRow(
-                            subject_id=task_id,
-                            field_name="heartbeat",
-                            assertion_id=assertion.assertion_id,
-                            resolver_name=belief.selected_by.name,
-                            resolver_version=belief.selected_by.version,
-                        )
-                    )
-                else:
-                    current.assertion_id = assertion.assertion_id
-                    current.resolver_name = belief.selected_by.name
-                    current.resolver_version = belief.selected_by.version
-                changed += 1
+                await self._reconcile_alerts_for_assessment(
+                    session,
+                    assessment=heartbeat_assessment,
+                    source_assertion_id=assertion.assertion_id,
+                    now=asserted_at,
+                )
+                changed += await self._assess_and_reconcile_dwell(
+                    session,
+                    task_id=task_id,
+                    now=asserted_at,
+                )
             budget_rows = list((await session.execute(_periodic_budget_rows_statement())).scalars())
             changed += await self._assess_budget_rows(
                 session,
@@ -1157,6 +2843,94 @@ class SqlAnsichBackend:
         await self._refresh_active_task_read_model(
             now=asserted_at,
             lost_ranges=lost_ranges,
+        )
+        return changed
+
+    async def _assess_and_reconcile_dwell(
+        self,
+        session: AsyncSession,
+        *,
+        task_id: str,
+        now: datetime,
+    ) -> int:
+        step = await session.scalar(
+            select(AnsichStepRow)
+            .where(
+                AnsichStepRow.task_id == task_id,
+                AnsichStepRow.status.not_in(("closed", "model_failed")),
+            )
+            .order_by(AnsichStepRow.step_seq.desc())
+            .limit(1)
+        )
+        tool = None
+        if step is not None:
+            tool = await session.scalar(
+                select(AnsichToolCallRow)
+                .where(
+                    AnsichToolCallRow.step_id == step.entity_id,
+                    AnsichToolCallRow.execution_status.in_(("issued", "acting")),
+                )
+                .order_by(AnsichToolCallRow.call_seq.desc())
+                .limit(1)
+            )
+        evidence_obs_id = None
+        if tool is not None:
+            evidence_obs_id = tool.started_obs_id or tool.issued_obs_id
+        if evidence_obs_id is None and step is not None:
+            evidence_obs_id = step.started_obs_id
+        action_observation = None if evidence_obs_id is None else await session.scalar(select(AnsichObservationRow).where(AnsichObservationRow.obs_id == evidence_obs_id))
+        dwell = assess_dwell(
+            since=(None if action_observation is None else _as_utc(action_observation.occurred_at)),
+            evidence_obs_id=evidence_obs_id,
+            now=now,
+            long_dwell_seconds=self._long_dwell_seconds,
+        )
+        evidence = tuple(EvidenceRef(obs_id=obs_id) for obs_id in dwell.evidence_obs_ids)
+        config_hash = canonical_config_hash({"long_dwell_seconds": self._long_dwell_seconds})
+        assessment = Assessment(
+            subject_id=task_id,
+            field_name="dwell",
+            value={"value": dwell.value},
+            as_of=dwell.since or now,
+            asserted_at=dwell.asserted_at,
+            assessor=dwell.source,
+            config_hash=config_hash,
+            authority_class="configured_rule",
+            fidelity_class=dwell.fidelity_class,
+            evidence=evidence,
+        )
+        current = await session.get(
+            AnsichCurrentBeliefRow,
+            (task_id, "dwell"),
+        )
+        if evidence_obs_id is None and current is None:
+            return 0
+        current_assertion = (
+            None
+            if current is None
+            else await session.get(
+                AnsichBeliefAssertionRow,
+                current.assertion_id,
+            )
+        )
+        current_evidence: tuple[str, ...] = ()
+        if current_assertion is not None:
+            current_evidence = tuple((await session.execute(select(AnsichBeliefEvidenceRow.obs_id).where(AnsichBeliefEvidenceRow.assertion_id == current_assertion.assertion_id).order_by(AnsichBeliefEvidenceRow.ordinal))).scalars())
+        unchanged = current_assertion is not None and current_assertion.value_json == assessment.value and current_assertion.config_hash == config_hash and current_evidence == dwell.evidence_obs_ids
+        if unchanged:
+            assertion = current_assertion
+            changed = 0
+        else:
+            assertion, did_change = await self._persist_assessment(
+                session,
+                assessment,
+            )
+            changed = int(did_change)
+        await self._reconcile_alerts_for_assessment(
+            session,
+            assessment=assessment,
+            source_assertion_id=assertion.assertion_id,
+            now=now,
         )
         return changed
 
@@ -1258,7 +3032,20 @@ class SqlAnsichBackend:
                 asserted_at=belief.asserted_at,
                 source_name=belief.source.name,
                 source_version=belief.source.version,
+                assessor_name=belief.source.name,
+                assessor_version=belief.source.version,
+                config_hash=canonical_config_hash(
+                    {
+                        "dimension": budget.dimension,
+                        "aggregation_scope": budget.aggregation_scope,
+                        "warning_limit": budget.warning_limit,
+                        "hard_limit": budget.hard_limit,
+                        "enforcement": budget.enforcement,
+                    }
+                ),
+                authority_class="configured_rule",
                 fidelity_class=belief.fidelity_class,
+                confidence=None,
             )
             session.add(assertion)
             for ordinal, obs_id in enumerate(belief.evidence_obs_ids):
@@ -1352,6 +3139,9 @@ class SqlAnsichBackend:
             for current, assertion in rows:
                 evidence = tuple((await session.execute(select(AnsichBeliefEvidenceRow.obs_id).where(AnsichBeliefEvidenceRow.assertion_id == assertion.assertion_id).order_by(AnsichBeliefEvidenceRow.ordinal))).scalars())
                 value_json = assertion.value_json
+                as_of_known = value_json.get("as_of_known")
+                if as_of_known is None:
+                    as_of_known = value_json.get("value") != "unknown" and value_json.get("usage_value") is not None
                 beliefs.append(
                     BudgetHealthBelief(
                         dimension=value_json["dimension"],
@@ -1361,7 +3151,7 @@ class SqlAnsichBackend:
                         warning_limit=value_json.get("warning_limit"),
                         hard_limit=value_json.get("hard_limit"),
                         overshoot=value_json.get("overshoot"),
-                        as_of=(_as_utc(assertion.as_of) if value_json.get("as_of_known") else None),
+                        as_of=(_as_utc(assertion.as_of) if as_of_known else None),
                         asserted_at=_as_utc(assertion.asserted_at),
                         source=NamedVersion(
                             name=assertion.source_name,
@@ -2540,7 +4330,12 @@ class SqlAnsichBackend:
             asserted_at=observation.recorded_at,
             source_name="task-control",
             source_version="1",
+            assessor_name="task-control",
+            assessor_version="1",
+            config_hash=canonical_config_hash({"control_projector": "1"}),
+            authority_class="deterministic",
             fidelity_class="hard",
+            confidence=None,
         )
         session.add(assertion)
         session.add(
@@ -3213,7 +5008,12 @@ class SqlAnsichBackend:
             asserted_at=observation.recorded_at,
             source_name=observation.producer.name,
             source_version=observation.producer.version,
+            assessor_name=observation.producer.name,
+            assessor_version=observation.producer.version,
+            config_hash=canonical_config_hash({"tool_terminal_precedence": "1"}),
+            authority_class="deterministic",
             fidelity_class="hard",
+            confidence=None,
         )
         session.add(assertion)
         session.add(

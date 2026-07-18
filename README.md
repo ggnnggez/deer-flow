@@ -566,6 +566,18 @@ When enabled, every Gateway HTTP response includes `X-Trace-Id`, logs include `t
 
 Ansich is an embedded, developer/operator-first observability module for inspecting Agent Tasks, logical Steps and LLM attempts, model-visible context, ToolCall accountability, context compression, and ContentBlock lineage. Enable `ansich.enabled: true` in `config.yaml`, restart the Gateway, and open the admin-only `/workspace/ansich/operations` page. Collection is fail-open: an Ansich write or projection failure degrades observability without changing the Agent run result. The collector queue is bounded by both `ansich.queue_capacity` and `ansich.queue_byte_capacity`; current usage and high-watermarks are visible in Operations. While a Run is active, the owning worker emits graph-independent liveness observations every `ansich.heartbeat_interval_seconds` (default 10 seconds); `heartbeat_stale_after_seconds` is an assessment threshold and never changes the Run's hard status. The active-task lens combines the current Step/Tool, dwell, heartbeat age, local token/Step/Tool/wall-time usage, effective runtime budgets, overshoot, projection lag, and lost ranges; a separate non-polling, cursor-paged history view keeps completed, failed, and interrupted Tasks available for retrospective diagnosis. Unknown or incomplete evidence stays explicit, inclusive usage remains unavailable until its rollup phase, and the UI reports failed projection jobs separately from a genuinely empty effective context.
 
+The Alerts lens adds evidence-backed episodes for exact action repetition,
+absolute budget limits, Tool frequency, heartbeat/dwell, and observability
+failures. Exact repetition and absolute breaches can resolve the current Task
+behavior as runaway; changing-argument Tool frequency remains an operational
+signal only. Administrators can acknowledge/dismiss an Alert or explicitly
+confirm the existing DeerFlow interrupt/rollback actions. These actions verify
+the server-side Task-to-Run mapping and use idempotency keys; an Ansich audit
+failure is reported as degraded without blocking the underlying DeerFlow
+action. Assessor thresholds can be configured under `ansich.assessors` with
+`exact_repetition_window`, `tool_frequency_window_seconds`, and
+`tool_frequency_threshold`.
+
 #### LangSmith Tracing
 
 DeerFlow has built-in [LangSmith](https://smith.langchain.com) integration for observability. When enabled, all LLM calls, agent runs, and tool executions are traced and visible in the LangSmith dashboard.

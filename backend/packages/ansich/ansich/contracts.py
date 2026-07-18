@@ -35,6 +35,13 @@ ToolObservationKind = Literal[
     "tool.unknown_terminal",
 ]
 BudgetObservationKind = Literal["budget.configured", "budget.consumed"]
+OperatorObservationKind = Literal[
+    "operator.action_requested",
+    "operator.action_succeeded",
+    "operator.action_failed",
+    "operator.alert_acknowledged",
+    "operator.alert_dismissed",
+]
 UsageDimension = Literal[
     "input_tokens",
     "output_tokens",
@@ -46,7 +53,7 @@ UsageDimension = Literal[
     "wall_time_ms",
     "child_tasks_spawned",
 ]
-ObservationKind = TaskLifecycleKind | StepObservationKind | LlmObservationKind | ContextObservationKind | ToolObservationKind | BudgetObservationKind | Literal["task.heartbeat", "observability.degraded"]
+ObservationKind = TaskLifecycleKind | StepObservationKind | LlmObservationKind | ContextObservationKind | ToolObservationKind | BudgetObservationKind | OperatorObservationKind | Literal["task.heartbeat", "observability.degraded"]
 ControlValue = Literal["unknown", "created", "running", "completed", "failed", "interrupted"]
 TaskLifecycleScope = Literal["all", "active", "terminal"]
 
@@ -154,6 +161,7 @@ class ObservationEnvelope(BaseModel):
         "context_state",
         "context_snapshot",
         "context_compression",
+        "alert",
     ] = "task"
     subject_id: str
     fidelity_class: Literal["hard"] = "hard"
@@ -192,6 +200,10 @@ class ObservationEnvelope(BaseModel):
             raise ValueError("context compression observation subject_type must be context_compression")
         elif self.kind.startswith("budget.") and (self.subject_type != "task" or self.subject_id != self.task_id):
             raise ValueError("budget observation subject must identify task_id")
+        elif self.kind.startswith("operator.alert_") and self.subject_type != "alert":
+            raise ValueError("Alert workflow observation subject_type must be alert")
+        elif self.kind.startswith("operator.action_") and (self.subject_type != "task" or self.subject_id != self.task_id):
+            raise ValueError("Operator action observation subject must identify task_id")
         if self.kind == "task.heartbeat":
             payload = self.payload or {}
             elapsed_ms = payload.get("elapsed_ms")

@@ -12,6 +12,7 @@ const TOOL_VISIBLE_BLOCK_ID = "bb695124-12f7-48fd-bc4e-54058924d85a";
 const COMPRESSION_ID = "ac695124-12f7-48fd-bc4e-54058924d85a";
 const OLDER_COMPRESSION_ID = "9c695124-12f7-48fd-bc4e-54058924d85a";
 const SUMMARY_BLOCK_ID = "cc695124-12f7-48fd-bc4e-54058924d85a";
+const ALERT_ID = "ec695124-12f7-48fd-bc4e-54058924d85a";
 const HEALTH = {
   status: "healthy",
   queue_depth: 0,
@@ -644,6 +645,213 @@ test("operations keeps terminal Task history separate from running work", async 
 
   await page.waitForURL(`**/workspace/ansich/tasks/${TASK_ID}`);
   await expect(page.getByRole("heading", { name: TASK_ID })).toBeVisible();
+});
+
+test("operator inspects alert evidence before confirming workflow and runtime actions", async ({
+  page,
+}) => {
+  mockLangGraphAPI(page, { threads: [] });
+  let detailRequests = 0;
+  let workflowState = "open";
+  let workflowVersion = 1;
+  let interruptRequests = 0;
+  const alertSummary = () => ({
+    alert_id: ALERT_ID,
+    subject_id: TASK_ID,
+    alert_type: "exact_repetition",
+    episode: 1,
+    severity: "critical",
+    workflow_state: workflowState,
+    workflow_version: workflowVersion,
+    shadow: false,
+    opened_at: "2026-07-17T12:00:03Z",
+    as_of: "2026-07-17T12:00:03Z",
+    updated_at: "2026-07-17T12:00:03Z",
+    resolved_at: null,
+    rule: { name: "action-repetition", version: "1.0.0" },
+    rule_config_hash:
+      "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    stable_condition_key: "exact-repetition",
+    source_assertion_id: "assertion-e2e",
+    resolution_reason: null,
+    dismissal_reason: null,
+    evidence_count: 1,
+  });
+  const sourceBelief = {
+    assertion_id: "assertion-e2e",
+    subject_id: TASK_ID,
+    field_name: "behavior_signal:action-repetition",
+    value: { value: "runaway", reason: "exact_repetition" },
+    as_of: "2026-07-17T12:00:03Z",
+    asserted_at: "2026-07-17T12:00:03Z",
+    assessor: { name: "action-repetition", version: "1.0.0" },
+    config_hash:
+      "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    authority_class: "configured_rule",
+    fidelity_class: "rule",
+    confidence: null,
+    evidence_obs_ids: ["13bd27c7-51b1-4164-9380-b98c40c2bfe0"],
+  };
+  const behaviorBelief = {
+    ...sourceBelief,
+    assertion_id: "behavior-e2e",
+    field_name: "behavior",
+    assessor: { name: "behavior-aggregate", version: "1.0.0" },
+    value: { value: "runaway", reason: "runaway_signal_present" },
+  };
+  await page.route("**/api/ansich/operations/active-tasks?*", (route) =>
+    route.fulfill({
+      status: 200,
+      contentType: "application/json",
+      body: JSON.stringify({
+        items: [ACTIVE_TASK],
+        next_cursor: null,
+        projection_status: HEALTH,
+      }),
+    }),
+  );
+  await page.route("**/api/ansich/operations/alerts?*", (route) =>
+    route.fulfill({
+      status: 200,
+      contentType: "application/json",
+      body: JSON.stringify({
+        items: [alertSummary()],
+        next_cursor: null,
+        projection_status: HEALTH,
+      }),
+    }),
+  );
+  await page.route(`**/api/ansich/operations/alerts/${ALERT_ID}`, (route) => {
+    detailRequests += 1;
+    return route.fulfill({
+      status: 200,
+      contentType: "application/json",
+      body: JSON.stringify({
+        alert: {
+          alert: alertSummary(),
+          source_belief: sourceBelief,
+          evidence: [
+            {
+              ingest_seq: 3,
+              obs_id: "13bd27c7-51b1-4164-9380-b98c40c2bfe0",
+              schema_version: 1,
+              kind: "tool.issued",
+              occurred_at: "2026-07-17T12:00:03Z",
+              recorded_at: "2026-07-17T12:00:03Z",
+              task_id: TASK_ID,
+              step_id: STEP_ID,
+              subject_type: "tool_call",
+              subject_id: TOOL_CALL_ID,
+              fidelity_class: "hard",
+              producer: {
+                name: "deerflow-tool-observer",
+                version: "1",
+                instance_id: "e2e",
+              },
+              producer_seq: 3,
+              source_event_id: "tool:e2e:issued",
+              correlation_id: TASK_ID,
+              causation_obs_id: null,
+              payload: { tool_name: "web_search" },
+              payload_ref_id: null,
+            },
+          ],
+          current_beliefs: [behaviorBelief],
+          workflow_history: [],
+          available_actions:
+            workflowState === "open"
+              ? ["acknowledge", "dismiss", "interrupt", "rollback"]
+              : ["dismiss", "interrupt", "rollback"],
+        },
+        projection_status: HEALTH,
+      }),
+    });
+  });
+  await page.route(
+    `**/api/ansich/operations/alerts/${ALERT_ID}/acknowledge`,
+    async (route) => {
+      expect(await route.request().postDataJSON()).toEqual({
+        workflow_version: 1,
+      });
+      workflowState = "acknowledged";
+      workflowVersion = 2;
+      return route.fulfill({
+        status: 409,
+        contentType: "application/json",
+        body: JSON.stringify({
+          detail: {
+            message: "Ansich Alert workflow version conflict",
+            current_alert: alertSummary(),
+          },
+        }),
+      });
+    },
+  );
+  await page.route(
+    `**/api/ansich/tasks/${TASK_ID}/actions/interrupt`,
+    (route) => {
+      interruptRequests += 1;
+      expect(route.request().headers()["idempotency-key"]).toBeTruthy();
+      return route.fulfill({
+        status: 200,
+        contentType: "application/json",
+        body: JSON.stringify({
+          action: {
+            action_id: "action-e2e",
+            task_id: TASK_ID,
+            action_type: "interrupt",
+            idempotency_key: route.request().headers()["idempotency-key"],
+            status: "succeeded",
+            result: { outcome: "cancelled" },
+          },
+          audit_status: "degraded",
+          idempotent_replay: false,
+        }),
+      });
+    },
+  );
+
+  await page.goto("/workspace/ansich/operations");
+  await page.getByRole("tab", { name: "Alerts" }).click();
+  await expect(page.getByText("Exact action repetition")).toBeVisible();
+  await expect(page.getByText("Runaway behavior")).toBeVisible();
+  expect(detailRequests).toBe(0);
+  await page.getByRole("button", { name: /Exact action repetition/ }).click();
+  await expect(page.getByText("Source belief")).toBeVisible();
+  await expect(page.getByText("tool.issued", { exact: true })).toBeVisible();
+  expect(detailRequests).toBe(1);
+
+  await page.getByRole("button", { name: "Acknowledge" }).click();
+  const workflowConfirmation = page.getByRole("dialog").last();
+  await workflowConfirmation
+    .getByRole("button", { name: "Acknowledge" })
+    .click();
+  await expect(
+    page.getByText("Ansich Alert workflow version conflict"),
+  ).toBeVisible();
+  await workflowConfirmation.getByRole("button", { name: "Cancel" }).click();
+  await expect(page.getByText("tool.issued", { exact: true })).toBeVisible();
+  await expect.poll(() => detailRequests).toBeGreaterThan(1);
+  await expect(
+    page
+      .getByRole("dialog", { name: "Alert details" })
+      .getByText("Acknowledged", { exact: true }),
+  ).toBeVisible();
+
+  await page.getByRole("button", { name: "Interrupt" }).click();
+  const runtimeConfirmation = page.getByRole("dialog").last();
+  await expect(
+    runtimeConfirmation.getByText(
+      "Interrupt stops this execution and preserves its current checkpoint. It is not a pause operation.",
+    ),
+  ).toBeVisible();
+  await runtimeConfirmation.getByRole("button", { name: "Interrupt" }).click();
+  await expect(
+    page.getByText(
+      "The operator action completed, but its Ansich audit record is degraded.",
+    ),
+  ).toBeVisible();
+  expect(interruptRequests).toBe(1);
 });
 
 test("context tab distinguishes failed projection from no observed context", async ({

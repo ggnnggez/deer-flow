@@ -15,7 +15,7 @@
 # ============================================================================
 # Bump this number when the config schema changes.
 # Run `make config-upgrade` to merge new fields into your local config.yaml.
-config_version: 29
+config_version: 30
 
 # ============================================================================
 # Logging
@@ -1678,6 +1678,12 @@ ansich:
   heartbeat_interval_seconds: 10
   heartbeat_stale_after_seconds: 30
   long_dwell_seconds: 120
+  # Assessor thresholds are hashed into every Belief Assertion. Changing one
+  # changes the rule config identity without rewriting earlier assertions.
+  assessors:
+    exact_repetition_window: 5
+    tool_frequency_window_seconds: 300
+    tool_frequency_threshold: 30
 
 # ============================================================================
 # Run Events Configuration

@@ -37,6 +37,9 @@ def create_sql_ansich_service(
     inline_payload_max_bytes: int = 65_536,
     heartbeat_stale_after_seconds: int = 30,
     long_dwell_seconds: int = 120,
+    exact_repetition_window: int = 5,
+    tool_frequency_window_seconds: int = 300,
+    tool_frequency_threshold: int = 30,
 ) -> AnsichService:
     return AnsichService(
         SqlAnsichBackend(
@@ -47,6 +50,9 @@ def create_sql_ansich_service(
             inline_payload_max_bytes=inline_payload_max_bytes,
             heartbeat_stale_after_seconds=heartbeat_stale_after_seconds,
             long_dwell_seconds=long_dwell_seconds,
+            exact_repetition_window=exact_repetition_window,
+            tool_frequency_window_seconds=tool_frequency_window_seconds,
+            tool_frequency_threshold=tool_frequency_threshold,
         ),
         queue_capacity=queue_capacity,
         queue_byte_capacity=queue_byte_capacity,
@@ -84,6 +90,9 @@ def create_embedded_ansich_service(config, session_factory):
         inline_payload_max_bytes=config.inline_payload_max_bytes,
         heartbeat_stale_after_seconds=config.heartbeat_stale_after_seconds,
         long_dwell_seconds=config.long_dwell_seconds,
+        exact_repetition_window=config.assessors.exact_repetition_window,
+        tool_frequency_window_seconds=config.assessors.tool_frequency_window_seconds,
+        tool_frequency_threshold=config.assessors.tool_frequency_threshold,
     )
 
 

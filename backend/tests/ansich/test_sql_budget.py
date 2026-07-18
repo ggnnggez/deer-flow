@@ -157,14 +157,24 @@ async def test_sql_budget_health_retains_terminal_overshoot_and_evidence(tmp_pat
         await engine.dispose()
 
     assert periodic_changes == 0
-    assert health_after_periodic_assessment == terminal_health
-    assert rebuilt_terminal_health == terminal_health
     assert len(terminal_health) == 1
+    assert len(health_after_periodic_assessment) == 1
+    assert len(rebuilt_terminal_health) == 1
+    assert health_after_periodic_assessment[0].model_dump(exclude={"selected_by"}) == terminal_health[0].model_dump(exclude={"selected_by"})
+    assert health_after_periodic_assessment[0].selected_by.name == "ansich-default"
     belief = terminal_health[0]
     assert belief.value == "exceeded"
     assert belief.usage_value == 107
     assert belief.overshoot == 7
     assert belief.evidence_obs_ids == (configured.obs_id, consumed.obs_id)
+    rebuilt = rebuilt_terminal_health[0]
+    assert rebuilt.value == belief.value
+    assert rebuilt.usage_value == belief.usage_value
+    assert rebuilt.hard_limit == belief.hard_limit
+    assert rebuilt.overshoot == belief.overshoot
+    assert rebuilt.as_of == belief.as_of
+    assert rebuilt.evidence_obs_ids == belief.evidence_obs_ids
+    assert rebuilt.source.name == "absolute-limit"
 
 
 @pytest.mark.anyio

@@ -35,6 +35,11 @@ export type AnsichObservationKind =
   | "tool.cancelled"
   | "tool.failed"
   | "tool.unknown_terminal"
+  | "operator.action_requested"
+  | "operator.action_succeeded"
+  | "operator.action_failed"
+  | "operator.alert_acknowledged"
+  | "operator.alert_dismissed"
   | "observability.degraded";
 
 export interface AnsichNamedVersion {
@@ -83,7 +88,8 @@ export interface AnsichObservation {
     | "content_block"
     | "context_state"
     | "context_snapshot"
-    | "context_compression";
+    | "context_compression"
+    | "alert";
   subject_id: string;
   fidelity_class: "hard";
   producer: AnsichProducer;
@@ -138,6 +144,7 @@ export interface AnsichTaskListResponse {
 
 export interface AnsichTaskResponse {
   task: AnsichTask;
+  behavior: AnsichBeliefAssertion | null;
   projection_status: AnsichHealth;
 }
 
@@ -255,6 +262,121 @@ export interface AnsichActiveTaskListResponse {
   next_cursor: string | null;
   projection_status: AnsichHealth;
   updated_at: string | null;
+}
+
+export type AnsichAlertType =
+  | "budget_warning"
+  | "budget_exceeded"
+  | "exact_repetition"
+  | "tool_frequency"
+  | "heartbeat_missing"
+  | "long_dwell"
+  | "observability_degradation"
+  | "projection_failure";
+
+export type AnsichAlertWorkflowState =
+  | "open"
+  | "acknowledged"
+  | "dismissed"
+  | "resolved";
+
+export interface AnsichBeliefAssertion {
+  assertion_id: string;
+  subject_id: string;
+  field_name: string;
+  value: Record<string, unknown>;
+  as_of: string;
+  asserted_at: string;
+  assessor: AnsichNamedVersion;
+  config_hash: string;
+  authority_class:
+    | "human_override"
+    | "deterministic"
+    | "configured_rule"
+    | "automated";
+  fidelity_class: "hard" | "rule" | "soft";
+  confidence: number | null;
+  evidence_obs_ids: string[];
+}
+
+export interface AnsichAlertSummary {
+  alert_id: string;
+  subject_id: string;
+  alert_type: AnsichAlertType;
+  episode: number;
+  severity: "info" | "warning" | "critical";
+  workflow_state: AnsichAlertWorkflowState;
+  workflow_version: number;
+  shadow: boolean;
+  opened_at: string;
+  as_of: string;
+  updated_at: string;
+  resolved_at: string | null;
+  rule: AnsichNamedVersion;
+  rule_config_hash: string;
+  stable_condition_key: string;
+  source_assertion_id: string;
+  resolution_reason: string | null;
+  dismissal_reason: string | null;
+  evidence_count: number;
+}
+
+export interface AnsichAlertWorkflowEvent {
+  event_id: string;
+  obs_id: string;
+  action: string;
+  from_state: AnsichAlertWorkflowState;
+  to_state: AnsichAlertWorkflowState;
+  workflow_version: number;
+  reason: string | null;
+  operator_id: string | null;
+  occurred_at: string;
+}
+
+export interface AnsichAlertDetail {
+  alert: AnsichAlertSummary;
+  source_belief: AnsichBeliefAssertion;
+  evidence: AnsichObservation[];
+  current_beliefs: AnsichBeliefAssertion[];
+  workflow_history: AnsichAlertWorkflowEvent[];
+  available_actions: Array<
+    "acknowledge" | "dismiss" | "interrupt" | "rollback"
+  >;
+}
+
+export interface AnsichAlertListResponse {
+  items: AnsichAlertSummary[];
+  next_cursor: string | null;
+  projection_status: AnsichHealth;
+}
+
+export interface AnsichAlertDetailResponse {
+  alert: AnsichAlertDetail;
+  projection_status: AnsichHealth;
+}
+
+export interface AnsichAlertWorkflowResponse {
+  alert: AnsichAlertSummary;
+  projection_status: AnsichHealth;
+}
+
+export interface AnsichOperatorAction {
+  action_id?: string;
+  task_id: string;
+  action_type: "interrupt" | "rollback";
+  idempotency_key: string;
+  status: "requested" | "succeeded" | "failed";
+  requested_obs_id?: string | null;
+  terminal_obs_id?: string | null;
+  result: Record<string, unknown> | null;
+  created_at?: string;
+  updated_at?: string;
+}
+
+export interface AnsichOperatorActionResponse {
+  action: AnsichOperatorAction;
+  audit_status: "recorded" | "degraded";
+  idempotent_replay: boolean;
 }
 
 export interface AnsichTaskUsageResponse {

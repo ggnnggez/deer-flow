@@ -2,6 +2,11 @@ import { fetch } from "@/core/api/fetcher";
 import { getBackendBaseURL } from "@/core/config";
 
 import type {
+  AnsichAlertDetailResponse,
+  AnsichAlertListResponse,
+  AnsichAlertType,
+  AnsichAlertWorkflowResponse,
+  AnsichAlertWorkflowState,
   AnsichContentPayloadResponse,
   AnsichActiveTaskListResponse,
   AnsichContentLineageResponse,
@@ -20,6 +25,7 @@ import type {
   AnsichHealth,
   AnsichToolCallResponse,
   AnsichToolResultPayloadResponse,
+  AnsichOperatorActionResponse,
 } from "./types";
 
 export class AnsichApiError extends Error {
@@ -96,6 +102,118 @@ export async function fetchAnsichActiveTasks(
     await throwAnsichApiError(
       response,
       `Failed to load active Ansich tasks: ${response.statusText}`,
+    );
+  }
+  return response.json();
+}
+
+export interface AnsichAlertFilters {
+  alertType?: AnsichAlertType;
+  workflowState?: AnsichAlertWorkflowState;
+  taskId?: string;
+  severity?: "info" | "warning" | "critical";
+  shadow?: boolean;
+  cursor?: string;
+}
+
+export async function fetchAnsichAlerts(
+  limit = 100,
+  filters: AnsichAlertFilters = {},
+): Promise<AnsichAlertListResponse> {
+  const query = new URLSearchParams({ limit: String(limit) });
+  if (filters.alertType) query.set("type", filters.alertType);
+  if (filters.workflowState) query.set("state", filters.workflowState);
+  if (filters.taskId) query.set("task", filters.taskId);
+  if (filters.severity) query.set("severity", filters.severity);
+  if (filters.shadow !== undefined) {
+    query.set("shadow", String(filters.shadow));
+  }
+  if (filters.cursor) query.set("cursor", filters.cursor);
+  const response = await fetch(
+    ansichUrl(`/operations/alerts?${query.toString()}`),
+  );
+  if (!response.ok) {
+    await throwAnsichApiError(
+      response,
+      `Failed to load Ansich alerts: ${response.statusText}`,
+    );
+  }
+  return response.json();
+}
+
+export async function fetchAnsichAlert(
+  alertId: string,
+): Promise<AnsichAlertDetailResponse> {
+  const response = await fetch(
+    ansichUrl(`/operations/alerts/${encodeURIComponent(alertId)}`),
+  );
+  if (!response.ok) {
+    await throwAnsichApiError(
+      response,
+      `Failed to load Ansich alert: ${response.statusText}`,
+    );
+  }
+  return response.json();
+}
+
+async function changeAnsichAlertWorkflow(
+  alertId: string,
+  action: "acknowledge" | "dismiss",
+  workflowVersion: number,
+  reason?: string,
+): Promise<AnsichAlertWorkflowResponse> {
+  const body =
+    action === "dismiss"
+      ? { workflow_version: workflowVersion, reason }
+      : { workflow_version: workflowVersion };
+  const response = await fetch(
+    ansichUrl(`/operations/alerts/${encodeURIComponent(alertId)}/${action}`),
+    {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+    },
+  );
+  if (!response.ok) {
+    await throwAnsichApiError(
+      response,
+      `Failed to ${action} Ansich alert: ${response.statusText}`,
+    );
+  }
+  return response.json();
+}
+
+export async function acknowledgeAnsichAlert(
+  alertId: string,
+  workflowVersion: number,
+): Promise<AnsichAlertWorkflowResponse> {
+  return changeAnsichAlertWorkflow(alertId, "acknowledge", workflowVersion);
+}
+
+export async function dismissAnsichAlert(
+  alertId: string,
+  workflowVersion: number,
+  reason: string,
+): Promise<AnsichAlertWorkflowResponse> {
+  return changeAnsichAlertWorkflow(alertId, "dismiss", workflowVersion, reason);
+}
+
+export async function executeAnsichTaskAction(
+  taskId: string,
+  action: "interrupt" | "rollback",
+  idempotencyKey: string,
+): Promise<AnsichOperatorActionResponse> {
+  const response = await fetch(
+    ansichUrl(`/tasks/${encodeURIComponent(taskId)}/actions/${action}`),
+    {
+      method: "POST",
+      headers: { "Idempotency-Key": idempotencyKey },
+    },
+  );
+  if (!response.ok) {
+    await throwAnsichApiError(
+      response,
+      `Failed to ${action} Ansich task: ${response.statusText}`,
     );
   }
   return response.json();

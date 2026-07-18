@@ -25,6 +25,27 @@ def test_ansich_is_disabled_by_default_with_bounded_runtime_settings():
     assert config.heartbeat_interval_seconds == 10
     assert config.heartbeat_stale_after_seconds == 30
     assert config.long_dwell_seconds == 120
+    assert config.assessors.exact_repetition_window == 5
+    assert config.assessors.tool_frequency_window_seconds == 300
+    assert config.assessors.tool_frequency_threshold == 30
+
+
+def test_ansich_assessor_thresholds_are_nested_and_validated():
+    config = AnsichConfig.model_validate(
+        {
+            "assessors": {
+                "exact_repetition_window": 7,
+                "tool_frequency_window_seconds": 120,
+                "tool_frequency_threshold": 20,
+            }
+        }
+    )
+
+    assert config.assessors.exact_repetition_window == 7
+    assert config.assessors.tool_frequency_window_seconds == 120
+    assert config.assessors.tool_frequency_threshold == 20
+    with pytest.raises(ValidationError):
+        AnsichConfig.model_validate({"assessors": {"exact_repetition_window": 1}})
 
 
 def test_heartbeat_staleness_requires_at_least_two_intervals():

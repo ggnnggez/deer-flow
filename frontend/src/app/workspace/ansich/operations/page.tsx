@@ -8,6 +8,7 @@ import { Button } from "@/components/ui/button";
 import { Skeleton } from "@/components/ui/skeleton";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import {
+  AnsichAlertPanel,
   AnsichProjectionHealth,
   AnsichActiveTaskRow,
   AnsichTaskRow,
@@ -19,6 +20,7 @@ import {
 } from "@/components/workspace/workspace-container";
 import {
   useAnsichActiveTasks,
+  useAnsichAlerts,
   useAnsichTaskHistory,
 } from "@/core/ansich/hooks";
 import { useAuth } from "@/core/auth/AuthProvider";
@@ -28,9 +30,9 @@ export default function AnsichOperationsPage() {
   const { t } = useI18n();
   const { user } = useAuth();
   const isAdmin = user?.system_role === "admin";
-  const [selectedView, setSelectedView] = useState<"active" | "history">(
-    "active",
-  );
+  const [selectedView, setSelectedView] = useState<
+    "active" | "history" | "alerts"
+  >("active");
   const activeTasksQuery = useAnsichActiveTasks(
     100,
     isAdmin && selectedView === "active",
@@ -39,16 +41,26 @@ export default function AnsichOperationsPage() {
     100,
     isAdmin && selectedView === "history",
   );
+  const alertsQuery = useAnsichAlerts(
+    100,
+    isAdmin && selectedView === "alerts",
+  );
   const historyPages = historyTasksQuery.data?.pages ?? [];
   const historyTasks = historyPages.flatMap((page) => page.items);
+  const alertPages = alertsQuery.data?.pages ?? [];
+  const alerts = alertPages.flatMap((page) => page.items);
   const selectedProjectionStatus =
     selectedView === "active"
       ? activeTasksQuery.data?.projection_status
-      : historyPages.at(-1)?.projection_status;
+      : selectedView === "history"
+        ? historyPages.at(-1)?.projection_status
+        : alertPages.at(-1)?.projection_status;
   const selectedError =
     selectedView === "active"
       ? activeTasksQuery.error
-      : historyTasksQuery.error;
+      : selectedView === "history"
+        ? historyTasksQuery.error
+        : alertsQuery.error;
 
   useEffect(() => {
     document.title = `${t.ansich.title} - ${t.pages.appName}`;
@@ -94,7 +106,7 @@ export default function AnsichOperationsPage() {
               <Tabs
                 value={selectedView}
                 onValueChange={(value) =>
-                  setSelectedView(value as "active" | "history")
+                  setSelectedView(value as "active" | "history" | "alerts")
                 }
                 className="space-y-4"
               >
@@ -105,6 +117,7 @@ export default function AnsichOperationsPage() {
                   <TabsTrigger value="history">
                     {t.ansich.taskHistory}
                   </TabsTrigger>
+                  <TabsTrigger value="alerts">{t.ansich.alerts}</TabsTrigger>
                 </TabsList>
                 <TabsContent value="active">
                   <section aria-labelledby="ansich-active-task-list-title">
@@ -170,6 +183,15 @@ export default function AnsichOperationsPage() {
                       ) : null}
                     </div>
                   </section>
+                </TabsContent>
+                <TabsContent value="alerts">
+                  <AnsichAlertPanel
+                    alerts={alerts}
+                    isPending={alertsQuery.isPending}
+                    hasNextPage={Boolean(alertsQuery.hasNextPage)}
+                    isFetchingNextPage={alertsQuery.isFetchingNextPage}
+                    onLoadMore={() => void alertsQuery.fetchNextPage()}
+                  />
                 </TabsContent>
               </Tabs>
             </>

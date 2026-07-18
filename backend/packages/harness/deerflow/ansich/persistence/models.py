@@ -8,6 +8,7 @@ from sqlalchemy import (
     Boolean,
     CheckConstraint,
     DateTime,
+    Float,
     ForeignKey,
     Index,
     Integer,
@@ -118,6 +119,65 @@ class AnsichProjectorVersionRow(Base):
     projector_name: Mapped[str] = mapped_column(String(64), primary_key=True)
     projector_version: Mapped[str] = mapped_column(String(32), primary_key=True)
     installed_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, default=_utc_now)
+
+
+class AnsichAssessorJobRow(Base):
+    __tablename__ = "ansich_assessor_jobs"
+
+    job_id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    subject_id: Mapped[str] = mapped_column(
+        String(36),
+        ForeignKey("ansich_tasks.entity_id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    assessor_name: Mapped[str] = mapped_column(String(64), nullable=False)
+    assessor_version: Mapped[str] = mapped_column(String(32), nullable=False)
+    evidence_watermark: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    status: Mapped[str] = mapped_column(String(16), nullable=False, default="pending")
+    attempts: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    available_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        nullable=False,
+        default=_utc_now,
+    )
+    lease_owner: Mapped[str | None] = mapped_column(String(128))
+    lease_expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    last_error: Mapped[str | None] = mapped_column(Text)
+
+    __table_args__ = (
+        UniqueConstraint(
+            "subject_id",
+            "assessor_name",
+            "assessor_version",
+            "evidence_watermark",
+            name="uq_ansich_assessor_job_watermark",
+        ),
+        Index(
+            "ix_ansich_assessor_jobs_claim",
+            "status",
+            "available_at",
+            "lease_expires_at",
+        ),
+    )
+
+
+class AnsichAssessorErrorRow(Base):
+    __tablename__ = "ansich_assessor_errors"
+
+    error_id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    job_id: Mapped[str] = mapped_column(
+        String(36),
+        ForeignKey("ansich_assessor_jobs.job_id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    attempt: Mapped[int] = mapped_column(Integer, nullable=False)
+    error_type: Mapped[str] = mapped_column(String(128), nullable=False)
+    message: Mapped[str] = mapped_column(Text, nullable=False)
+    occurred_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        nullable=False,
+        default=_utc_now,
+    )
 
 
 class AnsichEntityRow(Base):
@@ -645,7 +705,12 @@ class AnsichBeliefAssertionRow(Base):
     asserted_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
     source_name: Mapped[str] = mapped_column(String(64), nullable=False)
     source_version: Mapped[str] = mapped_column(String(32), nullable=False)
+    assessor_name: Mapped[str] = mapped_column(String(64), nullable=False)
+    assessor_version: Mapped[str] = mapped_column(String(32), nullable=False)
+    config_hash: Mapped[str] = mapped_column(String(64), nullable=False)
+    authority_class: Mapped[str] = mapped_column(String(32), nullable=False)
     fidelity_class: Mapped[str] = mapped_column(String(16), nullable=False)
+    confidence: Mapped[float | None] = mapped_column(Float)
 
 
 class AnsichCurrentBeliefRow(Base):
@@ -677,6 +742,193 @@ class AnsichTransitionRow(Base):
     to_value: Mapped[str] = mapped_column(String(32), nullable=False)
     occurred_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
     evidence_obs_id: Mapped[str] = mapped_column(String(36), ForeignKey("ansich_observations.obs_id"), nullable=False, unique=True)
+
+
+class AnsichAlertRow(Base):
+    __tablename__ = "ansich_alerts"
+
+    entity_id: Mapped[str] = mapped_column(
+        String(36),
+        ForeignKey("ansich_entities.entity_id", ondelete="CASCADE"),
+        primary_key=True,
+    )
+    alert_key: Mapped[str] = mapped_column(String(64), nullable=False)
+    episode: Mapped[int] = mapped_column(Integer, nullable=False)
+    alert_type: Mapped[str] = mapped_column(String(32), nullable=False)
+    subject_id: Mapped[str] = mapped_column(
+        String(36),
+        ForeignKey("ansich_entities.entity_id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    source_assertion_id: Mapped[str] = mapped_column(
+        String(36),
+        ForeignKey("ansich_belief_assertions.assertion_id"),
+        nullable=False,
+    )
+    rule_name: Mapped[str] = mapped_column(String(64), nullable=False)
+    rule_version: Mapped[str] = mapped_column(String(32), nullable=False)
+    rule_config_hash: Mapped[str] = mapped_column(String(64), nullable=False)
+    stable_condition_key: Mapped[str] = mapped_column(String(256), nullable=False)
+    severity: Mapped[str] = mapped_column(String(16), nullable=False)
+    shadow: Mapped[bool] = mapped_column(Boolean, nullable=False)
+    opened_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    as_of: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    resolved_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    resolution_reason: Mapped[str | None] = mapped_column(String(64))
+    workflow_state: Mapped[str] = mapped_column(String(16), nullable=False)
+    workflow_version: Mapped[int] = mapped_column(Integer, nullable=False)
+    dismissal_reason: Mapped[str | None] = mapped_column(String(512))
+
+    __table_args__ = (
+        UniqueConstraint(
+            "alert_key",
+            "episode",
+            name="uq_ansich_alert_episode",
+        ),
+        Index(
+            "ix_ansich_alerts_workflow_updated",
+            "workflow_state",
+            "updated_at",
+        ),
+        Index(
+            "ix_ansich_alerts_subject_type",
+            "subject_id",
+            "alert_type",
+        ),
+    )
+
+
+class AnsichAlertEvidenceRow(Base):
+    __tablename__ = "ansich_alert_evidence"
+
+    alert_id: Mapped[str] = mapped_column(
+        String(36),
+        ForeignKey("ansich_alerts.entity_id", ondelete="CASCADE"),
+        primary_key=True,
+    )
+    obs_id: Mapped[str] = mapped_column(
+        String(36),
+        ForeignKey("ansich_observations.obs_id", ondelete="CASCADE"),
+        primary_key=True,
+    )
+    role: Mapped[str] = mapped_column(String(32), nullable=False)
+    ordinal: Mapped[int] = mapped_column(Integer, nullable=False)
+
+    __table_args__ = (
+        UniqueConstraint(
+            "alert_id",
+            "ordinal",
+            name="uq_ansich_alert_evidence_ordinal",
+        ),
+    )
+
+
+class AnsichAlertWorkflowEventRow(Base):
+    __tablename__ = "ansich_alert_workflow_events"
+
+    event_id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    alert_id: Mapped[str] = mapped_column(
+        String(36),
+        ForeignKey("ansich_alerts.entity_id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    obs_id: Mapped[str] = mapped_column(
+        String(36),
+        ForeignKey("ansich_observations.obs_id", ondelete="CASCADE"),
+        nullable=False,
+        unique=True,
+    )
+    action: Mapped[str] = mapped_column(String(32), nullable=False)
+    from_state: Mapped[str] = mapped_column(String(16), nullable=False)
+    to_state: Mapped[str] = mapped_column(String(16), nullable=False)
+    workflow_version: Mapped[int] = mapped_column(Integer, nullable=False)
+    reason: Mapped[str | None] = mapped_column(String(512))
+    operator_id: Mapped[str | None] = mapped_column(String(256))
+    occurred_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+
+    __table_args__ = (
+        Index(
+            "ix_ansich_alert_workflow_history",
+            "alert_id",
+            "workflow_version",
+        ),
+    )
+
+
+class AnsichAlertReadModelRow(Base):
+    __tablename__ = "ansich_alert_read_model"
+
+    alert_id: Mapped[str] = mapped_column(
+        String(36),
+        ForeignKey("ansich_alerts.entity_id", ondelete="CASCADE"),
+        primary_key=True,
+    )
+    subject_id: Mapped[str] = mapped_column(String(36), nullable=False)
+    alert_type: Mapped[str] = mapped_column(String(32), nullable=False)
+    severity: Mapped[str] = mapped_column(String(16), nullable=False)
+    workflow_state: Mapped[str] = mapped_column(String(16), nullable=False)
+    shadow: Mapped[bool] = mapped_column(Boolean, nullable=False)
+    opened_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    as_of: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    resolved_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    summary_json: Mapped[dict] = mapped_column(JSON, nullable=False)
+    evidence_count: Mapped[int] = mapped_column(Integer, nullable=False)
+
+    __table_args__ = (
+        Index(
+            "ix_ansich_alert_read_filters",
+            "workflow_state",
+            "severity",
+            "alert_type",
+            "updated_at",
+        ),
+        Index(
+            "ix_ansich_alert_read_subject",
+            "subject_id",
+            "updated_at",
+        ),
+    )
+
+
+class AnsichOperatorActionRow(Base):
+    __tablename__ = "ansich_operator_actions"
+
+    action_id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    task_id: Mapped[str] = mapped_column(
+        String(36),
+        ForeignKey("ansich_tasks.entity_id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    action_type: Mapped[str] = mapped_column(String(32), nullable=False)
+    idempotency_key: Mapped[str] = mapped_column(String(128), nullable=False)
+    status: Mapped[str] = mapped_column(String(16), nullable=False)
+    requested_obs_id: Mapped[str | None] = mapped_column(
+        String(36),
+        ForeignKey("ansich_observations.obs_id", ondelete="SET NULL"),
+    )
+    terminal_obs_id: Mapped[str | None] = mapped_column(
+        String(36),
+        ForeignKey("ansich_observations.obs_id", ondelete="SET NULL"),
+    )
+    result_json: Mapped[dict | None] = mapped_column(JSON)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+
+    __table_args__ = (
+        UniqueConstraint(
+            "task_id",
+            "action_type",
+            "idempotency_key",
+            name="uq_ansich_operator_action_idempotency",
+        ),
+        Index(
+            "ix_ansich_operator_actions_task_updated",
+            "task_id",
+            "updated_at",
+        ),
+    )
 
 
 class AnsichTaskSummaryRow(Base):

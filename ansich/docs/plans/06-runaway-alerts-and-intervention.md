@@ -2,11 +2,15 @@
 
 ## 实现状态（2026-07-18）
 
-🟡 开发中。首批 UI/API 工作已完成 Phase 4 跟进项 L3②（commit
-`0508a066`）：Task-scoped、cursor-paged、metadata-only 的上下文压缩摘要查询
-替代 bounded timeline 派生，Context & Lineage 支持显式继续分页，完整 membership
-仍按单条记录 lazy load。Assessor、Resolver、Alert episode、调度、Operator action
-与告警 UI 尚待本阶段后续切片实现。
+✅ 本地纵向切片已完成。除先行完成的 Phase 4 跟进项 L3②（commit
+`0508a066`）外，现已落地版本化 exact-repetition、absolute-limit 与 tool-frequency
+assessor、通用 Belief resolver、持久化 assessor job/error、Alert episode/read model、
+heartbeat/long-dwell wall-clock 评估、管理员告警查询与工作流 API、DeerFlow
+interrupt/rollback 代理，以及 Operations Alerts/Task behavior UI。SQLite 迁移与并发
+语义、PostgreSQL DDL 编译、全部 233 项后端 Ansich 测试、663 项前端单测、前端
+lint/typecheck 和关键告警 Playwright 流程均已通过。真实 PostgreSQL 升级矩阵、关闭
+Ansich 的基准对比和生产 paper drill 仍属于最终生产就绪门禁，因此本状态不代表这些
+跨阶段门禁已经完成。
 
 ## 1. 交付目标
 
@@ -102,9 +106,17 @@ Alert ack/dismiss 使用 `workflow_version` 乐观并发；冲突返回 409 并�
 
 Projector 完成相关 Step/usage/heartbeat Observation 后 enqueue assessor job，而不是在 API 查询时临时推断。job key 为 `(subject_id, assessor_name, assessor_version, evidence_watermark)`；重复投递幂等。
 
-heartbeat/long dwell 需要 wall-clock scheduler，每次扫描只为超过阈值的 running Task生成 rule evaluation Observation；当前 wall clock参与 assertion `asserted_at`，evidence仍引用最后 heartbeat/transition。Task terminal 后 resolve operational Alert，但 absolute-limit事实 assertion 保留。
+heartbeat/long dwell 使用 wall-clock scheduler，只扫描 running Task。评估不按秒制造
+synthetic Observation；只在 `fresh↔stale↔unknown` 或
+`normal↔long↔unknown` 状态变化时追加 rule assertion，并以最后 heartbeat/Step/Tool
+Observation 作为 ordered evidence。当前 wall clock 只进入 assertion `asserted_at`，
+age/duration 留在 read model 动态呈现。Task terminal 后 resolve operational Alert，但
+absolute-limit 事实 assertion 保留。
 
-poison assessor job 走 Phase 1 projection error；Phase 11 完成租约和隔离。
+assessor job 使用独立的 durable lease、attempt 上限与 error 表；poison job 转 failed，
+计入统一 `health.failed_jobs`，并由 `retry_failed_projections` 显式恢复，不阻塞原始
+Observation 或 DeerFlow runtime。Phase 11 继续负责多 worker、长期保留和生产级隔离
+加固，而不是补齐本阶段的基本失败闭环。
 
 ## 8. API 与 UI
 
@@ -143,3 +155,23 @@ ack/dismiss/interrupt/rollback 均需要确认对话框、pending 防重复和�
 - Alert confirmation、resolve、recurrence 按 episode 幂等工作。
 - resolver 输出可追到原 assertion、resolver version和所有 supporting Observations。
 - Operator actions只代理 DeerFlow 已支持语义，并有 requested/succeeded/failed 审计结果。
+
+## 11. 落地说明
+
+- `0017_ansich_alerts` 扩展既有 assertion provenance，并新增 assessor job/error、Alert、
+  evidence、workflow、read model 和 operator action 表；所有表仍在 `ansich_*` 命名空间。
+- Projector 按 `(subject_id, assessor_name, assessor_version,
+  evidence_watermark)` 幂等投递 job。评估严格读取 watermark 以内证据；无用量/无动作的
+  结果以 watermark 的发生时间作为 `as_of`，不会因晚处理覆盖更新事实。
+- `behavior-aggregate@1.0.0` 只聚合 exact repetition 和绝对预算的当前 runaway
+  signal。tool frequency 独立开 operational Alert，不进入 behavior runaway。
+- Alert list 使用 cursor/filter 查询；detail 才按需读取 source assertion、ordered
+  Observation evidence、当前 Beliefs 与 workflow history。重复确认同一条件不新建 episode，
+  terminal Task 不开新 operational Alert。
+- ack/dismiss 使用 `workflow_version` 乐观并发。interrupt/rollback 只接受 Ansich
+  Task→DeerFlow Run/thread 的服务端映射，要求 `Idempotency-Key`；数据库原子冲突处理保证
+  并发重试只有一个调用者获得执行权。requested 审计失败时 runtime action 仍执行，但响应
+  明确返回 `audit_status=degraded`。
+- Operations 新增独立 Alerts 页签，5 秒轮询 metadata-only 列表；详情、证据与动作按需
+  加载。所有动作有确认对话框、pending 去重和结果 toast，失败不会关闭证据详情。Task
+  Overview 直接展示 resolver 选出的 behavior Belief，不在前端推断语义状态。

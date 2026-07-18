@@ -321,7 +321,7 @@ CORS is same-origin by default when requests enter through nginx on port 2026. S
 | **Models** (`/api/models`) | `GET /` - list models; `GET /{name}` - model details |
 | **Features** (`/api/features`) | `GET /` - report config-gated feature availability (currently `agents_api.enabled`) for frontend UI gating |
 | **Console** (`/api/console`) | Read-only cross-thread observability for the current user (the data layer for an operations dashboard or external monitoring): `GET /stats` - headline counters (runs/threads/agents/tokens/cost); `GET /runs` - paginated run history joined with thread titles (per-run cost); `GET /usage` - zero-filled daily token series + per-model breakdown with spend. Queries `runs`/`threads_meta` directly as a reporting layer (no new `RunStore` methods); requires a SQL database backend — returns 503 on `database.backend: memory`. Real-cost estimation reads optional `models[*].pricing` (`currency`, `input_per_million`, `output_per_million`, `input_cache_hit_per_million`; `ModelConfig` is `extra="allow"`, so no schema change) and prices each run from its `token_usage_by_model` input/output split. Pricing is **cache-aware**: `RunJournal` accumulates prompt-cache hits from `usage_metadata.input_token_details.cache_read` into a sparse `cache_read_tokens` bucket key (also threaded through `SubagentTokenCollector` → `record_external_llm_usage_records`), and cache-hit input tokens are billed at `input_cache_hit_per_million` (omitted → billed at the miss price, a conservative upper bound). Legacy rows fall back to run-level totals at `model_name`; unpriced models yield `cost: null` and cost fields are null when no pricing is configured |
-| **Ansich** (`/api/ansich`) | Admin-only developer/operator Agent observability, gated by startup-only `ansich.enabled`. Task reads include evidence-backed ControlBelief, a cursor-paged lifecycle/Step/system-operation timeline, logical Steps with physical LLM retry attempts, ordered adapter-visible ContextSnapshot inventory, ordered ToolCall accountability, a Task-scoped cursor-paged context-compression summary inventory plus lazy detail, bounded ContentBlock provenance, forward possible-exposure queries, and Phase 5 active-task/Usage/Budget operations reads. ToolCall inventory, raw result, and model-visible result have separate endpoints; payload endpoints are logged and `no-store`. Lineage/snapshot/compression endpoints return metadata only and never read raw bodies. `GET /health` remains process-local and readable when SQL storage is unavailable; projection reads return 503 with the same health summary when storage is unavailable. |
+| **Ansich** (`/api/ansich`) | Admin-only developer/operator Agent observability, gated by startup-only `ansich.enabled`. Task reads include evidence-backed Control/behavior Beliefs, lifecycle/Step/system-operation history, physical LLM attempts, ordered ContextSnapshot/ToolCall accountability, Task-scoped context-compression inventory, bounded ContentBlock lineage, Phase 5 active-task/Usage/Budget reads, and Phase 6 Alert list/detail/workflow plus interrupt/rollback proxy actions. Tool/raw/visible payloads stay on separate logged `no-store` endpoints; lineage/snapshot/compression and alert-list reads are metadata-only. `GET /health` remains process-local and readable when SQL storage is unavailable; projection reads return 503 with the same health summary when storage is unavailable. |
 | **MCP** (`/api/mcp`) | `GET /config` - get config; `PUT /config` - update config (saves to extensions_config.json) |
 | **Skills** (`/api/skills`) | `GET /` - list skills; `GET /{name}` - details; `PUT /{name}` - update enabled; `POST /install` - install from .skill archive (accepts standard optional frontmatter like `version`, `author`, `compatibility`) |
 | **Memory** (`/api/memory`) | `GET /` - memory data; `POST /reload` - force reload; `GET /config` - config; `GET /status` - config + data |
@@ -457,6 +457,32 @@ the current read-model refresh, so unchanged evidence/state does not append a
 new assertion every assessment tick while Operations still shows current age.
 Unknown heartbeat/dwell/budget values are rule assessments with evidence and
 policy-hash resolver versions; none may overwrite hard control state.
+
+Phase 6 event-driven assessors run from durable jobs keyed by subject,
+assessor name/version, and evidence watermark. Exact action repetition and
+absolute effective-budget breaches can feed `behavior-aggregate@1.0.0`;
+argument-changing Tool frequency is an operational Alert only and must never
+promote `Task.behavior` to runaway. Assessor jobs have independent leases,
+attempt limits, and durable errors; failed jobs contribute to the shared
+Ansich health count and are requeued through `retry_failed_projections` without
+blocking the DeerFlow runtime. Evaluations read only evidence at or below their
+watermark, and no-evidence results use the watermark event time as `as_of`, not
+the later processing time. The wall-clock loop scans running Tasks and appends
+heartbeat/dwell assertions only on categorical transitions; age and duration
+remain dynamic read-model fields. Alert episodes use stable condition keys,
+retain ordered Observation evidence, resolve operational episodes on terminal
+Tasks, and never delete their source facts.
+
+Alert list/detail and acknowledge/dismiss routes are admin-only;
+acknowledge/dismiss require the current `workflow_version`. Task interrupt and
+rollback routes resolve the Run/thread solely from the server-side Ansich Task
+mapping, validate it against `RunManager`, and require `Idempotency-Key`.
+Database conflict handling atomically elects one concurrent request to call the
+runtime. The action audit records requested/succeeded/failed Observations, but
+a requested-audit write failure remains fail-open for the existing DeerFlow
+action and is returned as `audit_status=degraded`. Interrupt means stop while
+retaining the current checkpoint, never pause; rollback uses the existing
+pre-Run checkpoint behavior.
 
 **Workspace change review**: `packages/harness/deerflow/workspace_changes/`
 captures a pre-run and post-run snapshot of the thread-owned `workspace` and
@@ -797,6 +823,7 @@ This invokes `alembic revision --autogenerate` against the live ORM models. Revi
 - `migrations/versions/0014_ansich_context_lineage.py` — typed ContentBlock producers, exact ordered context-compression inventories, bidirectional derivation indexes, and materialized snapshot-block reverse memberships
 - `migrations/versions/0015_ansich_projection_deadline.py` — durable first-seen time for dependency-pending projection jobs and their bounded failure deadline
 - `migrations/versions/0016_ansich_operations.py` — Phase 5 heartbeat, local Usage contribution, TaskBudget, and materialized active-task projections
+- `migrations/versions/0017_ansich_alerts.py` — Phase 6 assessor jobs/errors, versioned assertion provenance, Alert episodes/workflow/read model, and idempotent operator-action audit
 - `persistence/bootstrap.py` — `bootstrap_schema(engine, backend=...)`, the three-branch decision + locking
 - Tests: `tests/test_persistence_bootstrap.py` (branches), `tests/test_persistence_bootstrap_concurrency.py` (concurrency), `tests/test_persistence_bootstrap_regression.py` (issue #3682), `tests/test_persistence_migrations_env.py` (filter), `tests/blocking_io/test_persistence_bootstrap.py` (asyncio.to_thread anchor)
 

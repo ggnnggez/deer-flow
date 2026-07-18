@@ -113,3 +113,61 @@ def test_phase_five_observation_builders_reject_invalid_measurements() -> None:
             effective_value=-1,
             source_event_id="run:run-invalid-budget:budget:steps",
         )
+
+
+def test_phase_six_operator_observations_use_alert_and_task_subjects() -> None:
+    task_id = new_id()
+    alert_id = new_id()
+    producer = Producer(
+        name="operator-api",
+        version="1",
+        instance_id="gateway-test",
+    )
+    now = datetime.now(UTC)
+
+    alert_observation = ObservationEnvelope(
+        kind="operator.alert_acknowledged",
+        occurred_at=now,
+        task_id=task_id,
+        subject_type="alert",
+        subject_id=alert_id,
+        producer=producer,
+        source_event_id=f"alert:{alert_id}:acknowledged:2",
+        correlation_id="request-ack-1",
+        payload={"workflow_version": 2},
+    )
+    action_observation = ObservationEnvelope(
+        kind="operator.action_requested",
+        occurred_at=now,
+        task_id=task_id,
+        subject_type="task",
+        subject_id=task_id,
+        producer=producer,
+        source_event_id="task:action:interrupt:request-1:requested",
+        correlation_id="request-1",
+        payload={"action": "interrupt", "idempotency_key": "request-1"},
+    )
+
+    assert alert_observation.subject_id == alert_id
+    assert action_observation.subject_id == task_id
+
+
+def test_phase_six_operator_observation_rejects_the_wrong_subject_type() -> None:
+    task_id = new_id()
+
+    with pytest.raises(ValidationError, match="Alert workflow observation"):
+        ObservationEnvelope(
+            kind="operator.alert_dismissed",
+            occurred_at=datetime.now(UTC),
+            task_id=task_id,
+            subject_type="task",
+            subject_id=task_id,
+            producer=Producer(
+                name="operator-api",
+                version="1",
+                instance_id="gateway-test",
+            ),
+            source_event_id="alert:dismissed:wrong-subject",
+            correlation_id="request-dismiss-1",
+            payload={"workflow_version": 2, "reason": "false_positive"},
+        )

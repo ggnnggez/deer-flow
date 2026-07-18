@@ -103,6 +103,21 @@ lazily after an explicit admin click and must never be placed in the polling
 response or TanStack query cache pre-emptively. Tool raw and model-visible
 payloads use separate `no-store` API calls and separate buttons; never collapse
 them into one generic result field.
+
+Phase 6 adds a separately polled, cursor-paged “Alerts” lens to Operations.
+The list remains metadata-only; selecting an episode lazily fetches its source
+Belief, assessor/rule version and config hash, ordered Observation evidence,
+current Task Beliefs, workflow history, and available actions. Presentation
+must distinguish exact/absolute runaway evidence from Tool-frequency
+operational signals, heartbeat liveness rules, and shadow observation-only
+policy. Task Overview renders the backend-resolved current behavior Belief and
+never derives semantic state in the browser. Acknowledge/dismiss use the
+server's workflow version, while interrupt/rollback require an explicit
+confirmation and a per-attempt idempotency key. Pending actions disable
+duplicates; 409/failure paths refetch and preserve the evidence dialog, never
+show optimistic success. Interrupt copy says that execution stops while the
+current checkpoint is retained and must not call it pause; rollback copy names
+the pre-run checkpoint restore.
 Phase 4 keeps lineage lazy as well: each ContentBlock row loads its local
 backward provenance, forward descendants, or possible exposures only after the
 admin selects that action. The graph view must retain depth, transform labels,

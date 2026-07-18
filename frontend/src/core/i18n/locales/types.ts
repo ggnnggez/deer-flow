@@ -419,6 +419,65 @@ export interface Translations {
     enforcement: string;
     enforced: string;
     shadow: string;
+    alerts: string;
+    alert: string;
+    alertDetails: string;
+    noAlerts: string;
+    alertType: string;
+    category: string;
+    severity: string;
+    workflow: string;
+    episode: string;
+    evidenceCount: string;
+    rule: string;
+    configHash: string;
+    sourceBelief: string;
+    currentBehavior: string;
+    workflowHistory: string;
+    viewDetails: string;
+    acknowledge: string;
+    dismiss: string;
+    interrupt: string;
+    rollback: string;
+    cancel: string;
+    confirmAction: string;
+    dismissReason: string;
+    dismissReasonRequired: string;
+    workflowActionSucceeded: string;
+    operatorActionSucceeded: string;
+    operatorActionAuditDegraded: string;
+    interruptWarning: string;
+    rollbackWarning: string;
+    resolutionReason: string;
+    dismissalReason: string;
+    operator: string;
+    alertCategory: {
+      runaway: string;
+      operational: string;
+      liveness: string;
+      observability: string;
+    };
+    alertTypeLabel: {
+      budget_warning: string;
+      budget_exceeded: string;
+      exact_repetition: string;
+      tool_frequency: string;
+      heartbeat_missing: string;
+      long_dwell: string;
+      observability_degradation: string;
+      projection_failure: string;
+    };
+    alertWorkflow: {
+      open: string;
+      acknowledged: string;
+      dismissed: string;
+      resolved: string;
+    };
+    alertSeverity: {
+      info: string;
+      warning: string;
+      critical: string;
+    };
     heartbeatState: {
       unknown: string;
       fresh: string;

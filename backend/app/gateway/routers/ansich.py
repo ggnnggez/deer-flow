@@ -6,10 +6,18 @@ import logging
 from datetime import datetime
 from typing import Literal
 
+from ansich.alerts import AlertWorkflowConflict
 from ansich.contracts import ControlValue, TaskLifecycleScope
-from fastapi import APIRouter, HTTPException, Query, Request, Response
+from fastapi import APIRouter, Header, HTTPException, Query, Request, Response
+from pydantic import BaseModel, Field
 
-from app.gateway.deps import require_admin_user
+from app.gateway.deps import (
+    get_current_user_from_request,
+    get_run_manager,
+    require_admin_user,
+)
+from deerflow.runtime.runs.manager import CancelOutcome
+from deerflow.runtime.runs.schemas import RunStatus
 
 router = APIRouter(prefix="/api/ansich", tags=["ansich"])
 _ADMIN_REQUIRED = "Ansich developer/operator observability requires an admin account."
@@ -84,6 +92,40 @@ def _decode_compression_cursor(
             status_code=422,
             detail="Invalid Ansich ContextCompression cursor",
         ) from exc
+
+
+def _decode_alert_cursor(
+    value: str | None,
+) -> tuple[datetime, str] | None:
+    if value is None:
+        return None
+    try:
+        padded = value + "=" * (-len(value) % 4)
+        decoded = json.loads(base64.urlsafe_b64decode(padded).decode())
+        if not isinstance(decoded, list) or len(decoded) != 2 or not all(isinstance(item, str) for item in decoded):
+            raise ValueError
+        updated_at = datetime.fromisoformat(decoded[0])
+        if updated_at.tzinfo is None:
+            raise ValueError
+        return updated_at, decoded[1]
+    except (
+        binascii.Error,
+        ValueError,
+        UnicodeDecodeError,
+        json.JSONDecodeError,
+    ) as exc:
+        raise HTTPException(
+            status_code=422,
+            detail="Invalid Ansich Alert cursor",
+        ) from exc
+
+
+class AlertWorkflowRequest(BaseModel):
+    workflow_version: int = Field(ge=1)
+
+
+class AlertDismissRequest(AlertWorkflowRequest):
+    reason: str = Field(min_length=1, max_length=512)
 
 
 def _encode_timeline_cursor(occurred_at: datetime, ingest_seq: int) -> str:
@@ -177,6 +219,384 @@ async def list_active_tasks(
         return Response(status_code=304, headers={"ETag": etag})
     response.headers["ETag"] = etag
     return body
+
+
+@router.get("/operations/alerts")
+async def list_alerts(
+    request: Request,
+    alert_type: Literal[
+        "budget_warning",
+        "budget_exceeded",
+        "exact_repetition",
+        "tool_frequency",
+        "heartbeat_missing",
+        "long_dwell",
+        "observability_degradation",
+        "projection_failure",
+    ]
+    | None = Query(default=None, alias="type"),
+    workflow_state: Literal[
+        "open",
+        "acknowledged",
+        "dismissed",
+        "resolved",
+    ]
+    | None = Query(default=None, alias="state"),
+    task_id: str | None = Query(default=None, alias="task"),
+    severity: Literal["info", "warning", "critical"] | None = Query(default=None),
+    shadow: bool | None = Query(default=None),
+    from_time: datetime | None = Query(default=None, alias="from"),
+    to_time: datetime | None = Query(default=None, alias="to"),
+    limit: int = Query(default=100, ge=1, le=500),
+    cursor: str | None = Query(default=None),
+) -> dict:
+    await require_admin_user(request, detail=_ADMIN_REQUIRED)
+    service = _service_or_503(request)
+    _ensure_queryable(service)
+    for timestamp in (from_time, to_time):
+        if timestamp is not None and timestamp.tzinfo is None:
+            raise HTTPException(
+                status_code=422,
+                detail="Ansich Alert time filters must include a timezone",
+            )
+    try:
+        alerts = await service.list_alerts(
+            limit=limit + 1,
+            alert_type=alert_type,
+            workflow_state=workflow_state,
+            task_id=task_id,
+            severity=severity,
+            shadow=shadow,
+            from_time=from_time,
+            to_time=to_time,
+            cursor=_decode_alert_cursor(cursor),
+        )
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise HTTPException(
+            status_code=503,
+            detail={
+                "message": "Ansich Alert query failed",
+                "projection_status": _projection_status(service),
+            },
+        ) from exc
+    page = alerts[:limit]
+    next_cursor = None
+    if len(alerts) > limit and page:
+        next_cursor = _encode_cursor(
+            page[-1].updated_at,
+            page[-1].alert_id,
+        )
+    return {
+        "items": [item.model_dump(mode="json") for item in page],
+        "next_cursor": next_cursor,
+        "projection_status": _projection_status(service),
+    }
+
+
+@router.get("/operations/alerts/{alert_id}")
+async def get_alert_detail(alert_id: str, request: Request) -> dict:
+    await require_admin_user(request, detail=_ADMIN_REQUIRED)
+    service = _service_or_503(request)
+    _ensure_queryable(service)
+    try:
+        detail = await service.get_alert_detail(alert_id)
+    except Exception as exc:
+        raise HTTPException(
+            status_code=503,
+            detail={
+                "message": "Ansich Alert detail query failed",
+                "projection_status": _projection_status(service),
+            },
+        ) from exc
+    if detail is None:
+        raise HTTPException(status_code=404, detail="Ansich Alert not found")
+    return {
+        "alert": detail.model_dump(mode="json"),
+        "projection_status": _projection_status(service),
+    }
+
+
+async def _change_alert_workflow(
+    *,
+    alert_id: str,
+    action: Literal["acknowledge", "dismiss"],
+    workflow_version: int,
+    reason: str | None,
+    request: Request,
+) -> dict:
+    await require_admin_user(request, detail=_ADMIN_REQUIRED)
+    user = getattr(request.state, "user", None)
+    if user is None:
+        user = await get_current_user_from_request(request)
+    service = _service_or_503(request)
+    _ensure_queryable(service)
+    try:
+        if action == "acknowledge":
+            alert = await service.acknowledge_alert(
+                alert_id,
+                expected_workflow_version=workflow_version,
+                operator_id=str(user.id),
+            )
+        else:
+            alert = await service.dismiss_alert(
+                alert_id,
+                expected_workflow_version=workflow_version,
+                operator_id=str(user.id),
+                reason=reason or "",
+            )
+    except AlertWorkflowConflict as exc:
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "message": "Ansich Alert workflow version conflict",
+                "current_alert": exc.current.model_dump(mode="json"),
+            },
+        ) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    except Exception as exc:
+        raise HTTPException(
+            status_code=503,
+            detail={
+                "message": "Ansich Alert workflow write failed",
+                "projection_status": _projection_status(service),
+            },
+        ) from exc
+    if alert is None:
+        raise HTTPException(status_code=404, detail="Ansich Alert not found")
+    return {
+        "alert": alert.model_dump(mode="json"),
+        "projection_status": _projection_status(service),
+    }
+
+
+@router.post("/operations/alerts/{alert_id}/acknowledge")
+async def acknowledge_alert(
+    alert_id: str,
+    body: AlertWorkflowRequest,
+    request: Request,
+) -> dict:
+    return await _change_alert_workflow(
+        alert_id=alert_id,
+        action="acknowledge",
+        workflow_version=body.workflow_version,
+        reason=None,
+        request=request,
+    )
+
+
+@router.post("/operations/alerts/{alert_id}/dismiss")
+async def dismiss_alert(
+    alert_id: str,
+    body: AlertDismissRequest,
+    request: Request,
+) -> dict:
+    return await _change_alert_workflow(
+        alert_id=alert_id,
+        action="dismiss",
+        workflow_version=body.workflow_version,
+        reason=body.reason,
+        request=request,
+    )
+
+
+async def _run_operator_action(
+    *,
+    task_id: str,
+    action_type: Literal["interrupt", "rollback"],
+    idempotency_key: str,
+    request: Request,
+) -> dict:
+    await require_admin_user(request, detail=_ADMIN_REQUIRED)
+    if not idempotency_key.strip() or len(idempotency_key) > 128:
+        raise HTTPException(
+            status_code=422,
+            detail="Idempotency-Key must contain 1 to 128 characters",
+        )
+    service = _service_or_503(request)
+    _ensure_queryable(service)
+    user = getattr(request.state, "user", None)
+    if user is None:
+        user = await get_current_user_from_request(request)
+    operator_id = str(user.id)
+    target = await service.get_task_action_target(task_id)
+    if target is None:
+        raise HTTPException(status_code=404, detail="Ansich Task not found")
+    if target.source_kind != "deerflow_run":
+        raise HTTPException(
+            status_code=409,
+            detail="Ansich Task is not backed by a DeerFlow Run",
+        )
+    run_manager = get_run_manager(request)
+    record = await run_manager.get(target.run_id)
+    if record is None or record.run_id != target.run_id or (target.thread_id is not None and record.thread_id != target.thread_id):
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "message": "Ansich Task source does not match the DeerFlow Run",
+                "task_id": task_id,
+                "run_id": target.run_id,
+                "thread_id": target.thread_id,
+            },
+        )
+
+    existing = await service.get_operator_action(
+        task_id=task_id,
+        action_type=action_type,
+        idempotency_key=idempotency_key,
+    )
+    if existing is not None and existing.status in {"succeeded", "failed"}:
+        return {
+            "action": existing.model_dump(mode="json"),
+            "audit_status": "recorded",
+            "idempotent_replay": True,
+        }
+    if existing is not None:
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "message": "Operator action is already in progress",
+                "action": existing.model_dump(mode="json"),
+            },
+        )
+    if target.control_value != "running" or record.status not in {RunStatus.pending, RunStatus.running}:
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "message": "DeerFlow Run does not support this action in its current state",
+                "task_control": target.control_value,
+                "run_status": str(record.status),
+            },
+        )
+
+    audit_status = "recorded"
+    action = None
+    try:
+        action, created = await service.begin_operator_action(
+            task_id=task_id,
+            action_type=action_type,
+            idempotency_key=idempotency_key,
+            operator_id=operator_id,
+        )
+        if not created:
+            if action.status in {"succeeded", "failed"}:
+                return {
+                    "action": action.model_dump(mode="json"),
+                    "audit_status": "recorded",
+                    "idempotent_replay": True,
+                }
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "message": "Operator action is already in progress",
+                    "action": action.model_dump(mode="json"),
+                },
+            )
+    except HTTPException:
+        raise
+    except Exception:
+        logger.exception(
+            "Ansich operator action requested audit failed",
+            extra={"ansich_task_id": task_id, "action_type": action_type},
+        )
+        audit_status = "degraded"
+
+    runtime_error = None
+    try:
+        outcome = await run_manager.cancel(
+            target.run_id,
+            action=action_type,
+        )
+        succeeded = outcome in {
+            CancelOutcome.cancelled,
+            CancelOutcome.taken_over,
+        }
+        result: dict[str, object] = {"outcome": str(outcome)}
+        if not succeeded:
+            runtime_error = f"Run action was rejected: {outcome}"
+    except Exception as exc:
+        succeeded = False
+        runtime_error = str(exc) or type(exc).__name__
+        result = {
+            "outcome": "exception",
+            "error_type": type(exc).__name__,
+            "message": runtime_error,
+        }
+
+    if action is not None:
+        try:
+            finished = await service.finish_operator_action(
+                action.action_id,
+                succeeded=succeeded,
+                operator_id=operator_id,
+                result=result,
+            )
+            if finished is not None:
+                action = finished
+            else:
+                audit_status = "degraded"
+        except Exception:
+            logger.exception(
+                "Ansich operator action terminal audit failed",
+                extra={
+                    "ansich_task_id": task_id,
+                    "action_type": action_type,
+                },
+            )
+            audit_status = "degraded"
+
+    action_payload = (
+        {
+            "task_id": task_id,
+            "action_type": action_type,
+            "idempotency_key": idempotency_key,
+            "status": "succeeded" if succeeded else "failed",
+            "result": result,
+        }
+        if action is None
+        else action.model_dump(mode="json")
+    )
+    body = {
+        "action": action_payload,
+        "audit_status": audit_status,
+        "idempotent_replay": False,
+    }
+    if not succeeded:
+        raise HTTPException(
+            status_code=409,
+            detail={**body, "message": runtime_error},
+        )
+    return body
+
+
+@router.post("/tasks/{task_id}/actions/interrupt")
+async def interrupt_task(
+    task_id: str,
+    request: Request,
+    idempotency_key: str = Header(alias="Idempotency-Key"),
+) -> dict:
+    return await _run_operator_action(
+        task_id=task_id,
+        action_type="interrupt",
+        idempotency_key=idempotency_key,
+        request=request,
+    )
+
+
+@router.post("/tasks/{task_id}/actions/rollback")
+async def rollback_task(
+    task_id: str,
+    request: Request,
+    idempotency_key: str = Header(alias="Idempotency-Key"),
+) -> dict:
+    return await _run_operator_action(
+        task_id=task_id,
+        action_type="rollback",
+        idempotency_key=idempotency_key,
+        request=request,
+    )
 
 
 @router.get("/tasks/{task_id}/usage")
@@ -286,6 +706,7 @@ async def get_task(task_id: str, request: Request) -> dict:
     _ensure_queryable(service)
     try:
         task = await service.get_task(task_id)
+        behavior = await service.get_current_belief(task_id, "behavior")
     except Exception as exc:
         raise HTTPException(
             status_code=503,
@@ -295,6 +716,7 @@ async def get_task(task_id: str, request: Request) -> dict:
         raise HTTPException(status_code=404, detail="Ansich Task not found")
     return {
         "task": task.model_dump(mode="json"),
+        "behavior": None if behavior is None else behavior.model_dump(mode="json"),
         "projection_status": _projection_status(service),
     }
 

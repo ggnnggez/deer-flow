@@ -6,6 +6,11 @@ rs.mock("@/core/api/fetcher", () => ({
 
 import {
   AnsichApiError,
+  acknowledgeAnsichAlert,
+  dismissAnsichAlert,
+  executeAnsichTaskAction,
+  fetchAnsichAlert,
+  fetchAnsichAlerts,
   fetchAnsichActiveTasks,
   fetchAnsichContentExposures,
   fetchAnsichContentLineage,
@@ -110,6 +115,45 @@ describe("Ansich API", () => {
       expect.stringContaining(`/api/ansich/tasks/${encoded}/usage`),
       expect.stringContaining(`/api/ansich/tasks/${encoded}/budgets`),
     ]);
+  });
+
+  it("uses the Phase 6 alert and operator action endpoints", async () => {
+    mockedFetch.mockResolvedValue(jsonResponse({}));
+
+    await fetchAnsichAlerts(25, {
+      alertType: "exact_repetition",
+      workflowState: "open",
+      taskId: "task/one",
+      cursor: "next page",
+    });
+    await fetchAnsichAlert("alert/one");
+    await acknowledgeAnsichAlert("alert/one", 2);
+    await dismissAnsichAlert("alert/one", 3, "expected maintenance");
+    await executeAnsichTaskAction("task/one", "rollback", "rollback-once");
+
+    expect(mockedFetch.mock.calls[0]?.[0]).toEqual(
+      expect.stringContaining(
+        "/api/ansich/operations/alerts?limit=25&type=exact_repetition&state=open&task=task%2Fone&cursor=next+page",
+      ),
+    );
+    expect(mockedFetch.mock.calls[1]?.[0]).toEqual(
+      expect.stringContaining("/api/ansich/operations/alerts/alert%2Fone"),
+    );
+    expect(mockedFetch.mock.calls[2]?.[1]).toMatchObject({
+      method: "POST",
+      body: JSON.stringify({ workflow_version: 2 }),
+    });
+    expect(mockedFetch.mock.calls[3]?.[1]).toMatchObject({
+      method: "POST",
+      body: JSON.stringify({
+        workflow_version: 3,
+        reason: "expected maintenance",
+      }),
+    });
+    expect(mockedFetch.mock.calls[4]?.[1]).toMatchObject({
+      method: "POST",
+      headers: { "Idempotency-Key": "rollback-once" },
+    });
   });
 
   it("URL-encodes a task ID for both task and timeline requests", async () => {
