@@ -13,6 +13,10 @@ const COMPRESSION_ID = "ac695124-12f7-48fd-bc4e-54058924d85a";
 const OLDER_COMPRESSION_ID = "9c695124-12f7-48fd-bc4e-54058924d85a";
 const SUMMARY_BLOCK_ID = "cc695124-12f7-48fd-bc4e-54058924d85a";
 const ALERT_ID = "ec695124-12f7-48fd-bc4e-54058924d85a";
+const RELEASE_ID = "fc695124-12f7-48fd-bc4e-54058924d85a";
+const OTHER_RELEASE_ID = "0d695124-12f7-48fd-bc4e-54058924d85a";
+const RELEASE_HASH = "a".repeat(64);
+const OTHER_RELEASE_HASH = "b".repeat(64);
 const HEALTH = {
   status: "healthy",
   queue_depth: 0,
@@ -167,6 +171,123 @@ test("admin navigates from Ansich operations to evidence-backed Task detail", as
         projection_status: HEALTH,
       }),
     }),
+  );
+  const releaseSummary = {
+    release_id: RELEASE_ID,
+    namespace: "deerflow",
+    agent_name: "lead-agent",
+    release_hash: RELEASE_HASH,
+    schema_version: 1,
+    model_hash: "1".repeat(64),
+    prompt_hash: "2".repeat(64),
+    tool_catalog_hash: "3".repeat(64),
+    policy_hash: "4".repeat(64),
+    runtime_build_id: "5".repeat(64),
+    created_at: "2026-07-17T12:00:00Z",
+    task_count: 2,
+    quality_status: "unassessed",
+  };
+  const releaseManifest = {
+    schema_version: 1,
+    namespace: "deerflow",
+    agent_name: "lead-agent",
+    model: {
+      requested: "fast",
+      effective: "provider/model-v1",
+      provider: "provider",
+      behavior_parameters: { temperature: 0 },
+    },
+    prompt: {
+      template_id: "lead-v1",
+      template_hash: "6".repeat(64),
+      rendered_base_prompt_hash: "7".repeat(64),
+      rendered_base_prompt_preview: "Controlled system prompt preview",
+      soul_hash: null,
+      available_skill_catalog_hash: null,
+    },
+    tools: [
+      {
+        name: "web_search",
+        description: "Search the web",
+        argument_schema: {
+          type: "object",
+          properties: { query: { type: "string" } },
+        },
+        schema_hash: "8".repeat(64),
+        source: "builtin",
+        deferred: false,
+        behavior_metadata: {},
+      },
+    ],
+    policy: {
+      middleware_chain: [],
+      values: { non_interactive: false },
+    },
+    runtime_build: {
+      package_version: "2.1.0",
+      image_digest: "unknown",
+      git_commit: "e2e",
+    },
+  };
+  await page.route(`**/api/ansich/tasks/${TASK_ID}/agent-release`, (route) =>
+    route.fulfill({
+      status: 200,
+      contentType: "application/json",
+      body: JSON.stringify({
+        binding: {
+          task_id: TASK_ID,
+          relation_role: "executed_by",
+          established_obs_id: "release-observation-e2e",
+          release: { summary: releaseSummary, manifest: releaseManifest },
+        },
+        provider_drift: {
+          assertion_id: "drift-e2e",
+          subject_id: TASK_ID,
+          field_name: "configuration_drift",
+          value: {
+            value: "matched",
+            effective_model: "provider/model-v1",
+            provider_reported_model: "models/provider/model-v1",
+          },
+          as_of: "2026-07-17T12:00:02Z",
+          asserted_at: "2026-07-17T12:00:02Z",
+          assessor: { name: "configuration-drift", version: "1.0.0" },
+          config_hash: "9".repeat(64),
+          authority_class: "configured_rule",
+          fidelity_class: "rule",
+          confidence: null,
+          evidence_obs_ids: ["provider-response-e2e"],
+        },
+        projection_status: HEALTH,
+      }),
+    }),
+  );
+  await page.route("**/api/ansich/agent-releases?*", (route) =>
+    route.fulfill({
+      status: 200,
+      contentType: "application/json",
+      body: JSON.stringify({
+        items: [
+          releaseSummary,
+          {
+            ...releaseSummary,
+            release_id: OTHER_RELEASE_ID,
+            release_hash: OTHER_RELEASE_HASH,
+            model_hash: "0".repeat(64),
+          },
+        ],
+        operational_distributions: { availability: "unavailable" },
+        projection_status: HEALTH,
+      }),
+    }),
+  );
+  let rawReleaseManifestRequests = 0;
+  await page.route(
+    `**/api/ansich/agent-releases/${RELEASE_ID}/manifest`,
+    (route) => {
+      rawReleaseManifestRequests += 1;
+      return route.abort();
+    },
   );
   await page.route(`**/api/ansich/tasks/${TASK_ID}/steps`, (route) =>
     route.fulfill({
@@ -431,7 +552,8 @@ test("admin navigates from Ansich operations to evidence-backed Task detail", as
     `**/api/ansich/tasks/${TASK_ID}/context-compressions?*`,
     (route) => {
       const cursor = new URL(route.request().url()).searchParams.get("cursor");
-      const compressionId = cursor === null ? COMPRESSION_ID : OLDER_COMPRESSION_ID;
+      const compressionId =
+        cursor === null ? COMPRESSION_ID : OLDER_COMPRESSION_ID;
       return route.fulfill({
         status: 200,
         contentType: "application/json",
@@ -585,6 +707,17 @@ test("admin navigates from Ansich operations to evidence-backed Task detail", as
   await expect(page.getByText("source", { exact: true })).toBeVisible();
   await page.getByRole("button", { name: "Load raw payload" }).click();
   await expect(page.getByText('"inspect me"')).toBeVisible();
+  await page.getByRole("tab", { name: "Agent release" }).click();
+  await expect(
+    page.getByText("provider/model-v1", { exact: true }).first(),
+  ).toBeVisible();
+  await expect(
+    page.getByText("Controlled system prompt preview", { exact: true }),
+  ).toBeVisible();
+  await expect(page.getByText(/Quality: Unassessed/).first()).toBeVisible();
+  await page.getByText("builtin:web_search", { exact: true }).click();
+  await expect(page.getByText('"query"')).toBeVisible();
+  expect(rawReleaseManifestRequests).toBe(0);
 });
 
 test("operations keeps terminal Task history separate from running work", async ({

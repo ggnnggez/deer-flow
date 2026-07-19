@@ -18,6 +18,7 @@ import { Skeleton } from "@/components/ui/skeleton";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import {
   AnsichContextPanel,
+  AnsichAgentReleasePanel,
   AnsichBudgetPanel,
   AnsichObservationTimeline,
   AnsichProjectionHealth,
@@ -126,6 +127,9 @@ export default function AnsichTaskDetailPage() {
                   </TabsTrigger>
                   <TabsTrigger value="steps">{t.ansich.steps}</TabsTrigger>
                   <TabsTrigger value="budgets">{t.ansich.budgets}</TabsTrigger>
+                  <TabsTrigger value="agent-release">
+                    {t.ansich.agentRelease}
+                  </TabsTrigger>
                   <TabsTrigger value="context">
                     {t.ansich.contextAndLineage}
                   </TabsTrigger>
@@ -245,6 +249,13 @@ export default function AnsichTaskDetailPage() {
 
                 <TabsContent value="budgets">
                   <AnsichBudgetPanel taskId={taskId} polling={taskIsRunning} />
+                </TabsContent>
+
+                <TabsContent value="agent-release">
+                  <AnsichAgentReleasePanel
+                    taskId={taskId}
+                    polling={taskIsRunning}
+                  />
                 </TabsContent>
 
                 <TabsContent value="context">

@@ -9,16 +9,19 @@ import {
   acknowledgeAnsichAlert,
   dismissAnsichAlert,
   executeAnsichTaskAction,
+  compareAnsichAgentReleases,
   fetchAnsichAlert,
   fetchAnsichAlerts,
   fetchAnsichStepContext,
   fetchAnsichActiveTasks,
+  fetchAnsichAgentReleases,
   fetchAnsichTaskCompressions,
   fetchAnsichTaskSteps,
   fetchAnsichTaskBudgets,
   fetchAnsichTask,
   fetchAnsichTaskTimeline,
   fetchAnsichTaskUsage,
+  fetchAnsichTaskAgentRelease,
   fetchAnsichTasks,
 } from "./api";
 import type {
@@ -27,6 +30,7 @@ import type {
   AnsichContextCompressionListResponse,
   AnsichTaskLifecycleScope,
   AnsichTaskListResponse,
+  AnsichTaskAgentReleaseResponse,
   AnsichTaskResponse,
 } from "./types";
 
@@ -58,6 +62,15 @@ export function taskListRefreshInterval(
   pageVisible: boolean,
 ): number | false {
   if (!pageVisible || lifecycleScope === "terminal") return false;
+  return REFRESH_INTERVAL_MS;
+}
+
+export function taskReleaseRefreshInterval(
+  data: AnsichTaskAgentReleaseResponse | undefined,
+  pageVisible: boolean,
+  taskRunning: boolean,
+): number | false {
+  if (!pageVisible || !taskRunning || data?.binding) return false;
   return REFRESH_INTERVAL_MS;
 }
 
@@ -200,6 +213,55 @@ export function useAnsichTask(taskId: string, enabled = true) {
     refetchInterval: (query) =>
       taskDetailRefreshInterval(query.state.data, pageIsVisible()),
     refetchIntervalInBackground: false,
+  });
+}
+
+export function useAnsichTaskAgentRelease(
+  taskId: string,
+  enabled = true,
+  polling = false,
+) {
+  return useQuery({
+    queryKey: ["ansich", "tasks", taskId, "agent-release"],
+    queryFn: () => fetchAnsichTaskAgentRelease(taskId),
+    enabled: enabled && Boolean(taskId),
+    retry: false,
+    refetchInterval: (query) =>
+      taskReleaseRefreshInterval(query.state.data, pageIsVisible(), polling),
+    refetchIntervalInBackground: false,
+  });
+}
+
+export function useAnsichAgentReleases(limit = 100, enabled = true) {
+  return useQuery({
+    queryKey: ["ansich", "agent-releases", { limit }],
+    queryFn: () => fetchAnsichAgentReleases(limit),
+    enabled,
+    retry: false,
+  });
+}
+
+export function useAnsichAgentReleaseComparison(
+  leftReleaseId: string | null,
+  rightReleaseId: string | null,
+  enabled = true,
+) {
+  return useQuery({
+    queryKey: [
+      "ansich",
+      "agent-releases",
+      "compare",
+      leftReleaseId,
+      rightReleaseId,
+    ],
+    queryFn: () =>
+      compareAnsichAgentReleases(leftReleaseId ?? "", rightReleaseId ?? ""),
+    enabled:
+      enabled &&
+      Boolean(leftReleaseId) &&
+      Boolean(rightReleaseId) &&
+      leftReleaseId !== rightReleaseId,
+    retry: false,
   });
 }
 

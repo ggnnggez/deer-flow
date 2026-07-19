@@ -7,6 +7,8 @@ import type {
   AnsichAlertType,
   AnsichAlertWorkflowResponse,
   AnsichAlertWorkflowState,
+  AnsichAgentReleaseComparisonResponse,
+  AnsichAgentReleaseListResponse,
   AnsichContentPayloadResponse,
   AnsichActiveTaskListResponse,
   AnsichContentLineageResponse,
@@ -21,6 +23,7 @@ import type {
   AnsichTaskBudgetsResponse,
   AnsichTaskResponse,
   AnsichTaskUsageResponse,
+  AnsichTaskAgentReleaseResponse,
   AnsichTimelineResponse,
   AnsichHealth,
   AnsichToolCallResponse,
@@ -102,6 +105,54 @@ export async function fetchAnsichActiveTasks(
     await throwAnsichApiError(
       response,
       `Failed to load active Ansich tasks: ${response.statusText}`,
+    );
+  }
+  return response.json();
+}
+
+export async function fetchAnsichAgentReleases(
+  limit = 100,
+): Promise<AnsichAgentReleaseListResponse> {
+  const response = await fetch(ansichUrl(`/agent-releases?limit=${limit}`));
+  if (!response.ok) {
+    await throwAnsichApiError(
+      response,
+      `Failed to load Ansich Agent releases: ${response.statusText}`,
+    );
+  }
+  return response.json();
+}
+
+export async function fetchAnsichTaskAgentRelease(
+  taskId: string,
+): Promise<AnsichTaskAgentReleaseResponse> {
+  const response = await fetch(
+    ansichUrl(`/tasks/${encodeURIComponent(taskId)}/agent-release`),
+  );
+  if (!response.ok) {
+    await throwAnsichApiError(
+      response,
+      `Failed to load Ansich Task Agent release: ${response.statusText}`,
+    );
+  }
+  return response.json();
+}
+
+export async function compareAnsichAgentReleases(
+  leftReleaseId: string,
+  rightReleaseId: string,
+): Promise<AnsichAgentReleaseComparisonResponse> {
+  const query = new URLSearchParams({
+    left: leftReleaseId,
+    right: rightReleaseId,
+  });
+  const response = await fetch(
+    ansichUrl(`/agent-releases/compare?${query.toString()}`),
+  );
+  if (!response.ok) {
+    await throwAnsichApiError(
+      response,
+      `Failed to compare Ansich Agent releases: ${response.statusText}`,
     );
   }
   return response.json();

@@ -82,7 +82,7 @@ describe("Ansich presentation", () => {
     ).toEqual({ status: "exceeded", percent: 107, overshoot: 7 });
   });
 
-  it("advertises only alert types with Phase 6 producers", () => {
+  it("advertises only alert types with implemented producers", () => {
     expect(ANSICH_PRODUCED_ALERT_TYPES).toEqual([
       "budget_warning",
       "budget_exceeded",
@@ -90,11 +90,15 @@ describe("Ansich presentation", () => {
       "tool_frequency",
       "heartbeat_missing",
       "long_dwell",
+      "configuration_drift",
     ]);
     expect(getAlertPresentationCategory("exact_repetition")).toBe("runaway");
     expect(getAlertPresentationCategory("budget_exceeded")).toBe("runaway");
     expect(getAlertPresentationCategory("tool_frequency")).toBe("operational");
     expect(getAlertPresentationCategory("long_dwell")).toBe("operational");
     expect(getAlertPresentationCategory("heartbeat_missing")).toBe("liveness");
+    expect(getAlertPresentationCategory("configuration_drift")).toBe(
+      "operational",
+    );
   });
 });

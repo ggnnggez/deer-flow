@@ -15,6 +15,7 @@ export type AnsichObservationKind =
   | "task.failed"
   | "task.interrupted"
   | "task.heartbeat"
+  | "agent_release.resolved"
   | "budget.configured"
   | "budget.consumed"
   | "step.started"
@@ -89,6 +90,7 @@ export interface AnsichObservation {
     | "context_state"
     | "context_snapshot"
     | "context_compression"
+    | "agent_release"
     | "alert";
   subject_id: string;
   fidelity_class: "hard";
@@ -271,6 +273,7 @@ export const ANSICH_PRODUCED_ALERT_TYPES = [
   "tool_frequency",
   "heartbeat_missing",
   "long_dwell",
+  "configuration_drift",
 ] as const;
 
 export type AnsichAlertType = (typeof ANSICH_PRODUCED_ALERT_TYPES)[number];
@@ -700,4 +703,128 @@ export interface AnsichToolResultPayloadResponse {
   visible_result?: AnsichToolResult;
   raw_payload?: AnsichContentPayloadResponse["payload"];
   visible_payload?: AnsichContentPayloadResponse["payload"];
+}
+
+export interface AnsichAgentReleaseSummary {
+  release_id: string;
+  namespace: string;
+  agent_name: string;
+  release_hash: string;
+  schema_version: number;
+  model_hash: string;
+  prompt_hash: string;
+  tool_catalog_hash: string;
+  policy_hash: string;
+  runtime_build_id: string;
+  created_at: string;
+  task_count: number;
+  quality_status: "unassessed";
+}
+
+export interface AnsichAgentReleaseManifest {
+  schema_version: number;
+  namespace: string;
+  agent_name: string;
+  model: {
+    requested: string | null;
+    effective: string;
+    provider: string | null;
+    behavior_parameters: Record<string, unknown>;
+  };
+  prompt: {
+    template_id: string;
+    template_hash: string;
+    rendered_base_prompt_hash: string;
+    rendered_base_prompt_preview: string;
+    soul_hash: string | null;
+    available_skill_catalog_hash: string | null;
+  };
+  tools: Array<{
+    name: string;
+    description: string;
+    argument_schema: Record<string, unknown>;
+    schema_hash: string;
+    source: string;
+    deferred: boolean;
+    behavior_metadata: Record<string, unknown>;
+  }>;
+  policy: {
+    middleware_chain: Array<{
+      name: string;
+      public_parameters: Record<string, unknown>;
+    }>;
+    values: Record<string, unknown>;
+  };
+  runtime_build: {
+    package_version: string;
+    image_digest: string;
+    git_commit: string;
+  };
+}
+
+export interface AnsichAgentReleaseDetail {
+  summary: AnsichAgentReleaseSummary;
+  manifest: AnsichAgentReleaseManifest;
+}
+
+export interface AnsichAgentReleaseListResponse {
+  items: AnsichAgentReleaseSummary[];
+  operational_distributions: { availability: "unavailable" };
+  projection_status: AnsichHealth;
+}
+
+export interface AnsichTaskAgentReleaseResponse {
+  binding: {
+    task_id: string;
+    relation_role: "executed_by";
+    established_obs_id: string;
+    release: AnsichAgentReleaseDetail;
+  } | null;
+  provider_drift: AnsichBeliefAssertion | null;
+  projection_status: AnsichHealth;
+}
+
+export interface AnsichReleaseFieldChange {
+  path: string;
+  left: unknown;
+  right: unknown;
+}
+
+export interface AnsichAgentReleaseComparison {
+  left_release_hash: string;
+  right_release_hash: string;
+  changed_components: Array<
+    "model" | "prompt" | "tools" | "policy" | "runtime_build"
+  >;
+  model: AnsichReleaseFieldChange[];
+  prompt: AnsichReleaseFieldChange[];
+  tools: {
+    added: Array<{ source: string; name: string }>;
+    removed: Array<{ source: string; name: string }>;
+    schema_changed: Array<{
+      source: string;
+      name: string;
+      left: unknown;
+      right: unknown;
+    }>;
+    description_changed: Array<{
+      source: string;
+      name: string;
+      left: unknown;
+      right: unknown;
+    }>;
+    source_changed: Array<{
+      name: string;
+      left_source: string;
+      right_source: string;
+    }>;
+  };
+  policy: AnsichReleaseFieldChange[];
+  build: AnsichReleaseFieldChange[];
+  quality_status: "unassessed";
+}
+
+export interface AnsichAgentReleaseComparisonResponse {
+  comparison: AnsichAgentReleaseComparison;
+  projection_status: AnsichHealth;
 }

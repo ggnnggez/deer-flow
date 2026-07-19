@@ -85,7 +85,7 @@ insufficient evidence rather than healthy; Budget bars exist only when a limit
 and complete Usage are both known, and may show terminal overshoot. Inclusive
 Usage remains explicitly unavailable until Phase 8. They must not derive
 end-user progress percentages or fake Step counts. Task detail has Overview,
-Budgets, Timeline, Steps, and Context tabs. Logical Steps fold
+Budgets, Timeline, Steps, Context, and Agent Release tabs. Logical Steps fold
 provider retries into attempts and render internal system operations separately;
 each ToolCall renders an ordered four-stage accountability chain (Issued,
 Authorization, Execution, Visible to model). Unknown authorization/execution is
@@ -118,11 +118,22 @@ duplicates; 409/failure paths refetch and preserve the evidence dialog, never
 show optimistic success. Interrupt copy says that execution stops while the
 current checkpoint is retained and must not call it pause; rollback copy names
 the pre-run checkpoint restore.
-The Phase 6 UI advertises only Alert types with live producers: budget
+The UI advertises only Alert types with live producers: budget
 warning/exceeded, exact repetition, Tool frequency, heartbeat missing, and long
-dwell. `observability_degradation` and `projection_failure` remain Phase 11
+dwell; Phase 7 also exposes provider `configuration_drift`.
+`observability_degradation` and `projection_failure` remain Phase 11
 domain reservations and must not appear in frontend filter constants or locale
 copy before their producer and subject-mapping contracts exist.
+
+Phase 7's Agent Release tab reads the Task's immutable `executed_by` binding
+separately from the normal Task polling query. It renders component hashes,
+sanitized effective model/policy/build values, structured Tool schemas, and the
+backend-resolved provider-drift Belief/evidence. The normal detail response may
+show only the controlled prompt preview; the full manifest is never prefetched
+or placed in the release query cache. Release comparison always consumes the
+backend typed diff and keeps Tool added/removed/schema/description/source changes
+distinct. Until an evaluator and operational aggregation exist, quality and
+distribution labels remain explicitly `unassessed` and `unavailable`.
 Phase 4 keeps lineage lazy as well: each ContentBlock row loads its local
 backward provenance, forward descendants, or possible exposures only after the
 admin selects that action. The graph view must retain depth, transform labels,

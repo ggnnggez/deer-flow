@@ -15,6 +15,7 @@ export function getAlertPresentationCategory(
       return "runaway";
     case "tool_frequency":
     case "long_dwell":
+    case "configuration_drift":
       return "operational";
     case "heartbeat_missing":
       return "liveness";

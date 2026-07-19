@@ -4,10 +4,12 @@ import {
   activeTasksRefreshInterval,
   taskListRefreshInterval,
   taskDetailRefreshInterval,
+  taskReleaseRefreshInterval,
 } from "@/core/ansich/hooks";
 import type {
   AnsichActiveTaskListResponse,
   AnsichTaskResponse,
+  AnsichTaskAgentReleaseResponse,
 } from "@/core/ansich/types";
 
 describe("Ansich polling policy", () => {
@@ -39,5 +41,17 @@ describe("Ansich polling policy", () => {
     expect(taskListRefreshInterval("terminal", true)).toBe(false);
     expect(taskListRefreshInterval("all", true)).toBe(5_000);
     expect(taskListRefreshInterval("all", false)).toBe(false);
+  });
+
+  it("polls a running Task only until its immutable release binding arrives", () => {
+    const unresolved = { binding: null } as AnsichTaskAgentReleaseResponse;
+    const resolved = {
+      binding: { release: { summary: { release_id: "release" } } },
+    } as AnsichTaskAgentReleaseResponse;
+
+    expect(taskReleaseRefreshInterval(unresolved, true, true)).toBe(5_000);
+    expect(taskReleaseRefreshInterval(resolved, true, true)).toBe(false);
+    expect(taskReleaseRefreshInterval(unresolved, false, true)).toBe(false);
+    expect(taskReleaseRefreshInterval(unresolved, true, false)).toBe(false);
   });
 });

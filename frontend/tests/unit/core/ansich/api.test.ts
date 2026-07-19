@@ -15,6 +15,7 @@ import {
   fetchAnsichContentExposures,
   fetchAnsichContentLineage,
   fetchAnsichContentPayload,
+  compareAnsichAgentReleases,
   fetchAnsichContextCompression,
   fetchAnsichContextSnapshot,
   fetchAnsichStep,
@@ -26,6 +27,8 @@ import {
   fetchAnsichTasks,
   fetchAnsichTaskBudgets,
   fetchAnsichTaskUsage,
+  fetchAnsichAgentReleases,
+  fetchAnsichTaskAgentRelease,
 } from "@/core/ansich/api";
 import { fetch } from "@/core/api/fetcher";
 
@@ -154,6 +157,22 @@ describe("Ansich API", () => {
       method: "POST",
       headers: { "Idempotency-Key": "rollback-once" },
     });
+  });
+
+  it("uses the Phase 7 release inventory, Task binding, and typed comparison endpoints", async () => {
+    mockedFetch.mockResolvedValue(jsonResponse({}));
+
+    await fetchAnsichAgentReleases(40);
+    await fetchAnsichTaskAgentRelease("task/one");
+    await compareAnsichAgentReleases("release/left", "release right");
+
+    expect(mockedFetch.mock.calls.map((call) => call[0])).toEqual([
+      expect.stringContaining("/api/ansich/agent-releases?limit=40"),
+      expect.stringContaining("/api/ansich/tasks/task%2Fone/agent-release"),
+      expect.stringContaining(
+        "/api/ansich/agent-releases/compare?left=release%2Fleft&right=release+right",
+      ),
+    ]);
   });
 
   it("URL-encodes a task ID for both task and timeline requests", async () => {

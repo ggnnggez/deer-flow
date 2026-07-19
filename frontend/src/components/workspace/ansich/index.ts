@@ -1,6 +1,7 @@
 export { AnsichObservationTimeline } from "./observation-timeline";
 export { AnsichAlertPanel } from "./alert-panel";
 export { AnsichActiveTaskRow } from "./active-task-row";
+export { AnsichAgentReleasePanel } from "./agent-release-panel";
 export { AnsichBudgetPanel } from "./budget-panel";
 export { AnsichProjectionHealth } from "./projection-health";
 export { AnsichStatusBadge } from "./status-badge";
