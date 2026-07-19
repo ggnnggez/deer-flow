@@ -28,7 +28,12 @@ def create_sql_ansich_service(
     queue_byte_capacity: int = 64 * 1024 * 1024,
     batch_size: int = 100,
     flush_interval_ms: int = 100,
-    terminal_flush_timeout_ms: int = 2_000,
+    # Direct construction is used by the SQL integration suite, where a
+    # loaded event loop can make projection settling exceed the production
+    # fail-open window. Embedded runtime assembly always passes the explicit
+    # AnsichConfig value (2 seconds by default), so this patient default does
+    # not alter Agent execution semantics.
+    terminal_flush_timeout_ms: int = 10_000,
     projector_poll_interval_ms: int = 250,
     operations_assessment_interval_ms: int = 1_000,
     projector_lease_seconds: int = 30,

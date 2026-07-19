@@ -1,10 +1,11 @@
 from datetime import UTC, datetime
+from unittest.mock import MagicMock
 
 import pytest
 from ansich import ObservationEnvelope, new_id
 from pydantic import ValidationError
 
-from deerflow.ansich import create_embedded_ansich_service
+from deerflow.ansich import create_embedded_ansich_service, create_sql_ansich_service
 from deerflow.config.ansich_config import AnsichConfig
 
 
@@ -54,6 +55,18 @@ def test_heartbeat_staleness_requires_at_least_two_intervals():
             heartbeat_interval_seconds=10,
             heartbeat_stale_after_seconds=19,
         )
+
+
+def test_direct_sql_factory_waits_longer_without_changing_embedded_timeout() -> None:
+    direct = create_sql_ansich_service(MagicMock())
+    embedded = create_embedded_ansich_service(
+        AnsichConfig(enabled=True, terminal_flush_timeout_ms=2345),
+        MagicMock(),
+    )
+
+    assert direct._terminal_flush_timeout_seconds == 10
+    assert embedded is not None
+    assert embedded._terminal_flush_timeout_seconds == 2.345
 
 
 @pytest.mark.anyio

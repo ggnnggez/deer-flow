@@ -533,6 +533,12 @@ bounded prompt preview, and Task timeline serialization applies the same rule to
 the release observation; the complete sanitized manifest uses a separately
 logged `Cache-Control: no-store` route.
 
+The direct `create_sql_ansich_service()` constructor uses a 10-second terminal
+projection-settle timeout so SQLite integration tests do not confuse transient
+suite load with incomplete projections. Production embedded assembly always
+passes `AnsichConfig.terminal_flush_timeout_ms` explicitly (2 seconds by
+default), preserving the runtime's bounded fail-open terminal flush.
+
 **Workspace change review**: `packages/harness/deerflow/workspace_changes/`
 captures a pre-run and post-run snapshot of the thread-owned `workspace` and
 `outputs` directories. `runtime/runs/worker.py` performs the filesystem scan via
