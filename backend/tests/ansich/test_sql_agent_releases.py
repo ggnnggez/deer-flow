@@ -30,6 +30,7 @@ def _release(*, effective_model: str = "provider/model-v1"):
             requested_model="requested-alias",
             effective_model=effective_model,
             model_provider="provider",
+            model_behavior_parameters={"model": effective_model},
             rendered_base_prompt="You are DeerFlow.",
             prompt_template_id="lead-v1",
             effective_policies={"non_interactive": False},

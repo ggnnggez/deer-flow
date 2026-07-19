@@ -515,7 +515,12 @@ fingerprint, deduplicates immutable releases, and establishes one Task
 `executed_by` binding. Component and release hashes exclude requested aliases,
 secrets, runtime addresses, and dynamic ContextSnapshot content. Provider model
 identity from `llm.responded` remains attempt evidence; a versioned assessor may
-produce `configuration_drift` without mutating the release. Admin APIs list,
+produce `configuration_drift` without mutating the release. The
+`configuration-drift@1.1.0` assessor treats manifest
+`behavior_parameters.model` as a provider model: exact names and `-`, `.`, or
+`:` revision suffixes match, while other names mismatch. If the manifest lacks
+that provider field and only the DeerFlow registry alias is available,
+inequality remains `unknown`. Admin APIs list,
 inspect, and compare typed release components. Ordinary detail returns only a
 bounded prompt preview, and Task timeline serialization applies the same rule to
 the release observation; the complete sanitized manifest uses a separately

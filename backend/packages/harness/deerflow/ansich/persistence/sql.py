@@ -1338,7 +1338,9 @@ class SqlAnsichBackend:
         model_summary = model_component.summary_json or {}
         behavior_parameters = model_summary.get("behavior_parameters")
         provider_model = behavior_parameters.get("model") if isinstance(behavior_parameters, dict) else None
-        effective_model = provider_model if isinstance(provider_model, str) and provider_model else model_summary.get("effective")
+        has_provider_model = isinstance(provider_model, str) and bool(provider_model.strip())
+        effective_model = provider_model if has_provider_model else model_summary.get("effective")
+        expected_model_source = "provider_model" if has_provider_model else "registry_alias"
         if not isinstance(effective_model, str) or not effective_model:
             return None
         latest = (
@@ -1365,6 +1367,7 @@ class SqlAnsichBackend:
             return assess_configuration_drift(
                 task_id=task_id,
                 effective_model=effective_model,
+                expected_model_source=expected_model_source,
                 provider_reported_model=None,
                 response_obs_id=None,
                 as_of=as_of,
@@ -1374,6 +1377,7 @@ class SqlAnsichBackend:
         return assess_configuration_drift(
             task_id=task_id,
             effective_model=effective_model,
+            expected_model_source=expected_model_source,
             provider_reported_model=attempt.provider_model,
             response_obs_id=response.obs_id,
             as_of=_as_utc(response.occurred_at),

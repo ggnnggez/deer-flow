@@ -142,6 +142,10 @@ def test_runtime_secret_changes_do_not_change_release_identity() -> None:
         ("provider/model-v1", "matched"),
         ("models/provider/model-v1", "matched"),
         ("provider/model-v2", "mismatch"),
+        ("different-model", "mismatch"),
+        ("provider-model-2026-07-19", "matched"),
+        ("provider-model.revision-2", "matched"),
+        ("provider-model:latest", "matched"),
         (None, "unknown"),
     ],
 )
@@ -151,7 +155,8 @@ def test_provider_model_drift_is_attempt_evidence_not_release_identity(
 ) -> None:
     assessed = assess_configuration_drift(
         task_id="task",
-        effective_model="provider/model-v1",
+        effective_model=("provider-model" if reported and reported.startswith("provider-model") else "provider/model-v1"),
+        expected_model_source="provider_model",
         provider_reported_model=reported,
         response_obs_id=None,
         as_of=datetime.now(UTC),
@@ -165,6 +170,7 @@ def test_provider_model_drift_stays_unknown_when_configured_alias_is_not_compara
     assessed = assess_configuration_drift(
         task_id="task",
         effective_model="fast-alias",
+        expected_model_source="registry_alias",
         provider_reported_model="provider/model-v1",
         response_obs_id="response-observation",
         as_of=datetime.now(UTC),
@@ -173,6 +179,21 @@ def test_provider_model_drift_stays_unknown_when_configured_alias_is_not_compara
 
     assert assessed.value["value"] == "unknown"
     assert assessed.evidence[0].obs_id == "response-observation"
+
+
+def test_configuration_drift_assessor_version_tracks_bare_model_normalization() -> None:
+    assessed = assess_configuration_drift(
+        task_id="task",
+        effective_model="provider-model",
+        expected_model_source="provider_model",
+        provider_reported_model="different-model",
+        response_obs_id=None,
+        as_of=datetime.now(UTC),
+        asserted_at=datetime.now(UTC),
+    )
+
+    assert assessed.assessor.version == "1.1.0"
+    assert assessed.value["expected_model_source"] == "provider_model"
 
 
 def test_typed_release_diff_keeps_tool_source_in_the_stable_key() -> None:
