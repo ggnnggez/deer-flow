@@ -17,7 +17,7 @@
 - Phase 4 代码评审的跟进项登记在 [phase-4-review-followups.md](phase-4-review-followups.md)；M1/M2/M3、L1/L2 与 L3①/② 均已完成；L3② 的前端压缩列表独立 API 已作为 Phase 6 首批 UI/API 工作落地。
 - Phase 5 代码评审的跟进项登记在 [phase-5-review-followups.md](phase-5-review-followups.md)；M1/M2/M3 与搭车项 L1/L2 均已修复，Phase 6 开工前置项已清；L3（usage 贡献契约收紧）留到 Phase 8 前。
 - Phase 6 代码评审的跟进项登记在 [phase-6-review-followups.md](phase-6-review-followups.md)；L3（wall_time 覆盖语义）已由 `b910ba82` 修复，M1（assessor job 合并）与 L1（对账读放大）已由 `4f5ec989` 修复；L4 已由 `0a38a96d` 明确延后到 Phase 11 并隐藏未生产类型。Phase 7 开工前置项已清；L2（孤儿 requested action 回收）仍按原归属留到 Phase 11 前。
-- Phase 7 代码评审的跟进项登记在 [phase-7-review-followups.md](phase-7-review-followups.md)；其中 M2（coalescing 测试套件级 flaky）建议立即修复，M1（drift 裸名判定）与 M3（policy manifest 契约化）需在 Phase 8 前完成，L2（descriptor 私有通道回归）随 Phase 8 顺带处理，L1（二线 credential validator）留到 Phase 9 前。
+- Phase 7 代码评审的跟进项登记在 [phase-7-review-followups.md](phase-7-review-followups.md)；M2（coalescing 测试套件级 flaky）已由 `e91d9f1c` 修复，M1（drift 裸名判定）与 M3（policy manifest 契约化）仍需在 Phase 8 前完成，L2（descriptor 私有通道回归）随 Phase 8 顺带处理，L1（二线 credential validator）留到 Phase 9 前。
 
 ## 固定实现边界
 

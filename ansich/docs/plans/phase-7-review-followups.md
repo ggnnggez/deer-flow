@@ -7,14 +7,14 @@
 | 编号 | 摘要 | 状态 | 修复时间 | Commit |
 | ---- | ---- | ---- | -------- | ------ |
 | M1 | drift 判定对裸模型名一律 `unknown`,最常见的自托管漂移场景永不触发 mismatch | ⬜ 未修复 | — | — |
-| M2 | P6 的 assessor coalescing 测试在全套件负载下时序性失败(flaky) | ⬜ 未修复 | — | — |
+| M2 | P6 的 assessor coalescing 测试在全套件负载下时序性失败(flaky) | ✅ 已修复 | 2026-07-19 | `e91d9f1c` |
 | M3 | policy manifest 覆盖依赖属性探测,计划 §3 清单未被契约化,存在静默缺项 | ⬜ 未修复 | — | — |
 | L1 | 计划 §5 的二线 credential validator 缺位(只有指纹校验,无 post-sanitization 模式检测) | ⬜ 未修复 | — | — |
 | L2 | descriptor 经 `__pregel_runtime` 私有键传递,LangGraph 升级可能静默降级 | ⬜ 未修复 | — | — |
 
 ## M1. drift 判定对裸模型名一律 `unknown`
 
-- 状态:⬜ 未修复。
+- 状态:✅ 已于 2026-07-19 修复(commit `e91d9f1c`)。计数 monkeypatch 与 SQL listener 现在都在 `service.start()` 之前安装，后台 projector 的首次 assessment 无法再在测试观测点就绪前消费 staged job；目标回归已连续通过 3 次。
 - 位置:`backend/packages/ansich/ansich/assessment/configuration_drift.py::assess_configuration_drift`(`elif expected is None or "/" not in expected or "/" not in reported: value = "unknown"`)+ `sql.py::_assess_configuration_drift_at`(expected 优先取 manifest `behavior_parameters.model`)。
 - 现状:`mismatch` 分支只有当 expected 与 reported **都含 `/`** 时才可达。SQL 侧的 expected 优先使用 manifest 里的 provider model 字符串(`ModelConfig.model`,即实际发给 provider 的名字,不是 DeerFlow 注册 alias),此时两个裸名不相等是"明确不一致"——自托管 vLLM/SGLang 服务了与配置不同的权重、OpenAI-compatible 网关路由错模型,恰是计划 §7 要抓的运维场景,但都会被判 `unknown` 不告警。同时另一个方向也有误差:`"gpt-4o"` vs provider 报告的日期版本 `"gpt-4o-2024-08-06"` 也是 `unknown`,而它应当是 matched(revision)。注释里"裸名可能是 registry alias"的担忧只在 `behavior_parameters.model` 缺失、回退到 `model_summary.effective`(alias)时成立。净效果:该 assessor 与 `configuration_drift` Alert 在典型配置下几乎不可能产生 `mismatch`,功能核心近乎不可达。
 - 方向:区分 expected 的来源——来自 `behavior_parameters.model`(provider 字符串)时启用裸名比较:相等或 reported 以 expected + 分隔符(`-`/`.`/`:`)开头视为 matched(revision),其余为 mismatch;仅当只能取 alias(provider 字符串缺失)时保持 unknown。normalization 规则变更需 bump assessor version(计划 §2)。配三类回归测试:裸名真不一致 → mismatch;日期 revision 后缀 → matched;alias 回退 → unknown。
