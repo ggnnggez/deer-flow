@@ -8,7 +8,7 @@
 | ---- | ---- | ---- | -------- | ------ |
 | M1 | drift 判定对裸模型名一律 `unknown`,最常见的自托管漂移场景永不触发 mismatch | ✅ 已修复 | 2026-07-19 | `08cd6b1c` |
 | M2 | P6 的 assessor coalescing 测试在全套件负载下时序性失败(flaky) | ✅ 已修复 | 2026-07-19 | `e91d9f1c` |
-| M3 | policy manifest 覆盖依赖属性探测,计划 §3 清单未被契约化,存在静默缺项 | ⬜ 未修复 | — | — |
+| M3 | policy manifest 覆盖依赖属性探测,计划 §3 清单未被契约化,存在静默缺项 | ✅ 已修复 | 2026-07-20 | `256d2c91` |
 | L1 | 计划 §5 的二线 credential validator 缺位(只有指纹校验,无 post-sanitization 模式检测) | ⬜ 未修复 | — | — |
 | L2 | descriptor 经 `__pregel_runtime` 私有键传递,LangGraph 升级可能静默降级 | ⬜ 未修复 | — | — |
 
@@ -30,7 +30,7 @@
 
 ## M3. policy manifest 覆盖依赖属性探测,计划 §3 清单未契约化
 
-- 状态:⬜ 未修复。
+- 状态:✅ 已于 2026-07-20 修复(commit `256d2c91`)。`runtime_descriptor` 现在优先消费 middleware 的 `release_policy_parameters() -> dict` 显式契约；无契约或第三方契约抛错时 fail-open 回退旧探测，并在新 manifest 的 `public_parameters` 中标 `probed=true`(不改 descriptor schema，历史 release fingerprint 可继续验证/重放)。summarization 显式声明 trigger/keep/prompt hash/summary-model identity，guardrail 声明 policy ID/version 与 effective provider rules，Tool output/token/loop/subagent-limit/deferred/todo/terminal/safety 策略也转为显式契约。lead assembly 从与执行相同的 subagent registry 产生 type allowlist 及逐类型 `max_turns`/`timeout_seconds`。Phase 7 §3 pin 测试固定 middleware order、summary/Tool output/token/loop/guardrail、subagent/plan/deferred 与 terminal/safety 路径，并验证 fallback marker 参与 policy hash。**自 `256d2c91` 起新 release 的 policy manifest 语义已修正，其 `policy_hash` 不可与该 commit 前的历史 release 直接比较。**
 - 位置:`backend/packages/harness/deerflow/runtime_descriptor.py::_MIDDLEWARE_PUBLIC_FIELDS` / `describe_middleware`(hasattr 探测手工属性清单 + `_config` 侥幸抓取)+ `lead_agent/agent.py` 的 `effective_policies` 组装。
 - 现状:policy_hash 覆盖 = middleware 链(顺序/类型名)+ 探测命中的属性 + 恰好存了 `self._config` 的中间件配置(token budget、tool output budget 因此覆盖)。但计划 §3 的 v1 清单里至少三项**不在** manifest 中:summarization 的 summary model identity(`self.model`/`_summary_model` 是模型对象,`_plain_value` 返回 None);guardrail/authorization policy ID 与 effective version(GuardrailMiddleware 未暴露探测属性);lead 链的 subagent `max_turns`/`timeout`(仅 subagent descriptor 的 policies 里有)。这些策略变更不会改变 release hash——"行为变化必产生新 release"的完成条件对它们不成立。反向风险同样存在:middleware 重命名/删除一个内部属性会静默改变所有新 release 的 policy_hash,没有任何测试会失败。
 - 方向:把探测式采集改为显式声明——middleware 提供 `release_policy_parameters() -> dict` 协议方法(无该方法的 fallback 到现有探测并在 manifest 标注 `probed=true`);为 §3 的 v1 清单加一条 pin 测试,逐项断言对应值存在于 policy manifest 路径中,清单变化必须显式改测试。
