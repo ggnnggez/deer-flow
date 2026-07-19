@@ -27,6 +27,7 @@ from deerflow.authz.principal import normalize_authz_attributes
 from deerflow.config import get_app_config
 from deerflow.config.app_config import AppConfig
 from deerflow.models import create_chat_model
+from deerflow.runtime_descriptor import build_runtime_descriptor
 from deerflow.skills.tool_policy import filter_tools_by_skill_allowed_tools
 from deerflow.skills.types import Skill
 from deerflow.subagents.config import SubagentConfig, resolve_subagent_model_name
@@ -488,6 +489,9 @@ class SubagentExecutor:
         # not just the first — because the v2 contract advertises more than one
         # cap reason.
         self._stop_reason_middlewares: list[Any] = []
+        self.runtime_descriptor: Any | None = None
+        self._release_rendered_system_prompt = self.config.system_prompt or ""
+        self._release_enabled_skills: list[Any] = []
 
         logger.info(f"[trace={self.trace_id}] SubagentExecutor initialized: {config.name} with {len(self.tools)} tools")
 
@@ -541,7 +545,7 @@ class SubagentExecutor:
 
         # system_prompt is included in initial state messages (see _build_initial_state)
         # to avoid multiple SystemMessages which some LLM APIs don't support.
-        return create_agent(
+        agent = create_agent(
             model=model,
             tools=tools if tools is not None else self.tools,
             middleware=middlewares,
@@ -549,6 +553,49 @@ class SubagentExecutor:
             state_schema=ThreadState,
             checkpointer=False,
         )
+        from types import SimpleNamespace
+
+        get_model_config = getattr(app_config, "get_model_config", None)
+        model_config = get_model_config(self.model_name) if callable(get_model_config) else None
+        if model_config is None:
+            model_config = SimpleNamespace(
+                model=self.model_name,
+                use="unknown",
+                supports_thinking=False,
+                supports_reasoning_effort=False,
+                supports_vision=False,
+            )
+        deferred_names = deferred_setup.deferred_names if deferred_setup is not None else frozenset()
+        self.runtime_descriptor = build_runtime_descriptor(
+            namespace="deerflow",
+            agent_name=self.config.name,
+            requested_model=(self.config.model if self.config.model != "inherit" else self.parent_model),
+            effective_model=self.model_name,
+            model_config=model_config,
+            thinking_enabled=False,
+            reasoning_effort=None,
+            rendered_base_prompt=self._release_rendered_system_prompt,
+            prompt_template_id="deerflow-subagent-v1",
+            tools=list(tools if tools is not None else self.tools),
+            middlewares=middlewares,
+            deferred_names=deferred_names,
+            enabled_skills=self._release_enabled_skills,
+            effective_policies={
+                "max_turns": self.config.max_turns,
+                "timeout_seconds": self.config.timeout_seconds,
+                "tool_allowlist": self.config.tools,
+                "tool_denylist": self.config.disallowed_tools,
+                "deferred_tools": {
+                    "enabled": bool(deferred_names),
+                    "catalog_hash": (deferred_setup.catalog_hash if deferred_setup is not None else None),
+                },
+            },
+        )
+        try:
+            setattr(agent, "__ansich_agent_runtime_descriptor", self.runtime_descriptor)
+        except Exception:
+            logger.debug("Subagent graph does not accept Ansich runtime descriptor attribute", exc_info=True)
+        return agent
 
     def _consume_guard_stop_reason(self) -> str | None:
         """Pop and return the guard-cap stop reason set during the last run.
@@ -653,6 +700,7 @@ class SubagentExecutor:
 
         # Load skills as conversation items (Codex pattern)
         skills = await self._load_skills()
+        self._release_enabled_skills = list(skills)
         filtered_tools = self._apply_skill_allowed_tools(skills)
         # Assemble deferred tool_search AFTER policy filtering (fail-closed),
         # mirroring the lead path so subagents stop binding full MCP schemas.
@@ -683,7 +731,8 @@ class SubagentExecutor:
 
         messages: list[Any] = []
         if system_parts:
-            messages.append(SystemMessage(content="\n\n".join(system_parts)))
+            self._release_rendered_system_prompt = "\n\n".join(system_parts)
+            messages.append(SystemMessage(content=self._release_rendered_system_prompt))
 
         # Then the actual task
         messages.append(HumanMessage(content=task))

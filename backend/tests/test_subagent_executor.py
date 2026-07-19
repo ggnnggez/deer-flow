@@ -337,6 +337,10 @@ class TestAgentConstruction:
         assert captured["agent"]["middleware"] is middlewares
         assert captured["agent"]["tools"] == []
         assert captured["agent"]["system_prompt"] is None  # system_prompt is merged into initial state messages
+        assert executor.runtime_descriptor.agent_name == "test-agent"
+        assert executor.runtime_descriptor.effective_model == "parent-model"
+        assert [middleware.name for middleware in executor.runtime_descriptor.middleware_chain] == [type(middleware).__name__ for middleware in middlewares]
+        assert executor.runtime_descriptor.rendered_base_prompt == base_config.system_prompt
 
     @pytest.mark.anyio
     async def test_load_skill_messages_uses_explicit_app_config_for_skill_storage(

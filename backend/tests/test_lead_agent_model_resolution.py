@@ -183,6 +183,57 @@ def test_internal_make_lead_agent_uses_explicit_app_config(monkeypatch):
     assert result["model"] is not None
 
 
+def test_lead_agent_assembly_descriptor_uses_the_exact_compiled_inputs(monkeypatch):
+    app_config = _make_app_config([_make_model("effective-model", supports_thinking=True)])
+
+    import deerflow.tools as tools_module
+
+    @tool
+    def exact_tool(query: str) -> str:
+        """Search the exact runtime catalog."""
+
+        return query
+
+    class ExactMiddleware:
+        pass
+
+    exact_middleware = ExactMiddleware()
+    monkeypatch.setattr(tools_module, "get_available_tools", lambda **kwargs: [exact_tool])
+    monkeypatch.setattr(
+        lead_agent_module,
+        "build_middlewares",
+        lambda config, model_name, agent_name=None, **kwargs: [exact_middleware],
+    )
+    monkeypatch.setattr(lead_agent_module, "create_chat_model", lambda **kwargs: object())
+
+    compiled_inputs: dict[str, object] = {}
+    compiled_graph = MagicMock()
+
+    def _capture_create_agent(**kwargs):
+        compiled_inputs.update(kwargs)
+        return compiled_graph
+
+    monkeypatch.setattr(lead_agent_module, "create_agent", _capture_create_agent)
+
+    assembly = lead_agent_module._assemble_lead_agent(
+        {
+            "context": {
+                "model_name": "effective-model",
+                "thinking_enabled": True,
+                "reasoning_effort": "high",
+            }
+        },
+        app_config=app_config,
+    )
+
+    assert assembly.graph is compiled_graph
+    assert [tool.name for tool in compiled_inputs["tools"]] == [tool.name for tool in assembly.descriptor.loaded_tools]
+    assert [type(middleware).__name__ for middleware in compiled_inputs["middleware"]] == [middleware.name for middleware in assembly.descriptor.middleware_chain]
+    assert compiled_inputs["system_prompt"] == assembly.descriptor.rendered_base_prompt
+    assert assembly.descriptor.requested_model == "effective-model"
+    assert assembly.descriptor.effective_model == "effective-model"
+
+
 def test_make_lead_agent_uses_runtime_app_config_from_context_without_global_read(monkeypatch):
     app_config = _make_app_config([_make_model("context-model", supports_thinking=False)])
 
