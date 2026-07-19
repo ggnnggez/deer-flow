@@ -11,7 +11,7 @@
 | M3 | Operations 页面用 active list 替换全部 Task 列表,历史 Task 失去 UI 入口 | ✅ 已修复 | 2026-07-18 | `bb9b1126` |
 | L1 | read model 每周期无条件重写 `updated_at`,ETag/304 机制几乎永不命中 | ✅ 已修复 | 2026-07-18 | `b6819263` |
 | L2 | 两个管理员 GET 在空结果时同步触发全量 assessment(读端点做重写工作) | ✅ 已修复 | 2026-07-18 | `b3bf19aa` |
-| L3 | token 维度的 `budget.consumed` 未被排除,存在与 `llm.responded` usage 双计的潜在路径 | ⬜ 未修复 | — | — |
+| L3 | token 维度的 `budget.consumed` 未被排除,存在与 `llm.responded` usage 双计的潜在路径 | ✅ 已修复 | 2026-07-19 | `fe4634bf` |
 
 ## M1. `assess_operations` 每秒无过滤扫描全部历史 budget 行
 
@@ -56,7 +56,7 @@
 
 ## L3. token 维度的 `budget.consumed` 存在潜在双计路径
 
-- 状态:⬜ 未修复。
+- 状态:✅ 已于 2026-07-19 修复(commit `fe4634bf`)。`budget.consumed` 的 usage 贡献改为显式白名单，只接受 `wall_time_ms` 与 `child_tasks_spawned`；token 和结构维度均由各自的主观测产生贡献。回归覆盖 token/structural 维度被忽略，并将 absolute budget 与 terminal overshoot 的测试证据改为真实 `llm.responded` usage，确认告警、terminal 保留与 rebuild 语义不变。
 - 位置:`backend/packages/ansich/ansich/usage.py::usage_contributions_for_observation` 的 `budget.consumed` 分支(仅排除 `_STRUCTURAL_DIMENSION_BY_KIND.values()`,即 llm_attempts/steps/tool_calls_*)。
 - 现状:token 维度(input/output/total_tokens)的权威来源是 `llm.responded.usage_metadata`;但若未来某个 probe 发出 dimension 为 token 的 `budget.consumed`,提取器会照单接受并与 `llm.responded` 的贡献相加(双计)。当前仓库内没有这样的 producer(wall_time_ms 是唯一的 `budget.consumed` 使用者),属 latent 风险,但契约上没有任何东西阻止它。
 - 方向:在提取器排除 token 维度的 `budget.consumed`(或仅允许显式白名单 `wall_time_ms`/`child_tasks_spawned`),配一条"token 维度 budget.consumed 被忽略"的单测。
