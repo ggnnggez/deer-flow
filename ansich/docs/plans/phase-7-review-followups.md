@@ -6,7 +6,7 @@
 
 | 编号 | 摘要 | 状态 | 修复时间 | Commit |
 | ---- | ---- | ---- | -------- | ------ |
-| M1 | drift 判定对裸模型名一律 `unknown`,最常见的自托管漂移场景永不触发 mismatch | ⬜ 未修复 | — | — |
+| M1 | drift 判定对裸模型名一律 `unknown`,最常见的自托管漂移场景永不触发 mismatch | ✅ 已修复 | 2026-07-19 | `08cd6b1c` |
 | M2 | P6 的 assessor coalescing 测试在全套件负载下时序性失败(flaky) | ✅ 已修复 | 2026-07-19 | `e91d9f1c` |
 | M3 | policy manifest 覆盖依赖属性探测,计划 §3 清单未被契约化,存在静默缺项 | ⬜ 未修复 | — | — |
 | L1 | 计划 §5 的二线 credential validator 缺位(只有指纹校验,无 post-sanitization 模式检测) | ⬜ 未修复 | — | — |
@@ -22,7 +22,7 @@
 
 ## M2. assessor coalescing 测试在全套件下时序性失败
 
-- 状态:⬜ 未修复。
+- 状态:✅ 已于 2026-07-19 修复(commit `08cd6b1c`)。SQL assessor 现在显式传入 expected 来源：manifest `behavior_parameters.model` 视为 provider model，裸名不同判 `mismatch`，reported 以 expected + `-`/`.`/`:` 开头视为 revision match；只有回退到 registry alias 时不等仍判 `unknown`。normalization 语义变更同时将 assessor bump 到 `configuration-drift@1.1.0`，并用新 config hash 隔离历史规则。SQLite release 投影回归与领域三分类测试已覆盖 provider mismatch、revision match 和 alias unknown。
 - 位置:`backend/tests/ansich/test_sql_alerts.py::test_sql_assessor_jobs_coalesce_to_highest_pending_watermark`(P6 commit `4f5ec989` 引入)。
 - 现状:单测与文件级运行稳定通过,但全套件运行实测失败(1 failed / 289,断言 `evaluated_watermarks == [highest_watermark]` 一带)。根因:测试用 `operations_assessment_interval_ms=60_000` 推远后台评估,但 P5 的 projector 循环在 `service.start()` 后**立即执行首次 assessment**(`next_assessment = loop.time()`);全套件负载下事件循环调度延迟,首次后台 assessment 可能在测试安装 monkeypatch 之前就消化了 staged 的 assessor job,导致计数为空。这是 P6 测试的潜伏竞态,P7 扩大套件(233→290 项)后开始显形;违反"仓库强制 TDD、套件必须绿"的门槛,CI 将间歇性红。
 - 方向:测试侧修复即可——在 `service.start()` **之前**安装 monkeypatch;或不启动后台循环(直接构造 backend、显式调用 `backend.assess_operations`);或给 service 加测试用的"首次评估延迟一个间隔"选项。修复后全套件连跑 3 次确认稳定。
