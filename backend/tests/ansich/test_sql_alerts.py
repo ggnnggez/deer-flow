@@ -263,7 +263,6 @@ async def test_sql_assessor_jobs_coalesce_to_highest_pending_watermark(
         flush_interval_ms=60_000,
         operations_assessment_interval_ms=60_000,
     )
-    await service.start()
     task_id = new_id()
     started_at = datetime(2026, 7, 18, 16, 45, tzinfo=UTC)
     evaluated_watermarks: list[int] = []
@@ -288,6 +287,17 @@ async def test_sql_assessor_jobs_coalesce_to_highest_pending_watermark(
     ) -> None:
         assessment_statements.append(" ".join(statement.lower().split()))
 
+    monkeypatch.setattr(
+        backend,
+        "_assess_action_repetition_at",
+        count_assessment,
+    )
+    event.listen(
+        engine.sync_engine,
+        "before_cursor_execute",
+        capture_assessment_sql,
+    )
+    await service.start()
     try:
         service.record_batch(
             (
@@ -341,25 +351,7 @@ async def test_sql_assessor_jobs_coalesce_to_highest_pending_watermark(
                     AnsichAssessorJobRow.assessor_name == "action-repetition",
                 )
             )
-        monkeypatch.setattr(
-            backend,
-            "_assess_action_repetition_at",
-            count_assessment,
-        )
-
-        event.listen(
-            engine.sync_engine,
-            "before_cursor_execute",
-            capture_assessment_sql,
-        )
-        try:
-            await service.assess_operations(now=started_at + timedelta(seconds=5))
-        finally:
-            event.remove(
-                engine.sync_engine,
-                "before_cursor_execute",
-                capture_assessment_sql,
-            )
+        await service.assess_operations(now=started_at + timedelta(seconds=5))
         signal = await service.get_current_belief(
             task_id,
             "behavior_signal:action-repetition",
@@ -376,6 +368,11 @@ async def test_sql_assessor_jobs_coalesce_to_highest_pending_watermark(
                 ).scalars()
             )
     finally:
+        event.remove(
+            engine.sync_engine,
+            "before_cursor_execute",
+            capture_assessment_sql,
+        )
         await service.stop()
         await engine.dispose()
 
