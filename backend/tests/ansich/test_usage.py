@@ -125,6 +125,25 @@ def test_explicit_budget_consumption_maps_to_its_declared_local_dimension():
     assert contributions[0].source_task_id == task_id
 
 
+@pytest.mark.parametrize(
+    "dimension",
+    ["input_tokens", "output_tokens", "total_tokens", "tool_calls_executed"],
+)
+def test_budget_consumed_ignores_dimensions_owned_by_primary_observations(
+    dimension: str,
+):
+    observation = ObservationEnvelope.budget_consumed(
+        task_id=new_id(),
+        run_id="run-duplicate-usage",
+        occurred_at=datetime(2026, 7, 18, 9, 3, tzinfo=UTC),
+        dimension=dimension,
+        delta=1234,
+        source_event_id=f"run:run-duplicate-usage:budget:{dimension}",
+    )
+
+    assert usage_contributions_for_observation(observation) == ()
+
+
 def test_started_task_tool_counts_one_spawned_child_without_counting_other_tools():
     task_id = new_id()
     step_id = new_id()

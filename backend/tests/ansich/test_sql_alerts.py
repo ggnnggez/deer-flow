@@ -490,13 +490,16 @@ async def test_sql_absolute_budget_breach_marks_runaway_and_opens_alert(
         effective_value=100,
         source_event_id="run:phase6-absolute:budget:configured",
     )
-    consumed = ObservationEnvelope.budget_consumed(
+    usage_observation = ObservationEnvelope(
+        kind="llm.responded",
+        subject_type="llm_attempt",
+        subject_id=new_id(),
         task_id=task_id,
-        run_id="run-phase6-absolute",
         occurred_at=started_at + timedelta(seconds=1),
-        dimension="total_tokens",
-        delta=101,
-        source_event_id="run:phase6-absolute:budget:consumed",
+        producer=Producer(name="phase6-budget-test", version="1", instance_id="test"),
+        source_event_id="run:phase6-absolute:llm:responded",
+        correlation_id="run-phase6-absolute",
+        payload={"attempt_no": 1, "latency_ms": 10, "usage": {"total_tokens": 101}},
     )
     try:
         service.record_batch(
@@ -518,7 +521,7 @@ async def test_sql_absolute_budget_breach_marks_runaway_and_opens_alert(
                     source_event_id="run:phase6-absolute:task:started",
                 ),
                 configured,
-                consumed,
+                usage_observation,
             )
         )
         await service.flush_task(task_id)
@@ -570,7 +573,7 @@ async def test_sql_absolute_budget_breach_marks_runaway_and_opens_alert(
     assert alert.workflow_state == "open"
     assert [item.obs_id for item in evidence] == [
         configured.obs_id,
-        consumed.obs_id,
+        usage_observation.obs_id,
     ]
     assert terminal_alert is not None
     assert terminal_alert.workflow_state == "resolved"

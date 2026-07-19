@@ -20,6 +20,8 @@ _STRUCTURAL_DIMENSION_BY_KIND: dict[str, UsageDimension] = {
     "tool.failed": "tool_calls_executed",
 }
 
+_BUDGET_CONSUMED_USAGE_DIMENSIONS: frozenset[UsageDimension] = frozenset({"wall_time_ms", "child_tasks_spawned"})
+
 
 class UsageContribution(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True, strict=True)
@@ -60,9 +62,7 @@ def usage_contributions_for_observation(
     if observation.kind == "budget.consumed" and observation.payload is not None:
         dimension = observation.payload.get("dimension")
         delta = observation.payload.get("delta")
-        if dimension in _STRUCTURAL_DIMENSION_BY_KIND.values():
-            return ()
-        if isinstance(dimension, str) and isinstance(delta, int) and not isinstance(delta, bool) and delta >= 0:
+        if dimension in _BUDGET_CONSUMED_USAGE_DIMENSIONS and isinstance(delta, int) and not isinstance(delta, bool) and delta >= 0:
             return (_contribution(observation, dimension, delta),)
     if observation.kind != "llm.responded" or observation.payload is None:
         return ()

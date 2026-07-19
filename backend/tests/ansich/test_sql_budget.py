@@ -106,13 +106,16 @@ async def test_sql_budget_health_retains_terminal_overshoot_and_evidence(tmp_pat
         effective_value=100,
         source_event_id="run:run-budget-health:budget:total_tokens",
     )
-    consumed = ObservationEnvelope.budget_consumed(
+    usage_observation = ObservationEnvelope(
+        kind="llm.responded",
+        subject_type="llm_attempt",
+        subject_id=new_id(),
         task_id=task_id,
-        run_id="run-budget-health",
         occurred_at=observed_at + timedelta(seconds=1),
-        dimension="total_tokens",
-        delta=107,
-        source_event_id="run:run-budget-health:usage:total_tokens",
+        producer=Producer(name="budget-health-test", version="1", instance_id="test"),
+        source_event_id="run:run-budget-health:llm:responded",
+        correlation_id="run-budget-health",
+        payload={"attempt_no": 1, "latency_ms": 10, "usage": {"total_tokens": 107}},
     )
 
     try:
@@ -135,7 +138,7 @@ async def test_sql_budget_health_retains_terminal_overshoot_and_evidence(tmp_pat
                     source_event_id="run:run-budget-health:task:started",
                 ),
                 configured,
-                consumed,
+                usage_observation,
                 ObservationEnvelope.task_lifecycle(
                     kind="task.completed",
                     task_id=task_id,
@@ -166,7 +169,7 @@ async def test_sql_budget_health_retains_terminal_overshoot_and_evidence(tmp_pat
     assert belief.value == "exceeded"
     assert belief.usage_value == 107
     assert belief.overshoot == 7
-    assert belief.evidence_obs_ids == (configured.obs_id, consumed.obs_id)
+    assert belief.evidence_obs_ids == (configured.obs_id, usage_observation.obs_id)
     rebuilt = rebuilt_terminal_health[0]
     assert rebuilt.value == belief.value
     assert rebuilt.usage_value == belief.usage_value
