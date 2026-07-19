@@ -2,14 +2,15 @@ from __future__ import annotations
 
 import logging
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from datetime import UTC, datetime
 from itertools import count
 from threading import Lock
 from uuid import uuid4
 
-from ansich import AnsichService, ObservationEnvelope, new_id
+from ansich import AnsichService, ObservationEnvelope, Producer, new_id
 from ansich.budget import ResolvedBudget
+from ansich.release import AgentRuntimeDescriptor, build_agent_release
 
 from deerflow.ansich.budgets import resolve_deerflow_task_budgets
 from deerflow.runtime.user_context import get_effective_user_id
@@ -75,6 +76,66 @@ class TaskControlProbe:
                 exc_info=True,
             )
         self._record("task.started")
+
+    def agent_release_resolved(
+        self,
+        descriptor: AgentRuntimeDescriptor | object,
+        *,
+        known_secrets: Sequence[str] = (),
+    ) -> None:
+        """Resolve and record the immutable starting actor without gating the Run."""
+
+        if self._service is None:
+            return
+        try:
+            release = build_agent_release(
+                AgentRuntimeDescriptor.model_validate(descriptor),
+                known_secrets=known_secrets,
+            )
+            self._service.record(
+                ObservationEnvelope.agent_release_resolved(
+                    task_id=self.task_id,
+                    run_id=self._run_id,
+                    occurred_at=datetime.now(UTC),
+                    release=release,
+                    source_event_id=f"run:{self._run_id}:agent-release:resolved",
+                    producer_seq=_next_producer_sequence(),
+                    producer_name="deerflow-agent-release",
+                    producer_version="1",
+                    producer_instance_id=_PRODUCER_INSTANCE_ID,
+                )
+            )
+        except Exception:
+            logger.warning(
+                "Ansich AgentRelease resolution failed for run %s",
+                self._run_id,
+            )
+            try:
+                self._service.record(
+                    ObservationEnvelope(
+                        kind="observability.degraded",
+                        occurred_at=datetime.now(UTC),
+                        task_id=self.task_id,
+                        subject_id=self.task_id,
+                        producer=Producer(
+                            name="deerflow-agent-release",
+                            version="1",
+                            instance_id=_PRODUCER_INSTANCE_ID,
+                        ),
+                        producer_seq=_next_producer_sequence(),
+                        source_event_id=(f"run:{self._run_id}:agent-release:resolution-failed"),
+                        correlation_id=self._run_id,
+                        payload={
+                            "component": "agent_release",
+                            "reason": "resolution_failed",
+                        },
+                    )
+                )
+            except Exception:
+                logger.warning(
+                    "Ansich AgentRelease degradation observation failed for run %s",
+                    self._run_id,
+                )
 
     async def terminal(self, status: str) -> None:
         kind = _TERMINAL_KIND_BY_STATUS.get(status)

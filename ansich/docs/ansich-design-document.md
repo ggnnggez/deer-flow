@@ -251,6 +251,8 @@ DeerFlow source event
 The Structural Projector performs only deterministic consequences, such as:
 
 - `task.created` registers a Task;
+- `agent_release.resolved` registers or reuses an immutable AgentRelease and
+  establishes the Task's one starting `executed_by` binding;
 - `llm.requested` registers an attempt projection and ContextSnapshot;
 - an Agent AIMessage completes the Step decision projection and registers its
   ToolCalls;
@@ -272,6 +274,7 @@ V1 assessors are deterministic and versioned:
 - absolute Step/token/wall-time limit assessor;
 - exact Tool/Step action-signature repetition assessor;
 - heartbeat/dwell assessor where configured;
+- configured-vs-provider-reported model drift assessor;
 - evaluation projector for developer/user/benchmark input.
 
 Generic Tool frequency is an operational signal, not automatically a runaway
@@ -688,12 +691,15 @@ V1 uses specific kinds rather than broad `llm_call` or `tool_io` buckets:
 task.created | task.started | task.heartbeat | task.completed |
 task.failed | task.interrupted
 
+agent_release.resolved
+
 step.started | step.closed
 
 llm.requested | llm.responded | llm.failed
 
 tool.issued | tool.started | tool.returned_raw | tool.result_visible |
-tool.denied | tool.timed_out | tool.cancelled | tool.failed
+tool.denied | tool.timed_out | tool.cancelled | tool.failed |
+tool.unknown_terminal
 
 content.produced | context.state_recorded | context.snapshotted |
 context.compressed
@@ -713,6 +719,26 @@ external.scheduler_triggered | external.webhook_received |
 external.config_changed | provider.timed_out | provider.rate_limited |
 sandbox.permission_denied | observability.degraded
 ```
+
+`agent_release.resolved` is schema version 1. Its subject is the deterministic
+AgentRelease entity ID and its Task remains `task_id`. The payload is:
+
+```text
+{
+  relation_role: "executed_by",
+  release: {
+    manifest: sanitized AgentReleaseManifest v1,
+    fingerprint: {
+      model_hash, prompt_hash, tool_catalog_hash,
+      policy_hash, runtime_build_id, release_hash
+    }
+  }
+}
+```
+
+The Structural Projector recomputes the fingerprint from the sanitized
+manifest before accepting it. A Task may bind one starting release only;
+later `external.config_changed` observations do not replace that binding.
 
 ### 7.3 Ordering and causality
 
@@ -768,6 +794,8 @@ These are the canonical append-only records.
 ansich_entities(entity_id, entity_type, primary_scope_id?, discovered_obs_id)
 
 ansich_agent_releases(entity_id FK, namespace, agent_name, release_hash, ...)
+ansich_agent_release_components(release_id FK, component_kind, component_hash, summary_json)
+ansich_task_agent_releases(task_id FK, release_id FK, relation_role, established_obs_id)
 ansich_tasks(entity_id FK, source_kind, source_id, trigger_obs_id, ...)
 ansich_steps(entity_id FK, task_id, step_seq, actor_kind, ...)
 ansich_tool_calls(entity_id FK, step_id, call_seq, provider_call_id?, ...)
@@ -1070,6 +1098,7 @@ GET /api/ansich/observations/{obs_id}
 GET /api/ansich/observations/{obs_id}/payload
 GET /api/ansich/agent-releases
 GET /api/ansich/agent-releases/{release_id}
+GET /api/ansich/agent-releases/{release_id}/manifest
 GET /api/ansich/agent-releases/compare?left=...&right=...
 ```
 
@@ -1077,7 +1106,11 @@ Lineage endpoints default to 8 levels/500 nodes, enforce hard limits of 32
 levels/2,000 nodes, and return a `truncated` reason plus structured unknown gaps.
 Forward lineage is labeled possible exposure. Snapshot, compression, lineage,
 and exposure reads are metadata-only; raw payload reads remain separate and
-audited.
+audited. The default AgentRelease detail similarly replaces the rendered base
+prompt with a bounded preview. Its complete sanitized manifest is available only
+through the separately logged, `Cache-Control: no-store` manifest endpoint;
+Task timeline serialization applies the same preview rule to
+`agent_release.resolved` so the generic evidence feed cannot bypass it.
 
 ### 11.3 Operator endpoints
 

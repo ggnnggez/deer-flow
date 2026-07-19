@@ -500,6 +500,11 @@ def _complete_assembly(
 ) -> LeadAgentAssembly:
     from deerflow.runtime_descriptor import build_runtime_descriptor
 
+    resolved_policies = dict(effective_policies)
+    resolved_policies.setdefault(
+        "recursion_limit",
+        config.get("recursion_limit", "framework-default"),
+    )
     descriptor = build_runtime_descriptor(
         namespace=namespace,
         agent_name=agent_name,
@@ -513,7 +518,7 @@ def _complete_assembly(
         middlewares=middlewares,
         deferred_names=deferred_names,
         enabled_skills=enabled_skills,
-        effective_policies=effective_policies,
+        effective_policies=resolved_policies,
     )
     _publish_runtime_descriptor(config, graph, descriptor)
     return LeadAgentAssembly(graph=graph, descriptor=descriptor)

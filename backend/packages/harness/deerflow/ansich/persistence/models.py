@@ -199,6 +199,113 @@ class AnsichTaskRow(Base):
     __table_args__ = (UniqueConstraint("source_kind", "source_id", name="uq_ansich_task_source"),)
 
 
+class AnsichAgentReleaseRow(Base):
+    __tablename__ = "ansich_agent_releases"
+
+    entity_id: Mapped[str] = mapped_column(
+        String(36),
+        ForeignKey("ansich_entities.entity_id", ondelete="CASCADE"),
+        primary_key=True,
+    )
+    namespace: Mapped[str] = mapped_column(String(128), nullable=False)
+    agent_name: Mapped[str] = mapped_column(String(128), nullable=False)
+    release_hash: Mapped[str] = mapped_column(String(64), nullable=False)
+    schema_version: Mapped[int] = mapped_column(Integer, nullable=False)
+    model_hash: Mapped[str] = mapped_column(String(64), nullable=False)
+    prompt_hash: Mapped[str] = mapped_column(String(64), nullable=False)
+    tool_catalog_hash: Mapped[str] = mapped_column(String(64), nullable=False)
+    policy_hash: Mapped[str] = mapped_column(String(64), nullable=False)
+    runtime_build_id: Mapped[str] = mapped_column(String(64), nullable=False)
+    manifest_payload_id: Mapped[str] = mapped_column(
+        String(36),
+        ForeignKey("ansich_payloads.payload_id", ondelete="RESTRICT"),
+        nullable=False,
+    )
+    discovered_obs_id: Mapped[str] = mapped_column(
+        String(36),
+        ForeignKey("ansich_observations.obs_id", ondelete="RESTRICT"),
+        nullable=False,
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        nullable=False,
+        default=_utc_now,
+    )
+
+    __table_args__ = (
+        UniqueConstraint(
+            "namespace",
+            "agent_name",
+            "release_hash",
+            name="uq_ansich_agent_release_identity",
+        ),
+        Index("ix_ansich_agent_releases_agent_created", "agent_name", "created_at"),
+        Index("ix_ansich_agent_releases_model_hash", "model_hash"),
+        Index("ix_ansich_agent_releases_prompt_hash", "prompt_hash"),
+        Index("ix_ansich_agent_releases_tool_hash", "tool_catalog_hash"),
+        Index("ix_ansich_agent_releases_policy_hash", "policy_hash"),
+        Index("ix_ansich_agent_releases_runtime_build", "runtime_build_id"),
+    )
+
+
+class AnsichAgentReleaseComponentRow(Base):
+    __tablename__ = "ansich_agent_release_components"
+
+    release_id: Mapped[str] = mapped_column(
+        String(36),
+        ForeignKey("ansich_agent_releases.entity_id", ondelete="CASCADE"),
+        primary_key=True,
+    )
+    component_kind: Mapped[str] = mapped_column(String(32), primary_key=True)
+    component_hash: Mapped[str] = mapped_column(String(64), nullable=False)
+    summary_json: Mapped[dict] = mapped_column(JSON, nullable=False)
+
+    __table_args__ = (
+        CheckConstraint(
+            "component_kind IN ('model', 'prompt', 'tools', 'policy', 'runtime_build')",
+            name="ck_ansich_agent_release_component_kind",
+        ),
+        Index(
+            "ix_ansich_agent_release_components_hash",
+            "component_kind",
+            "component_hash",
+        ),
+    )
+
+
+class AnsichTaskAgentReleaseRow(Base):
+    __tablename__ = "ansich_task_agent_releases"
+
+    task_id: Mapped[str] = mapped_column(
+        String(36),
+        ForeignKey("ansich_tasks.entity_id", ondelete="CASCADE"),
+        primary_key=True,
+    )
+    release_id: Mapped[str] = mapped_column(
+        String(36),
+        ForeignKey("ansich_agent_releases.entity_id", ondelete="RESTRICT"),
+        nullable=False,
+    )
+    relation_role: Mapped[str] = mapped_column(String(32), nullable=False)
+    established_obs_id: Mapped[str] = mapped_column(
+        String(36),
+        ForeignKey("ansich_observations.obs_id", ondelete="RESTRICT"),
+        nullable=False,
+    )
+
+    __table_args__ = (
+        CheckConstraint(
+            "relation_role = 'executed_by'",
+            name="ck_ansich_task_agent_release_role",
+        ),
+        Index(
+            "ix_ansich_task_agent_releases_release",
+            "release_id",
+            "task_id",
+        ),
+    )
+
+
 class AnsichStepRow(Base):
     __tablename__ = "ansich_steps"
 

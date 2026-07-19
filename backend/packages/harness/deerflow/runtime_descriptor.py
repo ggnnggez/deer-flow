@@ -53,12 +53,39 @@ _MIDDLEWARE_PUBLIC_FIELDS = (
     "warn_threshold",
     "hard_limit",
     "window_size",
+    "max_tracked_threads",
     "tool_freq_warn",
     "tool_freq_hard_limit",
-    "max_tokens_before_summary",
-    "messages_to_keep",
+    "trigger",
+    "keep",
+    "trim_tokens_to_summarize",
+    "fail_closed",
+    "passport",
+    "_tool_freq_overrides",
+    "_top_k",
     "_deferred",
     "_catalog_hash",
+)
+_MIDDLEWARE_HASHED_TEXT_FIELDS = (
+    "summary_prompt",
+    "system_prompt",
+    "tool_description",
+)
+_MODEL_IDENTITY_FIELDS = (
+    "model",
+    "model_name",
+    "deployment_name",
+)
+_PROVIDER_PARAMETER_FIELDS = (
+    "_allowed",
+    "_denied",
+    "_default_role",
+    "_resource_type",
+    "_action",
+)
+_DETECTOR_PARAMETER_FIELDS = (
+    "_finish_reasons",
+    "_stop_reasons",
 )
 
 
@@ -86,6 +113,52 @@ def _plain_value(value: object) -> object | None:
         except Exception:
             return None
     return None
+
+
+def _stable_type_name(value: object) -> str:
+    value_type = type(value)
+    return f"{value_type.__module__}.{value_type.__qualname__}"
+
+
+def _model_identity(value: object) -> dict[str, str]:
+    if isinstance(value, str):
+        return {"class": "builtins.str", "name": value}
+    resolved = value
+    seen: set[int] = set()
+    while hasattr(resolved, "bound") and id(resolved) not in seen:
+        seen.add(id(resolved))
+        bound = getattr(resolved, "bound")
+        if bound is None or bound is resolved:
+            break
+        resolved = bound
+    identity = {"class": _stable_type_name(resolved)}
+    for field_name in _MODEL_IDENTITY_FIELDS:
+        field_value = getattr(resolved, field_name, None)
+        if isinstance(field_value, str) and field_value:
+            identity["name"] = field_value
+            break
+    return identity
+
+
+def _provider_identity(value: object) -> dict[str, object]:
+    identity: dict[str, object] = {
+        "class": _stable_type_name(value),
+        "name": str(getattr(value, "name", type(value).__name__)),
+    }
+    parameters: dict[str, object] = {}
+    for field_name in _PROVIDER_PARAMETER_FIELDS:
+        if not hasattr(value, field_name):
+            continue
+        raw_value = getattr(value, field_name)
+        plain = _plain_value(raw_value)
+        if plain is not None or raw_value is None:
+            parameters[field_name.removeprefix("_")] = plain
+    if parameters:
+        identity["parameters"] = parameters
+    nested = getattr(value, "_provider", None)
+    if nested is not None and nested is not value:
+        identity["provider"] = _provider_identity(nested)
+    return identity
 
 
 def _tool_schema(tool: object) -> dict[str, object]:
@@ -157,6 +230,42 @@ def describe_middleware(middleware: object) -> MiddlewareRuntimeDescriptor:
         plain = _plain_value(raw_value)
         if plain is not None or raw_value is None:
             parameters[field_name.removeprefix("_")] = plain
+    for field_name in _MIDDLEWARE_HASHED_TEXT_FIELDS:
+        raw_value = getattr(middleware, field_name, None)
+        if isinstance(raw_value, str):
+            parameters[f"{field_name}_hash"] = sha256_canonical(raw_value)
+    model = getattr(middleware, "model", None)
+    if model is not None:
+        parameters["model"] = _model_identity(model)
+    provider = getattr(middleware, "provider", None)
+    if provider is not None:
+        parameters["provider"] = _provider_identity(provider)
+    routing_index = getattr(middleware, "_routing_index", None)
+    plain_routing_index = _plain_value(routing_index)
+    if plain_routing_index is not None:
+        parameters["routing_index_hash"] = sha256_canonical(
+            plain_routing_index,
+        )
+    detectors = getattr(middleware, "_detectors", None)
+    if isinstance(detectors, (list, tuple)):
+        detector_descriptors: list[dict[str, object]] = []
+        for detector in detectors:
+            descriptor: dict[str, object] = {
+                "class": _stable_type_name(detector),
+                "name": str(getattr(detector, "name", type(detector).__name__)),
+            }
+            detector_parameters: dict[str, object] = {}
+            for field_name in _DETECTOR_PARAMETER_FIELDS:
+                if not hasattr(detector, field_name):
+                    continue
+                raw_value = getattr(detector, field_name)
+                plain = _plain_value(raw_value)
+                if plain is not None or raw_value is None:
+                    detector_parameters[field_name.removeprefix("_")] = plain
+            if detector_parameters:
+                descriptor["parameters"] = detector_parameters
+            detector_descriptors.append(descriptor)
+        parameters["detectors"] = detector_descriptors
     config = getattr(middleware, "_config", None)
     plain_config = _plain_value(config)
     if isinstance(plain_config, dict):
@@ -220,6 +329,11 @@ def build_runtime_descriptor(
         for skill in enabled_skills
     ]
     use = getattr(model_config, "use", None)
+    assembled_tools = list(tools)
+    for middleware in middlewares:
+        middleware_tools = getattr(middleware, "tools", None)
+        if isinstance(middleware_tools, (list, tuple)):
+            assembled_tools.extend(middleware_tools)
     return AgentRuntimeDescriptor(
         namespace=namespace,
         agent_name=agent_name,
@@ -234,7 +348,7 @@ def build_runtime_descriptor(
         prompt_template_id=prompt_template_id,
         rendered_base_prompt=rendered_base_prompt,
         available_skill_catalog_hash=sha256_canonical(sorted(skill_catalog, key=lambda item: item["name"])),
-        loaded_tools=tuple(describe_tool(tool, deferred_names=deferred_names) for tool in tools),
+        loaded_tools=tuple(describe_tool(tool, deferred_names=deferred_names) for tool in assembled_tools),
         middleware_chain=tuple(describe_middleware(middleware) for middleware in middlewares),
         effective_policies=effective_policies,
         runtime_build=_runtime_build(),

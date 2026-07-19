@@ -925,7 +925,7 @@ def test_projection_dependency_deadline_migration_upgrades_sqlite(tmp_path) -> N
         engine.dispose()
 
     assert "dependency_pending_since" in column_names
-    assert revision == "0017_ansich_alerts"
+    assert revision == "0018_ansich_agent_releases"
     assert len(revision) <= 32
 
 

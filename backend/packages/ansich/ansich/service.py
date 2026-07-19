@@ -18,6 +18,7 @@ from ansich.lineage import ContentLineageView, LineageDirection, PossibleExposur
 from ansich.memory import InMemoryAnsichBackend
 from ansich.operations import ActiveTaskView, HeartbeatBelief
 from ansich.operator import OperatorActionView, TaskActionTarget
+from ansich.release import AgentReleaseDetailView, AgentReleaseSummaryView, TaskAgentReleaseView
 from ansich.step import ContentBlockPayloadView, ContentOccurrenceView, ContextSnapshotView, LlmAttemptView, StepView
 from ansich.tool import ToolCallView
 from ansich.usage import TaskUsageView
@@ -289,6 +290,37 @@ class AnsichService:
 
     async def get_task(self, task_id: str) -> TaskView | None:
         return await self._backend.get_task(task_id)
+
+    async def get_task_agent_release(
+        self,
+        task_id: str,
+    ) -> TaskAgentReleaseView | None:
+        return await self._backend.get_task_agent_release(task_id)
+
+    async def get_agent_release(
+        self,
+        release_id: str,
+    ) -> AgentReleaseDetailView | None:
+        return await self._backend.get_agent_release(release_id)
+
+    async def list_agent_releases(
+        self,
+        *,
+        limit: int = 100,
+        agent_name: str | None = None,
+        component_hash: str | None = None,
+        from_time: datetime | None = None,
+        to_time: datetime | None = None,
+    ) -> list[AgentReleaseSummaryView]:
+        if limit < 1:
+            raise ValueError("limit must be positive")
+        return await self._backend.list_agent_releases(
+            limit=limit,
+            agent_name=agent_name,
+            component_hash=component_hash,
+            from_time=from_time,
+            to_time=to_time,
+        )
 
     async def get_current_belief(
         self,

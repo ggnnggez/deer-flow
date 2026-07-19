@@ -194,8 +194,23 @@ def test_lead_agent_assembly_descriptor_uses_the_exact_compiled_inputs(monkeypat
 
         return query
 
+    @tool
+    def middleware_tool(value: str) -> str:
+        """Tool contributed by the effective middleware chain."""
+
+        return value
+
+    class SummaryModel:
+        model = "provider/summary-v1"
+
     class ExactMiddleware:
-        pass
+        tools = [middleware_tool]
+        trigger = ("fraction", 0.8)
+        keep = ("messages", 12)
+        trim_tokens_to_summarize = 4_000
+        summary_prompt = "Summarize the effective context."
+        model = SummaryModel()
+        _top_k = 4
 
     exact_middleware = ExactMiddleware()
     monkeypatch.setattr(tools_module, "get_available_tools", lambda **kwargs: [exact_tool])
@@ -217,18 +232,30 @@ def test_lead_agent_assembly_descriptor_uses_the_exact_compiled_inputs(monkeypat
 
     assembly = lead_agent_module._assemble_lead_agent(
         {
+            "recursion_limit": 73,
             "context": {
                 "model_name": "effective-model",
                 "thinking_enabled": True,
                 "reasoning_effort": "high",
-            }
+            },
         },
         app_config=app_config,
     )
 
     assert assembly.graph is compiled_graph
-    assert [tool.name for tool in compiled_inputs["tools"]] == [tool.name for tool in assembly.descriptor.loaded_tools]
+    assert [tool.name for tool in assembly.descriptor.loaded_tools] == [
+        *[tool.name for tool in compiled_inputs["tools"]],
+        "middleware_tool",
+    ]
     assert [type(middleware).__name__ for middleware in compiled_inputs["middleware"]] == [middleware.name for middleware in assembly.descriptor.middleware_chain]
+    middleware_policy = assembly.descriptor.middleware_chain[0].public_parameters
+    assert middleware_policy["trigger"] == ["fraction", 0.8]
+    assert middleware_policy["keep"] == ["messages", 12]
+    assert middleware_policy["trim_tokens_to_summarize"] == 4_000
+    assert middleware_policy["summary_prompt_hash"]
+    assert middleware_policy["model"]["name"] == "provider/summary-v1"
+    assert middleware_policy["top_k"] == 4
+    assert assembly.descriptor.effective_policies["recursion_limit"] == 73
     assert compiled_inputs["system_prompt"] == assembly.descriptor.rendered_base_prompt
     assert assembly.descriptor.requested_model == "effective-model"
     assert assembly.descriptor.effective_model == "effective-model"

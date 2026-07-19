@@ -60,6 +60,10 @@ from ansich.assessment.action_repetition import (
     build_step_action,
 )
 from ansich.assessment.base import Assessment, EvidenceRef, canonical_config_hash
+from ansich.assessment.configuration_drift import (
+    CONFIGURATION_DRIFT_ASSESSOR,
+    assess_configuration_drift,
+)
 from ansich.assessment.tool_frequency import (
     TOOL_FREQUENCY_ASSESSOR,
     ToolOccurrence,
@@ -98,6 +102,16 @@ from ansich.operations import (
     assess_heartbeat,
 )
 from ansich.operator import OperatorActionView, TaskActionTarget
+from ansich.release import (
+    AgentRelease,
+    AgentReleaseDetailView,
+    AgentReleaseManifest,
+    AgentReleaseSummaryView,
+    TaskAgentReleaseView,
+    release_entity_id,
+    validate_agent_release,
+)
+from ansich.release.canonical import canonical_json_bytes
 from ansich.tool import ContentDerivationSourceRole, ToolTransformKind
 from ansich.usage import (
     AggregationScope,
@@ -114,6 +128,8 @@ from sqlalchemy.orm import aliased
 
 from deerflow.ansich.persistence.models import (
     AnsichActiveTaskReadModelRow,
+    AnsichAgentReleaseComponentRow,
+    AnsichAgentReleaseRow,
     AnsichAlertEvidenceRow,
     AnsichAlertReadModelRow,
     AnsichAlertRow,
@@ -151,6 +167,7 @@ from deerflow.ansich.persistence.models import (
     AnsichRelationRow,
     AnsichScopeRow,
     AnsichStepRow,
+    AnsichTaskAgentReleaseRow,
     AnsichTaskBudgetRow,
     AnsichTaskHeartbeatRow,
     AnsichTaskRow,
@@ -211,7 +228,7 @@ _USAGE_PROJECTION_KINDS = frozenset(
 )
 _PROJECTORS = (("task-structural", "1"), ("task-control", "1"), ("task-step", "1"), ("task-usage", "1"), ("task-budget", "1"), ("task-heartbeat", "1"))
 _PROJECTOR_KINDS = {
-    "task-structural": frozenset(_CONTROL_BY_KIND),
+    "task-structural": frozenset((*_CONTROL_BY_KIND, "agent_release.resolved")),
     "task-control": frozenset(_CONTROL_BY_KIND),
     "task-step": _STEP_PROJECTION_KINDS,
     "task-usage": _USAGE_PROJECTION_KINDS,
@@ -222,6 +239,7 @@ _ASSESSOR_VERSIONS = {
     ACTION_REPETITION_ASSESSOR.name: ACTION_REPETITION_ASSESSOR.version,
     TOOL_FREQUENCY_ASSESSOR.name: TOOL_FREQUENCY_ASSESSOR.version,
     ABSOLUTE_LIMIT_ASSESSOR.name: ABSOLUTE_LIMIT_ASSESSOR.version,
+    CONFIGURATION_DRIFT_ASSESSOR.name: CONFIGURATION_DRIFT_ASSESSOR.version,
 }
 _USAGE_DIMENSION_ORDER = {
     "input_tokens": 0,
@@ -270,6 +288,8 @@ def _assessors_after_projection(
         )
     if projector_name in {"task-usage", "task-budget", "task-heartbeat"}:
         names.add(ABSOLUTE_LIMIT_ASSESSOR.name)
+    if (projector_name == "task-structural" and observation_kind == "agent_release.resolved") or (projector_name == "task-step" and observation_kind == "llm.responded"):
+        names.add(CONFIGURATION_DRIFT_ASSESSOR.name)
     if projector_name == "task-control" and observation_kind in {
         "task.completed",
         "task.failed",
@@ -898,6 +918,9 @@ class SqlAnsichBackend:
                 AnsichBeliefAssertionRow,
                 AnsichRelationEvidenceRow,
                 AnsichRelationRow,
+                AnsichTaskAgentReleaseRow,
+                AnsichAgentReleaseComponentRow,
+                AnsichAgentReleaseRow,
                 AnsichScopeRow,
                 AnsichTaskRow,
                 AnsichEntityRow,
@@ -1255,6 +1278,22 @@ class SqlAnsichBackend:
                             task_id=task_id,
                             now=now,
                         )
+                    elif assessor_name == CONFIGURATION_DRIFT_ASSESSOR.name:
+                        assessment = await self._assess_configuration_drift_at(
+                            session,
+                            task_id=task_id,
+                            evidence_watermark=evidence_watermark,
+                            now=now,
+                        )
+                        if assessment is not None:
+                            assertion, assertion_changed = await self._persist_assessment(session, assessment)
+                            changed += int(assertion_changed)
+                            changed += await self._reconcile_alerts_for_assessment(
+                                session,
+                                assessment=assessment,
+                                source_assertion_id=assertion.assertion_id,
+                                now=now,
+                            )
                     else:
                         raise ValueError(f"unknown Ansich assessor: {assessor_name}")
                     summary = await session.get(AnsichTaskSummaryRow, task_id)
@@ -1278,6 +1317,68 @@ class SqlAnsichBackend:
             except Exception as exc:
                 await self._record_assessor_error(job_id, attempt, exc)
         return changed
+
+    async def _assess_configuration_drift_at(
+        self,
+        session: AsyncSession,
+        *,
+        task_id: str,
+        evidence_watermark: int,
+        now: datetime,
+    ) -> Assessment | None:
+        binding = await session.get(AnsichTaskAgentReleaseRow, task_id)
+        if binding is None:
+            return None
+        model_component = await session.get(
+            AnsichAgentReleaseComponentRow,
+            (binding.release_id, "model"),
+        )
+        if model_component is None:
+            return None
+        model_summary = model_component.summary_json or {}
+        behavior_parameters = model_summary.get("behavior_parameters")
+        provider_model = behavior_parameters.get("model") if isinstance(behavior_parameters, dict) else None
+        effective_model = provider_model if isinstance(provider_model, str) and provider_model else model_summary.get("effective")
+        if not isinstance(effective_model, str) or not effective_model:
+            return None
+        latest = (
+            await session.execute(
+                select(AnsichLlmAttemptRow, AnsichObservationRow)
+                .join(
+                    AnsichObservationRow,
+                    AnsichObservationRow.obs_id == AnsichLlmAttemptRow.response_obs_id,
+                )
+                .where(
+                    AnsichLlmAttemptRow.task_id == task_id,
+                    AnsichObservationRow.ingest_seq <= evidence_watermark,
+                )
+                .order_by(
+                    AnsichObservationRow.ingest_seq.desc(),
+                    AnsichLlmAttemptRow.attempt_id.desc(),
+                )
+                .limit(1)
+            )
+        ).first()
+        if latest is None:
+            release = await session.get(AnsichAgentReleaseRow, binding.release_id)
+            as_of = now if release is None else _as_utc(release.created_at)
+            return assess_configuration_drift(
+                task_id=task_id,
+                effective_model=effective_model,
+                provider_reported_model=None,
+                response_obs_id=None,
+                as_of=as_of,
+                asserted_at=now,
+            )
+        attempt, response = latest
+        return assess_configuration_drift(
+            task_id=task_id,
+            effective_model=effective_model,
+            provider_reported_model=attempt.provider_model,
+            response_obs_id=response.obs_id,
+            as_of=_as_utc(response.occurred_at),
+            asserted_at=now,
+        )
 
     async def _assess_action_repetition_at(
         self,
@@ -2088,6 +2189,116 @@ class SqlAnsichBackend:
                 ),
                 **usage,
             )
+
+    @staticmethod
+    def _agent_release_summary_view(
+        row: AnsichAgentReleaseRow,
+        *,
+        task_count: int,
+    ) -> AgentReleaseSummaryView:
+        return AgentReleaseSummaryView(
+            release_id=row.entity_id,
+            namespace=row.namespace,
+            agent_name=row.agent_name,
+            release_hash=row.release_hash,
+            schema_version=row.schema_version,
+            model_hash=row.model_hash,
+            prompt_hash=row.prompt_hash,
+            tool_catalog_hash=row.tool_catalog_hash,
+            policy_hash=row.policy_hash,
+            runtime_build_id=row.runtime_build_id,
+            created_at=_as_utc(row.created_at),
+            task_count=task_count,
+        )
+
+    @staticmethod
+    async def _load_agent_release_manifest(
+        session: AsyncSession,
+        row: AnsichAgentReleaseRow,
+    ) -> AgentReleaseManifest:
+        payload = await session.get(AnsichPayloadRow, row.manifest_payload_id)
+        if payload is None:
+            raise RuntimeError(f"Ansich AgentRelease manifest payload disappeared: {row.manifest_payload_id}")
+        decoded = json.loads(payload.body.decode(payload.encoding))
+        return AgentReleaseManifest.model_validate(decoded)
+
+    async def get_agent_release(
+        self,
+        release_id: str,
+    ) -> AgentReleaseDetailView | None:
+        async with self._session_factory() as session:
+            row = await session.get(AnsichAgentReleaseRow, release_id)
+            if row is None:
+                return None
+            task_count = await session.scalar(select(func.count()).select_from(AnsichTaskAgentReleaseRow).where(AnsichTaskAgentReleaseRow.release_id == release_id))
+            return AgentReleaseDetailView(
+                summary=self._agent_release_summary_view(
+                    row,
+                    task_count=int(task_count or 0),
+                ),
+                manifest=await self._load_agent_release_manifest(session, row),
+            )
+
+    async def get_task_agent_release(
+        self,
+        task_id: str,
+    ) -> TaskAgentReleaseView | None:
+        async with self._session_factory() as session:
+            binding = await session.get(AnsichTaskAgentReleaseRow, task_id)
+            if binding is None:
+                return None
+            row = await session.get(AnsichAgentReleaseRow, binding.release_id)
+            if row is None:
+                return None
+            task_count = await session.scalar(select(func.count()).select_from(AnsichTaskAgentReleaseRow).where(AnsichTaskAgentReleaseRow.release_id == row.entity_id))
+            detail = AgentReleaseDetailView(
+                summary=self._agent_release_summary_view(
+                    row,
+                    task_count=int(task_count or 0),
+                ),
+                manifest=await self._load_agent_release_manifest(session, row),
+            )
+            return TaskAgentReleaseView(
+                task_id=task_id,
+                relation_role=cast(Literal["executed_by"], binding.relation_role),
+                established_obs_id=binding.established_obs_id,
+                release=detail,
+            )
+
+    async def list_agent_releases(
+        self,
+        *,
+        limit: int = 100,
+        agent_name: str | None = None,
+        component_hash: str | None = None,
+        from_time: datetime | None = None,
+        to_time: datetime | None = None,
+    ) -> list[AgentReleaseSummaryView]:
+        task_count = select(func.count()).select_from(AnsichTaskAgentReleaseRow).where(AnsichTaskAgentReleaseRow.release_id == AnsichAgentReleaseRow.entity_id).correlate(AnsichAgentReleaseRow).scalar_subquery()
+        statement = select(AnsichAgentReleaseRow, task_count.label("task_count"))
+        if agent_name is not None:
+            statement = statement.where(AnsichAgentReleaseRow.agent_name == agent_name)
+        if component_hash is not None:
+            statement = statement.where(
+                or_(
+                    AnsichAgentReleaseRow.model_hash == component_hash,
+                    AnsichAgentReleaseRow.prompt_hash == component_hash,
+                    AnsichAgentReleaseRow.tool_catalog_hash == component_hash,
+                    AnsichAgentReleaseRow.policy_hash == component_hash,
+                    AnsichAgentReleaseRow.runtime_build_id == component_hash,
+                )
+            )
+        if from_time is not None:
+            statement = statement.where(AnsichAgentReleaseRow.created_at >= from_time)
+        if to_time is not None:
+            statement = statement.where(AnsichAgentReleaseRow.created_at <= to_time)
+        statement = statement.order_by(
+            AnsichAgentReleaseRow.created_at.desc(),
+            AnsichAgentReleaseRow.entity_id,
+        ).limit(limit)
+        async with self._session_factory() as session:
+            rows = (await session.execute(statement)).all()
+        return [self._agent_release_summary_view(row, task_count=int(count or 0)) for row, count in rows]
 
     async def get_current_belief(
         self,
@@ -4417,6 +4628,9 @@ class SqlAnsichBackend:
         session: AsyncSession,
         observation: ObservationEnvelope,
     ) -> AnsichTaskRow | None:
+        if observation.kind == "agent_release.resolved":
+            await self._project_agent_release(session, observation)
+            return None
         if observation.kind not in _CONTROL_BY_KIND or observation.payload is None:
             return None
         entity = await session.get(AnsichEntityRow, observation.task_id)
@@ -4440,6 +4654,179 @@ class SqlAnsichBackend:
         await session.flush()
         await self._project_scopes(session, observation)
         return task
+
+    async def _project_agent_release(
+        self,
+        session: AsyncSession,
+        observation: ObservationEnvelope,
+    ) -> None:
+        if observation.payload is None:
+            raise ValueError("agent_release.resolved requires an inline decoded payload")
+        task = await session.get(AnsichTaskRow, observation.task_id)
+        if task is None:
+            raise _ProjectionDependencyPending(f"Ansich task is not projected: {observation.task_id}")
+        if observation.payload.get("relation_role") != "executed_by":
+            raise ValueError("AgentRelease relation_role must be executed_by")
+        release = AgentRelease.model_validate(observation.payload.get("release"))
+        validate_agent_release(release)
+        manifest = release.manifest
+        fingerprint = release.fingerprint
+        expected_release_id = release_entity_id(
+            manifest.namespace,
+            manifest.agent_name,
+            fingerprint.release_hash,
+        )
+        if observation.subject_id != expected_release_id:
+            raise ValueError("AgentRelease observation subject does not match release identity")
+
+        row = await session.get(AnsichAgentReleaseRow, expected_release_id)
+        if row is None:
+            entity = await session.get(AnsichEntityRow, expected_release_id)
+            if entity is None:
+                session.add(
+                    AnsichEntityRow(
+                        entity_id=expected_release_id,
+                        entity_type="agent_release",
+                        discovered_obs_id=observation.obs_id,
+                    )
+                )
+                await session.flush()
+            manifest_bytes = canonical_json_bytes(manifest.model_dump(mode="python"))
+            manifest_payload_id = release_entity_id(
+                manifest.namespace,
+                manifest.agent_name,
+                f"{fingerprint.release_hash}:manifest:{manifest.schema_version}",
+            )
+            manifest_payload = await session.get(AnsichPayloadRow, manifest_payload_id)
+            if manifest_payload is None:
+                session.add(
+                    AnsichPayloadRow(
+                        payload_id=manifest_payload_id,
+                        content_type="application/vnd.ansich.agent-release+json",
+                        encoding="utf-8",
+                        compression="none",
+                        byte_size=len(manifest_bytes),
+                        sha256=hashlib.sha256(manifest_bytes).hexdigest(),
+                        body=manifest_bytes,
+                    )
+                )
+            elif manifest_payload.body != manifest_bytes:
+                raise ValueError("AgentRelease manifest payload is immutable")
+            row = AnsichAgentReleaseRow(
+                entity_id=expected_release_id,
+                namespace=manifest.namespace,
+                agent_name=manifest.agent_name,
+                release_hash=fingerprint.release_hash,
+                schema_version=manifest.schema_version,
+                model_hash=fingerprint.model_hash,
+                prompt_hash=fingerprint.prompt_hash,
+                tool_catalog_hash=fingerprint.tool_catalog_hash,
+                policy_hash=fingerprint.policy_hash,
+                runtime_build_id=fingerprint.runtime_build_id,
+                manifest_payload_id=manifest_payload_id,
+                discovered_obs_id=observation.obs_id,
+                created_at=observation.occurred_at,
+            )
+            session.add(row)
+            await session.flush()
+            summaries = {
+                "model": manifest.model.model_dump(mode="json"),
+                "prompt": manifest.prompt.model_dump(
+                    mode="json",
+                    exclude={"rendered_base_prompt"},
+                ),
+                "tools": {
+                    "items": [
+                        tool.model_dump(
+                            mode="json",
+                            exclude={"argument_schema"},
+                        )
+                        for tool in manifest.tools
+                    ]
+                },
+                "policy": manifest.policy.model_dump(mode="json"),
+                "runtime_build": manifest.runtime_build.model_dump(mode="json"),
+            }
+            component_hashes = {
+                "model": fingerprint.model_hash,
+                "prompt": fingerprint.prompt_hash,
+                "tools": fingerprint.tool_catalog_hash,
+                "policy": fingerprint.policy_hash,
+                "runtime_build": fingerprint.runtime_build_id,
+            }
+            for component_kind, component_hash in component_hashes.items():
+                session.add(
+                    AnsichAgentReleaseComponentRow(
+                        release_id=expected_release_id,
+                        component_kind=component_kind,
+                        component_hash=component_hash,
+                        summary_json=summaries[component_kind],
+                    )
+                )
+        else:
+            stored_fingerprint = (
+                row.model_hash,
+                row.prompt_hash,
+                row.tool_catalog_hash,
+                row.policy_hash,
+                row.runtime_build_id,
+                row.release_hash,
+            )
+            incoming_fingerprint = (
+                fingerprint.model_hash,
+                fingerprint.prompt_hash,
+                fingerprint.tool_catalog_hash,
+                fingerprint.policy_hash,
+                fingerprint.runtime_build_id,
+                fingerprint.release_hash,
+            )
+            if stored_fingerprint != incoming_fingerprint:
+                raise ValueError("AgentRelease identity is immutable")
+
+        binding = await session.get(AnsichTaskAgentReleaseRow, observation.task_id)
+        if binding is None:
+            session.add(
+                AnsichTaskAgentReleaseRow(
+                    task_id=observation.task_id,
+                    release_id=expected_release_id,
+                    relation_role="executed_by",
+                    established_obs_id=observation.obs_id,
+                )
+            )
+        elif binding.release_id != expected_release_id:
+            raise ValueError("Task starting AgentRelease is immutable")
+
+        relation = await session.scalar(
+            select(AnsichRelationRow).where(
+                AnsichRelationRow.subject_id == observation.task_id,
+                AnsichRelationRow.predicate == "executed_by",
+                AnsichRelationRow.object_id == expected_release_id,
+            )
+        )
+        if relation is None:
+            relation = AnsichRelationRow(
+                relation_id=new_id(),
+                subject_id=observation.task_id,
+                predicate="executed_by",
+                object_id=expected_release_id,
+                asserted_obs_id=observation.obs_id,
+            )
+            session.add(relation)
+            await session.flush()
+        if (
+            await session.get(
+                AnsichRelationEvidenceRow,
+                (relation.relation_id, observation.obs_id),
+            )
+            is None
+        ):
+            session.add(
+                AnsichRelationEvidenceRow(
+                    relation_id=relation.relation_id,
+                    obs_id=observation.obs_id,
+                    ordinal=0,
+                )
+            )
 
     async def _project_control(
         self,
@@ -5013,7 +5400,6 @@ class SqlAnsichBackend:
                 attempt.operation_id = str(payload["operation_id"])
             if isinstance(payload.get("operation_kind"), str):
                 attempt.operation_kind = str(payload["operation_kind"])
-            attempt.provider_model = payload.get("configured_model") if isinstance(payload.get("configured_model"), str) else None
             if attempt.status == "incomplete":
                 attempt.status = "requested"
         elif observation.kind == "llm.responded":
@@ -5022,6 +5408,11 @@ class SqlAnsichBackend:
             attempt.latency_ms = int(payload["latency_ms"])
             attempt.usage_json = dict(payload.get("usage", {}))
             attempt.response_metadata_json = dict(payload.get("response_metadata", {}))
+            response_metadata = attempt.response_metadata_json
+            reported_model = payload.get("provider_model")
+            if not isinstance(reported_model, str):
+                reported_model = response_metadata.get("model_name")
+            attempt.provider_model = reported_model if isinstance(reported_model, str) else None
         elif observation.kind == "llm.failed":
             attempt.failure_obs_id = observation.obs_id
             attempt.status = "failed"

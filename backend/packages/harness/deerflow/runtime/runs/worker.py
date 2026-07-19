@@ -54,6 +54,10 @@ from deerflow.runtime.goal import (
     visible_conversation_signature,
     write_thread_goal,
 )
+from deerflow.runtime.secret_context import (
+    extract_request_secrets,
+    read_active_secrets,
+)
 from deerflow.runtime.serialization import serialize
 from deerflow.runtime.stream_bridge import StreamBridge
 from deerflow.runtime.user_context import get_effective_user_id, resolve_runtime_user_id
@@ -478,6 +482,26 @@ async def run_agent(
             agent = agent_factory(config=initial_runnable_config, app_config=ctx.app_config)
         else:
             agent = agent_factory(config=initial_runnable_config)
+
+        if ansich_task is not None:
+            descriptor = runtime_ctx.get("__ansich_agent_runtime_descriptor")
+            if descriptor is None:
+                descriptor = getattr(
+                    agent,
+                    "__ansich_agent_runtime_descriptor",
+                    None,
+                )
+            # A missing descriptor is itself an observability degradation.
+            # The fail-open probe records that fact without gating the Run.
+            ansich_task.agent_release_resolved(
+                descriptor,
+                known_secrets=tuple(
+                    {
+                        *extract_request_secrets(runtime_ctx).values(),
+                        *read_active_secrets(runtime_ctx).values(),
+                    }
+                ),
+            )
 
         # Capture the effective (resolved) model name from the agent's metadata.
         # _resolve_model_name in agent.py may return the default model if the

@@ -17,6 +17,7 @@ AlertType = Literal[
     "tool_frequency",
     "heartbeat_missing",
     "long_dwell",
+    "configuration_drift",
     "observability_degradation",
     "projection_failure",
 ]
@@ -410,6 +411,17 @@ def alert_conditions_from_assessment(
                 alert_type="long_dwell",
                 stable_condition_key="task-dwell",
                 active=value == "long",
+                severity="warning",
+            ),
+        )
+    if assessment.field_name == "configuration_drift":
+        return (
+            _condition(
+                assessment,
+                source_assertion_id=source_assertion_id,
+                alert_type="configuration_drift",
+                stable_condition_key="provider-model",
+                active=value == "mismatch",
                 severity="warning",
             ),
         )

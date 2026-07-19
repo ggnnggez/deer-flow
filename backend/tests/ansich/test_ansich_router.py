@@ -6,6 +6,7 @@ from uuid import uuid4
 import pytest
 from _router_auth_helpers import make_authed_test_app
 from ansich import AnsichService, ObservationEnvelope, Producer, new_id
+from ansich.release import AgentRuntimeDescriptor, build_agent_release
 from httpx import ASGITransport, AsyncClient
 from langchain.agents import create_agent
 from langchain_core.language_models import BaseChatModel
@@ -39,6 +40,98 @@ def regular_user() -> User:
         password_hash="x",
         system_role="user",
     )
+
+
+@pytest.mark.anyio
+async def test_admin_can_inspect_compare_and_audit_raw_agent_release_manifest(
+    caplog,
+):
+    caplog.set_level("INFO", logger=ansich_router.__name__)
+    service = AnsichService.in_memory()
+    await service.start()
+    task_ids = (new_id(), new_id())
+    releases = tuple(
+        build_agent_release(
+            AgentRuntimeDescriptor(
+                namespace="deerflow",
+                agent_name="lead-agent",
+                effective_model=model,
+                prompt_template_id="lead-v1",
+                rendered_base_prompt=(f"private full prompt for {model} " + "x" * 300 + " FULL_PROMPT_TAIL"),
+                effective_policies={"max_steps": max_steps},
+            )
+        )
+        for model, max_steps in (
+            ("provider/model-v1", 20),
+            ("provider/model-v2", 30),
+        )
+    )
+    try:
+        for index, (task_id, release) in enumerate(zip(task_ids, releases, strict=True)):
+            run_id = f"release-api-{index}"
+            service.record_batch(
+                (
+                    ObservationEnvelope.task_lifecycle(
+                        kind="task.created",
+                        task_id=task_id,
+                        source_kind="deerflow_run",
+                        source_id=run_id,
+                        occurred_at=datetime.now(UTC),
+                        source_event_id=f"run:{run_id}:task:created",
+                    ),
+                    ObservationEnvelope.agent_release_resolved(
+                        task_id=task_id,
+                        run_id=run_id,
+                        occurred_at=datetime.now(UTC),
+                        release=release,
+                        source_event_id=f"run:{run_id}:agent-release:resolved",
+                    ),
+                )
+            )
+            await service.flush_task(task_id)
+        bindings = [await service.get_task_agent_release(task_id) for task_id in task_ids]
+        release_ids = [binding.release.summary.release_id for binding in bindings if binding]
+        app = make_authed_test_app(user_factory=admin_user)
+        app.state.ansich_service = service
+        app.include_router(ansich_router.router)
+        async with AsyncClient(
+            transport=ASGITransport(app=app),
+            base_url="http://test",
+        ) as client:
+            listed = await client.get("/api/ansich/agent-releases")
+            detail = await client.get(f"/api/ansich/agent-releases/{release_ids[0]}")
+            raw_manifest = await client.get(f"/api/ansich/agent-releases/{release_ids[0]}/manifest")
+            compared = await client.get(
+                "/api/ansich/agent-releases/compare",
+                params={"left": release_ids[0], "right": release_ids[1]},
+            )
+            task_release = await client.get(f"/api/ansich/tasks/{task_ids[0]}/agent-release")
+            timeline = await client.get(f"/api/ansich/tasks/{task_ids[0]}/timeline")
+    finally:
+        await service.stop()
+
+    assert listed.status_code == 200
+    assert len(listed.json()["items"]) == 2
+    assert all(item["quality_status"] == "unassessed" for item in listed.json()["items"])
+    assert detail.status_code == 200
+    assert "FULL_PROMPT_TAIL" not in detail.text
+    assert "rendered_base_prompt_preview" in detail.text
+    assert raw_manifest.status_code == 200
+    assert "FULL_PROMPT_TAIL" in raw_manifest.text
+    assert raw_manifest.headers["cache-control"] == "no-store"
+    assert "Ansich raw AgentRelease manifest accessed" in caplog.text
+    assert compared.status_code == 200
+    assert compared.json()["comparison"]["changed_components"] == [
+        "model",
+        "prompt",
+        "policy",
+    ]
+    assert task_release.status_code == 200
+    assert task_release.json()["binding"]["relation_role"] == "executed_by"
+    assert timeline.status_code == 200
+    assert "FULL_PROMPT_TAIL" not in timeline.text
+    release_event = next(item for item in timeline.json()["items"] if item["kind"] == "agent_release.resolved")
+    assert release_event["payload"]["release"]["manifest"]["prompt"]["rendered_base_prompt_preview"].endswith("…")
 
 
 class _ApiObservedModel(BaseChatModel):

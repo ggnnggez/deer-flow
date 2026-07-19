@@ -8,6 +8,11 @@ from typing import Literal
 
 from ansich.alerts import AlertWorkflowConflict
 from ansich.contracts import ControlValue, TaskLifecycleScope
+from ansich.release import (
+    AgentRelease,
+    AgentReleaseFingerprint,
+    compare_agent_releases,
+)
 from fastapi import APIRouter, Header, HTTPException, Query, Request, Response
 from pydantic import BaseModel, Field
 
@@ -128,6 +133,170 @@ class AlertDismissRequest(AlertWorkflowRequest):
     reason: str = Field(min_length=1, max_length=512)
 
 
+def _redact_release_prompt(manifest: dict) -> None:
+    rendered_prompt = manifest["prompt"].pop("rendered_base_prompt", "")
+    suffix = "…" if len(rendered_prompt) > 240 else ""
+    manifest["prompt"]["rendered_base_prompt_preview"] = f"{rendered_prompt[:240]}{suffix}"
+
+
+def _safe_release_detail(detail) -> dict:
+    manifest = detail.manifest.model_dump(mode="json")
+    _redact_release_prompt(manifest)
+    return {
+        "summary": detail.summary.model_dump(mode="json"),
+        "manifest": manifest,
+    }
+
+
+def _release_from_detail(detail) -> AgentRelease:
+    summary = detail.summary
+    return AgentRelease(
+        manifest=detail.manifest,
+        fingerprint=AgentReleaseFingerprint(
+            model_hash=summary.model_hash,
+            prompt_hash=summary.prompt_hash,
+            tool_catalog_hash=summary.tool_catalog_hash,
+            policy_hash=summary.policy_hash,
+            runtime_build_id=summary.runtime_build_id,
+            release_hash=summary.release_hash,
+        ),
+    )
+
+
+@router.get("/agent-releases")
+async def list_agent_releases(
+    request: Request,
+    agent_name: str | None = Query(default=None, alias="agent"),
+    component_hash: str | None = Query(default=None, alias="component"),
+    from_time: datetime | None = Query(default=None, alias="from"),
+    to_time: datetime | None = Query(default=None, alias="to"),
+    limit: int = Query(default=100, ge=1, le=500),
+) -> dict:
+    await require_admin_user(request, detail=_ADMIN_REQUIRED)
+    service = _service_or_503(request)
+    _ensure_queryable(service)
+    for timestamp in (from_time, to_time):
+        if timestamp is not None and timestamp.tzinfo is None:
+            raise HTTPException(
+                status_code=422,
+                detail="Ansich AgentRelease time filters must include a timezone",
+            )
+    try:
+        releases = await service.list_agent_releases(
+            limit=limit,
+            agent_name=agent_name,
+            component_hash=component_hash,
+            from_time=from_time,
+            to_time=to_time,
+        )
+    except Exception as exc:
+        raise HTTPException(
+            status_code=503,
+            detail={
+                "message": "Ansich AgentRelease query failed",
+                "projection_status": _projection_status(service),
+            },
+        ) from exc
+    return {
+        "items": [item.model_dump(mode="json") for item in releases],
+        "operational_distributions": {"availability": "unavailable"},
+        "projection_status": _projection_status(service),
+    }
+
+
+@router.get("/agent-releases/compare")
+async def compare_releases(
+    request: Request,
+    left: str = Query(min_length=1),
+    right: str = Query(min_length=1),
+) -> dict:
+    await require_admin_user(request, detail=_ADMIN_REQUIRED)
+    service = _service_or_503(request)
+    _ensure_queryable(service)
+    try:
+        left_detail = await service.get_agent_release(left)
+        right_detail = await service.get_agent_release(right)
+    except Exception as exc:
+        raise HTTPException(
+            status_code=503,
+            detail={
+                "message": "Ansich AgentRelease comparison query failed",
+                "projection_status": _projection_status(service),
+            },
+        ) from exc
+    if left_detail is None or right_detail is None:
+        raise HTTPException(status_code=404, detail="Ansich AgentRelease not found")
+    comparison = compare_agent_releases(
+        _release_from_detail(left_detail),
+        _release_from_detail(right_detail),
+    )
+    return {
+        "comparison": comparison.model_dump(mode="json"),
+        "projection_status": _projection_status(service),
+    }
+
+
+@router.get("/agent-releases/{release_id}")
+async def get_agent_release(release_id: str, request: Request) -> dict:
+    await require_admin_user(request, detail=_ADMIN_REQUIRED)
+    service = _service_or_503(request)
+    _ensure_queryable(service)
+    try:
+        detail = await service.get_agent_release(release_id)
+    except Exception as exc:
+        raise HTTPException(
+            status_code=503,
+            detail={
+                "message": "Ansich AgentRelease query failed",
+                "projection_status": _projection_status(service),
+            },
+        ) from exc
+    if detail is None:
+        raise HTTPException(status_code=404, detail="Ansich AgentRelease not found")
+    return {
+        "release": _safe_release_detail(detail),
+        "projection_status": _projection_status(service),
+    }
+
+
+@router.get("/agent-releases/{release_id}/manifest")
+async def get_agent_release_manifest(
+    release_id: str,
+    request: Request,
+    response: Response,
+) -> dict:
+    """Return the complete sanitized manifest through an audited, non-cached path."""
+
+    await require_admin_user(request, detail=_ADMIN_REQUIRED)
+    service = _service_or_503(request)
+    _ensure_queryable(service)
+    try:
+        detail = await service.get_agent_release(release_id)
+    except Exception as exc:
+        raise HTTPException(
+            status_code=503,
+            detail={
+                "message": "Ansich AgentRelease manifest query failed",
+                "projection_status": _projection_status(service),
+            },
+        ) from exc
+    if detail is None:
+        raise HTTPException(status_code=404, detail="Ansich AgentRelease not found")
+    user = getattr(request.state, "user", None)
+    logger.info(
+        "Ansich raw AgentRelease manifest accessed",
+        extra={
+            "ansich_release_id": release_id,
+            "ansich_actor_id": str(getattr(user, "id", "unknown")),
+        },
+    )
+    response.headers["Cache-Control"] = "no-store"
+    return {
+        "release_id": release_id,
+        "manifest": detail.manifest.model_dump(mode="json"),
+    }
+
+
 def _encode_timeline_cursor(occurred_at: datetime, ingest_seq: int) -> str:
     payload = json.dumps([occurred_at.isoformat(), ingest_seq], separators=(",", ":")).encode()
     return base64.urlsafe_b64encode(payload).decode().rstrip("=")
@@ -231,6 +400,7 @@ async def list_alerts(
         "tool_frequency",
         "heartbeat_missing",
         "long_dwell",
+        "configuration_drift",
     ]
     | None = Query(default=None, alias="type"),
     workflow_state: Literal[
@@ -597,6 +767,43 @@ async def rollback_task(
     )
 
 
+@router.get("/tasks/{task_id}/agent-release")
+async def get_task_agent_release(task_id: str, request: Request) -> dict:
+    await require_admin_user(request, detail=_ADMIN_REQUIRED)
+    service = _service_or_503(request)
+    _ensure_queryable(service)
+    try:
+        task = await service.get_task(task_id)
+        if task is None:
+            raise HTTPException(status_code=404, detail="Ansich Task not found")
+        binding = await service.get_task_agent_release(task_id)
+        drift = await service.get_current_belief(task_id, "configuration_drift")
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise HTTPException(
+            status_code=503,
+            detail={
+                "message": "Ansich Task AgentRelease query failed",
+                "projection_status": _projection_status(service),
+            },
+        ) from exc
+    return {
+        "binding": (
+            None
+            if binding is None
+            else {
+                "task_id": binding.task_id,
+                "relation_role": binding.relation_role,
+                "established_obs_id": binding.established_obs_id,
+                "release": _safe_release_detail(binding.release),
+            }
+        ),
+        "provider_drift": (None if drift is None else drift.model_dump(mode="json")),
+        "projection_status": _projection_status(service),
+    }
+
+
 @router.get("/tasks/{task_id}/usage")
 async def get_task_usage(task_id: str, request: Request) -> dict:
     await require_admin_user(request, detail=_ADMIN_REQUIRED)
@@ -768,6 +975,11 @@ def _timeline_item(ingest_seq: int, observation) -> dict:
     # endpoint; the polling timeline carries inventory metadata only.
     if observation.kind == "content.produced" and isinstance(payload, dict):
         item["payload"] = {key: value for key, value in payload.items() if key != "body"}
+    elif observation.kind == "agent_release.resolved" and isinstance(payload, dict):
+        release = payload.get("release")
+        manifest = release.get("manifest") if isinstance(release, dict) else None
+        if isinstance(manifest, dict) and isinstance(manifest.get("prompt"), dict):
+            _redact_release_prompt(manifest)
     return item
 
 

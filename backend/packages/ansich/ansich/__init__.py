@@ -35,6 +35,13 @@ from ansich.lineage import (
     PossibleExposureItemView,
     PossibleExposureView,
 )
+from ansich.release import (
+    AgentRelease,
+    AgentReleaseDetailView,
+    AgentReleaseSummaryView,
+    AgentRuntimeDescriptor,
+    TaskAgentReleaseView,
+)
 from ansich.service import AnsichService
 from ansich.step import ContentBlockPayloadView, ContentOccurrenceView, ContextSnapshotItemView, ContextSnapshotView, LlmAttemptView, StepView
 from ansich.tool import ContentDerivationView, ToolBelief, ToolCallView, ToolResultView
@@ -46,6 +53,10 @@ __all__ = [
     "AlertReconciliation",
     "AnsichHealth",
     "AnsichService",
+    "AgentRelease",
+    "AgentReleaseDetailView",
+    "AgentReleaseSummaryView",
+    "AgentRuntimeDescriptor",
     "AssessorDescriptor",
     "AuthorityClass",
     "BeliefAssertion",
@@ -78,6 +89,7 @@ __all__ = [
     "RecordReceipt",
     "ResolvedBelief",
     "TaskLifecycleScope",
+    "TaskAgentReleaseView",
     "TaskView",
     "ToolBelief",
     "ToolCallView",

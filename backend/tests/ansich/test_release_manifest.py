@@ -1,12 +1,17 @@
 from __future__ import annotations
 
+from datetime import UTC, datetime
+
 import pytest
+from ansich.assessment.configuration_drift import assess_configuration_drift
 from ansich.release import (
+    AgentRelease,
     AgentRuntimeDescriptor,
     MiddlewareRuntimeDescriptor,
     RuntimeBuildDescriptor,
     ToolRuntimeDescriptor,
     build_agent_release,
+    compare_agent_releases,
 )
 
 
@@ -67,6 +72,14 @@ def test_release_hash_is_stable_for_tool_set_order_and_requested_model_alias() -
     assert second.manifest.model.requested == "another-alias"
 
 
+def test_release_manifest_rejects_an_unknown_schema_version() -> None:
+    payload = build_agent_release(_descriptor()).model_dump(mode="python")
+    payload["manifest"]["schema_version"] = 2
+
+    with pytest.raises(ValueError):
+        AgentRelease.model_validate(payload)
+
+
 @pytest.mark.parametrize(
     ("field", "replacement"),
     [
@@ -121,3 +134,78 @@ def test_runtime_secret_changes_do_not_change_release_identity() -> None:
     second = _descriptor(model_behavior_parameters={"temperature": 0, "api_key": "second"})
 
     assert build_agent_release(first).fingerprint.release_hash == build_agent_release(second).fingerprint.release_hash
+
+
+@pytest.mark.parametrize(
+    ("reported", "expected"),
+    [
+        ("provider/model-v1", "matched"),
+        ("models/provider/model-v1", "matched"),
+        ("provider/model-v2", "mismatch"),
+        (None, "unknown"),
+    ],
+)
+def test_provider_model_drift_is_attempt_evidence_not_release_identity(
+    reported: str | None,
+    expected: str,
+) -> None:
+    assessed = assess_configuration_drift(
+        task_id="task",
+        effective_model="provider/model-v1",
+        provider_reported_model=reported,
+        response_obs_id=None,
+        as_of=datetime.now(UTC),
+        asserted_at=datetime.now(UTC),
+    )
+
+    assert assessed.value["value"] == expected
+
+
+def test_provider_model_drift_stays_unknown_when_configured_alias_is_not_comparable() -> None:
+    assessed = assess_configuration_drift(
+        task_id="task",
+        effective_model="fast-alias",
+        provider_reported_model="provider/model-v1",
+        response_obs_id="response-observation",
+        as_of=datetime.now(UTC),
+        asserted_at=datetime.now(UTC),
+    )
+
+    assert assessed.value["value"] == "unknown"
+    assert assessed.evidence[0].obs_id == "response-observation"
+
+
+def test_typed_release_diff_keeps_tool_source_in_the_stable_key() -> None:
+    left_descriptor = _descriptor(
+        loaded_tools=(
+            ToolRuntimeDescriptor(
+                name="search",
+                description="Search",
+                argument_schema={"type": "object"},
+                source="builtin",
+            ),
+        ),
+        effective_policies={"nested": {"limit": 3}},
+    )
+    right_descriptor = left_descriptor.model_copy(
+        update={
+            "loaded_tools": (
+                ToolRuntimeDescriptor(
+                    name="search",
+                    description="Search",
+                    argument_schema={"type": "object"},
+                    source="mcp:catalog",
+                ),
+            ),
+            "effective_policies": {"nested": {"limit": 4}},
+        }
+    )
+
+    diff = compare_agent_releases(
+        build_agent_release(left_descriptor),
+        build_agent_release(right_descriptor),
+    )
+
+    assert [item.name for item in diff.tools.source_changed] == ["search"]
+    assert diff.tools.schema_changed == ()
+    assert [item.path for item in diff.policy] == ["values.nested.limit"]

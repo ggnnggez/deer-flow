@@ -4,8 +4,110 @@ import logging
 
 import pytest
 from ansich import AnsichService
+from ansich.release import AgentRuntimeDescriptor
 
 from deerflow.ansich.probes import TaskControlProbe
+
+
+@pytest.mark.asyncio
+async def test_agent_release_resolution_follows_task_created_and_binds_starting_actor():
+    service = AnsichService.in_memory()
+    await service.start()
+    probe = TaskControlProbe(
+        service,
+        run_id="run-release-probe",
+        thread_id="thread-release-probe",
+    )
+    descriptor = AgentRuntimeDescriptor(
+        namespace="deerflow",
+        agent_name="lead-agent",
+        effective_model="provider/model-v1",
+        prompt_template_id="lead-v1",
+        rendered_base_prompt="You are DeerFlow.",
+    )
+
+    try:
+        probe.created()
+        probe.agent_release_resolved(descriptor)
+        await service.flush_task(probe.task_id)
+        observations = await service.list_observations(probe.task_id)
+        binding = await service.get_task_agent_release(probe.task_id)
+    finally:
+        await service.stop()
+
+    assert [item.kind for item in observations[:2]] == [
+        "task.created",
+        "agent_release.resolved",
+    ]
+    assert binding is not None
+    assert binding.release.manifest.model.effective == "provider/model-v1"
+
+
+@pytest.mark.asyncio
+async def test_agent_release_resolution_failure_is_fail_open_and_does_not_log_descriptor_secrets(
+    caplog,
+):
+    service = AnsichService.in_memory()
+    await service.start()
+    probe = TaskControlProbe(
+        service,
+        run_id="run-invalid-release-probe",
+        thread_id="thread-invalid-release-probe",
+    )
+    secret = "release-descriptor-secret"
+
+    try:
+        probe.created()
+        with caplog.at_level(
+            logging.WARNING,
+            logger="deerflow.ansich.probes.task_control",
+        ):
+            probe.agent_release_resolved({"api_key": secret})
+        await service.flush_task(probe.task_id)
+        observations = await service.list_observations(probe.task_id)
+    finally:
+        await service.stop()
+
+    assert secret not in caplog.text
+    assert any(
+        item.kind == "observability.degraded"
+        and item.payload
+        == {
+            "component": "agent_release",
+            "reason": "resolution_failed",
+        }
+        for item in observations
+    )
+
+
+@pytest.mark.asyncio
+async def test_agent_release_resolution_filters_request_scoped_secret_values() -> None:
+    service = AnsichService.in_memory()
+    await service.start()
+    probe = TaskControlProbe(
+        service,
+        run_id="run-secret-release-probe",
+        thread_id="thread-secret-release-probe",
+    )
+    secret = "request-scoped-release-secret"
+    descriptor = AgentRuntimeDescriptor(
+        namespace="deerflow",
+        agent_name="lead-agent",
+        effective_model="provider/model-v1",
+        prompt_template_id="lead-v1",
+        rendered_base_prompt=f"Prompt accidentally includes {secret}",
+    )
+
+    try:
+        probe.created()
+        probe.agent_release_resolved(descriptor, known_secrets=(secret,))
+        await service.flush_task(probe.task_id)
+        binding = await service.get_task_agent_release(probe.task_id)
+    finally:
+        await service.stop()
+
+    assert binding is not None
+    assert secret not in binding.release.manifest.model_dump_json()
 
 
 @pytest.mark.asyncio

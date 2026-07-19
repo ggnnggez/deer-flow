@@ -15,6 +15,13 @@ from ansich.contracts import ControlBelief, ControlValue, NamedVersion, Observat
 from ansich.control import should_select_control_candidate
 from ansich.heartbeat import TaskHeartbeatView
 from ansich.lineage import ContentBlockView, ContentProducerView, LineageDirection, PossibleExposureItemView
+from ansich.release import (
+    AgentRelease,
+    AgentReleaseDetailView,
+    AgentReleaseSummaryView,
+    TaskAgentReleaseView,
+    validate_agent_release,
+)
 from ansich.step import ContentBlockPayloadView, ContentOccurrenceView, ContextSnapshotItemView, ContextSnapshotView, LlmAttemptView, StepView
 from ansich.tool import (
     ContentDerivationSourceRole,
@@ -53,6 +60,8 @@ class InMemoryAnsichBackend:
         self._seen: set[tuple[str, str, str]] = set()
         self._tasks: dict[str, TaskView] = {}
         self._observations: list[ObservationEnvelope] = []
+        self._agent_releases: dict[str, tuple[AgentRelease, datetime]] = {}
+        self._task_agent_releases: dict[str, tuple[str, str]] = {}
 
     async def persist_and_project(self, observations: list[ObservationEnvelope]) -> int:
         processed = 0
@@ -113,6 +122,88 @@ class InMemoryAnsichBackend:
                 "tool_calls_executed": len(executed_ids),
             }
         )
+
+    def _agent_release_detail(self, release_id: str) -> AgentReleaseDetailView | None:
+        stored = self._agent_releases.get(release_id)
+        if stored is None:
+            return None
+        release, created_at = stored
+        fingerprint = release.fingerprint
+        manifest = release.manifest
+        task_count = sum(bound_release_id == release_id for bound_release_id, _ in self._task_agent_releases.values())
+        return AgentReleaseDetailView(
+            summary=AgentReleaseSummaryView(
+                release_id=release_id,
+                namespace=manifest.namespace,
+                agent_name=manifest.agent_name,
+                release_hash=fingerprint.release_hash,
+                schema_version=manifest.schema_version,
+                model_hash=fingerprint.model_hash,
+                prompt_hash=fingerprint.prompt_hash,
+                tool_catalog_hash=fingerprint.tool_catalog_hash,
+                policy_hash=fingerprint.policy_hash,
+                runtime_build_id=fingerprint.runtime_build_id,
+                created_at=created_at,
+                task_count=task_count,
+            ),
+            manifest=manifest,
+        )
+
+    async def get_task_agent_release(
+        self,
+        task_id: str,
+    ) -> TaskAgentReleaseView | None:
+        binding = self._task_agent_releases.get(task_id)
+        if binding is None:
+            return None
+        release_id, established_obs_id = binding
+        detail = self._agent_release_detail(release_id)
+        if detail is None:
+            return None
+        return TaskAgentReleaseView(
+            task_id=task_id,
+            relation_role="executed_by",
+            established_obs_id=established_obs_id,
+            release=detail,
+        )
+
+    async def get_agent_release(
+        self,
+        release_id: str,
+    ) -> AgentReleaseDetailView | None:
+        return self._agent_release_detail(release_id)
+
+    async def list_agent_releases(
+        self,
+        *,
+        limit: int = 100,
+        agent_name: str | None = None,
+        component_hash: str | None = None,
+        from_time: datetime | None = None,
+        to_time: datetime | None = None,
+    ) -> list[AgentReleaseSummaryView]:
+        details = [detail for release_id in self._agent_releases if (detail := self._agent_release_detail(release_id)) is not None]
+        if agent_name is not None:
+            details = [item for item in details if item.summary.agent_name == agent_name]
+        if component_hash is not None:
+            details = [
+                item
+                for item in details
+                if component_hash
+                in {
+                    item.summary.model_hash,
+                    item.summary.prompt_hash,
+                    item.summary.tool_catalog_hash,
+                    item.summary.policy_hash,
+                    item.summary.runtime_build_id,
+                }
+            ]
+        if from_time is not None:
+            details = [item for item in details if item.summary.created_at >= from_time]
+        if to_time is not None:
+            details = [item for item in details if item.summary.created_at <= to_time]
+        details.sort(key=lambda item: (item.summary.created_at, item.summary.release_id), reverse=True)
+        return [item.summary for item in details[:limit]]
 
     async def get_task_by_source(self, source_kind: str, source_id: str) -> TaskView | None:
         task = next(
@@ -985,6 +1076,24 @@ class InMemoryAnsichBackend:
         )
 
     def _project(self, observation: ObservationEnvelope) -> None:
+        if observation.kind == "agent_release.resolved":
+            if observation.payload is None:
+                return
+            release = AgentRelease.model_validate(observation.payload.get("release"))
+            validate_agent_release(release)
+            release_id = observation.subject_id
+            self._agent_releases.setdefault(
+                release_id,
+                (release, observation.occurred_at),
+            )
+            binding = self._task_agent_releases.get(observation.task_id)
+            if binding is not None and binding[0] != release_id:
+                raise ValueError("Task starting AgentRelease is immutable")
+            self._task_agent_releases.setdefault(
+                observation.task_id,
+                (release_id, observation.obs_id),
+            )
+            return
         if observation.kind not in _CONTROL_BY_KIND or observation.payload is None:
             return
         existing = self._tasks.get(observation.task_id)

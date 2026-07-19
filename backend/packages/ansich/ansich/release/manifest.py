@@ -2,7 +2,10 @@ from __future__ import annotations
 
 import re
 from collections.abc import Mapping, Sequence
-from typing import Any
+from datetime import datetime
+from hashlib import sha256
+from typing import Any, Literal
+from uuid import UUID
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
@@ -94,7 +97,7 @@ class ReleasePolicyManifest(_FrozenModel):
 
 
 class AgentReleaseManifest(_FrozenModel):
-    schema_version: int = _SCHEMA_VERSION
+    schema_version: Literal[1] = _SCHEMA_VERSION
     namespace: str
     agent_name: str
     model: ReleaseModelManifest
@@ -116,6 +119,76 @@ class AgentReleaseFingerprint(_FrozenModel):
 class AgentRelease(_FrozenModel):
     manifest: AgentReleaseManifest
     fingerprint: AgentReleaseFingerprint
+
+
+class AgentReleaseSummaryView(_FrozenModel):
+    release_id: str
+    namespace: str
+    agent_name: str
+    release_hash: str
+    schema_version: int
+    model_hash: str
+    prompt_hash: str
+    tool_catalog_hash: str
+    policy_hash: str
+    runtime_build_id: str
+    created_at: datetime
+    task_count: int = Field(ge=0)
+    quality_status: Literal["unassessed"] = "unassessed"
+
+
+class AgentReleaseDetailView(_FrozenModel):
+    summary: AgentReleaseSummaryView
+    manifest: AgentReleaseManifest
+
+
+class TaskAgentReleaseView(_FrozenModel):
+    task_id: str
+    relation_role: Literal["executed_by"]
+    established_obs_id: str
+    release: AgentReleaseDetailView
+
+
+def release_entity_id(namespace: str, agent_name: str, release_hash: str) -> str:
+    digest = sha256(f"ansich-agent-release\0{namespace}\0{agent_name}\0{release_hash}".encode()).digest()
+    return str(UUID(bytes=digest[:16], version=4))
+
+
+def fingerprint_release_manifest(manifest: AgentReleaseManifest) -> AgentReleaseFingerprint:
+    model_hash = sha256_canonical(
+        {
+            "effective": manifest.model.effective,
+            "provider": manifest.model.provider,
+            "behavior_parameters": manifest.model.behavior_parameters,
+        }
+    )
+    prompt_hash = sha256_canonical(manifest.prompt.model_dump(mode="python"))
+    tool_catalog_hash = sha256_canonical([tool.model_dump(mode="python") for tool in manifest.tools])
+    policy_hash = sha256_canonical(manifest.policy.model_dump(mode="python"))
+    runtime_build_id = sha256_canonical(manifest.runtime_build.model_dump(mode="python"))
+    component_hashes = {
+        "model_hash": model_hash,
+        "prompt_hash": prompt_hash,
+        "tool_catalog_hash": tool_catalog_hash,
+        "policy_hash": policy_hash,
+        "runtime_build_id": runtime_build_id,
+    }
+    return AgentReleaseFingerprint(
+        **component_hashes,
+        release_hash=sha256_canonical(
+            {
+                "schema_version": manifest.schema_version,
+                "namespace": manifest.namespace,
+                "agent_name": manifest.agent_name,
+                "component_hashes": component_hashes,
+            }
+        ),
+    )
+
+
+def validate_agent_release(release: AgentRelease) -> None:
+    if fingerprint_release_manifest(release.manifest) != release.fingerprint:
+        raise ValueError("AgentRelease fingerprint does not match its sanitized manifest")
 
 
 def _remove_runtime_addresses(value: object) -> object:
@@ -179,11 +252,6 @@ def build_agent_release(
     policy_values = dict(_sanitize(descriptor.effective_policies, known_secrets=known_secrets))
     build = RuntimeBuildDescriptor.model_validate(_sanitize(descriptor.runtime_build.model_dump(mode="python"), known_secrets=known_secrets))
 
-    model_identity = {
-        "effective": descriptor.effective_model,
-        "provider": descriptor.model_provider,
-        "behavior_parameters": model_parameters,
-    }
     prompt = ReleasePromptManifest(
         template_id=descriptor.prompt_template_id,
         template_hash=descriptor.prompt_template_hash or sha256_canonical({"template_id": descriptor.prompt_template_id}),
@@ -200,37 +268,19 @@ def build_agent_release(
     )
     policy = ReleasePolicyManifest(middleware_chain=middleware_chain, values=policy_values)
 
-    model_hash = sha256_canonical(model_identity)
-    prompt_hash = sha256_canonical(prompt.model_dump(mode="python"))
-    tool_catalog_hash = sha256_canonical([tool.model_dump(mode="python") for tool in tools])
-    policy_hash = sha256_canonical(policy.model_dump(mode="python"))
-    runtime_build_id = sha256_canonical(build.model_dump(mode="python"))
-    component_hashes = {
-        "model_hash": model_hash,
-        "prompt_hash": prompt_hash,
-        "tool_catalog_hash": tool_catalog_hash,
-        "policy_hash": policy_hash,
-        "runtime_build_id": runtime_build_id,
-    }
-    release_hash = sha256_canonical(
-        {
-            "schema_version": _SCHEMA_VERSION,
-            "namespace": descriptor.namespace,
-            "agent_name": descriptor.agent_name,
-            "component_hashes": component_hashes,
-        }
+    manifest = AgentReleaseManifest(
+        namespace=descriptor.namespace,
+        agent_name=descriptor.agent_name,
+        model=model,
+        prompt=prompt,
+        tools=tools,
+        policy=policy,
+        runtime_build=build,
     )
+    fingerprint = fingerprint_release_manifest(manifest)
     return AgentRelease(
-        manifest=AgentReleaseManifest(
-            namespace=descriptor.namespace,
-            agent_name=descriptor.agent_name,
-            model=model,
-            prompt=prompt,
-            tools=tools,
-            policy=policy,
-            runtime_build=build,
-        ),
-        fingerprint=AgentReleaseFingerprint(**component_hashes, release_hash=release_hash),
+        manifest=manifest,
+        fingerprint=fingerprint,
     )
 
 
@@ -238,9 +288,15 @@ __all__ = [
     "AgentRelease",
     "AgentReleaseFingerprint",
     "AgentReleaseManifest",
+    "AgentReleaseDetailView",
+    "AgentReleaseSummaryView",
     "AgentRuntimeDescriptor",
     "MiddlewareRuntimeDescriptor",
     "RuntimeBuildDescriptor",
     "ToolRuntimeDescriptor",
+    "TaskAgentReleaseView",
     "build_agent_release",
+    "fingerprint_release_manifest",
+    "release_entity_id",
+    "validate_agent_release",
 ]

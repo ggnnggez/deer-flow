@@ -53,7 +53,20 @@ UsageDimension = Literal[
     "wall_time_ms",
     "child_tasks_spawned",
 ]
-ObservationKind = TaskLifecycleKind | StepObservationKind | LlmObservationKind | ContextObservationKind | ToolObservationKind | BudgetObservationKind | OperatorObservationKind | Literal["task.heartbeat", "observability.degraded"]
+ObservationKind = (
+    TaskLifecycleKind
+    | StepObservationKind
+    | LlmObservationKind
+    | ContextObservationKind
+    | ToolObservationKind
+    | BudgetObservationKind
+    | OperatorObservationKind
+    | Literal[
+        "agent_release.resolved",
+        "task.heartbeat",
+        "observability.degraded",
+    ]
+)
 ControlValue = Literal["unknown", "created", "running", "completed", "failed", "interrupted"]
 TaskLifecycleScope = Literal["all", "active", "terminal"]
 
@@ -161,6 +174,7 @@ class ObservationEnvelope(BaseModel):
         "context_state",
         "context_snapshot",
         "context_compression",
+        "agent_release",
         "alert",
     ] = "task"
     subject_id: str
@@ -198,6 +212,8 @@ class ObservationEnvelope(BaseModel):
             raise ValueError("context snapshot observation subject_type must be context_snapshot")
         elif self.kind == "context.compressed" and self.subject_type != "context_compression":
             raise ValueError("context compression observation subject_type must be context_compression")
+        elif self.kind == "agent_release.resolved" and self.subject_type != "agent_release":
+            raise ValueError("agent release observation subject_type must be agent_release")
         elif self.kind.startswith("budget.") and (self.subject_type != "task" or self.subject_id != self.task_id):
             raise ValueError("budget observation subject must identify task_id")
         elif self.kind.startswith("operator.alert_") and self.subject_type != "alert":
@@ -326,6 +342,48 @@ class ObservationEnvelope(BaseModel):
                 "producer_instance_id": producer_instance_id,
                 "ownership_epoch": ownership_epoch,
                 "elapsed_ms": elapsed_ms,
+            },
+        )
+
+    @classmethod
+    def agent_release_resolved(
+        cls,
+        *,
+        task_id: str,
+        run_id: str,
+        occurred_at: datetime,
+        release: object,
+        source_event_id: str,
+        producer_seq: int = 1,
+        producer_name: str = "agent-release-probe",
+        producer_version: str = "1",
+        producer_instance_id: str = "local",
+    ) -> Self:
+        from ansich.release import AgentRelease, release_entity_id
+
+        resolved = AgentRelease.model_validate(release)
+        manifest = resolved.manifest
+        return cls(
+            kind="agent_release.resolved",
+            occurred_at=occurred_at,
+            task_id=task_id,
+            subject_type="agent_release",
+            subject_id=release_entity_id(
+                manifest.namespace,
+                manifest.agent_name,
+                resolved.fingerprint.release_hash,
+            ),
+            producer=Producer(
+                name=producer_name,
+                version=producer_version,
+                instance_id=producer_instance_id,
+            ),
+            producer_seq=producer_seq,
+            source_event_id=source_event_id,
+            correlation_id=run_id,
+            payload={
+                "relation_role": "executed_by",
+                "release": resolved.model_dump(mode="json"),
             },
         )
 

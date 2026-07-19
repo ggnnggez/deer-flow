@@ -12,6 +12,7 @@ from ansich.heartbeat import TaskHeartbeatView
 from ansich.lineage import ContentBlockView, LineageDirection, PossibleExposureItemView
 from ansich.operations import ActiveTaskView, HeartbeatBelief
 from ansich.operator import OperatorActionView, TaskActionTarget
+from ansich.release import AgentReleaseDetailView, AgentReleaseSummaryView, TaskAgentReleaseView
 from ansich.step import ContentBlockPayloadView, ContentOccurrenceView, ContextSnapshotView, LlmAttemptView, StepView
 from ansich.tool import ContentDerivationView, ToolCallView
 from ansich.usage import TaskUsageView
@@ -21,6 +22,26 @@ class AnsichBackend(Protocol):
     async def persist_and_project(self, observations: list[ObservationEnvelope]) -> int: ...
 
     async def get_task(self, task_id: str) -> TaskView | None: ...
+
+    async def get_task_agent_release(
+        self,
+        task_id: str,
+    ) -> TaskAgentReleaseView | None: ...
+
+    async def get_agent_release(
+        self,
+        release_id: str,
+    ) -> AgentReleaseDetailView | None: ...
+
+    async def list_agent_releases(
+        self,
+        *,
+        limit: int = 100,
+        agent_name: str | None = None,
+        component_hash: str | None = None,
+        from_time: datetime | None = None,
+        to_time: datetime | None = None,
+    ) -> list[AgentReleaseSummaryView]: ...
 
     async def get_current_belief(
         self,
