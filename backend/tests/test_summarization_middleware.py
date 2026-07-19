@@ -88,6 +88,19 @@ def _middleware(
     )
 
 
+def test_release_policy_parameters_include_summary_model_identity() -> None:
+    middleware = _middleware(trigger=("tokens", 8000), keep=("messages", 12))
+    middleware.model.model = "provider/summary-v1"
+    middleware.trim_tokens_to_summarize = 4000
+
+    policy = middleware.release_policy_parameters()
+
+    assert policy["trigger"] == ["tokens", 8000]
+    assert policy["keep"] == ["messages", 12]
+    assert policy["trim_tokens_to_summarize"] == 4000
+    assert policy["summary_model"]["name"] == "provider/summary-v1"
+
+
 def test_before_summarization_hook_receives_messages_before_compression() -> None:
     captured: list[SummarizationEvent] = []
     middleware = _middleware(before_summarization=[captured.append])

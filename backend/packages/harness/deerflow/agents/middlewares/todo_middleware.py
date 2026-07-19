@@ -112,6 +112,15 @@ class TodoMiddleware(TodoListMiddleware):
 
     state_schema = ThreadState
 
+    def release_policy_parameters(self) -> dict[str, object]:
+        from ansich.release.canonical import sha256_canonical
+
+        return {
+            "system_prompt_hash": sha256_canonical(self.system_prompt),
+            "tool_description_hash": sha256_canonical(self.tool_description),
+            "state_channel": "todos",
+        }
+
     @override
     def before_model(
         self,

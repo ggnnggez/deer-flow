@@ -34,6 +34,26 @@ class GuardrailMiddleware(AgentMiddleware[AgentState]):
         self.fail_closed = fail_closed
         self.passport = passport
 
+    def release_policy_parameters(self) -> dict[str, object]:
+        provider_parameters: dict[str, object] = {}
+        release_parameters = getattr(self.provider, "release_policy_parameters", None)
+        if callable(release_parameters):
+            declared = release_parameters()
+            if isinstance(declared, dict):
+                provider_parameters = declared
+        policy_id = getattr(self.provider, "policy_id", None)
+        if not isinstance(policy_id, str) or not policy_id:
+            policy_id = str(getattr(self.provider, "name", type(self.provider).__name__))
+        policy_version = getattr(self.provider, "policy_version", None)
+        if not isinstance(policy_version, str) or not policy_version:
+            policy_version = str(getattr(self.provider, "version", "unknown"))
+        return {
+            "fail_closed": self.fail_closed,
+            "passport": self.passport,
+            "policy": {"id": policy_id, "version": policy_version},
+            "provider_parameters": provider_parameters,
+        }
+
     @staticmethod
     def _resolve_context(request: ToolCallRequest) -> dict:
         runtime = getattr(request, "runtime", None)

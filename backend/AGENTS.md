@@ -520,7 +520,14 @@ produce `configuration_drift` without mutating the release. The
 `behavior_parameters.model` as a provider model: exact names and `-`, `.`, or
 `:` revision suffixes match, while other names mismatch. If the manifest lacks
 that provider field and only the DeerFlow registry alias is available,
-inequality remains `unknown`. Admin APIs list,
+inequality remains `unknown`. Behavior-bearing middleware expose
+`release_policy_parameters()`; runtime descriptors prefer that explicit
+contract and mark compatibility attribute fallbacks with `probed=true` in the
+manifest. Summarization records its summary-model identity, guardrails record
+policy ID/version, and lead releases resolve the actual subagent type allowlist
+plus per-type `max_turns`/`timeout_seconds` from the same registry used for
+execution. These fields intentionally change policy hashes relative to releases
+created before this contract correction. Admin APIs list,
 inspect, and compare typed release components. Ordinary detail returns only a
 bounded prompt preview, and Task timeline serialization applies the same rule to
 the release observation; the complete sanitized manifest uses a separately

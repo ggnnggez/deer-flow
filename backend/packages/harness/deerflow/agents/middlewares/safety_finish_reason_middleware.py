@@ -72,6 +72,29 @@ class SafetyFinishReasonMiddleware(AgentMiddleware[AgentState]):
         # Copy so caller mutations after construction don't leak into us.
         self._detectors: list[SafetyTerminationDetector] = list(detectors) if detectors else default_detectors()
 
+    def release_policy_parameters(self) -> dict[str, object]:
+        detectors: list[dict[str, object]] = []
+        for detector in self._detectors:
+            detector_type = type(detector)
+            parameters: dict[str, object] = {}
+            for field_name in ("_finish_reasons", "_stop_reasons"):
+                if hasattr(detector, field_name):
+                    parameters[field_name.removeprefix("_")] = getattr(
+                        detector,
+                        field_name,
+                    )
+            descriptor: dict[str, object] = {
+                "class": f"{detector_type.__module__}.{detector_type.__qualname__}",
+                "name": str(getattr(detector, "name", detector_type.__name__)),
+            }
+            if parameters:
+                descriptor["parameters"] = parameters
+            detectors.append(descriptor)
+        return {
+            "action": "suppress_tool_calls",
+            "detectors": detectors,
+        }
+
     @classmethod
     def from_config(cls, config: SafetyFinishReasonConfig) -> SafetyFinishReasonMiddleware:
         """Construct from validated Pydantic config, honouring the

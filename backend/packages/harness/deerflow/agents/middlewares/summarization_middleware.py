@@ -107,6 +107,27 @@ class DeerFlowSummarizationMiddleware(SummarizationMiddleware):
         merged_tags = [*existing_tags, TAG_NOSTREAM] if TAG_NOSTREAM not in existing_tags else existing_tags
         self._summary_model = self.model.with_config(tags=merged_tags)
 
+    def release_policy_parameters(self) -> dict[str, object]:
+        """Return the effective compaction policy used for release identity."""
+        from ansich.release.canonical import sha256_canonical
+
+        from deerflow.runtime_descriptor import describe_model_identity
+
+        def plain_size(value: object) -> object:
+            if isinstance(value, tuple):
+                return [plain_size(child) for child in value]
+            if isinstance(value, list):
+                return [plain_size(child) for child in value]
+            return value
+
+        return {
+            "trigger": plain_size(self.trigger),
+            "keep": plain_size(self.keep),
+            "trim_tokens_to_summarize": self.trim_tokens_to_summarize,
+            "summary_prompt_hash": sha256_canonical(self.summary_prompt),
+            "summary_model": describe_model_identity(self.model),
+        }
+
     @override
     def _create_summary(self, messages_to_summarize: list[AnyMessage]) -> str | None:
         return self._summarize_with(messages_to_summarize)

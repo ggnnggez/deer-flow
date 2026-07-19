@@ -27,6 +27,7 @@ from deerflow.config.sandbox_config import SandboxConfig
 from deerflow.config.subagents_config import SubagentsAppConfig
 from deerflow.config.summarization_config import SummarizationConfig
 from deerflow.runtime.secret_context import write_slash_skill_source_path
+from deerflow.runtime_descriptor import describe_middleware
 from deerflow.skills.types import Skill, SkillCategory
 
 _POLICY_INTEGRATION_TOOL_CALLS: list[str] = []
@@ -249,6 +250,7 @@ def test_lead_agent_assembly_descriptor_uses_the_exact_compiled_inputs(monkeypat
     ]
     assert [type(middleware).__name__ for middleware in compiled_inputs["middleware"]] == [middleware.name for middleware in assembly.descriptor.middleware_chain]
     middleware_policy = assembly.descriptor.middleware_chain[0].public_parameters
+    assert middleware_policy["probed"] is True
     assert middleware_policy["trigger"] == ["fraction", 0.8]
     assert middleware_policy["keep"] == ["messages", 12]
     assert middleware_policy["trim_tokens_to_summarize"] == 4_000
@@ -259,6 +261,60 @@ def test_lead_agent_assembly_descriptor_uses_the_exact_compiled_inputs(monkeypat
     assert compiled_inputs["system_prompt"] == assembly.descriptor.rendered_base_prompt
     assert assembly.descriptor.requested_model == "effective-model"
     assert assembly.descriptor.effective_model == "effective-model"
+
+
+def test_runtime_descriptor_prefers_explicit_policy_contract_and_marks_probe_fallback():
+    class DeclaredMiddleware:
+        hard_limit = 99
+
+        def release_policy_parameters(self) -> dict[str, object]:
+            return {"hard_limit": 7, "strategy": "declared"}
+
+    class LegacyMiddleware:
+        hard_limit = 5
+
+    class BrokenContractMiddleware:
+        hard_limit = 3
+
+        def release_policy_parameters(self) -> dict[str, object]:
+            raise RuntimeError("broken third-party policy contract")
+
+    declared = describe_middleware(DeclaredMiddleware())
+    legacy = describe_middleware(LegacyMiddleware())
+    broken = describe_middleware(BrokenContractMiddleware())
+
+    assert declared.public_parameters == {"hard_limit": 7, "strategy": "declared"}
+    assert legacy.public_parameters == {"probed": True, "hard_limit": 5}
+    assert broken.public_parameters == {
+        "probed": True,
+        "contract_error": True,
+        "hard_limit": 3,
+    }
+
+
+def test_lead_release_policy_includes_effective_subagent_type_limits(monkeypatch):
+    app_config = _make_app_config([_make_model("effective-model", supports_thinking=False)])
+    app_config.subagents = SubagentsAppConfig(
+        timeout_seconds=321,
+        max_turns=17,
+    )
+    monkeypatch.setattr(
+        lead_agent_module,
+        "_available_subagent_names_for_release",
+        lambda _app_config: ["general-purpose"],
+    )
+
+    policy = lead_agent_module._subagent_release_policy(
+        app_config,
+        enabled=True,
+        max_concurrent=3,
+        max_total=6,
+    )
+
+    assert policy["type_allowlist"] == ["general-purpose"]
+    assert policy["runtime_limits"] == {
+        "general-purpose": {"max_turns": 17, "timeout_seconds": 321},
+    }
 
 
 def test_make_lead_agent_uses_runtime_app_config_from_context_without_global_read(monkeypatch):

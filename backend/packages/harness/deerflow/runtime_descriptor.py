@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import logging
 import os
 from importlib.metadata import PackageNotFoundError, version
+from typing import Protocol, runtime_checkable
 
 from ansich.release import (
     AgentRuntimeDescriptor,
@@ -25,6 +27,14 @@ _MODEL_BEHAVIOR_FIELDS = (
 )
 _MCP_FLAG = "deerflow_mcp"
 _MCP_SOURCE = "deerflow_mcp_source"
+logger = logging.getLogger(__name__)
+
+
+@runtime_checkable
+class ReleasePolicyProvider(Protocol):
+    """Explicit behavior-policy contract for middleware release identity."""
+
+    def release_policy_parameters(self) -> dict[str, object]: ...
 
 
 def _is_mcp_tool(tool: object) -> bool:
@@ -120,22 +130,28 @@ def _stable_type_name(value: object) -> str:
     return f"{value_type.__module__}.{value_type.__qualname__}"
 
 
-def _model_identity(value: object) -> dict[str, str]:
+def describe_model_identity(value: object) -> dict[str, str]:
+    original = value
     if isinstance(value, str):
         return {"class": "builtins.str", "name": value}
     resolved = value
     seen: set[int] = set()
-    while hasattr(resolved, "bound") and id(resolved) not in seen:
+    for _ in range(8):
+        if not hasattr(resolved, "bound") or id(resolved) in seen:
+            break
         seen.add(id(resolved))
         bound = getattr(resolved, "bound")
         if bound is None or bound is resolved:
             break
         resolved = bound
     identity = {"class": _stable_type_name(resolved)}
-    for field_name in _MODEL_IDENTITY_FIELDS:
-        field_value = getattr(resolved, field_name, None)
-        if isinstance(field_value, str) and field_value:
-            identity["name"] = field_value
+    for candidate in (resolved, original):
+        for field_name in _MODEL_IDENTITY_FIELDS:
+            field_value = getattr(candidate, field_name, None)
+            if isinstance(field_value, str) and field_value:
+                identity["name"] = field_value
+                break
+        if "name" in identity:
             break
     return identity
 
@@ -221,7 +237,7 @@ def describe_tool(tool: object, *, deferred_names: frozenset[str] = frozenset())
     )
 
 
-def describe_middleware(middleware: object) -> MiddlewareRuntimeDescriptor:
+def _probe_middleware_parameters(middleware: object) -> dict[str, object]:
     parameters: dict[str, object] = {}
     for field_name in _MIDDLEWARE_PUBLIC_FIELDS:
         if not hasattr(middleware, field_name):
@@ -236,7 +252,7 @@ def describe_middleware(middleware: object) -> MiddlewareRuntimeDescriptor:
             parameters[f"{field_name}_hash"] = sha256_canonical(raw_value)
     model = getattr(middleware, "model", None)
     if model is not None:
-        parameters["model"] = _model_identity(model)
+        parameters["model"] = describe_model_identity(model)
     provider = getattr(middleware, "provider", None)
     if provider is not None:
         parameters["provider"] = _provider_identity(provider)
@@ -270,6 +286,30 @@ def describe_middleware(middleware: object) -> MiddlewareRuntimeDescriptor:
     plain_config = _plain_value(config)
     if isinstance(plain_config, dict):
         parameters["config"] = plain_config
+    return parameters
+
+
+def describe_middleware(middleware: object) -> MiddlewareRuntimeDescriptor:
+    policy_provider = getattr(middleware, "release_policy_parameters", None)
+    if callable(policy_provider):
+        try:
+            parameters = _plain_value(policy_provider())
+            if not isinstance(parameters, dict):
+                raise TypeError("release_policy_parameters() must return a plain dict")
+        except Exception:
+            logger.warning(
+                "%s release policy contract failed; falling back to probed parameters",
+                type(middleware).__name__,
+                exc_info=True,
+            )
+            parameters = {
+                "probed": True,
+                "contract_error": True,
+                **_probe_middleware_parameters(middleware),
+            }
+    else:
+        parameters = _probe_middleware_parameters(middleware)
+        parameters = {"probed": True, **parameters}
     return MiddlewareRuntimeDescriptor(
         name=type(middleware).__name__,
         public_parameters=parameters,
@@ -356,7 +396,9 @@ def build_runtime_descriptor(
 
 
 __all__ = [
+    "ReleasePolicyProvider",
     "build_runtime_descriptor",
+    "describe_model_identity",
     "describe_middleware",
     "describe_tool",
 ]

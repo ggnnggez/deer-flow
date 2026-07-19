@@ -590,6 +590,9 @@ class ToolOutputBudgetMiddleware(AgentMiddleware[AgentState]):
         super().__init__()
         self._config = config if config is not None else _default_config()
 
+    def release_policy_parameters(self) -> dict[str, object]:
+        return {"config": self._config.model_dump(mode="python")}
+
     @classmethod
     def from_app_config(cls, app_config: Any) -> ToolOutputBudgetMiddleware:
         tool_output = getattr(app_config, "tool_output", None)

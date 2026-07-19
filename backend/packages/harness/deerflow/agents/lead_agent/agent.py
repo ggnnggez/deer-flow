@@ -77,6 +77,46 @@ def _default_max_total_subagents(app_config: object) -> int:
     return getattr(subagents_config, "max_total_per_run", DEFAULT_MAX_TOTAL_SUBAGENTS_PER_RUN)
 
 
+def _available_subagent_names_for_release(app_config: AppConfig) -> list[str]:
+    from deerflow.subagents import get_available_subagent_names
+
+    return get_available_subagent_names(app_config=app_config)
+
+
+def _subagent_release_policy(
+    app_config: AppConfig,
+    *,
+    enabled: bool,
+    max_concurrent: int,
+    max_total: int,
+) -> dict[str, object]:
+    policy: dict[str, object] = {
+        "enabled": enabled,
+        "max_concurrent": max_concurrent,
+        "max_total": max_total,
+        "type_allowlist": [],
+        "runtime_limits": {},
+    }
+    if not enabled:
+        return policy
+
+    from deerflow.subagents import get_subagent_config
+
+    type_allowlist = sorted(set(_available_subagent_names_for_release(app_config)))
+    runtime_limits: dict[str, object] = {}
+    for name in type_allowlist:
+        subagent_config = get_subagent_config(name, app_config=app_config)
+        if subagent_config is None:
+            continue
+        runtime_limits[name] = {
+            "max_turns": subagent_config.max_turns,
+            "timeout_seconds": subagent_config.timeout_seconds,
+        }
+    policy["type_allowlist"] = type_allowlist
+    policy["runtime_limits"] = runtime_limits
+    return policy
+
+
 def _append_memory_tools_without_name_conflicts(tools: list) -> None:
     """Append memory tools without dropping unrelated duplicate-named tools."""
     from deerflow.agents.memory.tools import get_memory_tools
@@ -694,11 +734,12 @@ def _assemble_lead_agent(config: RunnableConfig, *, app_config: AppConfig) -> Le
                 "bootstrap": True,
                 "non_interactive": non_interactive,
                 "plan_mode": is_plan_mode,
-                "subagents": {
-                    "enabled": subagent_enabled,
-                    "max_concurrent": max_concurrent_subagents,
-                    "max_total": max_total_subagents,
-                },
+                "subagents": _subagent_release_policy(
+                    resolved_app_config,
+                    enabled=subagent_enabled,
+                    max_concurrent=max_concurrent_subagents,
+                    max_total=max_total_subagents,
+                ),
                 "deferred_tools": {
                     "enabled": resolved_app_config.tool_search.enabled,
                     "catalog_hash": setup.catalog_hash,
@@ -804,11 +845,12 @@ def _assemble_lead_agent(config: RunnableConfig, *, app_config: AppConfig) -> Le
             "bootstrap": False,
             "non_interactive": non_interactive,
             "plan_mode": is_plan_mode,
-            "subagents": {
-                "enabled": subagent_enabled,
-                "max_concurrent": max_concurrent_subagents,
-                "max_total": max_total_subagents,
-            },
+            "subagents": _subagent_release_policy(
+                resolved_app_config,
+                enabled=subagent_enabled,
+                max_concurrent=max_concurrent_subagents,
+                max_total=max_total_subagents,
+            ),
             "deferred_tools": {
                 "enabled": resolved_app_config.tool_search.enabled,
                 "catalog_hash": setup.catalog_hash,

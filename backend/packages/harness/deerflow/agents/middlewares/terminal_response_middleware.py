@@ -80,6 +80,15 @@ class TerminalResponseMiddleware(AgentMiddleware[AgentState]):
         self._retry_counts: BoundedDict[tuple[str, str], int] = BoundedDict(1000)
         self._pending_prompts: BoundedDict[tuple[str, str], bool] = BoundedDict(1000)
 
+    def release_policy_parameters(self) -> dict[str, object]:
+        from ansich.release.canonical import sha256_canonical
+
+        return {
+            "post_tool_empty_retry_limit": 1,
+            "recovery_prompt_hash": sha256_canonical(_RECOVERY_PROMPT),
+            "fallback_content_hash": sha256_canonical(_FALLBACK_CONTENT),
+        }
+
     @staticmethod
     def _key(runtime: Runtime) -> tuple[str, str]:
         context = getattr(runtime, "context", None)

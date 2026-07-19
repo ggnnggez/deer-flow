@@ -136,6 +136,127 @@ def test_runtime_secret_changes_do_not_change_release_identity() -> None:
     assert build_agent_release(first).fingerprint.release_hash == build_agent_release(second).fingerprint.release_hash
 
 
+def test_phase7_policy_manifest_v1_paths_are_pinned() -> None:
+    descriptor = _descriptor(
+        middleware_chain=(
+            MiddlewareRuntimeDescriptor(
+                name="DeerFlowSummarizationMiddleware",
+                public_parameters={
+                    "trigger": ["tokens", 8000],
+                    "keep": ["messages", 12],
+                    "summary_model": {"class": "provider.ChatModel", "name": "summary-v1"},
+                },
+            ),
+            MiddlewareRuntimeDescriptor(
+                name="ToolOutputBudgetMiddleware",
+                public_parameters={
+                    "config": {
+                        "externalize_min_chars": 12000,
+                        "fallback_max_chars": 30000,
+                    }
+                },
+            ),
+            MiddlewareRuntimeDescriptor(
+                name="TokenBudgetMiddleware",
+                public_parameters={"config": {"max_tokens": 100000, "hard_stop_threshold": 1.0}},
+            ),
+            MiddlewareRuntimeDescriptor(
+                name="LoopDetectionMiddleware",
+                public_parameters={"warn_threshold": 3, "hard_limit": 5, "window_size": 20},
+            ),
+            MiddlewareRuntimeDescriptor(
+                name="GuardrailMiddleware",
+                public_parameters={"policy": {"id": "policy", "version": "1"}},
+            ),
+            MiddlewareRuntimeDescriptor(name="TodoMiddleware", public_parameters={"state_channel": "todos"}),
+            MiddlewareRuntimeDescriptor(
+                name="DeferredToolFilterMiddleware",
+                public_parameters={"promotion_scope": "graph_state_catalog_hash"},
+            ),
+            MiddlewareRuntimeDescriptor(name="TerminalResponseMiddleware"),
+            MiddlewareRuntimeDescriptor(name="SafetyFinishReasonMiddleware"),
+        ),
+        effective_policies={
+            "recursion_limit": 73,
+            "non_interactive": False,
+            "plan_mode": True,
+            "subagents": {
+                "enabled": True,
+                "type_allowlist": ["general-purpose"],
+                "runtime_limits": {
+                    "general-purpose": {"max_turns": 150, "timeout_seconds": 1800},
+                },
+            },
+            "deferred_tools": {"enabled": True, "catalog_hash": "catalog"},
+            "deferred_skills": True,
+        },
+    )
+
+    policy = build_agent_release(descriptor).manifest.policy
+    by_name = {item.name: item.public_parameters for item in policy.middleware_chain}
+
+    assert [item.name for item in policy.middleware_chain] == [
+        "DeerFlowSummarizationMiddleware",
+        "ToolOutputBudgetMiddleware",
+        "TokenBudgetMiddleware",
+        "LoopDetectionMiddleware",
+        "GuardrailMiddleware",
+        "TodoMiddleware",
+        "DeferredToolFilterMiddleware",
+        "TerminalResponseMiddleware",
+        "SafetyFinishReasonMiddleware",
+    ]
+    assert by_name["DeerFlowSummarizationMiddleware"]["trigger"] == ["tokens", 8000]
+    assert by_name["DeerFlowSummarizationMiddleware"]["keep"] == ["messages", 12]
+    assert by_name["DeerFlowSummarizationMiddleware"]["summary_model"]["name"] == "summary-v1"
+    assert by_name["ToolOutputBudgetMiddleware"]["config"]["fallback_max_chars"] == 30000
+    assert by_name["ToolOutputBudgetMiddleware"]["config"]["externalize_min_chars"] == 12000
+    assert by_name["TokenBudgetMiddleware"]["config"]["max_tokens"] == 100000
+    assert by_name["LoopDetectionMiddleware"]["hard_limit"] == 5
+    assert by_name["GuardrailMiddleware"]["policy"] == {"id": "policy", "version": "1"}
+    assert policy.values["recursion_limit"] == 73
+    assert policy.values["subagents"]["type_allowlist"] == ["general-purpose"]
+    assert policy.values["subagents"]["runtime_limits"]["general-purpose"] == {
+        "max_turns": 150,
+        "timeout_seconds": 1800,
+    }
+    assert policy.values["plan_mode"] is True
+    assert policy.values["non_interactive"] is False
+    assert policy.values["deferred_tools"]["enabled"] is True
+    assert policy.values["deferred_skills"] is True
+    assert by_name["TodoMiddleware"]["state_channel"] == "todos"
+    assert by_name["DeferredToolFilterMiddleware"]["promotion_scope"] == "graph_state_catalog_hash"
+    assert "TerminalResponseMiddleware" in by_name
+    assert "SafetyFinishReasonMiddleware" in by_name
+
+
+def test_middleware_probe_fallback_marker_survives_release_sanitization() -> None:
+    probed_descriptor = _descriptor(
+        middleware_chain=(
+            MiddlewareRuntimeDescriptor(
+                name="LegacyMiddleware",
+                public_parameters={"probed": True, "limit": 5},
+            ),
+        )
+    )
+    declared_descriptor = probed_descriptor.model_copy(
+        update={
+            "middleware_chain": (
+                MiddlewareRuntimeDescriptor(
+                    name="LegacyMiddleware",
+                    public_parameters={"limit": 5},
+                ),
+            )
+        }
+    )
+
+    probed = build_agent_release(probed_descriptor)
+    declared = build_agent_release(declared_descriptor)
+
+    assert probed.manifest.policy.middleware_chain[0].public_parameters["probed"] is True
+    assert probed.fingerprint.policy_hash != declared.fingerprint.policy_hash
+
+
 @pytest.mark.parametrize(
     ("reported", "expected"),
     [

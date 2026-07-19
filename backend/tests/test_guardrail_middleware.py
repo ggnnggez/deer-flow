@@ -83,6 +83,28 @@ class _ExplodingProvider:
 
 
 class TestAllowlistProvider:
+    def test_release_policy_contract_has_stable_identity_and_effective_rules(self):
+        provider = AllowlistProvider(
+            allowed_tools=["web_search", "read_file"],
+            denied_tools=["bash"],
+        )
+        middleware = GuardrailMiddleware(provider, fail_closed=True, passport="ops-policy")
+
+        policy = middleware.release_policy_parameters()
+
+        assert policy == {
+            "fail_closed": True,
+            "passport": "ops-policy",
+            "policy": {
+                "id": "deerflow.guardrails.allowlist",
+                "version": "1.0.0",
+            },
+            "provider_parameters": {
+                "allowed_tools": ["read_file", "web_search"],
+                "denied_tools": ["bash"],
+            },
+        }
+
     def test_no_restrictions_allows_all(self):
         provider = AllowlistProvider()
         req = GuardrailRequest(tool_name="bash", tool_input={})
