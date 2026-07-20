@@ -497,6 +497,13 @@ export const enUS: Translations = {
     dwell: "Dwell",
     heartbeat: "Heartbeat",
     localUsage: "Local usage",
+    inclusiveUsage: "Inclusive usage",
+    contributionSources: "Contribution sources by Task",
+    activeChildren: "{count} active children",
+    taskTree: "Task tree",
+    taskTreeDescription:
+      "Lead and delegated Tasks. Select a node to inspect its own timeline.",
+    taskTreeTruncated: "More related Tasks exist beyond the displayed depth.",
     budgets: "Budgets",
     agentRelease: "Agent release",
     noAgentRelease: "No Agent release was resolved for this Task.",

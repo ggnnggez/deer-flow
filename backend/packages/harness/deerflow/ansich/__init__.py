@@ -14,11 +14,32 @@ class _UnavailableBackend:
     async def get_task_by_source(self, source_kind, source_id):
         return None
 
-    async def list_tasks(self, *, limit=100, control=None, from_time=None, to_time=None, cursor=None):
+    async def list_tasks(
+        self,
+        *,
+        limit=100,
+        control=None,
+        lifecycle_scope="all",
+        from_time=None,
+        to_time=None,
+        cursor=None,
+        root_only=False,
+    ):
         return []
 
     async def list_observations(self, task_id):
         return []
+
+    async def list_task_children(self, task_id):
+        return []
+
+    async def list_task_tree_spawns(self, task_id, *, direction, depth):
+        return [], False
+
+    async def get_task_usage_breakdown(self, task_id, *, scope):
+        from ansich.usage import TaskUsageBreakdownView
+
+        return TaskUsageBreakdownView(task_id=task_id, scope=scope, sources=())
 
 
 def create_sql_ansich_service(

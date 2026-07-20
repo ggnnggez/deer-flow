@@ -29,6 +29,8 @@ import {
   fetchAnsichTaskUsage,
   fetchAnsichAgentReleases,
   fetchAnsichTaskAgentRelease,
+  fetchAnsichTaskChildren,
+  fetchAnsichTaskTree,
 } from "@/core/ansich/api";
 import { fetch } from "@/core/api/fetcher";
 
@@ -86,6 +88,20 @@ describe("Ansich API", () => {
     );
   });
 
+  it("can restrict Task history to top-level roots", async () => {
+    mockedFetch.mockResolvedValue(
+      jsonResponse({ items: [], projection_status: { status: "healthy" } }),
+    );
+
+    await fetchAnsichTasks(75, "terminal", undefined, true);
+
+    expect(mockedFetch).toHaveBeenCalledWith(
+      expect.stringContaining(
+        "/api/ansich/tasks?limit=75&lifecycle_scope=terminal&root_only=true",
+      ),
+    );
+  });
+
   it("pages Task compression summaries independently from timeline", async () => {
     mockedFetch.mockResolvedValue(
       jsonResponse({ items: [], projection_status: { status: "healthy" } }),
@@ -109,14 +125,22 @@ describe("Ansich API", () => {
     const taskId = "task/operations";
 
     await fetchAnsichActiveTasks(75);
-    await fetchAnsichTaskUsage(taskId);
+    await fetchAnsichTaskUsage(taskId, "inclusive");
     await fetchAnsichTaskBudgets(taskId);
+    await fetchAnsichTaskChildren(taskId);
+    await fetchAnsichTaskTree(taskId, "both", 4);
 
     const encoded = encodeURIComponent(taskId);
     expect(mockedFetch.mock.calls.map((call) => call[0])).toEqual([
       expect.stringContaining("/api/ansich/operations/active-tasks?limit=75"),
-      expect.stringContaining(`/api/ansich/tasks/${encoded}/usage`),
+      expect.stringContaining(
+        `/api/ansich/tasks/${encoded}/usage?scope=inclusive`,
+      ),
       expect.stringContaining(`/api/ansich/tasks/${encoded}/budgets`),
+      expect.stringContaining(`/api/ansich/tasks/${encoded}/children`),
+      expect.stringContaining(
+        `/api/ansich/tasks/${encoded}/tree?direction=both&depth=4`,
+      ),
     ]);
   });
 

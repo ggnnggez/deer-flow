@@ -14,8 +14,9 @@ from ansich.operations import ActiveTaskView, HeartbeatBelief
 from ansich.operator import OperatorActionView, TaskActionTarget
 from ansich.release import AgentReleaseDetailView, AgentReleaseSummaryView, TaskAgentReleaseView
 from ansich.step import ContentBlockPayloadView, ContentOccurrenceView, ContextSnapshotView, LlmAttemptView, StepView
+from ansich.task_tree import TaskSpawnView, TaskTreeDirection
 from ansich.tool import ContentDerivationView, ToolCallView
-from ansich.usage import TaskUsageView
+from ansich.usage import AggregationScope, TaskUsageBreakdownView, TaskUsageView
 
 
 class AnsichBackend(Protocol):
@@ -60,9 +61,20 @@ class AnsichBackend(Protocol):
         from_time: datetime | None = None,
         to_time: datetime | None = None,
         cursor: tuple[datetime, str] | None = None,
+        root_only: bool = False,
     ) -> list[TaskView]: ...
 
     async def list_observations(self, task_id: str) -> list[ObservationEnvelope]: ...
+
+    async def list_task_children(self, task_id: str) -> list[TaskSpawnView]: ...
+
+    async def list_task_tree_spawns(
+        self,
+        task_id: str,
+        *,
+        direction: TaskTreeDirection,
+        depth: int,
+    ) -> tuple[list[TaskSpawnView], bool]: ...
 
     async def list_alerts(
         self,
@@ -128,6 +140,13 @@ class AnsichBackend(Protocol):
     ) -> OperatorActionView | None: ...
 
     async def get_task_usage(self, task_id: str) -> TaskUsageView: ...
+
+    async def get_task_usage_breakdown(
+        self,
+        task_id: str,
+        *,
+        scope: AggregationScope,
+    ) -> TaskUsageBreakdownView: ...
 
     async def get_task_budgets(self, task_id: str) -> TaskBudgetsView: ...
 

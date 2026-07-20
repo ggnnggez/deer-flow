@@ -479,12 +479,25 @@ async def run_agent(
             return RunnableConfig(**continuation_config)
 
         if ctx.app_config is not None and _agent_factory_supports_app_config(agent_factory):
-            agent = agent_factory(config=initial_runnable_config, app_config=ctx.app_config)
+            agent_result = agent_factory(config=initial_runnable_config, app_config=ctx.app_config)
         else:
-            agent = agent_factory(config=initial_runnable_config)
+            agent_result = agent_factory(config=initial_runnable_config)
+
+        descriptor = None
+        try:
+            from deerflow.agents.lead_agent.agent import LeadAgentAssembly
+
+            if isinstance(agent_result, LeadAgentAssembly):
+                agent = agent_result.graph
+                descriptor = agent_result.descriptor
+            else:
+                agent = agent_result
+        except Exception:
+            # Third-party/custom graph factories keep the historical graph-only
+            # contract even if importing the lead assembly type fails.
+            agent = agent_result
 
         if ansich_task is not None:
-            descriptor = runtime_ctx.get("__ansich_agent_runtime_descriptor")
             if descriptor is None:
                 descriptor = getattr(
                     agent,

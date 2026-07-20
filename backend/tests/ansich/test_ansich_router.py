@@ -43,6 +43,131 @@ def regular_user() -> User:
 
 
 @pytest.mark.anyio
+async def test_admin_can_query_task_children_tree_and_selected_usage_scope():
+    service = AnsichService.in_memory()
+    await service.start()
+    parent_task_id = new_id()
+    child_task_id = new_id()
+    sibling_task_id = new_id()
+    step_id = new_id()
+    tool_call_id = new_id()
+    observed_at = datetime(2026, 7, 20, 12, 0, tzinfo=UTC)
+    try:
+        service.record_batch(
+            (
+                ObservationEnvelope.task_lifecycle(
+                    kind="task.created",
+                    task_id=parent_task_id,
+                    source_kind="deerflow_run",
+                    source_id="tree-api-parent",
+                    occurred_at=observed_at,
+                    source_event_id="run:tree-api-parent:task:created",
+                ),
+                ObservationEnvelope.task_lifecycle(
+                    kind="task.created",
+                    task_id=child_task_id,
+                    source_kind="deerflow_subagent",
+                    source_id="tree-api-child",
+                    occurred_at=observed_at,
+                    source_event_id="subagent:tree-api-child:task:created",
+                    attributes={
+                        "parent_task_id": parent_task_id,
+                        "spawning_step_id": step_id,
+                        "spawning_tool_call_id": tool_call_id,
+                        "subagent_name": "researcher",
+                    },
+                ),
+                ObservationEnvelope(
+                    kind="step.started",
+                    occurred_at=observed_at,
+                    task_id=parent_task_id,
+                    step_id=step_id,
+                    subject_type="step",
+                    subject_id=step_id,
+                    producer=Producer(
+                        name="tree-api-test",
+                        version="1",
+                        instance_id="test",
+                    ),
+                    source_event_id=f"step:{step_id}:started",
+                    correlation_id=parent_task_id,
+                    payload={"step_seq": 1, "actor_kind": "lead_agent"},
+                ),
+                ObservationEnvelope.task_lifecycle(
+                    kind="task.created",
+                    task_id=sibling_task_id,
+                    source_kind="deerflow_subagent",
+                    source_id="tree-api-sibling",
+                    occurred_at=observed_at,
+                    source_event_id="subagent:tree-api-sibling:task:created",
+                    attributes={
+                        "parent_task_id": parent_task_id,
+                        "spawning_step_id": new_id(),
+                        "spawning_tool_call_id": new_id(),
+                        "subagent_name": "writer",
+                    },
+                ),
+            )
+        )
+        await service.flush_task(parent_task_id)
+        await service.flush_task(child_task_id)
+        await service.flush_task(sibling_task_id)
+        app = make_authed_test_app(user_factory=admin_user)
+        app.state.ansich_service = service
+        app.include_router(ansich_router.router)
+        async with AsyncClient(
+            transport=ASGITransport(app=app),
+            base_url="http://test",
+        ) as client:
+            children = await client.get(f"/api/ansich/tasks/{parent_task_id}/children")
+            tree = await client.get(
+                f"/api/ansich/tasks/{parent_task_id}/tree",
+                params={"direction": "both", "depth": 4},
+            )
+            child_tree = await client.get(
+                f"/api/ansich/tasks/{child_task_id}/tree",
+                params={"direction": "both", "depth": 4},
+            )
+            root_tasks = await client.get(
+                "/api/ansich/tasks",
+                params={"root_only": "true"},
+            )
+            usage = await client.get(
+                f"/api/ansich/tasks/{parent_task_id}/usage",
+                params={"scope": "inclusive"},
+            )
+            excessive_depth = await client.get(
+                f"/api/ansich/tasks/{parent_task_id}/tree",
+                params={"depth": 33},
+            )
+    finally:
+        await service.stop()
+
+    assert children.status_code == 200
+    assert children.json()["items"][0]["child_task_id"] == child_task_id
+    assert tree.status_code == 200
+    assert {node["task"]["task_id"] for node in tree.json()["tree"]["nodes"]} == {
+        parent_task_id,
+        child_task_id,
+        sibling_task_id,
+    }
+    assert {node["task"]["task_id"] for node in child_tree.json()["tree"]["nodes"]} == {parent_task_id, child_task_id}
+    assert root_tasks.status_code == 200
+    assert [item["task_id"] for item in root_tasks.json()["items"]] == [parent_task_id]
+    assert tree.json()["tree"]["truncated"] is False
+    assert usage.status_code == 200
+    assert usage.json()["scope"] == "inclusive"
+    assert usage.json()["values"] == usage.json()["usage"]["inclusive"]
+    assert usage.json()["sources"] == [
+        {
+            "source_task_id": parent_task_id,
+            "values": usage.json()["values"],
+        }
+    ]
+    assert excessive_depth.status_code == 422
+
+
+@pytest.mark.anyio
 async def test_admin_can_inspect_compare_and_audit_raw_agent_release_manifest(
     caplog,
 ):
@@ -777,6 +902,8 @@ async def test_regular_user_is_forbidden_from_ansich_operations():
         snapshot_response = await client.get(f"/api/ansich/context-snapshots/{new_id()}")
         active_response = await client.get("/api/ansich/operations/active-tasks")
         usage_response = await client.get(f"/api/ansich/tasks/{new_id()}/usage")
+        children_response = await client.get(f"/api/ansich/tasks/{new_id()}/children")
+        tree_response = await client.get(f"/api/ansich/tasks/{new_id()}/tree")
         budgets_response = await client.get(f"/api/ansich/tasks/{new_id()}/budgets")
 
     assert response.status_code == 403
@@ -790,6 +917,8 @@ async def test_regular_user_is_forbidden_from_ansich_operations():
     assert snapshot_response.status_code == 403
     assert active_response.status_code == 403
     assert usage_response.status_code == 403
+    assert children_response.status_code == 403
+    assert tree_response.status_code == 403
     assert budgets_response.status_code == 403
 
 

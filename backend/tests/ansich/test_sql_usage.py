@@ -76,13 +76,17 @@ async def test_sql_usage_is_idempotent_and_preserves_unknown_token_dimensions(tm
         await engine.dispose()
 
     assert usage == rebuilt
-    assert usage.inclusive_status == "not_available"
+    assert usage.inclusive_status == "available"
     assert [(item.dimension, item.value) for item in usage.local] == [
         ("total_tokens", 41),
         ("llm_attempts", 1),
     ]
     assert usage.local[0].as_of == response.occurred_at
     assert usage.local[0].complete_through_ingest_seq > 0
+    assert [(item.dimension, item.value) for item in usage.inclusive] == [
+        ("total_tokens", 41),
+        ("llm_attempts", 1),
+    ]
 
 
 @pytest.mark.anyio

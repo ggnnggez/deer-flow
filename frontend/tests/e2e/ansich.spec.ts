@@ -3,12 +3,14 @@ import { expect, test } from "@playwright/test";
 import { mockLangGraphAPI } from "./utils/mock-api";
 
 const TASK_ID = "8a54d86c-b524-4f18-83e8-79b729c2a695";
+const CHILD_TASK_ID = "6a54d86c-b524-4f18-83e8-79b729c2a696";
 const HISTORY_TASK_ID = "7b43c75b-a413-4e07-92d7-68a618b1f584";
 const STEP_ID = "bb24aa10-f647-4c07-959a-0594087c818c";
 const BLOCK_ID = "d62dc6fd-4a91-4d32-95ae-3be8e1ddb1a9";
 const TOOL_CALL_ID = "3d4a8ed4-3996-41cb-9181-558ca744867b";
 const TOOL_RAW_BLOCK_ID = "967ddaf9-057c-4b8c-88f7-a59476eb50d5";
 const TOOL_VISIBLE_BLOCK_ID = "bb695124-12f7-48fd-bc4e-54058924d85a";
+const CHILD_OUTPUT_BLOCK_ID = "fd1a78d9-e7bb-4df7-b024-175dccbcac82";
 const COMPRESSION_ID = "ac695124-12f7-48fd-bc4e-54058924d85a";
 const OLDER_COMPRESSION_ID = "9c695124-12f7-48fd-bc4e-54058924d85a";
 const SUMMARY_BLOCK_ID = "cc695124-12f7-48fd-bc4e-54058924d85a";
@@ -49,6 +51,7 @@ const TASK = {
   source_id: "run-e2e",
   tool_calls_issued: 1,
   tool_calls_executed: 1,
+  observability_status: "healthy",
   control: {
     value: "completed",
     as_of: "2026-07-17T12:00:03Z",
@@ -101,8 +104,10 @@ const ACTIVE_TASK = {
   usage: {
     task_id: TASK_ID,
     local: [],
-    inclusive_status: "not_available",
+    inclusive: [],
+    inclusive_status: "available",
   },
+  active_child_count: 1,
   budgets: { task_id: TASK_ID, budgets: [] },
   budget_health: [],
   duration_ms: 3_000,
@@ -134,6 +139,118 @@ test("admin navigates from Ansich operations to evidence-backed Task detail", as
       status: 200,
       contentType: "application/json",
       body: JSON.stringify({ task: TASK, projection_status: HEALTH }),
+    }),
+  );
+  await page.route(`**/api/ansich/tasks/${TASK_ID}/tree?*`, (route) =>
+    route.fulfill({
+      status: 200,
+      contentType: "application/json",
+      body: JSON.stringify({
+        tree: {
+          root_task_id: TASK_ID,
+          direction: "both",
+          depth: 4,
+          nodes: [
+            {
+              task: TASK,
+              agent_release: null,
+              heartbeat: null,
+              current_step: null,
+              usage: {
+                task_id: TASK_ID,
+                local: [],
+                inclusive: [],
+                inclusive_status: "available",
+              },
+            },
+            {
+              task: {
+                ...TASK,
+                task_id: CHILD_TASK_ID,
+                source_kind: "deerflow_subagent",
+                source_id: "provider-task-e2e",
+              },
+              agent_release: null,
+              heartbeat: null,
+              current_step: {
+                step_id: STEP_ID,
+                step_seq: 1,
+                actor_kind: "subagent",
+                status: "acting",
+              },
+              usage: {
+                task_id: CHILD_TASK_ID,
+                local: [],
+                inclusive: [],
+                inclusive_status: "available",
+              },
+            },
+          ],
+          edges: [
+            {
+              parent_task_id: TASK_ID,
+              spawning_step_id: STEP_ID,
+              spawning_tool_call_id: TOOL_CALL_ID,
+              child_task_id: CHILD_TASK_ID,
+              established_obs_id: "spawn-e2e",
+              subagent_name: "researcher",
+            },
+          ],
+          truncated: false,
+        },
+        projection_status: HEALTH,
+      }),
+    }),
+  );
+  await page.route(`**/api/ansich/tasks/${TASK_ID}/usage?*`, (route) => {
+    const scope = new URL(route.request().url()).searchParams.get("scope");
+    const localValue = {
+      dimension: "total_tokens",
+      aggregation_scope: "local",
+      value: 100,
+      as_of: "2026-07-17T12:00:03Z",
+      complete_through_ingest_seq: 40,
+    };
+    const inclusiveValue = {
+      ...localValue,
+      aggregation_scope: "inclusive",
+      value: 160,
+    };
+    return route.fulfill({
+      status: 200,
+      contentType: "application/json",
+      body: JSON.stringify({
+        usage: {
+          task_id: TASK_ID,
+          local: [localValue],
+          inclusive: [inclusiveValue],
+          inclusive_status: "available",
+        },
+        scope,
+        values: scope === "inclusive" ? [inclusiveValue] : [localValue],
+        sources:
+          scope === "inclusive"
+            ? [
+                { source_task_id: TASK_ID, values: [localValue] },
+                {
+                  source_task_id: CHILD_TASK_ID,
+                  values: [{ ...inclusiveValue, value: 60 }],
+                },
+              ]
+            : [{ source_task_id: TASK_ID, values: [localValue] }],
+        projection_status: HEALTH,
+      }),
+    });
+  });
+  await page.route(`**/api/ansich/tasks/${TASK_ID}/budgets`, (route) =>
+    route.fulfill({
+      status: 200,
+      contentType: "application/json",
+      body: JSON.stringify({
+        budgets: { task_id: TASK_ID, budgets: [] },
+        health: [],
+        projection_status: HEALTH,
+      }),
     }),
   );
   await page.route(`**/api/ansich/tasks/${TASK_ID}/timeline`, (route) =>
@@ -537,8 +654,32 @@ test("admin navigates from Ansich operations to evidence-backed Task detail", as
                 },
                 depth: 0,
               },
+              {
+                block_id: CHILD_OUTPUT_BLOCK_ID,
+                kind: "assistant_output",
+                content_hash:
+                  "9ca1ab1e00000000000000000000000000000000000000000000000000000000",
+                byte_size: 24,
+                token_estimate: 6,
+                sensitivity_flags: [],
+                payload_status: "available",
+                producer: {
+                  producer_kind: "subagent_task",
+                  producer_entity_id: CHILD_TASK_ID,
+                  producer_obs_id: "33bd27c7-51b1-4164-9380-b98c40c2bfe0",
+                },
+                depth: 1,
+              },
             ],
-            edges: [],
+            edges: [
+              {
+                derived_block_id: BLOCK_ID,
+                source_block_id: CHILD_OUTPUT_BLOCK_ID,
+                transform_kind: "visible_result",
+                transform_version: "1",
+                established_obs_id: "43bd27c7-51b1-4164-9380-b98c40c2bfe0",
+              },
+            ],
             truncated: false,
             truncation_reason: null,
             unknown_gaps: [],
@@ -679,7 +820,17 @@ test("admin navigates from Ansich operations to evidence-backed Task detail", as
 
   await page.waitForURL(`**/workspace/ansich/tasks/${TASK_ID}`);
   await expect(page.getByRole("heading", { name: TASK_ID })).toBeVisible();
+  await expect(page.getByText("Task tree", { exact: true })).toBeVisible();
+  await expect(page.getByText(CHILD_TASK_ID, { exact: true })).toBeVisible();
   await expect(page.getByText("task-control@1", { exact: true })).toBeVisible();
+  await page.getByRole("tab", { name: "Budgets" }).click();
+  await page.getByRole("button", { name: "Inclusive usage" }).click();
+  await expect(page.getByText("160", { exact: true })).toBeVisible();
+  await page.getByText("Contribution sources by Task", { exact: true }).click();
+  await expect(page.getByText(CHILD_TASK_ID, { exact: true })).toBeVisible();
+  await expect(
+    page.getByText("total_tokens: 60", { exact: true }),
+  ).toBeVisible();
   await page.getByRole("tab", { name: "Lifecycle timeline" }).click();
   await expect(page.getByText("task.completed", { exact: true })).toBeVisible();
   await page.getByRole("tab", { name: "Steps" }).click();
@@ -695,6 +846,11 @@ test("admin navigates from Ansich operations to evidence-backed Task detail", as
   expect(lineageRequests).toBe(0);
   await page.getByRole("button", { name: "Trace sources" }).click();
   await expect(page.getByText("provenance", { exact: true })).toBeVisible();
+  await expect(
+    page
+      .getByRole("link", { name: `subagent_task:${CHILD_TASK_ID}` })
+      .first(),
+  ).toHaveAttribute("href", `/workspace/ansich/tasks/${CHILD_TASK_ID}`);
   expect(lineageRequests).toBe(1);
   await expect(
     page.getByRole("button", { name: "Load compression #1" }),
@@ -738,6 +894,7 @@ test("operations keeps terminal Task history separate from running work", async 
   await page.route("**/api/ansich/tasks?*", (route) => {
     const query = new URL(route.request().url()).searchParams;
     expect(query.get("lifecycle_scope")).toBe("terminal");
+    expect(query.get("root_only")).toBe("true");
     const cursor = query.get("cursor");
     return route.fulfill({
       status: 200,

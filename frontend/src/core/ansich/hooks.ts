@@ -23,6 +23,7 @@ import {
   fetchAnsichTaskUsage,
   fetchAnsichTaskAgentRelease,
   fetchAnsichTasks,
+  fetchAnsichTaskTree,
 } from "./api";
 import type {
   AnsichActiveTaskListResponse,
@@ -194,7 +195,8 @@ export function useAnsichTaskHistory(limit = 100, enabled = true) {
     string | undefined
   >({
     queryKey: ["ansich", "tasks", "history", { limit }] as const,
-    queryFn: ({ pageParam }) => fetchAnsichTasks(limit, "terminal", pageParam),
+    queryFn: ({ pageParam }) =>
+      fetchAnsichTasks(limit, "terminal", pageParam, true),
     initialPageParam: undefined,
     getNextPageParam: (lastPage) => lastPage.next_cursor ?? undefined,
     enabled,
@@ -358,10 +360,27 @@ export function useAnsichTaskUsage(
   taskId: string,
   enabled = true,
   polling = true,
+  scope: "local" | "inclusive" = "local",
 ) {
   return useQuery({
-    queryKey: ["ansich", "tasks", taskId, "usage"],
-    queryFn: () => fetchAnsichTaskUsage(taskId),
+    queryKey: ["ansich", "tasks", taskId, "usage", scope],
+    queryFn: () => fetchAnsichTaskUsage(taskId, scope),
+    enabled: enabled && Boolean(taskId),
+    retry: false,
+    refetchInterval: () =>
+      polling && pageIsVisible() ? REFRESH_INTERVAL_MS : false,
+    refetchIntervalInBackground: false,
+  });
+}
+
+export function useAnsichTaskTree(
+  taskId: string,
+  enabled = true,
+  polling = true,
+) {
+  return useQuery({
+    queryKey: ["ansich", "tasks", taskId, "tree", "both", 4],
+    queryFn: () => fetchAnsichTaskTree(taskId, "both", 4),
     enabled: enabled && Boolean(taskId),
     retry: false,
     refetchInterval: () =>

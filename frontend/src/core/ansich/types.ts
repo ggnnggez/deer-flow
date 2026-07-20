@@ -172,7 +172,44 @@ export interface AnsichTaskUsageValue {
 export interface AnsichTaskUsage {
   task_id: string;
   local: AnsichTaskUsageValue[];
-  inclusive_status: "not_available";
+  inclusive: AnsichTaskUsageValue[];
+  inclusive_status: "available";
+}
+
+export interface AnsichTaskUsageSource {
+  source_task_id: string;
+  values: AnsichTaskUsageValue[];
+}
+
+export interface AnsichTaskSpawn {
+  parent_task_id: string;
+  spawning_step_id: string;
+  spawning_tool_call_id: string;
+  child_task_id: string;
+  established_obs_id: string;
+  subagent_name: string | null;
+}
+
+export interface AnsichTaskTreeNode {
+  task: AnsichTask;
+  agent_release: AnsichTaskAgentReleaseResponse["binding"];
+  heartbeat: AnsichHeartbeatBelief | null;
+  current_step: {
+    step_id: string;
+    step_seq: number;
+    actor_kind: string;
+    status: string;
+  } | null;
+  usage: AnsichTaskUsage;
+}
+
+export interface AnsichTaskTree {
+  root_task_id: string;
+  direction: "ancestors" | "descendants" | "both";
+  depth: number;
+  nodes: AnsichTaskTreeNode[];
+  edges: AnsichTaskSpawn[];
+  truncated: boolean;
 }
 
 export interface AnsichTaskBudget {
@@ -248,6 +285,7 @@ export interface AnsichActiveTask {
   dwell: AnsichDwellBelief;
   heartbeat: AnsichHeartbeatBelief;
   usage: AnsichTaskUsage;
+  active_child_count: number;
   budgets: AnsichTaskBudgets;
   budget_health: AnsichBudgetHealthBelief[];
   duration_ms: number;
@@ -385,6 +423,19 @@ export interface AnsichOperatorActionResponse {
 
 export interface AnsichTaskUsageResponse {
   usage: AnsichTaskUsage;
+  scope: "local" | "inclusive";
+  values: AnsichTaskUsageValue[];
+  sources: AnsichTaskUsageSource[];
+  projection_status: AnsichHealth;
+}
+
+export interface AnsichTaskChildrenResponse {
+  items: AnsichTaskSpawn[];
+  projection_status: AnsichHealth;
+}
+
+export interface AnsichTaskTreeResponse {
+  tree: AnsichTaskTree;
   projection_status: AnsichHealth;
 }
 

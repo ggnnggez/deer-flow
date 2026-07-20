@@ -9,6 +9,7 @@ from ansich import ContextStateItem, ObservationEnvelope, Producer, new_id
 from ansich.serialization import (
     ANSICH_BLOCK_REF_KEY,
     ANSICH_CONTENT_KIND_KEY,
+    ANSICH_PRODUCER_ENTITY_ID_KEY,
     ANSICH_PRODUCER_KIND_KEY,
     ContextSnapshotCapture,
     ContextSnapshotItemCapture,
@@ -209,6 +210,7 @@ def _request_without_ansich_metadata(request: ModelRequest) -> ModelRequest:
         ANSICH_BLOCK_REF_KEY,
         ANSICH_CONTENT_KIND_KEY,
         ANSICH_PRODUCER_KIND_KEY,
+        ANSICH_PRODUCER_ENTITY_ID_KEY,
     }
 
     def clean(message):

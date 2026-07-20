@@ -321,7 +321,7 @@ CORS is same-origin by default when requests enter through nginx on port 2026. S
 | **Models** (`/api/models`) | `GET /` - list models; `GET /{name}` - model details |
 | **Features** (`/api/features`) | `GET /` - report config-gated feature availability (currently `agents_api.enabled`) for frontend UI gating |
 | **Console** (`/api/console`) | Read-only cross-thread observability for the current user (the data layer for an operations dashboard or external monitoring): `GET /stats` - headline counters (runs/threads/agents/tokens/cost); `GET /runs` - paginated run history joined with thread titles (per-run cost); `GET /usage` - zero-filled daily token series + per-model breakdown with spend. Queries `runs`/`threads_meta` directly as a reporting layer (no new `RunStore` methods); requires a SQL database backend — returns 503 on `database.backend: memory`. Real-cost estimation reads optional `models[*].pricing` (`currency`, `input_per_million`, `output_per_million`, `input_cache_hit_per_million`; `ModelConfig` is `extra="allow"`, so no schema change) and prices each run from its `token_usage_by_model` input/output split. Pricing is **cache-aware**: `RunJournal` accumulates prompt-cache hits from `usage_metadata.input_token_details.cache_read` into a sparse `cache_read_tokens` bucket key (also threaded through `SubagentTokenCollector` → `record_external_llm_usage_records`), and cache-hit input tokens are billed at `input_cache_hit_per_million` (omitted → billed at the miss price, a conservative upper bound). Legacy rows fall back to run-level totals at `model_name`; unpriced models yield `cost: null` and cost fields are null when no pricing is configured |
-| **Ansich** (`/api/ansich`) | Admin-only developer/operator Agent observability, gated by startup-only `ansich.enabled`. Task reads include evidence-backed Control/behavior Beliefs, lifecycle/Step/system-operation history, physical LLM attempts, ordered ContextSnapshot/ToolCall accountability, Task-scoped context-compression inventory, bounded ContentBlock lineage, active-task/Usage/Budget reads, Alert list/detail/workflow plus interrupt/rollback proxy actions, and immutable AgentRelease bindings/comparison/provider drift. Tool/raw/visible payloads and complete sanitized release manifests stay on separate logged `no-store` endpoints; lineage/snapshot/compression, release detail, and alert-list reads are metadata/preview-only. `GET /health` remains process-local and readable when SQL storage is unavailable; projection reads return 503 with the same health summary when storage is unavailable. |
+| **Ansich** (`/api/ansich`) | Admin-only developer/operator Agent observability, gated by startup-only `ansich.enabled`. Task reads include evidence-backed Control/behavior Beliefs, lifecycle/Step/system-operation history, physical LLM attempts, ordered ContextSnapshot/ToolCall accountability, Task-scoped context-compression inventory, bounded ContentBlock lineage, active-task/local-or-inclusive Usage/Budget reads with source breakdown, typed parent/child Task tree navigation, Alert list/detail/workflow plus interrupt/rollback proxy actions, and immutable AgentRelease bindings/comparison/provider drift. Tool/raw/visible payloads and complete sanitized release manifests stay on separate logged `no-store` endpoints; lineage/snapshot/compression, release detail, and alert-list reads are metadata/preview-only. `GET /health` remains process-local and readable when SQL storage is unavailable; projection reads return 503 with the same health summary when storage is unavailable. |
 | **MCP** (`/api/mcp`) | `GET /config` - get config; `PUT /config` - update config (saves to extensions_config.json) |
 | **Skills** (`/api/skills`) | `GET /` - list skills; `GET /{name}` - details; `PUT /{name}` - update enabled; `POST /install` - install from .skill archive (accepts standard optional frontmatter like `version`, `author`, `compatibility`) |
 | **Memory** (`/api/memory`) | `GET /` - memory data; `POST /reload` - force reload; `GET /config` - config; `GET /status` - config + data |
@@ -440,9 +440,29 @@ next cursor, not volatile projection health. Read-model refreshes compare
 normalized content and neither write the row nor bump `updated_at` when it is
 unchanged. Operations active-task and Task-budget GET routes never invoke the
 assessor synchronously; they return the latest projection while the background
-assessment loop owns writes. `GET /tasks/{task_id}/usage` returns
-local dimensions and explicitly marks inclusive usage unavailable until Phase
-8; `GET /tasks/{task_id}/budgets` returns configured policy plus health Beliefs.
+assessment loop owns writes. `GET /tasks/{task_id}/usage?scope=local|inclusive`
+returns scoped dimensions and their source-Task breakdown;
+`GET /tasks/{task_id}/budgets` returns configured policy plus health Beliefs.
+
+Phase 8 promotes each accepted `task` Tool delegation to a child Ansich Task.
+`task_tool.py` creates a deterministic `deerflow_subagent` identity and passes an
+explicit `AnsichExecutionContext` into `SubagentExecutor`; child context setup,
+collection, or release binding failures remain fail-open. The child runs the
+same decision/attempt/tool probe chain with its own effective AgentRelease and
+heartbeat. A child allocated before executor startup is closed as failed with an
+explicit startup reason instead of remaining permanently `created`.
+
+Typed `ansich_task_spawns` and self-free `ansich_task_ancestry` projections
+enforce one parent per child, validate the spawning Step/Tool against the parent,
+reject cycles, and support bounded ancestor/descendant queries. Usage
+contributions retain `(aggregate_task_id, source_task_id, dimension,
+source_obs_id)`: local summaries include self only, inclusive summaries fan out
+through ancestry, and a late spawn backfills existing descendant contributions.
+Heartbeat wall time is cumulative per source Task (maximum elapsed evidence),
+then summed across sources. Lead assembly returns an explicit
+`LeadAgentAssembly(graph, descriptor)` to the worker; the graph-only
+`make_lead_agent()` API and legacy custom-factory graph attribute remain
+compatibility fallbacks, not the normal descriptor transport.
 The general `GET /tasks` read accepts `lifecycle_scope=all|active|terminal` and
 applies that scope before its stable cursor/limit; the terminal scope is the
 non-polling Operations history source and includes completed, failed, and
@@ -880,6 +900,7 @@ This invokes `alembic revision --autogenerate` against the live ORM models. Revi
 - `migrations/versions/0016_ansich_operations.py` — Phase 5 heartbeat, local Usage contribution, TaskBudget, and materialized active-task projections
 - `migrations/versions/0017_ansich_alerts.py` — Phase 6 assessor jobs/errors, versioned assertion provenance, Alert episodes/workflow/read model, and idempotent operator-action audit
 - `migrations/versions/0018_ansich_agent_releases.py` — Phase 7 immutable AgentRelease manifests/component summaries and one starting release binding per Task
+- `migrations/versions/0019_ansich_task_tree_usage.py` — Phase 8 typed parent/child Task spawns and ancestry closure, source-aware usage contributions, and local/inclusive usage summaries
 - `persistence/bootstrap.py` — `bootstrap_schema(engine, backend=...)`, the three-branch decision + locking
 - Tests: `tests/test_persistence_bootstrap.py` (branches), `tests/test_persistence_bootstrap_concurrency.py` (concurrency), `tests/test_persistence_bootstrap_regression.py` (issue #3682), `tests/test_persistence_migrations_env.py` (filter), `tests/blocking_io/test_persistence_bootstrap.py` (asyncio.to_thread anchor)
 

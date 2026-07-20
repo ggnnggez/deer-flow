@@ -261,7 +261,7 @@ async def test_operator_endpoints_return_active_usage_budgets_and_etag(
     assert active.json()["items"][0]["task_id"] == task_id
     assert active.json()["items"][0]["heartbeat"]["value"] == "fresh"
     assert usage.status_code == 200
-    assert usage.json()["usage"]["inclusive_status"] == "not_available"
+    assert usage.json()["usage"]["inclusive_status"] == "available"
     assert usage.json()["usage"]["local"][0]["dimension"] == "steps"
     assert budgets.status_code == 200
     assert budgets.json()["budgets"]["budgets"][0]["dimension"] == "steps"

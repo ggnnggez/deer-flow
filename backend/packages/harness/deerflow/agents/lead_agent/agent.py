@@ -63,7 +63,6 @@ _NON_INTERACTIVE_DISABLED_TOOL_NAMES = frozenset({"ask_clarification"})
 # itself is plumbed into ``run_context`` by
 # ``ChannelManager._resolve_run_params``.
 _WEBHOOK_CHANNELS: frozenset[str] = frozenset({"github"})
-ANSICH_RUNTIME_DESCRIPTOR_KEY = "__ansich_agent_runtime_descriptor"
 
 
 @dataclass(frozen=True)
@@ -499,25 +498,30 @@ def _load_enabled_available_skills(available_skills: set[str] | None, *, app_con
 
 def make_lead_agent(config: RunnableConfig):
     """LangGraph graph factory; keep the signature compatible with LangGraph Server."""
+    return assemble_lead_agent(config).graph
+
+
+def assemble_lead_agent(
+    config: RunnableConfig,
+    *,
+    app_config: AppConfig | None = None,
+) -> LeadAgentAssembly:
+    """Return the compiled lead graph together with its runtime descriptor.
+
+    Gateway workers use this explicit assembly result so release attribution
+    does not depend on LangGraph private runtime keys or mutable graph attrs.
+    ``make_lead_agent`` remains the graph-only LangGraph Server ABI.
+    """
     runtime_config = _get_runtime_config(config)
     runtime_app_config = runtime_config.get("app_config")
-    return _make_lead_agent(config, app_config=runtime_app_config or get_app_config())
+    return _assemble_lead_agent(
+        config,
+        app_config=app_config or runtime_app_config or get_app_config(),
+    )
 
 
 def _make_lead_agent(config: RunnableConfig, *, app_config: AppConfig):
-    return _assemble_lead_agent(config, app_config=app_config).graph
-
-
-def _publish_runtime_descriptor(config: RunnableConfig, graph: Any, descriptor: Any) -> None:
-    configurable = config.get("configurable")
-    runtime = configurable.get("__pregel_runtime") if isinstance(configurable, dict) else None
-    runtime_context = getattr(runtime, "context", None)
-    if isinstance(runtime_context, dict):
-        runtime_context[ANSICH_RUNTIME_DESCRIPTOR_KEY] = descriptor
-    try:
-        setattr(graph, ANSICH_RUNTIME_DESCRIPTOR_KEY, descriptor)
-    except Exception:
-        logger.debug("Compiled graph does not accept Ansich runtime descriptor attribute", exc_info=True)
+    return assemble_lead_agent(config, app_config=app_config).graph
 
 
 def _complete_assembly(
@@ -560,7 +564,6 @@ def _complete_assembly(
         enabled_skills=enabled_skills,
         effective_policies=resolved_policies,
     )
-    _publish_runtime_descriptor(config, graph, descriptor)
     return LeadAgentAssembly(graph=graph, descriptor=descriptor)
 
 

@@ -1,3 +1,4 @@
+import asyncio
 import base64
 import binascii
 import hashlib
@@ -13,6 +14,7 @@ from ansich.release import (
     AgentReleaseFingerprint,
     compare_agent_releases,
 )
+from ansich.task_tree import TaskTreeDirection
 from fastapi import APIRouter, Header, HTTPException, Query, Request, Response
 from pydantic import BaseModel, Field
 
@@ -804,8 +806,80 @@ async def get_task_agent_release(task_id: str, request: Request) -> dict:
     }
 
 
+@router.get("/tasks/{task_id}/children")
+async def list_task_children(task_id: str, request: Request) -> dict:
+    await require_admin_user(request, detail=_ADMIN_REQUIRED)
+    service = _service_or_503(request)
+    _ensure_queryable(service)
+    try:
+        if await service.get_task(task_id) is None:
+            raise HTTPException(status_code=404, detail="Ansich Task not found")
+        children = await service.list_task_children(task_id)
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise HTTPException(
+            status_code=503,
+            detail={
+                "message": "Ansich child Task query failed",
+                "projection_status": _projection_status(service),
+            },
+        ) from exc
+    return {
+        "items": [item.model_dump(mode="json") for item in children],
+        "projection_status": _projection_status(service),
+    }
+
+
+@router.get("/tasks/{task_id}/tree")
+async def get_task_tree(
+    task_id: str,
+    request: Request,
+    direction: TaskTreeDirection = Query(default="both"),
+    depth: int = Query(default=4, ge=1, le=32),
+) -> dict:
+    await require_admin_user(request, detail=_ADMIN_REQUIRED)
+    service = _service_or_503(request)
+    _ensure_queryable(service)
+    try:
+        tree = await service.get_task_tree(
+            task_id,
+            direction=direction,
+            depth=depth,
+        )
+    except Exception as exc:
+        raise HTTPException(
+            status_code=503,
+            detail={
+                "message": "Ansich Task tree query failed",
+                "projection_status": _projection_status(service),
+            },
+        ) from exc
+    if tree is None:
+        raise HTTPException(status_code=404, detail="Ansich Task not found")
+    tree_payload = tree.model_dump(mode="json")
+    for payload, node in zip(tree_payload["nodes"], tree.nodes, strict=True):
+        binding = node.agent_release
+        if binding is None:
+            continue
+        payload["agent_release"] = {
+            "task_id": binding.task_id,
+            "relation_role": binding.relation_role,
+            "established_obs_id": binding.established_obs_id,
+            "release": _safe_release_detail(binding.release),
+        }
+    return {
+        "tree": tree_payload,
+        "projection_status": _projection_status(service),
+    }
+
+
 @router.get("/tasks/{task_id}/usage")
-async def get_task_usage(task_id: str, request: Request) -> dict:
+async def get_task_usage(
+    task_id: str,
+    request: Request,
+    scope: Literal["local", "inclusive"] = Query(default="local"),
+) -> dict:
     await require_admin_user(request, detail=_ADMIN_REQUIRED)
     service = _service_or_503(request)
     _ensure_queryable(service)
@@ -813,7 +887,10 @@ async def get_task_usage(task_id: str, request: Request) -> dict:
         task = await service.get_task(task_id)
         if task is None:
             raise HTTPException(status_code=404, detail="Ansich Task not found")
-        usage = await service.get_task_usage(task_id)
+        usage, breakdown = await asyncio.gather(
+            service.get_task_usage(task_id),
+            service.get_task_usage_breakdown(task_id, scope=scope),
+        )
     except HTTPException:
         raise
     except Exception as exc:
@@ -826,6 +903,9 @@ async def get_task_usage(task_id: str, request: Request) -> dict:
         ) from exc
     return {
         "usage": usage.model_dump(mode="json"),
+        "scope": scope,
+        "values": [item.model_dump(mode="json") for item in (usage.local if scope == "local" else usage.inclusive)],
+        "sources": [item.model_dump(mode="json") for item in breakdown.sources],
         "projection_status": _projection_status(service),
     }
 
@@ -867,6 +947,7 @@ async def list_tasks(
     to_time: datetime | None = Query(default=None, alias="to"),
     limit: int = Query(default=100, ge=1, le=500),
     cursor: str | None = Query(default=None),
+    root_only: bool = Query(default=False),
 ) -> dict:
     await require_admin_user(request, detail=_ADMIN_REQUIRED)
     service = _service_or_503(request)
@@ -882,6 +963,7 @@ async def list_tasks(
             from_time=from_time,
             to_time=to_time,
             cursor=_decode_cursor(cursor),
+            root_only=root_only,
         )
     except HTTPException:
         raise

@@ -29,6 +29,8 @@ import type {
   AnsichToolCallResponse,
   AnsichToolResultPayloadResponse,
   AnsichOperatorActionResponse,
+  AnsichTaskChildrenResponse,
+  AnsichTaskTreeResponse,
 } from "./types";
 
 export class AnsichApiError extends Error {
@@ -77,6 +79,7 @@ export async function fetchAnsichTasks(
   limit = 100,
   lifecycleScope: AnsichTaskLifecycleScope = "all",
   cursor?: string,
+  rootOnly = false,
 ): Promise<AnsichTaskListResponse> {
   const query = new URLSearchParams({ limit: String(limit) });
   if (lifecycleScope !== "all") {
@@ -84,6 +87,9 @@ export async function fetchAnsichTasks(
   }
   if (cursor) {
     query.set("cursor", cursor);
+  }
+  if (rootOnly) {
+    query.set("root_only", "true");
   }
   const response = await fetch(ansichUrl(`/tasks?${query.toString()}`));
   if (!response.ok) {
@@ -272,14 +278,49 @@ export async function executeAnsichTaskAction(
 
 export async function fetchAnsichTaskUsage(
   taskId: string,
+  scope: "local" | "inclusive" = "local",
 ): Promise<AnsichTaskUsageResponse> {
+  const query = new URLSearchParams({ scope });
   const response = await fetch(
-    ansichUrl(`/tasks/${encodeURIComponent(taskId)}/usage`),
+    ansichUrl(`/tasks/${encodeURIComponent(taskId)}/usage?${query.toString()}`),
   );
   if (!response.ok) {
     await throwAnsichApiError(
       response,
       `Failed to load Ansich usage: ${response.statusText}`,
+    );
+  }
+  return response.json();
+}
+
+export async function fetchAnsichTaskChildren(
+  taskId: string,
+): Promise<AnsichTaskChildrenResponse> {
+  const response = await fetch(
+    ansichUrl(`/tasks/${encodeURIComponent(taskId)}/children`),
+  );
+  if (!response.ok) {
+    await throwAnsichApiError(
+      response,
+      `Failed to load child Ansich tasks: ${response.statusText}`,
+    );
+  }
+  return response.json();
+}
+
+export async function fetchAnsichTaskTree(
+  taskId: string,
+  direction: "ancestors" | "descendants" | "both" = "both",
+  depth = 4,
+): Promise<AnsichTaskTreeResponse> {
+  const query = new URLSearchParams({ direction, depth: String(depth) });
+  const response = await fetch(
+    ansichUrl(`/tasks/${encodeURIComponent(taskId)}/tree?${query.toString()}`),
+  );
+  if (!response.ok) {
+    await throwAnsichApiError(
+      response,
+      `Failed to load Ansich task tree: ${response.statusText}`,
     );
   }
   return response.json();

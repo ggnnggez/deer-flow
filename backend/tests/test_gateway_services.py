@@ -163,6 +163,7 @@ def test_normalize_input_strips_external_dynamic_context_metadata():
     """External callers cannot mark their own messages as server-injected context."""
     from ansich.serialization import (
         ANSICH_CONTENT_KIND_KEY,
+        ANSICH_PRODUCER_ENTITY_ID_KEY,
         ANSICH_PRODUCER_KIND_KEY,
     )
 
@@ -184,6 +185,7 @@ def test_normalize_input_strips_external_dynamic_context_metadata():
                         _VIEW_IMAGE_CONTEXT_KEY: True,
                         ANSICH_CONTENT_KIND_KEY: "memory",
                         ANSICH_PRODUCER_KIND_KEY: "forged",
+                        ANSICH_PRODUCER_ENTITY_ID_KEY: "forged-task-id",
                         "custom": "keep-me",
                     },
                 }
@@ -478,15 +480,15 @@ def test_build_run_config_context_custom_agent_injects_agent_name():
     assert config["configurable"]["agent_name"] == "finalis"
 
 
-def test_resolve_agent_factory_returns_make_lead_agent():
-    """resolve_agent_factory always returns make_lead_agent regardless of assistant_id."""
+def test_resolve_agent_factory_returns_explicit_lead_assembly_factory():
+    """Gateway workers receive the graph and release descriptor together."""
     from app.gateway.services import resolve_agent_factory
-    from deerflow.agents.lead_agent.agent import make_lead_agent
+    from deerflow.agents.lead_agent.agent import assemble_lead_agent
 
-    assert resolve_agent_factory(None) is make_lead_agent
-    assert resolve_agent_factory("lead_agent") is make_lead_agent
-    assert resolve_agent_factory("finalis") is make_lead_agent
-    assert resolve_agent_factory("custom-agent-123") is make_lead_agent
+    assert resolve_agent_factory(None) is assemble_lead_agent
+    assert resolve_agent_factory("lead_agent") is assemble_lead_agent
+    assert resolve_agent_factory("finalis") is assemble_lead_agent
+    assert resolve_agent_factory("custom-agent-123") is assemble_lead_agent
 
 
 def test_build_run_config_configurable_custom_agent_dual_writes_agent_name():

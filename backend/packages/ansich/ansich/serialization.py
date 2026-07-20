@@ -30,6 +30,7 @@ ContentKind = Literal[
 
 ANSICH_CONTENT_KIND_KEY = "ansich_content_kind"
 ANSICH_PRODUCER_KIND_KEY = "ansich_producer_kind"
+ANSICH_PRODUCER_ENTITY_ID_KEY = "ansich_producer_entity_id"
 ANSICH_BLOCK_REF_KEY = "ansich_block_ref"
 
 _CONTENT_KINDS = frozenset(
@@ -226,6 +227,7 @@ def serialize_model_request(
         additional_kwargs = getattr(message, "additional_kwargs", None)
         declared_kind = additional_kwargs.get(ANSICH_CONTENT_KIND_KEY) if isinstance(additional_kwargs, Mapping) else None
         producer_kind = additional_kwargs.get(ANSICH_PRODUCER_KIND_KEY) if isinstance(additional_kwargs, Mapping) else None
+        producer_entity_id = additional_kwargs.get(ANSICH_PRODUCER_ENTITY_ID_KEY) if isinstance(additional_kwargs, Mapping) else None
         block_ref = additional_kwargs.get(ANSICH_BLOCK_REF_KEY) if isinstance(additional_kwargs, Mapping) else None
         message_id = _string_attribute(message, "id")
         message_occurrence_seq = 1
@@ -253,6 +255,7 @@ def serialize_model_request(
                         "message_occurrence_seq": message_occurrence_seq,
                         "part_ordinal": part_index,
                         "producer_kind": (producer_kind if isinstance(producer_kind, str) else _default_producer_kind(kind)),
+                        **({"producer_entity_id": producer_entity_id} if isinstance(producer_entity_id, str) else {}),
                         **({ANSICH_BLOCK_REF_KEY: block_ref} if isinstance(block_ref, str) else {}),
                         **({"tool_call_id": tool_call_id} if tool_call_id is not None else {}),
                     },

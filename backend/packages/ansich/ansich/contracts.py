@@ -281,6 +281,7 @@ class ObservationEnvelope(BaseModel):
         thread_id: str | None = None,
         owner_id: str | None = None,
         trigger_kind: str | None = None,
+        attributes: dict[str, object] | None = None,
         producer_name: str = "task-control-probe",
         producer_version: str = "1",
         producer_instance_id: str = "local",
@@ -292,6 +293,12 @@ class ObservationEnvelope(BaseModel):
             payload["owner_id"] = owner_id
         if trigger_kind is not None:
             payload["trigger_kind"] = trigger_kind
+        if attributes:
+            reserved = {"source_kind", "source_id", "thread_id", "owner_id", "trigger_kind"}
+            overlap = reserved.intersection(attributes)
+            if overlap:
+                raise ValueError("task lifecycle attributes cannot override reserved fields: " + ", ".join(sorted(overlap)))
+            payload.update(attributes)
         return cls(
             kind=kind,
             occurred_at=occurred_at,

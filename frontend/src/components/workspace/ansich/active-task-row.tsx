@@ -72,6 +72,14 @@ export function AnsichActiveTaskRow({ task }: { task: AnsichActiveTask }) {
           {usage.tool_calls_executed ?? "?"}/{usage.tool_calls_issued ?? "?"}{" "}
           tools
         </div>
+        {task.active_child_count ? (
+          <div className="text-muted-foreground">
+            {t.ansich.activeChildren.replace(
+              "{count}",
+              task.active_child_count.toLocaleString(),
+            )}
+          </div>
+        ) : null}
       </div>
       {budgetHealth ? (
         <RuleBadge

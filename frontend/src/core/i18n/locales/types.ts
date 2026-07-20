@@ -408,6 +408,12 @@ export interface Translations {
     dwell: string;
     heartbeat: string;
     localUsage: string;
+    inclusiveUsage: string;
+    contributionSources: string;
+    activeChildren: string;
+    taskTree: string;
+    taskTreeDescription: string;
+    taskTreeTruncated: string;
     budgets: string;
     agentRelease: string;
     noAgentRelease: string;

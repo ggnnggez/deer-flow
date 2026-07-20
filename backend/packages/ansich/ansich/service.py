@@ -16,12 +16,18 @@ from ansich.contracts import AnsichHealth, ControlValue, FlushResult, LostRange,
 from ansich.heartbeat import TaskHeartbeatView
 from ansich.lineage import ContentLineageView, LineageDirection, PossibleExposureView, find_possible_exposures, traverse_content_lineage
 from ansich.memory import InMemoryAnsichBackend
-from ansich.operations import ActiveTaskView, HeartbeatBelief
+from ansich.operations import ActiveStepView, ActiveTaskView, HeartbeatBelief
 from ansich.operator import OperatorActionView, TaskActionTarget
 from ansich.release import AgentReleaseDetailView, AgentReleaseSummaryView, TaskAgentReleaseView
 from ansich.step import ContentBlockPayloadView, ContentOccurrenceView, ContextSnapshotView, LlmAttemptView, StepView
+from ansich.task_tree import (
+    TaskSpawnView,
+    TaskTreeDirection,
+    TaskTreeNodeView,
+    TaskTreeView,
+)
 from ansich.tool import ToolCallView
-from ansich.usage import TaskUsageView
+from ansich.usage import AggregationScope, TaskUsageBreakdownView, TaskUsageView
 
 
 def _serialized_observation_size(observation: ObservationEnvelope) -> int:
@@ -344,6 +350,7 @@ class AnsichService:
         from_time: datetime | None = None,
         to_time: datetime | None = None,
         cursor: tuple[datetime, str] | None = None,
+        root_only: bool = False,
     ) -> list[TaskView]:
         if limit < 1:
             raise ValueError("limit must be positive")
@@ -354,10 +361,79 @@ class AnsichService:
             from_time=from_time,
             to_time=to_time,
             cursor=cursor,
+            root_only=root_only,
         )
 
     async def list_observations(self, task_id: str) -> list[ObservationEnvelope]:
         return await self._backend.list_observations(task_id)
+
+    async def list_task_children(self, task_id: str) -> list[TaskSpawnView]:
+        return await self._backend.list_task_children(task_id)
+
+    async def get_task_tree(
+        self,
+        task_id: str,
+        *,
+        direction: TaskTreeDirection = "both",
+        depth: int = 4,
+    ) -> TaskTreeView | None:
+        if depth < 1 or depth > 32:
+            raise ValueError("Task tree depth must be between 1 and 32")
+        root = await self._backend.get_task(task_id)
+        if root is None:
+            return None
+        edges, truncated = await self._backend.list_task_tree_spawns(
+            task_id,
+            direction=direction,
+            depth=depth,
+        )
+        node_ids = {task_id}
+        for edge in edges:
+            node_ids.add(edge.parent_task_id)
+            node_ids.add(edge.child_task_id)
+
+        async def load_node(node_id: str) -> TaskTreeNodeView | None:
+            task, release, heartbeat, usage, steps = await asyncio.gather(
+                self.get_task(node_id),
+                self.get_task_agent_release(node_id),
+                self.get_task_heartbeat_belief(node_id),
+                self.get_task_usage(node_id),
+                self.list_steps(node_id),
+            )
+            if task is None:
+                return None
+            current_step = max(
+                (step for step in steps if step.status not in {"closed", "model_failed"}),
+                key=lambda step: step.step_seq,
+                default=None,
+            )
+            return TaskTreeNodeView(
+                task=task,
+                agent_release=release,
+                heartbeat=heartbeat,
+                current_step=(
+                    None
+                    if current_step is None
+                    else ActiveStepView(
+                        step_id=current_step.step_id,
+                        step_seq=current_step.step_seq,
+                        actor_kind=current_step.actor_kind,
+                        status=current_step.status,
+                    )
+                ),
+                usage=usage,
+            )
+
+        loaded = await asyncio.gather(*(load_node(node_id) for node_id in sorted(node_ids)))
+        nodes = tuple(node for node in loaded if node is not None)
+        return TaskTreeView(
+            root_task_id=task_id,
+            direction=direction,
+            depth=depth,
+            nodes=nodes,
+            edges=tuple(edges),
+            truncated=truncated,
+        )
 
     async def list_alerts(
         self,
@@ -524,6 +600,14 @@ class AnsichService:
 
     async def get_task_usage(self, task_id: str) -> TaskUsageView:
         return await self._backend.get_task_usage(task_id)
+
+    async def get_task_usage_breakdown(
+        self,
+        task_id: str,
+        *,
+        scope: AggregationScope,
+    ) -> TaskUsageBreakdownView:
+        return await self._backend.get_task_usage_breakdown(task_id, scope=scope)
 
     async def get_task_budgets(self, task_id: str) -> TaskBudgetsView:
         return await self._backend.get_task_budgets(task_id)

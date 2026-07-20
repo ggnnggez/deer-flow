@@ -18,6 +18,7 @@ from typing import Any
 from ansich.serialization import (
     ANSICH_BLOCK_REF_KEY,
     ANSICH_CONTENT_KIND_KEY,
+    ANSICH_PRODUCER_ENTITY_ID_KEY,
     ANSICH_PRODUCER_KIND_KEY,
 )
 from fastapi import HTTPException, Request
@@ -71,6 +72,7 @@ _SERVER_OWNED_DYNAMIC_CONTEXT_KEYS = frozenset(
         _VIEW_IMAGE_CONTEXT_KEY,
         ANSICH_CONTENT_KIND_KEY,
         ANSICH_PRODUCER_KIND_KEY,
+        ANSICH_PRODUCER_ENTITY_ID_KEY,
         ANSICH_BLOCK_REF_KEY,
     }
 )
@@ -393,12 +395,12 @@ def resolve_agent_factory(assistant_id: str | None):
     Custom agents are implemented as ``lead_agent`` + an ``agent_name``
     injected into ``configurable`` or ``context`` — see
     :func:`build_run_config`.  All ``assistant_id`` values therefore map to the
-    same factory; the routing happens inside ``make_lead_agent`` when it reads
+    same factory; the routing happens inside ``assemble_lead_agent`` when it reads
     ``cfg["agent_name"]``.
     """
-    from deerflow.agents.lead_agent.agent import make_lead_agent
+    from deerflow.agents.lead_agent.agent import assemble_lead_agent
 
-    return make_lead_agent
+    return assemble_lead_agent
 
 
 # Lead-agent recursion budget bounds. The Gateway must NOT trust a

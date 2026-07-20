@@ -1,5 +1,6 @@
 "use client";
 
+import Link from "next/link";
 import { useState } from "react";
 
 import { Badge } from "@/components/ui/badge";
@@ -188,7 +189,9 @@ function LineageResult({ result }: { result: TraceResult }) {
                   <td className="p-2">{node.depth}</td>
                   <td className="p-2 font-mono break-all">{node.block_id}</td>
                   <td className="p-2">{node.kind}</td>
-                  <td className="p-2">{node.producer?.producer_kind ?? "—"}</td>
+                  <td className="p-2">
+                    <LineageProducer node={node} />
+                  </td>
                   <td className="p-2">
                     {node.token_estimate} {t.ansich.tokens} · {node.byte_size} bytes
                   </td>
@@ -219,11 +222,30 @@ function LineageNode({ node }: { node: AnsichLineageNode }) {
         {node.block_id}
       </code>
       <div className="text-muted-foreground">
-        {node.producer?.producer_kind ?? "—"} · {node.token_estimate}{" "}
+        <LineageProducer node={node} /> · {node.token_estimate}{" "}
         {t.ansich.tokens} · {node.byte_size} bytes
       </div>
     </div>
   );
+}
+
+function LineageProducer({ node }: { node: AnsichLineageNode }) {
+  const producer = node.producer;
+  if (!producer) return <>—</>;
+  if (
+    producer.producer_kind === "subagent_task" &&
+    producer.producer_entity_id
+  ) {
+    return (
+      <Link
+        href={`/workspace/ansich/tasks/${encodeURIComponent(producer.producer_entity_id)}`}
+        className="font-mono underline-offset-4 hover:underline"
+      >
+        {producer.producer_kind}:{producer.producer_entity_id}
+      </Link>
+    );
+  }
+  return <>{producer.producer_kind}</>;
 }
 
 export function AnsichCompressionExplorer({

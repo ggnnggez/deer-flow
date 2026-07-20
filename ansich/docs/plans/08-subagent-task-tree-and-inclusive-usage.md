@@ -104,3 +104,38 @@ Budget tab提供 local/inclusive切换并标明贡献来源。可展开 contribu
 - parent inclusive usage等于 self + descendants，原始 consumption只出现一次。
 - late/duplicate spawn与usage重放不双计。
 - parent取消但 child终态不确定时保持 unknown，不伪造 cancelled。
+
+## 11. 落地说明（2026-07-20）
+
+### 11.1 Runtime identity、context 与 release
+
+- `task_tool.py` 在委派参数通过校验后，以 parent Task、spawning Step、spawning ToolCall 和 executor stable task ID 构造确定性 child Task 身份，并记录 `source_kind=deerflow_subagent` 的 `task.created`。重复 attempt 不会产生第二个 child。
+- child 使用独立 `AnsichExecutionContext`，由 `task_tool` 显式传入 `SubagentExecutor`；executor 把该 context 直接放入实际 subagent runtime，而不依赖 ContextVar 在线程或协程之间偶然复制。
+- child 启动后拥有独立 lifecycle、heartbeat、Step、attempt、ToolCall 和实际 assembly 产生的 AgentRelease。lead worker 同时改为消费显式 `LeadAgentAssembly(graph, descriptor)`；`make_lead_agent()` 的 graph-only 返回和自定义 factory graph attribute 只作为兼容边界。
+- context 创建、Observation 写入或 release 绑定失败均 fail-open，不改变委派业务结果。若 child ID 已分配但 executor 构造/启动失败，探针以 `failure_reason=executor_start_failed` 关闭 child，避免永久残留在 `created`。
+
+### 11.2 Typed tree projection
+
+- migration `0019_ansich_task_tree_usage` 新增 `ansich_task_spawns` 与 `ansich_task_ancestry`。direct spawn 同时验证 spawning Step/Tool 确属 parent；`child_task_id` 唯一约束保证一个 child 只有一个 parent。
+- projector 写入 self-free transitive closure，并在写前拒绝 cycle 或第二 parent；失败保留 projection error，并按既有通道降低 observability health。
+- `direction=ancestors|descendants|both` 查询从 typed closure 构造 bounded tree；`both` 返回祖先与后代的并集，不把共同 parent 下的 sibling 误当作当前 Task 的后代。默认深度与 32 层硬上限按计划执行。
+
+### 11.3 Source-aware usage 与重放
+
+- `ansich_usage_contributions` 的身份扩展为 `(aggregate_task_id, source_task_id, dimension, source_obs_id)`。原始 Observation 仍只属于实际消耗 Task；ancestor fan-out 是可删除、可重放的投影，不复制原始事实。
+- self contribution 同时刷新 local 与 inclusive summary；descendant contribution 只刷新 ancestor 的 inclusive summary。usage 先到时正常沿 ancestry fan-out，spawn 后到时从 descendant 既有 self contribution 做 backfill，两种顺序得到相同结果。
+- token、attempt、Step、Tool 与 `child_tasks_spawned` 使用累加语义。heartbeat 的 `wall_time_ms` 是同一 source Task 的累计水位，因此先按 source 取最大值，再把 parent 与各 descendant 的水位相加，避免按心跳次数膨胀。
+- Budget assessor 按 `aggregation_scope` 读取同一套 contribution：local 只选 source=self，inclusive 读取全部 source；usage API 同时返回按 source Task 分组的解释数据。
+- migration 将历史 self contribution 映射到新的 aggregate/source 身份，为每个已有 local usage 生成对应 inclusive summary，并清空旧 active-task materialization，使其按新 JSON contract 重建。downgrade 先移除 fan-out/inclusive 派生行，再恢复旧列语义。
+
+### 11.4 API 与 Operator Lens
+
+- Gateway 新增 children、bounded tree、`usage?scope=local|inclusive`，并给 Task list 增加 `root_only`。active rows 返回 `active_child_count` 与 inclusive Usage；Task tree node 返回 release、control/heartbeat、当前 Step、local/inclusive Usage 和节点自身 health。
+- Operations 历史列表使用 `root_only=true`，避免 child 同时出现在顶层历史和 parent tree。Task Overview 显示可折叠树；点击 child 进入该 child 自己的详情页，不把 child Timeline/Steps 平铺进 parent。
+- Budget 面板支持 local/inclusive 切换并展示 source Task breakdown；Context lineage 中，带 server-owned producer Entity marker 的 parent-visible Tool result 可链接到 child Task。Gateway 丢弃客户端伪造 marker，attempt adapter 在 provider 调用前剥离内部 marker。
+
+### 11.5 验证边界
+
+- 后端回归覆盖确定性 identity、显式 context、child release/lifecycle、fail-open、唯一 parent/cycle、两层 closure、late spawn/late usage/replay、wall-time source 水位、SQLite 迁移与 PostgreSQL DDL 编译、tree/children/usage/root-only API。
+- 前端单测覆盖 scoped usage 请求和 root-only 历史参数；Ansich E2E fixture 覆盖 tree 展开、child 导航、inclusive source breakdown 与 producer child link。
+- 真实 PostgreSQL 升级矩阵、关闭 Ansich 的性能对比和生产 paper drill 仍按总计划作为最终生产就绪门禁，不阻塞本地 Phase 8 纵向切片。

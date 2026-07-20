@@ -112,9 +112,12 @@ from ansich.release import (
     validate_agent_release,
 )
 from ansich.release.canonical import canonical_json_bytes
+from ansich.task_tree import TaskSpawnView, TaskTreeDirection
 from ansich.tool import ContentDerivationSourceRole, ToolTransformKind
 from ansich.usage import (
     AggregationScope,
+    TaskUsageBreakdownView,
+    TaskUsageSourceView,
     TaskUsageValue,
     TaskUsageView,
     child_task_contribution_for_tool_started,
@@ -168,9 +171,11 @@ from deerflow.ansich.persistence.models import (
     AnsichScopeRow,
     AnsichStepRow,
     AnsichTaskAgentReleaseRow,
+    AnsichTaskAncestryRow,
     AnsichTaskBudgetRow,
     AnsichTaskHeartbeatRow,
     AnsichTaskRow,
+    AnsichTaskSpawnRow,
     AnsichTaskSummaryRow,
     AnsichTaskUsageRow,
     AnsichToolCallResultRow,
@@ -224,6 +229,7 @@ _USAGE_PROJECTION_KINDS = frozenset(
         "tool.cancelled",
         "tool.failed",
         "budget.consumed",
+        "task.heartbeat",
     }
 )
 _PROJECTORS = (("task-structural", "1"), ("task-control", "1"), ("task-step", "1"), ("task-usage", "1"), ("task-budget", "1"), ("task-heartbeat", "1"))
@@ -413,6 +419,7 @@ def _list_task_views_statement(
     from_time: datetime | None,
     to_time: datetime | None,
     cursor: tuple[datetime, str] | None,
+    root_only: bool = False,
 ):
     page_statement = select(
         AnsichTaskSummaryRow.task_id,
@@ -426,6 +433,8 @@ def _list_task_views_statement(
         AnsichTaskSummaryRow.tool_calls_issued,
         AnsichTaskSummaryRow.tool_calls_executed,
     )
+    if root_only:
+        page_statement = page_statement.where(~select(AnsichTaskSpawnRow.child_task_id).where(AnsichTaskSpawnRow.child_task_id == AnsichTaskSummaryRow.task_id).exists())
     if control is not None:
         page_statement = page_statement.where(AnsichTaskSummaryRow.control_value == control)
     lifecycle_controls = control_values_for_lifecycle_scope(lifecycle_scope)
@@ -892,6 +901,8 @@ class SqlAnsichBackend:
                 AnsichTaskBudgetRow,
                 AnsichTaskUsageRow,
                 AnsichUsageContributionRow,
+                AnsichTaskAncestryRow,
+                AnsichTaskSpawnRow,
                 AnsichContextSnapshotMissingItemRow,
                 AnsichContextSnapshotBlockMembershipRow,
                 AnsichContextSnapshotItemRow,
@@ -1063,6 +1074,7 @@ class SqlAnsichBackend:
                 job.last_error = message
                 if job.status == "failed":
                     self._failed_jobs += 1
+                    await self._mark_projection_task_degraded(session, job.obs_id)
                     session.add(
                         AnsichProjectionErrorRow(
                             error_id=new_id(),
@@ -1077,6 +1089,7 @@ class SqlAnsichBackend:
             job.status = "failed" if attempt >= self._projector_max_attempts else "pending"
             if job.status == "failed":
                 self._failed_jobs += 1
+                await self._mark_projection_task_degraded(session, job.obs_id)
             job.available_at = datetime.now(UTC) + timedelta(milliseconds=250)
             job.lease_owner = None
             job.lease_expires_at = None
@@ -1090,6 +1103,18 @@ class SqlAnsichBackend:
                     message=message,
                 )
             )
+
+    @staticmethod
+    async def _mark_projection_task_degraded(
+        session: AsyncSession,
+        obs_id: str,
+    ) -> None:
+        task_id = await session.scalar(select(AnsichObservationRow.task_id).where(AnsichObservationRow.obs_id == obs_id))
+        if task_id is None:
+            return
+        summary = await session.get(AnsichTaskSummaryRow, task_id)
+        if summary is not None:
+            summary.observability_status = "degraded"
 
     async def _claim_assessor_job(
         self,
@@ -1543,7 +1568,7 @@ class SqlAnsichBackend:
                         AnsichObservationRow.obs_id == AnsichUsageContributionRow.source_obs_id,
                     )
                     .where(
-                        AnsichUsageContributionRow.task_id == task_id,
+                        AnsichUsageContributionRow.aggregate_task_id == task_id,
                         AnsichObservationRow.ingest_seq <= evidence_watermark,
                     )
                     .order_by(
@@ -1556,17 +1581,46 @@ class SqlAnsichBackend:
         values: dict[tuple[UsageDimension, AggregationScope], int] = {}
         as_of: dict[tuple[UsageDimension, AggregationScope], datetime] = {}
         evidence: dict[tuple[UsageDimension, AggregationScope], list[str]] = {}
-        for contribution, _ in contribution_rows:
-            key = (
-                cast(UsageDimension, contribution.dimension),
-                cast(AggregationScope, "local"),
-            )
-            values[key] = values.get(key, 0) + contribution.delta
-            as_of[key] = max(
-                as_of.get(key, _as_utc(contribution.as_of)),
-                _as_utc(contribution.as_of),
-            )
-            evidence.setdefault(key, []).append(contribution.source_obs_id)
+        wall_time_by_source: dict[tuple[UsageDimension, AggregationScope], dict[str, int]] = {}
+        wall_time_terminal_evidence: dict[tuple[UsageDimension, AggregationScope], list[str]] = {}
+        wall_time_heartbeat_evidence: dict[
+            tuple[UsageDimension, AggregationScope],
+            dict[str, tuple[int, str]],
+        ] = {}
+        for contribution, source_observation in contribution_rows:
+            scopes: tuple[AggregationScope, ...] = ("local", "inclusive") if contribution.source_task_id == task_id else ("inclusive",)
+            for scope in scopes:
+                key = (cast(UsageDimension, contribution.dimension), scope)
+                if contribution.dimension == "wall_time_ms":
+                    source_values = wall_time_by_source.setdefault(key, {})
+                    source_values[contribution.source_task_id] = max(
+                        source_values.get(contribution.source_task_id, 0),
+                        contribution.delta,
+                    )
+                else:
+                    values[key] = values.get(key, 0) + contribution.delta
+                as_of[key] = max(
+                    as_of.get(key, _as_utc(contribution.as_of)),
+                    _as_utc(contribution.as_of),
+                )
+                if contribution.dimension != "wall_time_ms":
+                    evidence.setdefault(key, []).append(contribution.source_obs_id)
+                elif source_observation.kind == "task.heartbeat":
+                    by_source = wall_time_heartbeat_evidence.setdefault(key, {})
+                    previous = by_source.get(contribution.source_task_id)
+                    if previous is None or contribution.delta >= previous[0]:
+                        by_source[contribution.source_task_id] = (
+                            contribution.delta,
+                            contribution.source_obs_id,
+                        )
+                else:
+                    wall_time_terminal_evidence.setdefault(key, []).append(contribution.source_obs_id)
+        for key, source_values in wall_time_by_source.items():
+            values[key] = sum(source_values.values())
+            evidence[key] = [
+                *wall_time_terminal_evidence.get(key, ()),
+                *(item[1] for _, item in sorted(wall_time_heartbeat_evidence.get(key, {}).items())),
+            ]
 
         heartbeat_rows = list(
             (
@@ -2345,6 +2399,7 @@ class SqlAnsichBackend:
         from_time: datetime | None = None,
         to_time: datetime | None = None,
         cursor: tuple[datetime, str] | None = None,
+        root_only: bool = False,
     ) -> list[TaskView]:
         async with self._session_factory() as session:
             rows = (
@@ -2356,6 +2411,7 @@ class SqlAnsichBackend:
                         from_time=from_time,
                         to_time=to_time,
                         cursor=cursor,
+                        root_only=root_only,
                     )
                 )
             ).all()
@@ -2403,6 +2459,83 @@ class SqlAnsichBackend:
         async with self._session_factory() as session:
             rows = list((await session.execute(select(AnsichObservationRow).where(AnsichObservationRow.task_id == task_id).order_by(AnsichObservationRow.ingest_seq))).scalars())
         return [self._observation_from_row(row) for row in rows]
+
+    async def list_task_children(self, task_id: str) -> list[TaskSpawnView]:
+        async with self._session_factory() as session:
+            rows = list(
+                (
+                    await session.execute(
+                        select(AnsichTaskSpawnRow)
+                        .where(AnsichTaskSpawnRow.parent_task_id == task_id)
+                        .order_by(
+                            AnsichTaskSpawnRow.established_obs_id,
+                            AnsichTaskSpawnRow.child_task_id,
+                        )
+                    )
+                ).scalars()
+            )
+        return [
+            TaskSpawnView(
+                parent_task_id=row.parent_task_id,
+                spawning_step_id=row.spawning_step_id,
+                spawning_tool_call_id=row.spawning_tool_call_id,
+                child_task_id=row.child_task_id,
+                established_obs_id=row.established_obs_id,
+                subagent_name=row.subagent_name,
+            )
+            for row in rows
+        ]
+
+    async def list_task_tree_spawns(
+        self,
+        task_id: str,
+        *,
+        direction: TaskTreeDirection,
+        depth: int,
+    ) -> tuple[list[TaskSpawnView], bool]:
+        async with self._session_factory() as session:
+            descendant_rows = list((await session.execute(select(AnsichTaskAncestryRow).where(AnsichTaskAncestryRow.ancestor_task_id == task_id))).scalars()) if direction in {"descendants", "both"} else []
+            ancestor_rows = list((await session.execute(select(AnsichTaskAncestryRow).where(AnsichTaskAncestryRow.descendant_task_id == task_id))).scalars()) if direction in {"ancestors", "both"} else []
+            node_depths = {task_id: 0}
+            for row in descendant_rows:
+                if row.depth <= depth:
+                    node_depths[row.descendant_task_id] = row.depth
+            for row in ancestor_rows:
+                if row.depth <= depth:
+                    node_depths[row.ancestor_task_id] = -row.depth
+            node_ids = tuple(node_depths)
+            rows = list(
+                (
+                    await session.execute(
+                        select(AnsichTaskSpawnRow).where(
+                            AnsichTaskSpawnRow.parent_task_id.in_(node_ids),
+                            AnsichTaskSpawnRow.child_task_id.in_(node_ids),
+                        )
+                    )
+                ).scalars()
+            )
+        rows.sort(
+            key=lambda row: (
+                node_depths[row.child_task_id],
+                row.parent_task_id,
+                row.child_task_id,
+            )
+        )
+        truncated = any(row.depth > depth for row in descendant_rows) or any(row.depth > depth for row in ancestor_rows)
+        return (
+            [
+                TaskSpawnView(
+                    parent_task_id=row.parent_task_id,
+                    spawning_step_id=row.spawning_step_id,
+                    spawning_tool_call_id=row.spawning_tool_call_id,
+                    child_task_id=row.child_task_id,
+                    established_obs_id=row.established_obs_id,
+                    subagent_name=row.subagent_name,
+                )
+                for row in rows
+            ],
+            truncated,
+        )
 
     async def list_alerts(
         self,
@@ -2976,23 +3109,83 @@ class SqlAnsichBackend:
                     await session.execute(
                         select(AnsichTaskUsageRow).where(
                             AnsichTaskUsageRow.task_id == task_id,
-                            AnsichTaskUsageRow.aggregation_scope == "local",
                         )
                     )
                 ).scalars()
             )
-        rows.sort(key=lambda row: _USAGE_DIMENSION_ORDER[row.dimension])
-        return TaskUsageView(
-            task_id=task_id,
-            local=tuple(
+        rows.sort(
+            key=lambda row: (
+                row.aggregation_scope,
+                _USAGE_DIMENSION_ORDER[row.dimension],
+            )
+        )
+
+        def values_for(scope: AggregationScope) -> tuple[TaskUsageValue, ...]:
+            return tuple(
                 TaskUsageValue(
                     dimension=row.dimension,
-                    aggregation_scope="local",
+                    aggregation_scope=scope,
                     value=row.value,
                     as_of=_as_utc(row.as_of),
                     complete_through_ingest_seq=row.complete_through_ingest_seq,
                 )
                 for row in rows
+                if row.aggregation_scope == scope
+            )
+
+        return TaskUsageView(
+            task_id=task_id,
+            local=values_for("local"),
+            inclusive=values_for("inclusive"),
+        )
+
+    async def get_task_usage_breakdown(
+        self,
+        task_id: str,
+        *,
+        scope: AggregationScope,
+    ) -> TaskUsageBreakdownView:
+        statement = (
+            select(AnsichUsageContributionRow, AnsichObservationRow.ingest_seq)
+            .join(
+                AnsichObservationRow,
+                AnsichObservationRow.obs_id == AnsichUsageContributionRow.source_obs_id,
+            )
+            .where(AnsichUsageContributionRow.aggregate_task_id == task_id)
+        )
+        if scope == "local":
+            statement = statement.where(AnsichUsageContributionRow.source_task_id == task_id)
+        async with self._session_factory() as session:
+            rows = list((await session.execute(statement)).all())
+        grouped: dict[tuple[str, str], list[tuple[AnsichUsageContributionRow, int]]] = {}
+        for row, ingest_seq in rows:
+            grouped.setdefault((row.source_task_id, row.dimension), []).append((row, ingest_seq))
+        values_by_source: dict[str, list[TaskUsageValue]] = {}
+        for (source_task_id, dimension), group in grouped.items():
+            value = max(row.delta for row, _ in group) if dimension == "wall_time_ms" else sum(row.delta for row, _ in group)
+            values_by_source.setdefault(source_task_id, []).append(
+                TaskUsageValue(
+                    dimension=dimension,
+                    aggregation_scope=scope,
+                    value=value,
+                    as_of=max(_as_utc(row.as_of) for row, _ in group),
+                    complete_through_ingest_seq=max(ingest_seq for _, ingest_seq in group),
+                )
+            )
+        return TaskUsageBreakdownView(
+            task_id=task_id,
+            scope=scope,
+            sources=tuple(
+                TaskUsageSourceView(
+                    source_task_id=source_task_id,
+                    values=tuple(
+                        sorted(
+                            values,
+                            key=lambda item: _USAGE_DIMENSION_ORDER[item.dimension],
+                        )
+                    ),
+                )
+                for source_task_id, values in sorted(values_by_source.items())
             ),
         )
 
@@ -3332,8 +3525,9 @@ class SqlAnsichBackend:
                         await session.execute(
                             select(AnsichUsageContributionRow.source_obs_id)
                             .where(
-                                AnsichUsageContributionRow.task_id == budget_row.task_id,
+                                AnsichUsageContributionRow.aggregate_task_id == budget_row.task_id,
                                 AnsichUsageContributionRow.dimension == budget_row.dimension,
+                                *((AnsichUsageContributionRow.source_task_id == budget_row.task_id,) if budget_row.aggregation_scope == "local" else ()),
                             )
                             .order_by(
                                 AnsichUsageContributionRow.as_of,
@@ -3727,7 +3921,24 @@ class SqlAnsichBackend:
     ) -> list[ActiveTaskView]:
         if limit < 1:
             raise ValueError("limit must be positive")
-        statement = select(AnsichActiveTaskReadModelRow)
+        active_child_count = (
+            select(func.count())
+            .select_from(AnsichTaskSpawnRow)
+            .join(
+                AnsichTaskSummaryRow,
+                AnsichTaskSummaryRow.task_id == AnsichTaskSpawnRow.child_task_id,
+            )
+            .where(
+                AnsichTaskSpawnRow.parent_task_id == AnsichActiveTaskReadModelRow.task_id,
+                AnsichTaskSummaryRow.control_value == "running",
+            )
+            .correlate(AnsichActiveTaskReadModelRow)
+            .scalar_subquery()
+        )
+        statement = select(
+            AnsichActiveTaskReadModelRow,
+            active_child_count.label("active_child_count"),
+        )
         if owner_id is not None:
             statement = statement.where(AnsichActiveTaskReadModelRow.owner_id == owner_id)
         if agent_id is not None:
@@ -3760,11 +3971,15 @@ class SqlAnsichBackend:
             AnsichActiveTaskReadModelRow.task_id,
         ).limit(limit)
         async with self._session_factory() as session:
-            rows = list((await session.execute(statement)).scalars())
-        return [self._active_task_view(row) for row in rows]
+            rows = list((await session.execute(statement)).all())
+        return [self._active_task_view(row, active_child_count=int(child_count or 0)) for row, child_count in rows]
 
     @staticmethod
-    def _active_task_view(row: AnsichActiveTaskReadModelRow) -> ActiveTaskView:
+    def _active_task_view(
+        row: AnsichActiveTaskReadModelRow,
+        *,
+        active_child_count: int = 0,
+    ) -> ActiveTaskView:
         def strict_model(model_type, value):
             return model_type.model_validate_json(json.dumps(value))
 
@@ -3781,6 +3996,7 @@ class SqlAnsichBackend:
             dwell=strict_model(DwellBelief, row.dwell_json),
             heartbeat=strict_model(HeartbeatBelief, row.heartbeat_json),
             usage=strict_model(TaskUsageView, row.usage_json),
+            active_child_count=active_child_count,
             budgets=strict_model(TaskBudgetsView, row.budgets_json),
             budget_health=tuple(strict_model(BudgetHealthBelief, item) for item in row.budget_health_json),
             duration_ms=row.duration_ms,
@@ -4657,7 +4873,141 @@ class SqlAnsichBackend:
             session.add(task)
         await session.flush()
         await self._project_scopes(session, observation)
+        if observation.kind == "task.created" and str(observation.payload.get("source_kind")) == "deerflow_subagent":
+            await self._project_task_spawn(session, observation)
         return task
+
+    async def _project_task_spawn(
+        self,
+        session: AsyncSession,
+        observation: ObservationEnvelope,
+    ) -> None:
+        """Establish a typed parent/child edge and its transitive closure."""
+
+        if observation.payload is None:
+            raise ValueError("child task.created requires an inline payload")
+        payload = observation.payload
+        required = (
+            "parent_task_id",
+            "spawning_step_id",
+            "spawning_tool_call_id",
+        )
+        missing = [name for name in required if not isinstance(payload.get(name), str)]
+        if missing:
+            raise ValueError("child task.created is missing spawn identity: " + ", ".join(missing))
+        parent_task_id = str(payload["parent_task_id"])
+        step_id = str(payload["spawning_step_id"])
+        tool_call_id = str(payload["spawning_tool_call_id"])
+        child_task_id = observation.task_id
+        if parent_task_id == child_task_id:
+            raise ValueError("a Task cannot spawn itself")
+
+        parent = await session.get(AnsichTaskRow, parent_task_id)
+        step = await session.get(AnsichStepRow, step_id)
+        tool_call = await session.get(AnsichToolCallRow, tool_call_id)
+        if parent is None or step is None or tool_call is None:
+            raise _ProjectionDependencyPending(f"child Task {child_task_id} is waiting for its parent Step/ToolCall")
+        if step.task_id != parent_task_id:
+            raise ValueError("spawning Step does not belong to the parent Task")
+        if tool_call.task_id != parent_task_id or tool_call.step_id != step_id or tool_call.tool_name != "task":
+            raise ValueError("spawning ToolCall is not a task ToolCall on the parent Step")
+
+        existing = await session.get(AnsichTaskSpawnRow, child_task_id)
+        if existing is not None:
+            identity = (
+                existing.parent_task_id,
+                existing.spawning_step_id,
+                existing.spawning_tool_call_id,
+            )
+            if identity != (parent_task_id, step_id, tool_call_id):
+                raise ValueError("child Task already has a different parent")
+            return
+
+        if (
+            await session.get(
+                AnsichTaskAncestryRow,
+                (child_task_id, parent_task_id),
+            )
+            is not None
+        ):
+            raise ValueError("Task spawn would create an ancestry cycle")
+
+        session.add(
+            AnsichTaskSpawnRow(
+                parent_task_id=parent_task_id,
+                spawning_step_id=step_id,
+                spawning_tool_call_id=tool_call_id,
+                child_task_id=child_task_id,
+                established_obs_id=observation.obs_id,
+                subagent_name=(str(payload["subagent_name"]) if isinstance(payload.get("subagent_name"), str) else None),
+            )
+        )
+        ancestors = list((await session.execute(select(AnsichTaskAncestryRow).where(AnsichTaskAncestryRow.descendant_task_id == parent_task_id))).scalars())
+        descendants = list((await session.execute(select(AnsichTaskAncestryRow).where(AnsichTaskAncestryRow.ancestor_task_id == child_task_id))).scalars())
+        if any(descendant.descendant_task_id == parent_task_id for descendant in descendants):
+            raise ValueError("Task spawn would create an ancestry cycle")
+        ancestor_depths = [(parent_task_id, 0), *[(row.ancestor_task_id, row.depth) for row in ancestors]]
+        descendant_depths = [(child_task_id, 0), *[(row.descendant_task_id, row.depth) for row in descendants]]
+        for ancestor_id, ancestor_depth in ancestor_depths:
+            for descendant_id, descendant_depth in descendant_depths:
+                session.add(
+                    AnsichTaskAncestryRow(
+                        ancestor_task_id=ancestor_id,
+                        descendant_task_id=descendant_id,
+                        depth=ancestor_depth + 1 + descendant_depth,
+                        established_obs_id=observation.obs_id,
+                    )
+                )
+        await session.flush()
+        await self._backfill_spawn_usage(
+            session,
+            ancestor_task_ids=tuple(item[0] for item in ancestor_depths),
+            descendant_task_ids=tuple(item[0] for item in descendant_depths),
+            updated_at=observation.recorded_at,
+        )
+
+    async def _backfill_spawn_usage(
+        self,
+        session: AsyncSession,
+        *,
+        ancestor_task_ids: tuple[str, ...],
+        descendant_task_ids: tuple[str, ...],
+        updated_at: datetime,
+    ) -> None:
+        """Fan out already-durable descendant usage after a late spawn edge."""
+
+        local_rows = list(
+            (
+                await session.execute(
+                    select(AnsichUsageContributionRow).where(
+                        AnsichUsageContributionRow.aggregate_task_id == AnsichUsageContributionRow.source_task_id,
+                        AnsichUsageContributionRow.source_task_id.in_(descendant_task_ids),
+                    )
+                )
+            ).scalars()
+        )
+        changed: set[tuple[str, str]] = set()
+        for ancestor_task_id in ancestor_task_ids:
+            for row in local_rows:
+                inserted = await self._insert_usage_contribution(
+                    session,
+                    aggregate_task_id=ancestor_task_id,
+                    source_task_id=row.source_task_id,
+                    dimension=row.dimension,
+                    source_obs_id=row.source_obs_id,
+                    delta=row.delta,
+                    as_of=_as_utc(row.as_of),
+                )
+                if inserted:
+                    changed.add((ancestor_task_id, row.dimension))
+        for aggregate_task_id, dimension in changed:
+            await self._refresh_usage_summary(
+                session,
+                task_id=aggregate_task_id,
+                dimension=dimension,
+                aggregation_scope="inclusive",
+                updated_at=updated_at,
+            )
 
     async def _project_agent_release(
         self,
@@ -5070,7 +5420,7 @@ class SqlAnsichBackend:
                         AnsichObservationRow.obs_id == AnsichUsageContributionRow.source_obs_id,
                     )
                     .where(
-                        AnsichUsageContributionRow.task_id == contribution.task_id,
+                        AnsichUsageContributionRow.aggregate_task_id == contribution.source_task_id,
                         AnsichUsageContributionRow.source_task_id == contribution.source_task_id,
                         AnsichUsageContributionRow.dimension == contribution.dimension,
                         AnsichObservationRow.subject_id == observation.subject_id,
@@ -5079,64 +5429,134 @@ class SqlAnsichBackend:
                 )
                 if existing_tool_contribution is not None:
                     continue
-
-            values = {
-                "task_id": contribution.task_id,
-                "source_task_id": contribution.source_task_id,
-                "dimension": contribution.dimension,
-                "source_obs_id": contribution.source_obs_id,
-                "delta": contribution.delta,
-                "as_of": contribution.as_of,
-            }
-            dialect_name = session.bind.dialect.name if session.bind is not None else ""
-            if dialect_name == "postgresql":
-                statement = postgresql_insert(AnsichUsageContributionRow).values(**values)
-            elif dialect_name == "sqlite":
-                statement = sqlite_insert(AnsichUsageContributionRow).values(**values)
-            else:
-                raise ValueError(f"unsupported Ansich SQL dialect: {dialect_name}")
-            inserted = (
-                await session.execute(
-                    statement.on_conflict_do_nothing(
-                        index_elements=[
-                            "task_id",
-                            "source_task_id",
-                            "dimension",
-                            "source_obs_id",
-                        ]
-                    ).returning(AnsichUsageContributionRow.source_obs_id)
+            ancestor_ids = tuple((await session.execute(select(AnsichTaskAncestryRow.ancestor_task_id).where(AnsichTaskAncestryRow.descendant_task_id == contribution.source_task_id))).scalars())
+            targets = (contribution.source_task_id, *ancestor_ids)
+            for aggregate_task_id in targets:
+                inserted = await self._insert_usage_contribution(
+                    session,
+                    aggregate_task_id=aggregate_task_id,
+                    source_task_id=contribution.source_task_id,
+                    dimension=contribution.dimension,
+                    source_obs_id=contribution.source_obs_id,
+                    delta=contribution.delta,
+                    as_of=contribution.as_of,
                 )
-            ).scalar_one_or_none()
-            if inserted is None:
-                continue
-
-            usage = await session.get(
-                AnsichTaskUsageRow,
-                (contribution.task_id, contribution.dimension, "local"),
-            )
-            if usage is None:
-                session.add(
-                    AnsichTaskUsageRow(
-                        task_id=contribution.task_id,
+                if not inserted:
+                    continue
+                if aggregate_task_id == contribution.source_task_id:
+                    await self._refresh_usage_summary(
+                        session,
+                        task_id=aggregate_task_id,
                         dimension=contribution.dimension,
                         aggregation_scope="local",
-                        value=contribution.delta,
-                        as_of=contribution.as_of,
-                        complete_through_ingest_seq=ingest_seq,
                         updated_at=observation.recorded_at,
                     )
+                await self._refresh_usage_summary(
+                    session,
+                    task_id=aggregate_task_id,
+                    dimension=contribution.dimension,
+                    aggregation_scope="inclusive",
+                    updated_at=observation.recorded_at,
                 )
-            else:
-                if contribution.dimension == "wall_time_ms":
-                    usage.value = max(usage.value, contribution.delta)
-                else:
-                    usage.value += contribution.delta
-                usage.as_of = max(_as_utc(usage.as_of), contribution.as_of)
-                usage.complete_through_ingest_seq = max(
-                    usage.complete_through_ingest_seq,
-                    ingest_seq,
+
+    @staticmethod
+    async def _insert_usage_contribution(
+        session: AsyncSession,
+        *,
+        aggregate_task_id: str,
+        source_task_id: str,
+        dimension: str,
+        source_obs_id: str,
+        delta: int,
+        as_of: datetime,
+    ) -> bool:
+        values = {
+            "aggregate_task_id": aggregate_task_id,
+            "source_task_id": source_task_id,
+            "dimension": dimension,
+            "source_obs_id": source_obs_id,
+            "delta": delta,
+            "as_of": as_of,
+        }
+        dialect_name = session.bind.dialect.name if session.bind is not None else ""
+        if dialect_name == "postgresql":
+            statement = postgresql_insert(AnsichUsageContributionRow).values(**values)
+        elif dialect_name == "sqlite":
+            statement = sqlite_insert(AnsichUsageContributionRow).values(**values)
+        else:
+            raise ValueError(f"unsupported Ansich SQL dialect: {dialect_name}")
+        inserted = (
+            await session.execute(
+                statement.on_conflict_do_nothing(
+                    index_elements=[
+                        "aggregate_task_id",
+                        "source_task_id",
+                        "dimension",
+                        "source_obs_id",
+                    ]
+                ).returning(AnsichUsageContributionRow.source_obs_id)
+            )
+        ).scalar_one_or_none()
+        return inserted is not None
+
+    @staticmethod
+    async def _refresh_usage_summary(
+        session: AsyncSession,
+        *,
+        task_id: str,
+        dimension: str,
+        aggregation_scope: AggregationScope,
+        updated_at: datetime,
+    ) -> None:
+        statement = (
+            select(AnsichUsageContributionRow, AnsichObservationRow.ingest_seq)
+            .join(
+                AnsichObservationRow,
+                AnsichObservationRow.obs_id == AnsichUsageContributionRow.source_obs_id,
+            )
+            .where(
+                AnsichUsageContributionRow.aggregate_task_id == task_id,
+                AnsichUsageContributionRow.dimension == dimension,
+            )
+        )
+        if aggregation_scope == "local":
+            statement = statement.where(AnsichUsageContributionRow.source_task_id == task_id)
+        rows = list((await session.execute(statement)).all())
+        if not rows:
+            return
+        if dimension == "wall_time_ms":
+            latest_by_source: dict[str, int] = {}
+            for contribution, _ in rows:
+                latest_by_source[contribution.source_task_id] = max(
+                    latest_by_source.get(contribution.source_task_id, 0),
+                    contribution.delta,
                 )
-                usage.updated_at = observation.recorded_at
+            value = sum(latest_by_source.values())
+        else:
+            value = sum(contribution.delta for contribution, _ in rows)
+        as_of = max(_as_utc(contribution.as_of) for contribution, _ in rows)
+        watermark = max(ingest_seq for _, ingest_seq in rows)
+        usage = await session.get(
+            AnsichTaskUsageRow,
+            (task_id, dimension, aggregation_scope),
+        )
+        if usage is None:
+            session.add(
+                AnsichTaskUsageRow(
+                    task_id=task_id,
+                    dimension=dimension,
+                    aggregation_scope=aggregation_scope,
+                    value=value,
+                    as_of=as_of,
+                    complete_through_ingest_seq=watermark,
+                    updated_at=updated_at,
+                )
+            )
+            return
+        usage.value = value
+        usage.as_of = as_of
+        usage.complete_through_ingest_seq = watermark
+        usage.updated_at = updated_at
 
     async def _project_step(self, session: AsyncSession, observation: ObservationEnvelope) -> bool:
         """Project logical decisions, physical LLM attempts, and request context.
@@ -6157,6 +6577,8 @@ class SqlAnsichBackend:
         scopes = (
             ("owner", observation.payload.get("owner_id")),
             ("thread", observation.payload.get("thread_id")),
+            ("workspace", observation.payload.get("workspace_ref")),
+            ("sandbox", observation.payload.get("sandbox_ref")),
         )
         for scope_kind, raw_scope_value in scopes:
             if not isinstance(raw_scope_value, str) or not raw_scope_value:

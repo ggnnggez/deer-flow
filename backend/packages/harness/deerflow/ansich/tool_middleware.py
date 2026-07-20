@@ -9,7 +9,12 @@ from typing import get_args
 from uuid import uuid4
 
 from ansich import ObservationEnvelope, Producer, new_id
-from ansich.serialization import ObservedContentCapture, serialize_observed_content
+from ansich.serialization import (
+    ANSICH_PRODUCER_ENTITY_ID_KEY,
+    ANSICH_PRODUCER_KIND_KEY,
+    ObservedContentCapture,
+    serialize_observed_content,
+)
 from ansich.tool import ToolTransformKind
 from langchain.agents.middleware import AgentMiddleware
 from langchain_core.messages import ToolMessage
@@ -102,6 +107,24 @@ def _capture_exception(exc: BaseException, request: ToolCallRequest) -> Observed
     )
 
 
+def _result_producer_metadata(
+    result: ToolMessage | Command,
+    request: ToolCallRequest,
+) -> dict[str, str]:
+    message = _tool_message(result, request)
+    additional_kwargs = None if message is None else getattr(message, "additional_kwargs", None)
+    if not isinstance(additional_kwargs, Mapping):
+        return {}
+    producer_kind = additional_kwargs.get(ANSICH_PRODUCER_KIND_KEY)
+    producer_entity_id = additional_kwargs.get(ANSICH_PRODUCER_ENTITY_ID_KEY)
+    if not isinstance(producer_kind, str) or not isinstance(producer_entity_id, str):
+        return {}
+    return {
+        "producer_kind": producer_kind,
+        "producer_entity_id": producer_entity_id,
+    }
+
+
 def _resolve_invocation(
     execution: AnsichExecutionContext,
     request: ToolCallRequest,
@@ -166,6 +189,7 @@ def _record_raw_result(
     *,
     terminal_kind: str,
     terminal_payload: dict[str, object] | None = None,
+    producer_metadata: Mapping[str, str] | None = None,
 ) -> None:
     registration = invocation.registration
     block_id = new_id()
@@ -186,6 +210,7 @@ def _record_raw_result(
             "source_identity": f"tool-call:{registration.tool_call_id}:raw-result",
             "redactions": [entry.model_dump(mode="json") for entry in capture.redactions],
             "warnings": list(capture.warnings),
+            **dict(producer_metadata or {}),
         },
     )
     duration_ms = 0
@@ -268,6 +293,7 @@ def _record_visible_result(
     *,
     transforms: tuple[Mapping[str, object], ...] = (),
     visible_message_id: str | None = None,
+    producer_metadata: Mapping[str, str] | None = None,
 ) -> None:
     registration = invocation.registration
     observations: list[ObservationEnvelope] = []
@@ -316,6 +342,7 @@ def _record_visible_result(
             "source_identity": f"tool-call:{registration.tool_call_id}:visible-result",
             "redactions": [entry.model_dump(mode="json") for entry in capture.redactions],
             "warnings": list(capture.warnings),
+            **dict(producer_metadata or {}),
         },
     )
     observations.append(content_observation)
@@ -388,6 +415,7 @@ class AnsichVisibleToolMiddleware(AgentMiddleware):
                         _capture_result(result, request, kind="tool_result_visible"),
                         transforms=read_tool_transforms(visible_message),
                         visible_message_id=(visible_message.id if visible_message is not None and isinstance(visible_message.id, str) else None),
+                        producer_metadata=_result_producer_metadata(result, request),
                     )
             except Exception:
                 pass
@@ -419,6 +447,7 @@ class AnsichVisibleToolMiddleware(AgentMiddleware):
                         _capture_result(result, request, kind="tool_result_visible"),
                         transforms=read_tool_transforms(visible_message),
                         visible_message_id=(visible_message.id if visible_message is not None and isinstance(visible_message.id, str) else None),
+                        producer_metadata=_result_producer_metadata(result, request),
                     )
             except Exception:
                 pass
@@ -464,6 +493,7 @@ class AnsichRawToolMiddleware(AgentMiddleware):
                 invocation,
                 _capture_result(result, request, kind="tool_result_raw"),
                 terminal_kind="tool.returned_raw",
+                producer_metadata=_result_producer_metadata(result, request),
             )
         except Exception:
             pass
@@ -505,6 +535,7 @@ class AnsichRawToolMiddleware(AgentMiddleware):
                 invocation,
                 _capture_result(result, request, kind="tool_result_raw"),
                 terminal_kind="tool.returned_raw",
+                producer_metadata=_result_producer_metadata(result, request),
             )
         except Exception:
             pass

@@ -71,6 +71,7 @@ class ActiveTaskView(BaseModel):
     dwell: DwellBelief
     heartbeat: HeartbeatBelief
     usage: TaskUsageView
+    active_child_count: int = Field(default=0, ge=0)
     budgets: TaskBudgetsView
     budget_health: tuple[BudgetHealthBelief, ...]
     duration_ms: int = Field(ge=0)

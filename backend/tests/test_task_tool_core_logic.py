@@ -8,6 +8,10 @@ from types import SimpleNamespace
 from unittest.mock import MagicMock
 
 import pytest
+from ansich.serialization import (
+    ANSICH_PRODUCER_ENTITY_ID_KEY,
+    ANSICH_PRODUCER_KIND_KEY,
+)
 from langchain_core.messages import ToolMessage
 from langgraph.types import Command
 
@@ -130,6 +134,17 @@ def test_task_result_command_derives_content_from_status_payload():
     )
     assert completed_with_runtime_metadata.additional_kwargs[SUBAGENT_MODEL_NAME_KEY] == "claude-3-7-sonnet"
     assert completed_with_runtime_metadata.additional_kwargs[SUBAGENT_TOKEN_USAGE_KEY]["total_tokens"] == 120
+
+    completed_with_ansich_producer = _task_tool_message(
+        task_tool_module._task_result_command(
+            tool_call_id="tc-completed-ansich",
+            status="completed",
+            result="done",
+            producer_task_id="a3c9a97e-3c9a-4f7c-86e0-532696fcbaee",
+        )
+    )
+    assert completed_with_ansich_producer.additional_kwargs[ANSICH_PRODUCER_KIND_KEY] == "subagent_task"
+    assert completed_with_ansich_producer.additional_kwargs[ANSICH_PRODUCER_ENTITY_ID_KEY] == "a3c9a97e-3c9a-4f7c-86e0-532696fcbaee"
 
     failed = _task_tool_message(
         task_tool_module._task_result_command(
@@ -265,6 +280,7 @@ def test_task_tool_forwards_channel_user_id_to_executor(monkeypatch):
     dispatching turn's channel_user_id (same propagation rule as user_role /
     oauth attribution)."""
     runtime = _make_runtime()
+    runtime.context["user_id"] = "owner-1"
     runtime.context["channel_user_id"] = "ou_group_sender_1"
     from deerflow.ansich.execution import ANSICH_EXECUTION_CONTEXT_KEY, AnsichExecutionContext
 
@@ -302,7 +318,197 @@ def test_task_tool_forwards_channel_user_id_to_executor(monkeypatch):
     message = _task_tool_message(output)
     assert message.content == "Task Succeeded. Result: done"
     assert captured["executor_kwargs"]["channel_user_id"] == "ou_group_sender_1"
-    assert captured["executor_kwargs"]["ansich_execution_context"] is ansich_execution
+    # Ansich is disabled for this fixture (the parent context has no service),
+    # so delegation carries no collector rather than sharing the parent one.
+    assert captured["executor_kwargs"]["ansich_execution_context"] is None
+
+
+def test_task_tool_creates_distinct_child_ansich_context_from_spawning_tool(monkeypatch):
+    from ansich import new_id
+
+    from deerflow.ansich.execution import ANSICH_EXECUTION_CONTEXT_KEY, AnsichExecutionContext
+
+    runtime = _make_runtime()
+    runtime.context["user_id"] = "owner-1"
+    service = MagicMock()
+    parent_task_id = new_id()
+    parent_execution = AnsichExecutionContext(task_id=parent_task_id, service=service)
+    spawning_step_id = new_id()
+    spawning_tool_call_id = new_id()
+    registration = parent_execution.register_tool_call(
+        tool_call_id=spawning_tool_call_id,
+        step_id=spawning_step_id,
+        step_seq=3,
+        call_seq=2,
+        provider_call_id="tc-child-context",
+        tool_name="task",
+        args_hash="args-hash",
+        issued_obs_id=new_id(),
+    )
+    runtime.context[ANSICH_EXECUTION_CONTEXT_KEY] = parent_execution
+    captured = {}
+
+    class DummyExecutor:
+        def __init__(self, **kwargs):
+            captured["executor_kwargs"] = kwargs
+
+        def execute_async(self, prompt, task_id=None):
+            return task_id or "generated-task-id"
+
+    monkeypatch.setattr(task_tool_module, "SubagentStatus", FakeSubagentStatus)
+    monkeypatch.setattr(task_tool_module, "SubagentExecutor", DummyExecutor)
+    monkeypatch.setattr(task_tool_module, "get_subagent_config", lambda _: _make_subagent_config())
+    monkeypatch.setattr(
+        task_tool_module,
+        "get_background_task_result",
+        lambda _: _make_result(FakeSubagentStatus.COMPLETED, result="done"),
+    )
+    monkeypatch.setattr(task_tool_module, "get_stream_writer", lambda: lambda _event: None)
+    monkeypatch.setattr(task_tool_module.asyncio, "sleep", _no_sleep)
+    monkeypatch.setattr("deerflow.tools.get_available_tools", lambda **kwargs: [])
+
+    with parent_execution.activate_tool_invocation(registration):
+        output = _run_task_tool(
+            runtime=runtime,
+            description="运行子任务",
+            prompt="collect diagnostics",
+            subagent_type="general-purpose",
+            tool_call_id="tc-child-context",
+        )
+
+    assert _task_tool_message(output).content == "Task Succeeded. Result: done"
+    child_execution = captured["executor_kwargs"]["ansich_execution_context"]
+    child_probe = captured["executor_kwargs"]["ansich_task_control"]
+    assert isinstance(child_execution, AnsichExecutionContext)
+    assert child_execution is not parent_execution
+    assert child_execution.task_id == child_probe.task_id
+    assert child_execution.task_id != parent_task_id
+    created = next(call.args[0] for call in service.record.call_args_list if call.args[0].kind == "task.created")
+    assert created.payload == {
+        "source_kind": "deerflow_subagent",
+        "source_id": "tc-child-context",
+        "thread_id": "thread-1",
+        "owner_id": "owner-1",
+        "trigger_kind": "subagent",
+        "parent_task_id": parent_task_id,
+        "spawning_step_id": spawning_step_id,
+        "spawning_tool_call_id": spawning_tool_call_id,
+        "subagent_name": "general-purpose",
+        "scope_inheritance_source": "parent_task",
+        "workspace_ref": "/tmp/workspace",
+        "sandbox_ref": "local",
+    }
+
+
+def test_child_ansich_context_failure_is_degraded_but_delegation_continues(monkeypatch):
+    from ansich import new_id
+
+    from deerflow.ansich.execution import ANSICH_EXECUTION_CONTEXT_KEY, AnsichExecutionContext
+
+    runtime = _make_runtime()
+    service = MagicMock()
+    parent_execution = AnsichExecutionContext(task_id=new_id(), service=service)
+    runtime.context[ANSICH_EXECUTION_CONTEXT_KEY] = parent_execution
+    captured = {}
+
+    class DummyExecutor:
+        def __init__(self, **kwargs):
+            captured["executor_kwargs"] = kwargs
+
+        def execute_async(self, prompt, task_id=None):
+            return task_id or "generated-task-id"
+
+    monkeypatch.setattr(task_tool_module, "SubagentStatus", FakeSubagentStatus)
+    monkeypatch.setattr(task_tool_module, "SubagentExecutor", DummyExecutor)
+    monkeypatch.setattr(task_tool_module, "get_subagent_config", lambda _: _make_subagent_config())
+    monkeypatch.setattr(
+        task_tool_module,
+        "_create_child_ansich_context",
+        MagicMock(side_effect=RuntimeError("collector unavailable")),
+    )
+    monkeypatch.setattr(
+        task_tool_module,
+        "get_background_task_result",
+        lambda _: _make_result(FakeSubagentStatus.COMPLETED, result="done"),
+    )
+    monkeypatch.setattr(task_tool_module, "get_stream_writer", lambda: lambda _event: None)
+    monkeypatch.setattr(task_tool_module.asyncio, "sleep", _no_sleep)
+    monkeypatch.setattr("deerflow.tools.get_available_tools", lambda **kwargs: [])
+
+    output = _run_task_tool(
+        runtime=runtime,
+        description="运行子任务",
+        prompt="collect diagnostics",
+        subagent_type="general-purpose",
+        tool_call_id="tc-context-failure",
+    )
+
+    assert _task_tool_message(output).content == "Task Succeeded. Result: done"
+    assert captured["executor_kwargs"]["ansich_execution_context"] is None
+    degraded = [call.args[0] for call in service.record.call_args_list if call.args[0].kind == "observability.degraded"]
+    assert len(degraded) == 1
+    assert degraded[0].payload == {
+        "component": "tool_call",
+        "reason": "child_context_initialization_failed",
+        "provider_tool_call_id": "tc-context-failure",
+    }
+
+
+def test_executor_start_failure_closes_allocated_child_task(monkeypatch):
+    from ansich import new_id
+
+    from deerflow.ansich.execution import (
+        ANSICH_EXECUTION_CONTEXT_KEY,
+        AnsichExecutionContext,
+    )
+
+    runtime = _make_runtime()
+    service = MagicMock()
+    parent_execution = AnsichExecutionContext(task_id=new_id(), service=service)
+    registration = parent_execution.register_tool_call(
+        tool_call_id=new_id(),
+        step_id=new_id(),
+        step_seq=1,
+        call_seq=1,
+        provider_call_id="tc-start-failure",
+        tool_name="task",
+        args_hash="a" * 64,
+        issued_obs_id=new_id(),
+    )
+    runtime.context[ANSICH_EXECUTION_CONTEXT_KEY] = parent_execution
+
+    class FailingExecutor:
+        def __init__(self, **kwargs):
+            pass
+
+        def execute_async(self, prompt, task_id=None):
+            raise RuntimeError("executor pool unavailable")
+
+    monkeypatch.setattr(task_tool_module, "SubagentExecutor", FailingExecutor)
+    monkeypatch.setattr(
+        task_tool_module,
+        "get_subagent_config",
+        lambda _: _make_subagent_config(),
+    )
+    monkeypatch.setattr("deerflow.tools.get_available_tools", lambda **kwargs: [])
+
+    with parent_execution.activate_tool_invocation(registration):
+        with pytest.raises(RuntimeError, match="executor pool unavailable"):
+            _run_task_tool(
+                runtime=runtime,
+                description="运行子任务",
+                prompt="collect diagnostics",
+                subagent_type="general-purpose",
+                tool_call_id="tc-start-failure",
+            )
+
+    lifecycle = [call.args[0] for call in service.record.call_args_list if call.args[0].kind.startswith("task.")]
+    assert [observation.kind for observation in lifecycle] == [
+        "task.created",
+        "task.failed",
+    ]
+    assert lifecycle[-1].payload is not None
+    assert lifecycle[-1].payload["failure_reason"] == "executor_start_failed"
 
 
 def test_task_tool_forwards_is_internal_true_to_executor(monkeypatch):

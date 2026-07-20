@@ -9,6 +9,7 @@ from ansich import AnsichService, ObservationEnvelope, Producer, new_id
 from ansich.memory import InMemoryAnsichBackend
 from ansich.release import AgentRuntimeDescriptor
 
+from deerflow.agents.lead_agent.agent import LeadAgentAssembly
 from deerflow.ansich.execution import ANSICH_EXECUTION_CONTEXT_KEY, AnsichExecutionContext
 from deerflow.runtime.runs.manager import RunRecord
 from deerflow.runtime.runs.schemas import DisconnectMode, RunStatus
@@ -149,6 +150,54 @@ def _heartbeat_app_config(*, interval_seconds: float = 0.01) -> SimpleNamespace:
     return SimpleNamespace(
         ansich=SimpleNamespace(heartbeat_interval_seconds=interval_seconds),
     )
+
+
+@pytest.mark.asyncio
+async def test_worker_records_descriptor_from_explicit_agent_assembly():
+    service = AnsichService.in_memory(flush_interval_ms=1)
+    await service.start()
+    record = RunRecord(
+        run_id="run-explicit-agent-assembly",
+        thread_id="thread-explicit-agent-assembly",
+        assistant_id="lead-agent",
+        status=RunStatus.pending,
+        on_disconnect=DisconnectMode.cancel,
+        owner_worker_id="worker-a",
+    )
+    descriptor = AgentRuntimeDescriptor(
+        namespace="deerflow",
+        agent_name="lead-agent",
+        effective_model="provider/model-v2",
+        prompt_template_id="lead-v1",
+        rendered_base_prompt="You are DeerFlow.",
+    )
+
+    try:
+        await run_agent(
+            RecordingBridge(),
+            RecordingRunManager(record),
+            record,
+            ctx=RunContext(
+                checkpointer=None,
+                ansich_service=service,
+                app_config=_heartbeat_app_config(),
+            ),
+            agent_factory=lambda config: LeadAgentAssembly(
+                graph=SuccessfulAgent(),
+                descriptor=descriptor,
+            ),
+            graph_input={"messages": []},
+            config={"configurable": {"thread_id": record.thread_id}},
+        )
+        task = await service.get_task_by_source("deerflow_run", record.run_id)
+        assert task is not None
+        await service.flush_task(task.task_id)
+        binding = await service.get_task_agent_release(task.task_id)
+    finally:
+        await service.stop()
+
+    assert binding is not None
+    assert binding.release.manifest.model.effective == "provider/model-v2"
 
 
 @pytest.mark.asyncio

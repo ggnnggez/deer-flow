@@ -82,9 +82,12 @@ automatic polling after its Task becomes terminal. Both render full Belief
 provenance plus projection health (`watermark`, lag, failed jobs, and lost
 ranges). Unknown heartbeat, Usage, or Budget evidence must be shown as
 insufficient evidence rather than healthy; Budget bars exist only when a limit
-and complete Usage are both known, and may show terminal overshoot. Inclusive
-Usage remains explicitly unavailable until Phase 8. They must not derive
-end-user progress percentages or fake Step counts. Task detail has Overview,
+and complete Usage are both known, and may show terminal overshoot. Phase 8 adds
+a collapsible Task tree to Overview, local/inclusive Usage scope selection and a
+source-Task breakdown to Budgets, and child producer links in Context lineage.
+History requests `root_only=true` so delegated children are discovered through
+their parent tree rather than duplicated as top-level history rows. These views
+must not derive end-user progress percentages or fake Step counts. Task detail has Overview,
 Budgets, Timeline, Steps, Context, and Agent Release tabs. Logical Steps fold
 provider retries into attempts and render internal system operations separately;
 each ToolCall renders an ordered four-stage accountability chain (Issued,

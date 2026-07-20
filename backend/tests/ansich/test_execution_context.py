@@ -11,6 +11,7 @@ from ansich import AnsichService, ContextStateItem, new_id
 from ansich.serialization import (
     ANSICH_BLOCK_REF_KEY,
     ANSICH_CONTENT_KIND_KEY,
+    ANSICH_PRODUCER_ENTITY_ID_KEY,
     ANSICH_PRODUCER_KIND_KEY,
     serialize_model_request,
     serialize_observed_content,
@@ -463,6 +464,7 @@ def test_attempt_adapter_strips_markers_without_an_active_execution_call() -> No
             ANSICH_BLOCK_REF_KEY: new_id(),
             ANSICH_CONTENT_KIND_KEY: "middleware_injection",
             ANSICH_PRODUCER_KIND_KEY: "test",
+            ANSICH_PRODUCER_ENTITY_ID_KEY: new_id(),
         },
     )
     request = ModelRequest(

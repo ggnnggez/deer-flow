@@ -44,7 +44,20 @@ from ansich.release import (
 )
 from ansich.service import AnsichService
 from ansich.step import ContentBlockPayloadView, ContentOccurrenceView, ContextSnapshotItemView, ContextSnapshotView, LlmAttemptView, StepView
+from ansich.task_tree import (
+    TaskAncestryView,
+    TaskSpawnView,
+    TaskTreeDirection,
+    TaskTreeNodeView,
+    TaskTreeView,
+)
 from ansich.tool import ContentDerivationView, ToolBelief, ToolCallView, ToolResultView
+from ansich.usage import (
+    TaskUsageBreakdownView,
+    TaskUsageSourceView,
+    TaskUsageValue,
+    TaskUsageView,
+)
 
 __all__ = [
     "Assessment",
@@ -89,8 +102,17 @@ __all__ = [
     "RecordReceipt",
     "ResolvedBelief",
     "TaskLifecycleScope",
+    "TaskAncestryView",
     "TaskAgentReleaseView",
+    "TaskSpawnView",
+    "TaskTreeDirection",
+    "TaskTreeNodeView",
+    "TaskTreeView",
     "TaskView",
+    "TaskUsageBreakdownView",
+    "TaskUsageSourceView",
+    "TaskUsageValue",
+    "TaskUsageView",
     "ToolBelief",
     "ToolCallView",
     "ToolResultView",

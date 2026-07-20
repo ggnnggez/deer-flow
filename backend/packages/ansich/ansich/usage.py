@@ -26,12 +26,18 @@ _BUDGET_CONSUMED_USAGE_DIMENSIONS: frozenset[UsageDimension] = frozenset({"wall_
 class UsageContribution(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True, strict=True)
 
-    task_id: str
+    aggregate_task_id: str
     source_task_id: str
     dimension: UsageDimension
     source_obs_id: str
     delta: int = Field(ge=0)
     as_of: datetime
+
+    @property
+    def task_id(self) -> str:
+        """Compatibility alias for pre-Phase-8 local-only consumers."""
+
+        return self.aggregate_task_id
 
 
 class TaskUsageValue(BaseModel):
@@ -49,13 +55,33 @@ class TaskUsageView(BaseModel):
 
     task_id: str
     local: tuple[TaskUsageValue, ...]
-    inclusive_status: Literal["not_available"] = "not_available"
+    inclusive: tuple[TaskUsageValue, ...] = ()
+    inclusive_status: Literal["available"] = "available"
+
+
+class TaskUsageSourceView(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True, strict=True)
+
+    source_task_id: str
+    values: tuple[TaskUsageValue, ...]
+
+
+class TaskUsageBreakdownView(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True, strict=True)
+
+    task_id: str
+    scope: AggregationScope
+    sources: tuple[TaskUsageSourceView, ...]
 
 
 def usage_contributions_for_observation(
     observation: ObservationEnvelope,
 ) -> tuple[UsageContribution, ...]:
     """Extract independent local-usage deltas from one durable observation."""
+    if observation.kind == "task.heartbeat" and observation.payload is not None:
+        elapsed_ms = observation.payload.get("elapsed_ms")
+        if isinstance(elapsed_ms, int) and not isinstance(elapsed_ms, bool) and elapsed_ms >= 0:
+            return (_contribution(observation, "wall_time_ms", elapsed_ms),)
     structural_dimension = _STRUCTURAL_DIMENSION_BY_KIND.get(observation.kind)
     if structural_dimension is not None:
         return (_contribution(observation, structural_dimension, 1),)
@@ -95,7 +121,7 @@ def _contribution(
     delta: int,
 ) -> UsageContribution:
     return UsageContribution(
-        task_id=observation.task_id,
+        aggregate_task_id=observation.task_id,
         source_task_id=observation.task_id,
         dimension=dimension,
         source_obs_id=observation.obs_id,

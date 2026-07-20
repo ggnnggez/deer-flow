@@ -23,6 +23,7 @@ from ansich.release import (
     validate_agent_release,
 )
 from ansich.step import ContentBlockPayloadView, ContentOccurrenceView, ContextSnapshotItemView, ContextSnapshotView, LlmAttemptView, StepView
+from ansich.task_tree import TaskSpawnView, TaskTreeDirection
 from ansich.tool import (
     ContentDerivationSourceRole,
     ContentDerivationView,
@@ -32,6 +33,9 @@ from ansich.tool import (
     ToolTransformKind,
 )
 from ansich.usage import (
+    AggregationScope,
+    TaskUsageBreakdownView,
+    TaskUsageSourceView,
     TaskUsageValue,
     TaskUsageView,
     child_task_contribution_for_tool_started,
@@ -221,8 +225,16 @@ class InMemoryAnsichBackend:
         from_time: datetime | None = None,
         to_time: datetime | None = None,
         cursor: tuple[datetime, str] | None = None,
+        root_only: bool = False,
     ) -> list[TaskView]:
         tasks = [task for task_id in self._tasks if (task := await self.get_task(task_id)) is not None]
+        if root_only:
+            child_ids = {
+                observation.task_id
+                for observation in self._observations
+                if observation.kind == "task.created" and observation.payload is not None and observation.payload.get("source_kind") == "deerflow_subagent" and isinstance(observation.payload.get("parent_task_id"), str)
+            }
+            tasks = [task for task in tasks if task.task_id not in child_ids]
         if control is not None:
             tasks = [task for task in tasks if task.control.value == control]
         lifecycle_controls = control_values_for_lifecycle_scope(lifecycle_scope)
@@ -245,59 +257,102 @@ class InMemoryAnsichBackend:
     async def list_observations(self, task_id: str) -> list[ObservationEnvelope]:
         return [observation for observation in self._observations if observation.task_id == task_id]
 
-    async def get_task_usage(self, task_id: str) -> TaskUsageView:
-        values: dict[str, int] = {}
-        as_of: dict[str, datetime] = {}
-        complete_through: dict[str, int] = {}
-        seen: set[tuple[str, str]] = set()
-        executed_tool_ids: set[str] = set()
-        for ingest_seq, observation in enumerate(self._observations, start=1):
-            if observation.task_id != task_id:
+    async def list_task_children(self, task_id: str) -> list[TaskSpawnView]:
+        children: list[TaskSpawnView] = []
+        for observation in self._observations:
+            payload = observation.payload
+            if observation.kind != "task.created" or payload is None or payload.get("source_kind") != "deerflow_subagent" or payload.get("parent_task_id") != task_id:
                 continue
-            if observation.kind == "task.heartbeat" and observation.payload is not None:
-                elapsed_ms = observation.payload.get("elapsed_ms")
-                if isinstance(elapsed_ms, int) and not isinstance(elapsed_ms, bool):
-                    values["wall_time_ms"] = max(
-                        values.get("wall_time_ms", 0),
-                        max(0, elapsed_ms),
-                    )
-                    as_of["wall_time_ms"] = max(
-                        as_of.get("wall_time_ms", observation.occurred_at),
-                        observation.occurred_at,
-                    )
-                    complete_through["wall_time_ms"] = ingest_seq
-            contributions = list(usage_contributions_for_observation(observation))
-            if observation.kind == "tool.started":
-                issued = next(
-                    (item for item in self._observations if item.task_id == task_id and item.subject_id == observation.subject_id and item.kind == "tool.issued" and item.payload is not None),
-                    None,
+            step_id = payload.get("spawning_step_id")
+            tool_call_id = payload.get("spawning_tool_call_id")
+            if not isinstance(step_id, str) or not isinstance(tool_call_id, str):
+                continue
+            children.append(
+                TaskSpawnView(
+                    parent_task_id=task_id,
+                    spawning_step_id=step_id,
+                    spawning_tool_call_id=tool_call_id,
+                    child_task_id=observation.task_id,
+                    established_obs_id=observation.obs_id,
+                    subagent_name=(str(payload["subagent_name"]) if isinstance(payload.get("subagent_name"), str) else None),
                 )
-                tool_name = None if issued is None else issued.payload.get("tool_name")
-                if isinstance(tool_name, str):
-                    child = child_task_contribution_for_tool_started(
-                        observation,
-                        tool_name=tool_name,
-                    )
-                    if child is not None:
-                        contributions.append(child)
-            for contribution in contributions:
-                key = (contribution.source_obs_id, contribution.dimension)
-                if key in seen:
-                    continue
-                if contribution.dimension == "tool_calls_executed":
-                    if observation.subject_id in executed_tool_ids:
+            )
+        return children
+
+    async def list_task_tree_spawns(
+        self,
+        task_id: str,
+        *,
+        direction: TaskTreeDirection,
+        depth: int,
+    ) -> tuple[list[TaskSpawnView], bool]:
+        all_edges: list[TaskSpawnView] = []
+        parent_ids: set[str] = set()
+        for observation in self._observations:
+            payload = observation.payload
+            if observation.kind != "task.created" or payload is None or payload.get("source_kind") != "deerflow_subagent":
+                continue
+            parent_id = payload.get("parent_task_id")
+            step_id = payload.get("spawning_step_id")
+            tool_call_id = payload.get("spawning_tool_call_id")
+            if not all(isinstance(value, str) for value in (parent_id, step_id, tool_call_id)):
+                continue
+            if observation.task_id in parent_ids:
+                continue
+            parent_ids.add(observation.task_id)
+            all_edges.append(
+                TaskSpawnView(
+                    parent_task_id=parent_id,
+                    spawning_step_id=step_id,
+                    spawning_tool_call_id=tool_call_id,
+                    child_task_id=observation.task_id,
+                    established_obs_id=observation.obs_id,
+                    subagent_name=(str(payload["subagent_name"]) if isinstance(payload.get("subagent_name"), str) else None),
+                )
+            )
+        by_parent: dict[str, list[TaskSpawnView]] = {}
+        by_child: dict[str, TaskSpawnView] = {}
+        for edge in all_edges:
+            by_parent.setdefault(edge.parent_task_id, []).append(edge)
+            by_child[edge.child_task_id] = edge
+
+        selected: dict[str, TaskSpawnView] = {}
+        truncated = False
+
+        if direction in {"descendants", "both"}:
+            frontier = [(task_id, 0)]
+            visited = {task_id}
+            while frontier:
+                current, current_depth = frontier.pop(0)
+                for edge in by_parent.get(current, ()):
+                    if current_depth >= depth:
+                        truncated = True
                         continue
-                    executed_tool_ids.add(observation.subject_id)
-                seen.add(key)
-                if contribution.dimension == "wall_time_ms":
-                    values[contribution.dimension] = max(
-                        values.get(contribution.dimension, 0),
-                        contribution.delta,
-                    )
-                else:
-                    values[contribution.dimension] = values.get(contribution.dimension, 0) + contribution.delta
-                as_of[contribution.dimension] = max(as_of.get(contribution.dimension, contribution.as_of), contribution.as_of)
-                complete_through[contribution.dimension] = max(complete_through.get(contribution.dimension, ingest_seq), ingest_seq)
+                    selected[edge.child_task_id] = edge
+                    if edge.child_task_id not in visited:
+                        visited.add(edge.child_task_id)
+                        frontier.append((edge.child_task_id, current_depth + 1))
+
+        if direction in {"ancestors", "both"}:
+            current = task_id
+            current_depth = 0
+            visited = {task_id}
+            while (parent_edge := by_child.get(current)) is not None:
+                if current_depth >= depth:
+                    truncated = True
+                    break
+                selected[parent_edge.child_task_id] = parent_edge
+                current = parent_edge.parent_task_id
+                current_depth += 1
+                if current in visited:
+                    truncated = True
+                    break
+                visited.add(current)
+        edges = list(selected.values())
+        edges.sort(key=lambda edge: (edge.parent_task_id, edge.child_task_id))
+        return edges, truncated
+
+    async def get_task_usage(self, task_id: str) -> TaskUsageView:
         order = {
             "input_tokens": 0,
             "output_tokens": 1,
@@ -309,17 +364,156 @@ class InMemoryAnsichBackend:
             "wall_time_ms": 7,
             "child_tasks_spawned": 8,
         }
-        local = tuple(
-            TaskUsageValue(
-                dimension=dimension,
-                aggregation_scope="local",
-                value=value,
-                as_of=as_of[dimension],
-                complete_through_ingest_seq=complete_through[dimension],
+
+        def local_values(source_task_id: str) -> dict[str, tuple[int, datetime, int]]:
+            values: dict[str, int] = {}
+            as_of: dict[str, datetime] = {}
+            complete_through: dict[str, int] = {}
+            seen: set[tuple[str, str]] = set()
+            executed_tool_ids: set[str] = set()
+            for ingest_seq, observation in enumerate(self._observations, start=1):
+                if observation.task_id != source_task_id:
+                    continue
+                if observation.kind == "task.heartbeat" and observation.payload is not None:
+                    elapsed_ms = observation.payload.get("elapsed_ms")
+                    if isinstance(elapsed_ms, int) and not isinstance(elapsed_ms, bool):
+                        values["wall_time_ms"] = max(
+                            values.get("wall_time_ms", 0),
+                            max(0, elapsed_ms),
+                        )
+                        as_of["wall_time_ms"] = max(
+                            as_of.get("wall_time_ms", observation.occurred_at),
+                            observation.occurred_at,
+                        )
+                        complete_through["wall_time_ms"] = ingest_seq
+                contributions = list(usage_contributions_for_observation(observation))
+                if observation.kind == "tool.started":
+                    issued = next(
+                        (item for item in self._observations if item.task_id == source_task_id and item.subject_id == observation.subject_id and item.kind == "tool.issued" and item.payload is not None),
+                        None,
+                    )
+                    tool_name = None if issued is None else issued.payload.get("tool_name")
+                    if isinstance(tool_name, str):
+                        child = child_task_contribution_for_tool_started(
+                            observation,
+                            tool_name=tool_name,
+                        )
+                        if child is not None:
+                            contributions.append(child)
+                for contribution in contributions:
+                    key = (contribution.source_obs_id, contribution.dimension)
+                    if key in seen:
+                        continue
+                    if contribution.dimension == "tool_calls_executed":
+                        if observation.subject_id in executed_tool_ids:
+                            continue
+                        executed_tool_ids.add(observation.subject_id)
+                    seen.add(key)
+                    if contribution.dimension == "wall_time_ms":
+                        values[contribution.dimension] = max(
+                            values.get(contribution.dimension, 0),
+                            contribution.delta,
+                        )
+                    else:
+                        values[contribution.dimension] = values.get(contribution.dimension, 0) + contribution.delta
+                    as_of[contribution.dimension] = max(
+                        as_of.get(contribution.dimension, contribution.as_of),
+                        contribution.as_of,
+                    )
+                    complete_through[contribution.dimension] = max(
+                        complete_through.get(contribution.dimension, ingest_seq),
+                        ingest_seq,
+                    )
+            return {
+                dimension: (
+                    value,
+                    as_of[dimension],
+                    complete_through[dimension],
+                )
+                for dimension, value in values.items()
+            }
+
+        direct_children: dict[str, set[str]] = {}
+        for observation in self._observations:
+            payload = observation.payload
+            if observation.kind == "task.created" and payload is not None and payload.get("source_kind") == "deerflow_subagent" and isinstance(payload.get("parent_task_id"), str):
+                direct_children.setdefault(str(payload["parent_task_id"]), set()).add(observation.task_id)
+        descendants = {task_id}
+        frontier = [task_id]
+        while frontier:
+            current = frontier.pop()
+            for child_id in direct_children.get(current, ()):
+                if child_id not in descendants:
+                    descendants.add(child_id)
+                    frontier.append(child_id)
+
+        local_map = local_values(task_id)
+        inclusive_map: dict[str, tuple[int, datetime, int]] = {}
+        for source_task_id in descendants:
+            for dimension, (value, item_as_of, watermark) in local_values(source_task_id).items():
+                previous = inclusive_map.get(dimension)
+                inclusive_map[dimension] = (
+                    value + (0 if previous is None else previous[0]),
+                    item_as_of if previous is None else max(item_as_of, previous[1]),
+                    watermark if previous is None else max(watermark, previous[2]),
+                )
+
+        def usage_values(
+            values: dict[str, tuple[int, datetime, int]],
+            scope: AggregationScope,
+        ) -> tuple[TaskUsageValue, ...]:
+            return tuple(
+                TaskUsageValue(
+                    dimension=dimension,
+                    aggregation_scope=scope,
+                    value=value,
+                    as_of=item_as_of,
+                    complete_through_ingest_seq=watermark,
+                )
+                for dimension, (value, item_as_of, watermark) in sorted(values.items(), key=lambda item: order[item[0]])
             )
-            for dimension, value in sorted(values.items(), key=lambda item: order[item[0]])
+
+        return TaskUsageView(
+            task_id=task_id,
+            local=usage_values(local_map, "local"),
+            inclusive=usage_values(inclusive_map, "inclusive"),
         )
-        return TaskUsageView(task_id=task_id, local=local)
+
+    async def get_task_usage_breakdown(
+        self,
+        task_id: str,
+        *,
+        scope: AggregationScope,
+    ) -> TaskUsageBreakdownView:
+        source_task_ids = {task_id}
+        if scope == "inclusive":
+            direct_children: dict[str, set[str]] = {}
+            for observation in self._observations:
+                payload = observation.payload
+                if observation.kind == "task.created" and payload is not None and payload.get("source_kind") == "deerflow_subagent" and isinstance(payload.get("parent_task_id"), str):
+                    direct_children.setdefault(str(payload["parent_task_id"]), set()).add(observation.task_id)
+            frontier = [task_id]
+            while frontier:
+                current = frontier.pop()
+                for child_id in direct_children.get(current, ()):
+                    if child_id not in source_task_ids:
+                        source_task_ids.add(child_id)
+                        frontier.append(child_id)
+        sources: list[TaskUsageSourceView] = []
+        for source_task_id in sorted(source_task_ids):
+            usage = await self.get_task_usage(source_task_id)
+            if usage.local:
+                sources.append(
+                    TaskUsageSourceView(
+                        source_task_id=source_task_id,
+                        values=tuple(item.model_copy(update={"aggregation_scope": scope}) for item in usage.local),
+                    )
+                )
+        return TaskUsageBreakdownView(
+            task_id=task_id,
+            scope=scope,
+            sources=tuple(sources),
+        )
 
     async def get_task_budgets(self, task_id: str) -> TaskBudgetsView:
         budgets: list[TaskBudgetView] = []

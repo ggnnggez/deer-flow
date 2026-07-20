@@ -1,6 +1,10 @@
 "use client";
 
+import Link from "next/link";
+import { useState } from "react";
+
 import { Badge } from "@/components/ui/badge";
+import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Progress } from "@/components/ui/progress";
 import { Skeleton } from "@/components/ui/skeleton";
@@ -16,7 +20,8 @@ export function AnsichBudgetPanel({
   polling: boolean;
 }) {
   const { t } = useI18n();
-  const usageQuery = useAnsichTaskUsage(taskId, true, polling);
+  const [scope, setScope] = useState<"local" | "inclusive">("local");
+  const usageQuery = useAnsichTaskUsage(taskId, true, polling, scope);
   const budgetsQuery = useAnsichTaskBudgets(taskId, true, polling);
   if (usageQuery.isPending || budgetsQuery.isPending) {
     return <Skeleton className="h-48 w-full" />;
@@ -29,7 +34,8 @@ export function AnsichBudgetPanel({
       </div>
     );
   }
-  const usage = usageQuery.data?.usage.local ?? [];
+  const usage = usageQuery.data?.values ?? [];
+  const usageSources = usageQuery.data?.sources ?? [];
   const budgets = budgetsQuery.data?.budgets.budgets ?? [];
   const health = budgetsQuery.data?.health ?? [];
 
@@ -37,7 +43,31 @@ export function AnsichBudgetPanel({
     <div className="space-y-4">
       <Card>
         <CardHeader>
-          <CardTitle>{t.ansich.localUsage}</CardTitle>
+          <div className="flex flex-wrap items-center justify-between gap-2">
+            <CardTitle>
+              {scope === "local"
+                ? t.ansich.localUsage
+                : t.ansich.inclusiveUsage}
+            </CardTitle>
+            <div className="flex gap-1">
+              <Button
+                type="button"
+                size="sm"
+                variant={scope === "local" ? "secondary" : "ghost"}
+                onClick={() => setScope("local")}
+              >
+                {t.ansich.localUsage}
+              </Button>
+              <Button
+                type="button"
+                size="sm"
+                variant={scope === "inclusive" ? "secondary" : "ghost"}
+                onClick={() => setScope("inclusive")}
+              >
+                {t.ansich.inclusiveUsage}
+              </Button>
+            </div>
+          </div>
         </CardHeader>
         <CardContent className="grid gap-3 sm:grid-cols-3">
           {usage.length ? (
@@ -56,6 +86,36 @@ export function AnsichBudgetPanel({
               {t.ansich.evidenceInsufficient}
             </div>
           )}
+          {scope === "inclusive" && usageSources.length ? (
+            <details className="sm:col-span-3">
+              <summary className="text-muted-foreground cursor-pointer text-sm">
+                {t.ansich.contributionSources}
+              </summary>
+              <div className="mt-2 space-y-2">
+                {usageSources.map((source) => (
+                  <div
+                    key={source.source_task_id}
+                    className="flex flex-wrap items-center justify-between gap-2 rounded-lg border p-3 text-xs"
+                  >
+                    <Link
+                      href={`/workspace/ansich/tasks/${encodeURIComponent(source.source_task_id)}`}
+                      className="font-mono underline-offset-4 hover:underline"
+                    >
+                      {source.source_task_id}
+                    </Link>
+                    <span className="text-muted-foreground">
+                      {source.values
+                        .map(
+                          (item) =>
+                            `${item.dimension}: ${item.value.toLocaleString()}`,
+                        )
+                        .join(" · ")}
+                    </span>
+                  </div>
+                ))}
+              </div>
+            </details>
+          ) : null}
         </CardContent>
       </Card>
 
@@ -130,9 +190,6 @@ export function AnsichBudgetPanel({
               {t.ansich.unconfigured}
             </div>
           )}
-          <div className="text-muted-foreground text-xs">
-            inclusive: {t.ansich.notAvailable}
-          </div>
         </CardContent>
       </Card>
     </div>

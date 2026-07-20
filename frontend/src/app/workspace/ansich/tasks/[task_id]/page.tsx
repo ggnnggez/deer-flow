@@ -24,6 +24,7 @@ import {
   AnsichProjectionHealth,
   AnsichStepsPanel,
   AnsichStatusBadge,
+  AnsichTaskTreePanel,
 } from "@/components/workspace/ansich";
 import {
   WorkspaceBody,
@@ -136,6 +137,10 @@ export default function AnsichTaskDetailPage() {
                 </TabsList>
 
                 <TabsContent value="overview" className="space-y-4">
+                  <AnsichTaskTreePanel
+                    taskId={taskId}
+                    polling={taskIsRunning}
+                  />
                   <Card>
                     <CardHeader>
                       <CardTitle>{t.ansich.currentBelief}</CardTitle>

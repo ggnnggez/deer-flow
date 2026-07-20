@@ -49,16 +49,33 @@ class TaskControlProbe:
         trigger_kind: str | None = None,
         monotonic: Callable[[], float] = time.monotonic,
         budgets: tuple[ResolvedBudget, ...] = (),
+        task_id: str | None = None,
+        source_kind: str = "deerflow_run",
+        source_id: str | None = None,
+        lifecycle_attributes: dict[str, object] | None = None,
+        flush_on_terminal: bool = True,
     ) -> None:
         self._service = service
-        self.task_id = new_id()
+        self.task_id = task_id or new_id()
         self._run_id = run_id
+        self._source_kind = source_kind
+        self._source_id = source_id or run_id
+        # Preserve the established top-level source-event identity so retries
+        # and replay still coalesce with observations written before child
+        # Tasks existed. Child Tasks get their own stable namespace.
+        self._source_event_prefix = f"run:{self._source_id}" if source_kind == "deerflow_run" and self._source_id == run_id else f"{source_kind}:{self._source_id}"
+        self._lifecycle_attributes = dict(lifecycle_attributes or {})
+        self._flush_on_terminal = flush_on_terminal
         self._thread_id = thread_id
         self._owner_id = owner_id
         self._trigger_kind = trigger_kind
         self._monotonic = monotonic
         self._started_monotonic: float | None = None
         self._budgets = budgets
+
+    @property
+    def source_id(self) -> str:
+        return self._source_id
 
     def created(self) -> None:
         self._record("task.created")
@@ -95,10 +112,10 @@ class TaskControlProbe:
             self._service.record(
                 ObservationEnvelope.agent_release_resolved(
                     task_id=self.task_id,
-                    run_id=self._run_id,
+                    run_id=self._source_id,
                     occurred_at=datetime.now(UTC),
                     release=release,
-                    source_event_id=f"run:{self._run_id}:agent-release:resolved",
+                    source_event_id=f"{self._source_event_prefix}:agent-release:resolved",
                     producer_seq=_next_producer_sequence(),
                     producer_name="deerflow-agent-release",
                     producer_version="1",
@@ -123,8 +140,8 @@ class TaskControlProbe:
                             instance_id=_PRODUCER_INSTANCE_ID,
                         ),
                         producer_seq=_next_producer_sequence(),
-                        source_event_id=(f"run:{self._run_id}:agent-release:resolution-failed"),
-                        correlation_id=self._run_id,
+                        source_event_id=(f"{self._source_event_prefix}:agent-release:resolution-failed"),
+                        correlation_id=self._source_id,
                         payload={
                             "component": "agent_release",
                             "reason": "resolution_failed",
@@ -133,22 +150,27 @@ class TaskControlProbe:
                 )
             except Exception:
                 logger.warning(
-                    "Ansich AgentRelease degradation observation failed for run %s",
-                    self._run_id,
+                    "Ansich AgentRelease degradation observation failed for source %s",
+                    self._source_id,
                 )
 
-    async def terminal(self, status: str) -> None:
+    async def terminal(
+        self,
+        status: str,
+        *,
+        attributes: dict[str, object] | None = None,
+    ) -> None:
         kind = _TERMINAL_KIND_BY_STATUS.get(status)
         self._record_wall_time()
         if kind is not None:
-            self._record(kind)
+            self._record(kind, attributes=attributes)
         else:
             logger.warning(
                 "Ansich has no terminal control mapping for run %s status %r; Task control stays non-terminal",
                 self._run_id,
                 status,
             )
-        if self._service is not None:
+        if self._service is not None and self._flush_on_terminal:
             try:
                 await self._service.flush_task(self.task_id)
             except Exception:
@@ -165,11 +187,11 @@ class TaskControlProbe:
             self._service.record(
                 ObservationEnvelope.budget_consumed(
                     task_id=self.task_id,
-                    run_id=self._run_id,
+                    run_id=self._source_id,
                     occurred_at=datetime.now(UTC),
                     dimension="wall_time_ms",
                     delta=elapsed_ms,
-                    source_event_id=f"run:{self._run_id}:budget:wall_time_ms:terminal",
+                    source_event_id=(f"{self._source_event_prefix}:budget:wall_time_ms:terminal"),
                     producer_seq=_next_producer_sequence(),
                     producer_name="deerflow-task-control",
                     producer_version="1",
@@ -190,7 +212,7 @@ class TaskControlProbe:
             self._service.record(
                 ObservationEnvelope.budget_configured(
                     task_id=self.task_id,
-                    run_id=self._run_id,
+                    run_id=self._source_id,
                     occurred_at=datetime.now(UTC),
                     dimension=budget.dimension,
                     aggregation_scope=budget.aggregation_scope,
@@ -200,7 +222,7 @@ class TaskControlProbe:
                     source_kind=budget.source_kind,
                     requested_value=budget.requested_value,
                     effective_value=budget.effective_value,
-                    source_event_id=(f"run:{self._run_id}:budget:{budget.dimension}:{budget.aggregation_scope}:configured"),
+                    source_event_id=(f"{self._source_event_prefix}:budget:{budget.dimension}:{budget.aggregation_scope}:configured"),
                     producer_seq=_next_producer_sequence(),
                     producer_name="deerflow-budget-configuration",
                     producer_version="1",
@@ -215,24 +237,30 @@ class TaskControlProbe:
                 exc_info=True,
             )
 
-    def _record(self, kind: str) -> None:
+    def _record(
+        self,
+        kind: str,
+        *,
+        attributes: dict[str, object] | None = None,
+    ) -> None:
         if self._service is None:
             return
         try:
             terminal_value = kind.removeprefix("task.")
-            source_event_id = f"run:{self._run_id}:task:terminal:{terminal_value}" if terminal_value in {"completed", "failed", "interrupted"} else f"run:{self._run_id}:task:{terminal_value}"
+            source_event_id = f"{self._source_event_prefix}:task:terminal:{terminal_value}" if terminal_value in {"completed", "failed", "interrupted"} else f"{self._source_event_prefix}:task:{terminal_value}"
             self._service.record(
                 ObservationEnvelope.task_lifecycle(
                     kind=kind,
                     task_id=self.task_id,
-                    source_kind="deerflow_run",
-                    source_id=self._run_id,
+                    source_kind=self._source_kind,
+                    source_id=self._source_id,
                     occurred_at=datetime.now(UTC),
                     source_event_id=source_event_id,
                     producer_seq=_next_producer_sequence(),
                     thread_id=self._thread_id,
                     owner_id=self._owner_id,
                     trigger_kind=self._trigger_kind,
+                    attributes=(self._lifecycle_attributes if kind == "task.created" else attributes),
                     producer_name="deerflow-task-control",
                     producer_version="1",
                     producer_instance_id=_PRODUCER_INSTANCE_ID,

@@ -2,7 +2,11 @@ from __future__ import annotations
 
 from ansich import new_id
 from ansich.contracts import RecordReceipt
-from ansich.serialization import serialize_observed_content
+from ansich.serialization import (
+    ANSICH_PRODUCER_ENTITY_ID_KEY,
+    ANSICH_PRODUCER_KIND_KEY,
+    serialize_observed_content,
+)
 from langchain_core.messages import ToolMessage
 
 from deerflow.ansich.execution import AnsichExecutionContext, ToolInvocation
@@ -129,3 +133,42 @@ def test_visible_classification_marks_wording_fallback_as_heuristic():
     payload = _visible_payload(service)
     assert payload["transform_kind"] == "truncated"
     assert payload["classified_by"] == "heuristic"
+
+
+def test_subagent_task_identity_is_preserved_on_parent_visible_content():
+    from deerflow.ansich.tool_middleware import (
+        _record_visible_result,
+        _result_producer_metadata,
+    )
+
+    service = _StubService()
+    execution = AnsichExecutionContext(task_id=new_id(), service=service)
+    invocation = _started_invocation(execution, raw_hash="0" * 64)
+    child_task_id = new_id()
+    message = ToolMessage(
+        content="child result",
+        tool_call_id="provider-transform",
+        name="task",
+        additional_kwargs={
+            ANSICH_PRODUCER_KIND_KEY: "subagent_task",
+            ANSICH_PRODUCER_ENTITY_ID_KEY: child_task_id,
+        },
+    )
+    metadata = _result_producer_metadata(message, object())  # type: ignore[arg-type]
+    capture = serialize_observed_content(
+        kind="tool_result_visible",
+        body={"content": "child result"},
+        path="test.visible",
+    )
+
+    _record_visible_result(
+        execution,
+        invocation,
+        capture,
+        producer_metadata=metadata,
+    )
+
+    produced = next(observation for _, batch in service.batches for observation in batch if observation.kind == "content.produced")
+    assert produced.payload is not None
+    assert produced.payload["producer_kind"] == "subagent_task"
+    assert produced.payload["producer_entity_id"] == child_task_id

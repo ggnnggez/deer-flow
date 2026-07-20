@@ -2,7 +2,7 @@
 
 本目录把 [Ansich v0.2 设计](../ansich-design-document.md) 拆成十二个可独立执行、可独立验收的阶段。阶段按顺序交付，每个阶段都必须形成一条可运行的纵向切片，而不是只提交数据表、只提交探针或只提交页面。
 
-## 当前实施状态（2026-07-19）
+## 当前实施状态（2026-07-20）
 
 - Phase 1 已形成可运行纵向切片：嵌入式启动、Run→Task 生命周期、严格 Observation 契约、有界 fail-open Collector、Observation/job 原子写入、独立 leased projector、Task/Scope/Belief 投影、重放、管理员 API，以及 dev/op 工作区列表和详情页均已实现。
 - SQLite、Gateway、Run worker、API、前端类型/lint、前端全量单测，以及管理员列表→Task 详情和 503 的真实浏览器 E2E 已经验证；Phase 1 尚未标记最终完成，因为 PostgreSQL 集成矩阵、关闭 Ansich 的基准对比和生产环境 paper drill 仍待执行。
@@ -10,14 +10,15 @@
 - Phase 3 已形成可运行的本地纵向切片：Tool intent、raw callable boundary、模型可见结果和 unknown/denied authorization attachment point 分离；Task terminal reconciliation、重启恢复、typed SQL 投影、issued/executed usage、管理员 API 以及四段责任链页面均已实现。SQLite migration/rebuild、后端 Ansich 回归、前端类型/lint 和 raw/visible 权限边界已验证；PostgreSQL 迁移矩阵与生产负载演练仍属于后续生产就绪门禁。
 - Phase 4 已形成可运行的本地纵向切片：typed producer/derivation 表、纯 BFS 谱系遍历、压缩前冻结的 source/preserved/removed inventory、summary block 与 `compressed` 边、snapshot 反向 membership、metadata-only 的 lineage/exposure/snapshot/compression API 以及 Context & Lineage 页面均已实现（详见 [04-context-lineage-and-compression.md](04-context-lineage-and-compression.md) 的实现状态）。PostgreSQL 迁移矩阵、关闭 Ansich 的基准对比和生产 paper drill 完成前不标记最终完成。
 - Phase 5 已形成可运行的本地纵向切片：owner-only Outer Run heartbeat、完整 rule Belief、local Usage、实际 runtime Budget 快照、`0016_ansich_operations` 投影/重放、active-task read model、管理员 API 与自适应轮询 Operator Lens 已落地（详见 [05-active-tasks-heartbeats-and-budgets.md](05-active-tasks-heartbeats-and-budgets.md)）。SQLite migration/rebuild、PostgreSQL DDL 语义、后端与前端回归已覆盖；真实 PostgreSQL 升级矩阵、关闭 Ansich 的基准和生产 paper drill 仍是最终生产就绪门禁。
-- Phase 7 已形成本地完整闭环：lead/subagent 实际 assembly 产出 runtime descriptor，Task admission 解析并绑定不可变 AgentRelease，typed projection/API 支持 release 查询与结构化比较，provider-reported model 作为 attempt evidence 驱动 `configuration_drift` Belief/Alert，Task 详情可查看脱敏配置、组件哈希和 release diff（详见 [07-agent-release-and-comparison.md](07-agent-release-and-comparison.md)）。SQLite 迁移、PostgreSQL DDL 编译、后端 Ansich 回归、前端类型/单元检查与关键 Playwright 流程已覆盖；真实 PostgreSQL 升级矩阵、关闭 Ansich 的基准和生产 paper drill 仍是最终生产就绪门禁。Phase 8–12 尚未开始实现；页面不得提前显示 inclusive usage、授权/副作用或语义评估的占位数据。
+- Phase 7 已形成本地完整闭环：lead/subagent 实际 assembly 产出 runtime descriptor，Task admission 解析并绑定不可变 AgentRelease，typed projection/API 支持 release 查询与结构化比较，provider-reported model 作为 attempt evidence 驱动 `configuration_drift` Belief/Alert，Task 详情可查看脱敏配置、组件哈希和 release diff（详见 [07-agent-release-and-comparison.md](07-agent-release-and-comparison.md)）。SQLite 迁移、PostgreSQL DDL 编译、后端 Ansich 回归、前端类型/单元检查与关键 Playwright 流程已覆盖；真实 PostgreSQL 升级矩阵、关闭 Ansich 的基准和生产 paper drill 仍是最终生产就绪门禁。
+- Phase 8 已形成本地纵向切片：实际 subagent 委派产生独立 child Task/context/release/probes/heartbeat，typed spawn 与 ancestry closure 支持多层树和环/第二 parent 防御，source-aware contribution 投影提供 local/inclusive Usage、late relation backfill 与可解释 source breakdown；tree/children/scoped usage/root-only API 及 Task tree、Budget scope、lineage child link UI 已落地（详见 [08-subagent-task-tree-and-inclusive-usage.md](08-subagent-task-tree-and-inclusive-usage.md)）。migration `0019_ansich_task_tree_usage` 覆盖历史 self usage 转换与 read-model 重建；真实 PostgreSQL 升级矩阵、关闭 Ansich 的基准和生产 paper drill 仍是最终生产就绪门禁。Phase 9–12 尚未开始实现；页面不得提前显示授权/副作用或语义评估的占位数据。
 - Phase 1 代码评审的跟进项登记在 [phase-1-review-followups.md](phase-1-review-followups.md)，各项带有修复状态、归属阶段与对应 commit；Phase 2 的实施前提 F4（projector 显式优先级）已修复。
 - Phase 2 代码评审的跟进项登记在 [phase-2-review-followups.md](phase-2-review-followups.md)；H2（上下文快照写放大与谱系完整性）的剩余压缩 inventory 与 derived-from 边已随 Phase 4 commit `a596a310` 落地，现已完成。
 - Phase 3 代码评审的跟进项登记在 [phase-3-review-followups.md](phase-3-review-followups.md)；M2（transform 显式元数据）与 M3（队列字节水位）均已完成，Phase 5 前置项已清；L1 观察开销基准按既定归属留到 Phase 12 验收前，不阻塞 Phase 5。
 - Phase 4 代码评审的跟进项登记在 [phase-4-review-followups.md](phase-4-review-followups.md)；M1/M2/M3、L1/L2 与 L3①/② 均已完成；L3② 的前端压缩列表独立 API 已作为 Phase 6 首批 UI/API 工作落地。
 - Phase 5 代码评审的跟进项登记在 [phase-5-review-followups.md](phase-5-review-followups.md)；M1/M2/M3 与 L1/L2 均已修复，L3（usage 贡献契约收紧）也已由 `fe4634bf` 修复，Phase 8 前的 Phase 5 到期项已清。
 - Phase 6 代码评审的跟进项登记在 [phase-6-review-followups.md](phase-6-review-followups.md)；L3（wall_time 覆盖语义）已由 `b910ba82` 修复，M1（assessor job 合并）与 L1（对账读放大）已由 `4f5ec989` 修复；L4 已由 `0a38a96d` 明确延后到 Phase 11 并隐藏未生产类型。Phase 7 开工前置项已清；L2（孤儿 requested action 回收）仍按原归属留到 Phase 11 前。
-- Phase 7 代码评审的跟进项登记在 [phase-7-review-followups.md](phase-7-review-followups.md)；M2（coalescing 测试套件级 flaky）已由 `e91d9f1c`/`4e5eb0fd` 修复并隔离 SQL 集成测试 settle 时序，M1（drift 裸名判定）已由 `08cd6b1c` 修复，M3（policy manifest 契约化）已由 `256d2c91` 修复，Phase 8 开工前的 Phase 7 必须项已清；L2（descriptor 私有通道回归）随 Phase 8 首批处理，L1（二线 credential validator）留到 Phase 9 前。
+- Phase 7 代码评审的跟进项登记在 [phase-7-review-followups.md](phase-7-review-followups.md)；M2（coalescing 测试套件级 flaky）已由 `e91d9f1c`/`4e5eb0fd` 修复并隔离 SQL 集成测试 settle 时序，M1（drift 裸名判定）已由 `08cd6b1c` 修复，M3（policy manifest 契约化）已由 `256d2c91` 修复，L2（descriptor 私有通道回归）已随 Phase 8 的显式 assembly/context 通道完成（commit 待提交）；L1（二线 credential validator）留到 Phase 9 前。
 
 ## 固定实现边界
 

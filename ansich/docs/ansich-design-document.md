@@ -256,7 +256,8 @@ The Structural Projector performs only deterministic consequences, such as:
 - `llm.requested` registers an attempt projection and ContextSnapshot;
 - an Agent AIMessage completes the Step decision projection and registers its
   ToolCalls;
-- `subagent.started` registers a child Task and `spawned` relation;
+- a child `task.created` with `source_kind=deerflow_subagent` registers the
+  child Task and its typed `spawned` relation;
 - `context.compressed` creates a summary ContentBlock and derivation edges.
 
 It must not judge whether a Step was good or whether a Task is stuck.
@@ -470,6 +471,14 @@ TaskBudget stores effective warning/hard limits and whether they apply to local
 or inclusive usage. Raw consumption is recorded only on the Task where it
 occurred; inclusive usage is projected through `spawned` relations to avoid
 double-writing evidence.
+
+Each contribution retains both the Task whose aggregate it updates and the Task
+where the usage originated. A local aggregate contains only self-originated
+contributions; an inclusive aggregate contains self plus all descendants. Late
+spawn relations backfill already-projected descendant contributions, while late
+usage fans out through the ancestry closure. For cumulative wall time, each
+source Task contributes the maximum evidenced elapsed value rather than a sum of
+its heartbeats; the inclusive value is then the sum across source Tasks.
 
 DeerFlow's effective runtime policy is the enforcement source of truth. Ansich
 may define shadow thresholds only when marked `enforcement = false`.
@@ -768,6 +777,11 @@ exact-value redacted. Broad regex scanning may add sensitivity flags but does no
 silently mutate arbitrary user content in v1. Every redaction stores a manifest
 containing field path and reason, never the original secret.
 
+Server-owned content metadata may identify the Entity that produced a model
+input block, for example a child Task that produced a parent-visible Tool result.
+Gateway request admission removes caller-supplied producer markers, and the
+attempt adapter removes all Ansich-only markers before provider invocation.
+
 Raw payload reads are admin-only in v1 and are themselves audited. Thread/user
 deletion cascades to observations, payloads, projections, and relations. Raw and
 structural retention periods are separately configurable; expired payloads leave
@@ -809,6 +823,8 @@ ansich_context_states(state_id FK, task_id, parent_state_id, state_hash, chain_d
 ansich_context_snapshots(entity_id FK, step_id, attempt_no, state_id FK, ...)
 ansich_context_compressions(entity_id FK, task_id, operation_id?, summary_block_id FK, ...)
 ansich_task_budgets(entity_id FK, task_id, dimension, aggregation_scope, ...)
+ansich_task_spawns(parent_task_id FK, spawning_step_id FK, spawning_tool_call_id FK, child_task_id FK, ...)
+ansich_task_ancestry(ancestor_task_id FK, descendant_task_id FK, depth, ...)
 ansich_scopes(entity_id FK, scope_kind, parent_scope_id?, ...)
 ansich_alerts(entity_id FK, alert_key, episode, alert_type, ...)
 ```
@@ -820,6 +836,8 @@ Typed details provide foreign keys, constraints, and portable indexes. Examples:
 UNIQUE(task_id, step_seq)
 UNIQUE(step_id, call_seq)
 UNIQUE(snapshot_id, ordinal)
+UNIQUE(child_task_id)
+UNIQUE(ancestor_task_id, descendant_task_id)
 ```
 
 ### 8.3 Belief zone
@@ -844,15 +862,18 @@ ansich_context_state_deltas
 ansich_context_state_missing_blocks
 ansich_content_block_derivations
 ansich_context_compression_items
+ansich_task_spawns
+ansich_task_ancestry
 ansich_relations
 ansich_relation_evidence
 ansich_authorization_snapshots
 ansich_tool_effects
 ```
 
-High-volume ordered/graph relations have typed tables. Low-frequency relations
-such as `follows_up`, `spawned`, and `within_scope` may use the generic relation
-table with indexed type/from/to columns.
+High-volume ordered/graph relations have typed tables. `spawned` is typed because
+tree navigation, ancestry rollup, cycle protection, and the one-parent invariant
+all depend on it. Low-frequency relations such as `follows_up` and `within_scope`
+may use the generic relation table with indexed type/from/to columns.
 
 `ansich_context_compression_items` has the primary identity
 `(compression_id, disposition, ordinal)` and stores `source`, `preserved`, and
@@ -866,14 +887,19 @@ copying all snapshot item metadata.
 ### 8.5 Usage/read projections
 
 ```text
+ansich_usage_contributions
 ansich_task_usage
 ansich_task_summaries
 ansich_active_task_read_model
 ansich_alert_read_model
 ```
 
-Usage rows always carry `as_of` and source Observation references even though
-they are measurements rather than semantic states.
+Usage contributions carry `aggregate_task_id`, `source_task_id`, dimension,
+source Observation, delta, and `as_of`. Their composite identity prevents replay
+from double-counting. `ansich_task_usage` materializes separate `local` and
+`inclusive` rows. Query responses may group the same contributions by source
+Task so an operator can explain an inclusive total without rereading raw
+Observations.
 
 The embedded Phase 3 slice keeps `tool_calls_issued` and
 `tool_calls_executed` on the Task summary read model. `executed` advances only

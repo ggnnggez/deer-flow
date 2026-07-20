@@ -4,8 +4,16 @@ import asyncio
 import logging
 import uuid
 from dataclasses import replace
+from datetime import UTC, datetime
+from hashlib import sha256
 from typing import TYPE_CHECKING, Annotated, Any, cast
+from uuid import UUID
 
+from ansich import ObservationEnvelope, Producer
+from ansich.serialization import (
+    ANSICH_PRODUCER_ENTITY_ID_KEY,
+    ANSICH_PRODUCER_KIND_KEY,
+)
 from langchain.tools import InjectedToolCallId, tool
 from langchain_core.callbacks import BaseCallbackManager
 from langchain_core.messages import ToolMessage
@@ -37,6 +45,8 @@ if TYPE_CHECKING:
     from deerflow.config.app_config import AppConfig
 
 logger = logging.getLogger(__name__)
+
+_ANSICH_CHILD_TASK_NAMESPACE = "d676e056-b13f-4f6b-89af-15c13adf6233"
 
 # Cache subagent token usage by tool_call_id so TokenUsageMiddleware can
 # write it back to the triggering AIMessage's usage_metadata.
@@ -194,6 +204,113 @@ def _merge_skill_allowlists(parent: list[str] | None, child: list[str] | None) -
     return [skill for skill in child if skill in parent_set]
 
 
+def _ansich_child_task_id(parent_task_id: str, spawning_tool_call_id: str) -> str:
+    digest = sha256(f"{_ANSICH_CHILD_TASK_NAMESPACE}:{parent_task_id}:{spawning_tool_call_id}".encode()).digest()
+    return str(UUID(bytes=digest[:16], version=4))
+
+
+def _create_child_ansich_context(
+    parent_execution: Any,
+    *,
+    executor_task_id: str,
+    thread_id: str | None,
+    owner_id: str | None,
+    subagent_name: str,
+    workspace_ref: str | None = None,
+    sandbox_ref: str | None = None,
+) -> tuple[Any | None, Any | None]:
+    """Create a child Task/context from the currently executing parent ToolCall.
+
+    This boundary is deliberately fail-open; callers catch every failure and
+    continue delegation without Ansich.
+    """
+    from deerflow.ansich.execution import AnsichExecutionContext
+    from deerflow.ansich.probes.task_control import TaskControlProbe
+
+    if not isinstance(parent_execution, AnsichExecutionContext) or parent_execution.service is None:
+        return None, None
+    invocation = parent_execution.current_tool_invocation()
+    if invocation is None:
+        raise RuntimeError("spawning Ansich ToolCall is unavailable")
+    registration = invocation.registration
+    child_task_id = _ansich_child_task_id(
+        parent_execution.task_id,
+        registration.tool_call_id,
+    )
+    child_probe = TaskControlProbe(
+        parent_execution.service,
+        run_id=executor_task_id,
+        task_id=child_task_id,
+        source_kind="deerflow_subagent",
+        source_id=executor_task_id,
+        thread_id=thread_id or "unknown",
+        owner_id=owner_id,
+        trigger_kind="subagent",
+        lifecycle_attributes={
+            "parent_task_id": parent_execution.task_id,
+            "spawning_step_id": registration.step_id,
+            "spawning_tool_call_id": registration.tool_call_id,
+            "subagent_name": subagent_name,
+            "scope_inheritance_source": "parent_task",
+            **({"workspace_ref": workspace_ref} if isinstance(workspace_ref, str) and workspace_ref else {}),
+            **({"sandbox_ref": sandbox_ref} if isinstance(sandbox_ref, str) and sandbox_ref else {}),
+        },
+        flush_on_terminal=False,
+    )
+    child_probe.created()
+    return (
+        AnsichExecutionContext(
+            task_id=child_task_id,
+            service=parent_execution.service,
+        ),
+        child_probe,
+    )
+
+
+def _record_child_ansich_degradation(
+    parent_execution: Any,
+    *,
+    provider_tool_call_id: str,
+) -> None:
+    """Best-effort parent evidence when child observation setup is unavailable."""
+    service = getattr(parent_execution, "service", None)
+    task_id = getattr(parent_execution, "task_id", None)
+    if service is None or not isinstance(task_id, str):
+        return
+    try:
+        payload: dict[str, object] = {
+            "component": "tool_call",
+            "reason": "child_context_initialization_failed",
+            "provider_tool_call_id": provider_tool_call_id,
+        }
+        invocation = parent_execution.current_tool_invocation()
+        if invocation is not None:
+            payload["spawning_tool_call_id"] = invocation.registration.tool_call_id
+        service.record(
+            ObservationEnvelope(
+                kind="observability.degraded",
+                occurred_at=datetime.now(UTC),
+                task_id=task_id,
+                subject_id=task_id,
+                producer=Producer(
+                    name="deerflow-subagent-observability",
+                    version="1",
+                    instance_id=task_id,
+                ),
+                producer_seq=parent_execution.next_producer_seq(),
+                source_event_id=(f"task:{task_id}:tool:{provider_tool_call_id}:child-context-failed"),
+                correlation_id=provider_tool_call_id,
+                payload=payload,
+            )
+        )
+    except Exception:
+        logger.warning(
+            "Could not record child Ansich context degradation for tool %s",
+            provider_tool_call_id,
+            exc_info=True,
+        )
+
+
 def _task_result_command(
     *,
     tool_call_id: str,
@@ -203,6 +320,7 @@ def _task_result_command(
     stop_reason: SubagentStopReasonValue | None = None,
     model_name: str | None = None,
     usage: dict[str, int] | None = None,
+    producer_task_id: str | None = None,
 ) -> Command:
     content, metadata_error = format_subagent_result_message(status, result=result, error=error, stop_reason=stop_reason)
     return Command(
@@ -212,14 +330,24 @@ def _task_result_command(
                     content=content,
                     tool_call_id=tool_call_id,
                     name="task",
-                    additional_kwargs=make_subagent_additional_kwargs(
-                        status,
-                        result=result,
-                        error=metadata_error,
-                        stop_reason=stop_reason,
-                        model_name=model_name,
-                        token_usage=usage,
-                    ),
+                    additional_kwargs={
+                        **make_subagent_additional_kwargs(
+                            status,
+                            result=result,
+                            error=metadata_error,
+                            stop_reason=stop_reason,
+                            model_name=model_name,
+                            token_usage=usage,
+                        ),
+                        **(
+                            {
+                                ANSICH_PRODUCER_KIND_KEY: "subagent_task",
+                                ANSICH_PRODUCER_ENTITY_ID_KEY: producer_task_id,
+                            }
+                            if producer_task_id is not None
+                            else {}
+                        ),
+                    },
                 )
             ]
         }
@@ -341,9 +469,9 @@ async def task_tool(
     run_id = parent_context.get("run_id")
     from deerflow.ansich.execution import ANSICH_EXECUTION_CONTEXT_KEY, AnsichExecutionContext
 
-    ansich_execution_context = parent_context.get(ANSICH_EXECUTION_CONTEXT_KEY)
-    if not isinstance(ansich_execution_context, AnsichExecutionContext):
-        ansich_execution_context = None
+    parent_ansich_execution_context = parent_context.get(ANSICH_EXECUTION_CONTEXT_KEY)
+    if not isinstance(parent_ansich_execution_context, AnsichExecutionContext):
+        parent_ansich_execution_context = None
     # IM-channel sender identity: group chats share one thread across senders,
     # so delegated bash commands need the dispatching turn's channel_user_id.
     channel_user_id = parent_context.get("channel_user_id")
@@ -382,6 +510,41 @@ async def task_tool(
         available_tools_kwargs["app_config"] = resolved_app_config
     tools = get_available_tools(**available_tools_kwargs)
 
+    child_ansich_execution_context = None
+    child_ansich_task_control = None
+    try:
+        (
+            child_ansich_execution_context,
+            child_ansich_task_control,
+        ) = _create_child_ansich_context(
+            parent_ansich_execution_context,
+            executor_task_id=tool_call_id,
+            thread_id=thread_id,
+            owner_id=user_id,
+            subagent_name=subagent_type,
+            workspace_ref=(thread_data.get("workspace_path") if isinstance(thread_data, dict) else None),
+            sandbox_ref=(sandbox_state.get("sandbox_id") if isinstance(sandbox_state, dict) else None),
+        )
+    except Exception:
+        logger.warning(
+            "[trace=%s] Could not initialize child Ansich context for task tool %s",
+            trace_id,
+            tool_call_id,
+            exc_info=True,
+        )
+        _record_child_ansich_degradation(
+            parent_ansich_execution_context,
+            provider_tool_call_id=tool_call_id,
+        )
+
+    child_ansich_task_id = getattr(child_ansich_execution_context, "task_id", None)
+
+    def child_result_command(**kwargs: Any) -> Command:
+        return _task_result_command(
+            **kwargs,
+            producer_task_id=(child_ansich_task_id if isinstance(child_ansich_task_id, str) else None),
+        )
+
     # Create executor
     executor_kwargs = {
         "config": config,
@@ -396,7 +559,8 @@ async def task_tool(
         "oauth_provider": oauth_provider,
         "oauth_id": oauth_id,
         "run_id": run_id,
-        "ansich_execution_context": ansich_execution_context,
+        "ansich_execution_context": child_ansich_execution_context,
+        "ansich_task_control": child_ansich_task_control,
         "channel_user_id": channel_user_id,
         "is_internal": is_internal,
         "authz_attributes": authz_attributes,
@@ -404,11 +568,27 @@ async def task_tool(
     }
     if resolved_app_config is not None:
         executor_kwargs["app_config"] = resolved_app_config
-    executor = SubagentExecutor(**executor_kwargs)
+    try:
+        executor = SubagentExecutor(**executor_kwargs)
 
-    # Start background execution (always async to prevent blocking)
-    # Use tool_call_id as task_id for better traceability
-    task_id = executor.execute_async(prompt, task_id=tool_call_id)
+        # Start background execution (always async to prevent blocking).
+        # Use tool_call_id as task_id for better traceability.
+        task_id = executor.execute_async(prompt, task_id=tool_call_id)
+    except Exception:
+        if child_ansich_task_control is not None:
+            try:
+                await child_ansich_task_control.terminal(
+                    "error",
+                    attributes={"failure_reason": "executor_start_failed"},
+                )
+            except Exception:
+                logger.warning(
+                    "[trace=%s] Could not close unstarted child Ansich Task for tool %s",
+                    trace_id,
+                    tool_call_id,
+                    exc_info=True,
+                )
+        raise
 
     # Poll for task completion in backend (removes need for LLM to poll)
     poll_count = 0
@@ -439,7 +619,7 @@ async def task_tool(
                 writer({"type": "task_failed", "task_id": task_id, "error": "Task disappeared from background tasks"})
                 cleanup_background_task(task_id)
                 error = f"Task {task_id} disappeared from background tasks"
-                return _task_result_command(
+                return child_result_command(
                     tool_call_id=tool_call_id,
                     status="failed",
                     error=error,
@@ -494,7 +674,7 @@ async def task_tool(
                 # stop_reason carries a guardrail cap (token_capped / turn_capped)
                 # when the run was ended early but still produced a final answer
                 # — the work survives on result_brief like a clean success.
-                return _task_result_command(
+                return child_result_command(
                     tool_call_id=tool_call_id,
                     status="completed",
                     result=result.result,
@@ -519,7 +699,7 @@ async def task_tool(
                 # A turn-capped run with no usable output surfaces as failed +
                 # stop_reason=turn_capped; the cap note lets the lead tell "out
                 # of budget" from "broken subagent".
-                return _task_result_command(
+                return child_result_command(
                     tool_call_id=tool_call_id,
                     status="failed",
                     error=result.error,
@@ -541,7 +721,7 @@ async def task_tool(
                 )
                 logger.info(f"[trace={trace_id}] Task {task_id} cancelled: {result.error}")
                 cleanup_background_task(task_id)
-                return _task_result_command(
+                return child_result_command(
                     tool_call_id=tool_call_id,
                     status="cancelled",
                     error=result.error,
@@ -562,7 +742,7 @@ async def task_tool(
                 )
                 logger.warning(f"[trace={trace_id}] Task {task_id} timed out: {result.error}")
                 cleanup_background_task(task_id)
-                return _task_result_command(
+                return child_result_command(
                     tool_call_id=tool_call_id,
                     status="timed_out",
                     error=result.error,
@@ -597,7 +777,7 @@ async def task_tool(
                 request_cancel_background_task(task_id)
                 _schedule_deferred_subagent_cleanup(task_id, trace_id, max_poll_count)
                 message = f"Task polling timed out after {timeout_minutes} minutes. This may indicate the background task is stuck. Status: {result.status.value}"
-                return _task_result_command(
+                return child_result_command(
                     tool_call_id=tool_call_id,
                     status="polling_timed_out",
                     error=message,

@@ -415,6 +415,7 @@ class SubagentExecutor:
         authz_attributes: Mapping[str, Any] | None = None,
         deerflow_trace_id: str | None = None,
         ansich_execution_context: Any | None = None,
+        ansich_task_control: Any | None = None,
     ):
         """Initialize the executor.
 
@@ -439,8 +440,10 @@ class SubagentExecutor:
                 the same run as the lead agent.
             deerflow_trace_id: DeerFlow request-level correlation id propagated
                 from the parent run for Langfuse metadata correlation.
-            ansich_execution_context: Parent Task-scoped allocator/collector;
-                subagent decisions share its monotonic Step sequence.
+            ansich_execution_context: Explicit child Task-scoped
+                allocator/collector. It must never be the parent context.
+            ansich_task_control: Fail-open lifecycle/release probe for the same
+                child Task.
         """
         self.config = config
         self.app_config = app_config
@@ -474,6 +477,8 @@ class SubagentExecutor:
         self.authz_attributes = normalize_authz_attributes(authz_attributes)
         self.deerflow_trace_id = deerflow_trace_id
         self.ansich_execution_context = ansich_execution_context
+        self.ansich_task_control = ansich_task_control
+        self._ansich_heartbeat: Any | None = None
 
         self._base_tools = _filter_tools(
             tools,
@@ -591,10 +596,6 @@ class SubagentExecutor:
                 },
             },
         )
-        try:
-            setattr(agent, "__ansich_agent_runtime_descriptor", self.runtime_descriptor)
-        except Exception:
-            logger.debug("Subagent graph does not accept Ansich runtime descriptor attribute", exc_info=True)
         return agent
 
     def _consume_guard_stop_reason(self) -> str | None:
@@ -614,6 +615,126 @@ class SubagentExecutor:
             if reason is not None:
                 return reason
         return None
+
+    def _start_ansich_task(self) -> None:
+        probe = self.ansich_task_control
+        if probe is None:
+            return
+        try:
+            probe.started()
+        except Exception:
+            logger.warning(
+                "[trace=%s] Child Ansich Task start failed for subagent %s",
+                self.trace_id,
+                self.config.name,
+                exc_info=True,
+            )
+
+    def _start_ansich_heartbeat(self, result: SubagentResult) -> None:
+        execution = self.ansich_execution_context
+        probe = self.ansich_task_control
+        service = getattr(execution, "service", None)
+        if execution is None or probe is None or service is None:
+            return
+        ansich_config = getattr(self.app_config, "ansich", None)
+        interval_seconds = getattr(
+            ansich_config,
+            "heartbeat_interval_seconds",
+            None,
+        )
+        if not isinstance(interval_seconds, int | float) or isinstance(interval_seconds, bool) or interval_seconds <= 0:
+            return
+        try:
+            from deerflow.ansich.probes.task_heartbeat import AnsichTaskHeartbeat
+
+            heartbeat = AnsichTaskHeartbeat(
+                service,
+                task_id=execution.task_id,
+                run_id=probe.source_id,
+                interval_seconds=float(interval_seconds),
+                worker_id=f"subagent-executor:{self.trace_id}",
+                ownership_epoch=execution.task_id,
+                is_owner=lambda: (
+                    result.status
+                    not in {
+                        SubagentStatus.COMPLETED,
+                        SubagentStatus.FAILED,
+                        SubagentStatus.TIMED_OUT,
+                        SubagentStatus.CANCELLED,
+                    }
+                ),
+            )
+            heartbeat.start()
+            self._ansich_heartbeat = heartbeat
+        except Exception:
+            logger.warning(
+                "[trace=%s] Child Ansich heartbeat start failed for subagent %s",
+                self.trace_id,
+                self.config.name,
+                exc_info=True,
+            )
+
+    async def _stop_ansich_heartbeat(self) -> None:
+        heartbeat = self._ansich_heartbeat
+        self._ansich_heartbeat = None
+        if heartbeat is None:
+            return
+        try:
+            await heartbeat.stop()
+        except Exception:
+            logger.warning(
+                "[trace=%s] Child Ansich heartbeat stop failed for subagent %s",
+                self.trace_id,
+                self.config.name,
+                exc_info=True,
+            )
+
+    def _record_ansich_release(self) -> None:
+        probe = self.ansich_task_control
+        if probe is None:
+            return
+        try:
+            probe.agent_release_resolved(self.runtime_descriptor)
+        except Exception:
+            logger.warning(
+                "[trace=%s] Child AgentRelease recording failed for subagent %s",
+                self.trace_id,
+                self.config.name,
+                exc_info=True,
+            )
+
+    async def _finish_ansich_task(self, result: SubagentResult) -> None:
+        probe = self.ansich_task_control
+        if probe is None:
+            return
+        if self.ansich_execution_context is not None:
+            try:
+                from deerflow.ansich.tool_middleware import reconcile_open_tool_calls
+
+                reconcile_open_tool_calls(self.ansich_execution_context)
+            except Exception:
+                logger.warning(
+                    "[trace=%s] Child Ansich Tool reconciliation failed for subagent %s",
+                    self.trace_id,
+                    self.config.name,
+                    exc_info=True,
+                )
+        try:
+            status = {
+                SubagentStatus.COMPLETED: "success",
+                SubagentStatus.FAILED: "error",
+                SubagentStatus.TIMED_OUT: "timeout",
+                SubagentStatus.CANCELLED: "interrupted",
+            }.get(result.status)
+            if status is not None:
+                await probe.terminal(status)
+        except Exception:
+            logger.warning(
+                "[trace=%s] Child Ansich Task terminal recording failed for subagent %s",
+                self.trace_id,
+                self.config.name,
+                exc_info=True,
+            )
 
     async def _load_skills(self) -> list[Skill]:
         """Load enabled skill metadata based on config.skills."""
@@ -786,9 +907,12 @@ class SubagentExecutor:
         processed_message_count = 0
 
         collector: SubagentTokenCollector | None = None
+        self._start_ansich_task()
+        self._start_ansich_heartbeat(result)
         try:
             state, final_tools, deferred_setup = await self._build_initial_state(task)
             agent = self._create_agent(final_tools, deferred_setup=deferred_setup)
+            self._record_ansich_release()
 
             # Token collector for subagent LLM calls
             collector_caller = f"subagent:{self.config.name}"
@@ -994,6 +1118,12 @@ class SubagentExecutor:
                         token_usage_records=records,
                     )
 
+        except asyncio.CancelledError:
+            result.try_set_terminal(
+                SubagentStatus.CANCELLED,
+                error="Cancelled by parent",
+                token_usage_records=(collector.snapshot_records() if collector is not None else None),
+            )
         except Exception as e:
             logger.exception(f"[trace={self.trace_id}] Subagent {self.config.name} async execution failed")
             result.try_set_terminal(
@@ -1002,6 +1132,8 @@ class SubagentExecutor:
                 token_usage_records=collector.snapshot_records() if collector is not None else None,
             )
 
+        await self._stop_ansich_heartbeat()
+        await self._finish_ansich_task(result)
         return result
 
     def _execute_in_isolated_loop(self, task: str, result_holder: SubagentResult | None = None) -> SubagentResult:

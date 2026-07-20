@@ -10,6 +10,7 @@ from sqlalchemy import (
     DateTime,
     Float,
     ForeignKey,
+    ForeignKeyConstraint,
     Index,
     Integer,
     LargeBinary,
@@ -323,6 +324,7 @@ class AnsichStepRow(Base):
 
     __table_args__ = (
         UniqueConstraint("task_id", "step_seq", name="uq_ansich_step_task_seq"),
+        UniqueConstraint("entity_id", "task_id", name="uq_ansich_step_entity_task"),
         Index("ix_ansich_steps_task_seq", "task_id", "step_seq"),
     )
 
@@ -444,6 +446,12 @@ class AnsichToolCallRow(Base):
 
     __table_args__ = (
         UniqueConstraint("step_id", "call_seq", name="uq_ansich_tool_call_step_seq"),
+        UniqueConstraint(
+            "entity_id",
+            "step_id",
+            "task_id",
+            name="uq_ansich_tool_call_entity_step_task",
+        ),
         Index("ix_ansich_tool_calls_step_seq", "step_id", "call_seq"),
         Index("ix_ansich_tool_calls_provider", "provider_call_id"),
         Index("ix_ansich_tool_calls_name_issued", "tool_name", "issued_obs_id"),
@@ -1057,17 +1065,113 @@ class AnsichTaskSummaryRow(Base):
     __table_args__ = (Index("ix_ansich_task_summaries_control_evidence", "control_value", "last_evidence_at"),)
 
 
+class AnsichTaskSpawnRow(Base):
+    __tablename__ = "ansich_task_spawns"
+
+    parent_task_id: Mapped[str] = mapped_column(String(36), primary_key=False)
+    spawning_step_id: Mapped[str] = mapped_column(String(36), nullable=False)
+    spawning_tool_call_id: Mapped[str] = mapped_column(String(36), nullable=False)
+    child_task_id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    established_obs_id: Mapped[str] = mapped_column(
+        String(36),
+        ForeignKey("ansich_observations.obs_id", ondelete="RESTRICT"),
+        nullable=False,
+    )
+    subagent_name: Mapped[str | None] = mapped_column(String(128))
+
+    __table_args__ = (
+        ForeignKeyConstraint(
+            ["parent_task_id"],
+            ["ansich_tasks.entity_id"],
+            ondelete="CASCADE",
+        ),
+        ForeignKeyConstraint(
+            ["child_task_id"],
+            ["ansich_tasks.entity_id"],
+            ondelete="CASCADE",
+        ),
+        ForeignKeyConstraint(
+            ["spawning_step_id", "parent_task_id"],
+            ["ansich_steps.entity_id", "ansich_steps.task_id"],
+            ondelete="CASCADE",
+            name="fk_ansich_task_spawn_parent_step",
+        ),
+        ForeignKeyConstraint(
+            ["spawning_tool_call_id", "spawning_step_id", "parent_task_id"],
+            [
+                "ansich_tool_calls.entity_id",
+                "ansich_tool_calls.step_id",
+                "ansich_tool_calls.task_id",
+            ],
+            ondelete="CASCADE",
+            name="fk_ansich_task_spawn_parent_tool",
+        ),
+        Index(
+            "ix_ansich_task_spawns_parent_child",
+            "parent_task_id",
+            "child_task_id",
+        ),
+    )
+
+
+class AnsichTaskAncestryRow(Base):
+    __tablename__ = "ansich_task_ancestry"
+
+    ancestor_task_id: Mapped[str] = mapped_column(
+        String(36),
+        ForeignKey("ansich_tasks.entity_id", ondelete="CASCADE"),
+        primary_key=True,
+    )
+    descendant_task_id: Mapped[str] = mapped_column(
+        String(36),
+        ForeignKey("ansich_tasks.entity_id", ondelete="CASCADE"),
+        primary_key=True,
+    )
+    depth: Mapped[int] = mapped_column(Integer, nullable=False)
+    established_obs_id: Mapped[str] = mapped_column(
+        String(36),
+        ForeignKey("ansich_observations.obs_id", ondelete="RESTRICT"),
+        nullable=False,
+    )
+
+    __table_args__ = (
+        CheckConstraint(
+            "ancestor_task_id <> descendant_task_id",
+            name="ck_ansich_task_ancestry_self_free",
+        ),
+        CheckConstraint(
+            "depth > 0",
+            name="ck_ansich_task_ancestry_positive_depth",
+        ),
+        Index(
+            "ix_ansich_task_ancestry_descendant_ancestor",
+            "descendant_task_id",
+            "ancestor_task_id",
+        ),
+    )
+
+
 class AnsichUsageContributionRow(Base):
     __tablename__ = "ansich_usage_contributions"
 
-    task_id: Mapped[str] = mapped_column(String(36), ForeignKey("ansich_tasks.entity_id", ondelete="CASCADE"), primary_key=True)
+    aggregate_task_id: Mapped[str] = mapped_column(
+        String(36),
+        ForeignKey("ansich_tasks.entity_id", ondelete="CASCADE"),
+        primary_key=True,
+    )
     source_task_id: Mapped[str] = mapped_column(String(36), ForeignKey("ansich_tasks.entity_id", ondelete="CASCADE"), primary_key=True)
     dimension: Mapped[str] = mapped_column(String(32), primary_key=True)
     source_obs_id: Mapped[str] = mapped_column(String(36), ForeignKey("ansich_observations.obs_id", ondelete="CASCADE"), primary_key=True)
     delta: Mapped[int] = mapped_column(BigInteger, nullable=False)
     as_of: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
 
-    __table_args__ = (Index("ix_ansich_usage_contributions_task_dimension", "task_id", "dimension"),)
+    __table_args__ = (
+        Index(
+            "ix_ansich_usage_contributions_task_dimension",
+            "aggregate_task_id",
+            "dimension",
+        ),
+    )
 
 
 class AnsichTaskUsageRow(Base):

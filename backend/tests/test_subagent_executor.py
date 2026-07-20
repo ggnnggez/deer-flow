@@ -22,7 +22,7 @@ from datetime import datetime
 from importlib.metadata import version as package_version
 from pathlib import Path
 from types import ModuleType, SimpleNamespace
-from unittest.mock import MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 from packaging.version import Version
@@ -2548,6 +2548,119 @@ class _FakeStreamAgent:
         self.captured_context = context
         return
         yield  # pragma: no cover - make this an async generator
+
+
+@pytest.mark.anyio
+async def test_subagent_execution_owns_child_ansich_lifecycle_and_release(
+    classes,
+    monkeypatch,
+):
+    from ansich.release import AgentRuntimeDescriptor
+
+    from deerflow.ansich.execution import (
+        ANSICH_EXECUTION_CONTEXT_KEY,
+        AnsichExecutionContext,
+    )
+
+    child_task_id = "00000000-0000-4000-8000-000000000042"
+    child_execution = AnsichExecutionContext(task_id=child_task_id)
+    child_probe = MagicMock(task_id=child_task_id)
+    child_probe.terminal = AsyncMock()
+    executor = classes["SubagentExecutor"](
+        config=classes["SubagentConfig"](
+            name="general-purpose",
+            description="Child lifecycle test",
+            system_prompt="test",
+            max_turns=5,
+            timeout_seconds=30,
+        ),
+        tools=[],
+        parent_model="test-model",
+        thread_id="parent-thread-1",
+        ansich_execution_context=child_execution,
+        ansich_task_control=child_probe,
+    )
+    descriptor = AgentRuntimeDescriptor(
+        namespace="deerflow",
+        agent_name="general-purpose",
+        effective_model="provider/child-v1",
+        prompt_template_id="deerflow-subagent-v1",
+        rendered_base_prompt="test",
+    )
+    fake_agent = _FakeStreamAgent()
+
+    async def build_initial_state(task):
+        return ({"messages": [classes["HumanMessage"](content=task)]}, [], None)
+
+    def create_agent(*args, **kwargs):  # noqa: ARG001
+        executor.runtime_descriptor = descriptor
+        return fake_agent
+
+    monkeypatch.setattr(executor, "_build_initial_state", build_initial_state)
+    monkeypatch.setattr(executor, "_create_agent", create_agent)
+
+    result = await executor._aexecute("do child work")
+
+    assert result.status == classes["SubagentStatus"].COMPLETED
+    child_probe.started.assert_called_once_with()
+    child_probe.agent_release_resolved.assert_called_once_with(descriptor)
+    child_probe.terminal.assert_awaited_once_with("success")
+    assert fake_agent.captured_context[ANSICH_EXECUTION_CONTEXT_KEY] is child_execution
+
+
+@pytest.mark.anyio
+async def test_subagent_execution_emits_independent_child_heartbeat(
+    classes,
+    monkeypatch,
+):
+    from deerflow.ansich.execution import AnsichExecutionContext
+
+    child_task_id = "00000000-0000-4000-8000-000000000043"
+    service = MagicMock()
+    child_execution = AnsichExecutionContext(task_id=child_task_id, service=service)
+    child_probe = MagicMock(task_id=child_task_id, source_id="executor-task-43")
+    child_probe.terminal = AsyncMock()
+    executor = classes["SubagentExecutor"](
+        config=classes["SubagentConfig"](
+            name="general-purpose",
+            description="Child heartbeat test",
+            system_prompt="test",
+            max_turns=5,
+            timeout_seconds=30,
+        ),
+        tools=[],
+        app_config=SimpleNamespace(
+            ansich=SimpleNamespace(heartbeat_interval_seconds=0.001),
+        ),
+        parent_model="test-model",
+        thread_id="parent-thread-1",
+        trace_id="trace-child-heartbeat",
+        ansich_execution_context=child_execution,
+        ansich_task_control=child_probe,
+    )
+
+    class SlowAgent(_FakeStreamAgent):
+        async def astream(self, state, *, config, context, stream_mode):  # noqa: ARG002
+            self.captured_config = config
+            self.captured_context = context
+            await asyncio.sleep(0.01)
+            return
+            yield
+
+    fake_agent = SlowAgent()
+
+    async def build_initial_state(task):
+        return ({"messages": [classes["HumanMessage"](content=task)]}, [], None)
+
+    monkeypatch.setattr(executor, "_build_initial_state", build_initial_state)
+    monkeypatch.setattr(executor, "_create_agent", lambda *args, **kwargs: fake_agent)
+
+    await executor._aexecute("do child work")
+
+    heartbeats = [call.args[0] for call in service.record.call_args_list if call.args[0].kind == "task.heartbeat"]
+    assert heartbeats
+    assert {observation.task_id for observation in heartbeats} == {child_task_id}
+    assert {observation.correlation_id for observation in heartbeats} == {"executor-task-43"}
 
 
 class TestSubagentCheckpointLineage:
