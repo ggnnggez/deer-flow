@@ -10,7 +10,7 @@
 | M2 | P6 的 assessor coalescing 测试在全套件负载下时序性失败(flaky) | ✅ 已修复 | 2026-07-20 | `e91d9f1c`, `4e5eb0fd` |
 | M3 | policy manifest 覆盖依赖属性探测,计划 §3 清单未被契约化,存在静默缺项 | ✅ 已修复 | 2026-07-20 | `256d2c91` |
 | L1 | 计划 §5 的二线 credential validator 缺位(只有指纹校验,无 post-sanitization 模式检测) | ⬜ 未修复 | — | — |
-| L2 | descriptor 经 `__pregel_runtime` 私有键传递,LangGraph 升级可能静默降级 | ✅ 已修复 | 2026-07-20 | commit 待提交 |
+| L2 | descriptor 经 `__pregel_runtime` 私有键传递,LangGraph 升级可能静默降级 | ✅ 已修复 | 2026-07-20 | `79cd13b1` |
 
 ## M1. drift 判定对裸模型名一律 `unknown`
 
@@ -46,7 +46,7 @@
 
 ## L2. descriptor 经 `__pregel_runtime` 私有键传递
 
-- 状态:✅ 已于 2026-07-20 完成修复(commit 待提交)。正常 lead worker 路径现在消费显式 `LeadAgentAssembly(graph, descriptor)` 返回值，descriptor 不再经 `__pregel_runtime` 往返；`make_lead_agent()` 继续保留 graph-only 公共兼容接口。Subagent 直接消费自身真实 assembly 产生的 descriptor，并通过显式 child `AnsichExecutionContext` 传递 Task 作用域。自定义 agent factory 若只返回 graph，worker 仍保留 graph attribute 兼容读取，但它已不再是内建 lead/subagent 的主通道。集成回归固定了 descriptor 经 Gateway factory → worker → `agent_release.resolved` 的真实路径。
+- 状态:✅ 已于 2026-07-20 完成修复(commit `79cd13b1`)。正常 lead worker 路径现在消费显式 `LeadAgentAssembly(graph, descriptor)` 返回值，descriptor 不再经 `__pregel_runtime` 往返；`make_lead_agent()` 继续保留 graph-only 公共兼容接口。Subagent 直接消费自身真实 assembly 产生的 descriptor，并通过显式 child `AnsichExecutionContext` 传递 Task 作用域。自定义 agent factory 若只返回 graph，worker 仍保留 graph attribute 兼容读取，但它已不再是内建 lead/subagent 的主通道。集成回归固定了 descriptor 经 Gateway factory → worker → `agent_release.resolved` 的真实路径。
 - 位置:`lead_agent/agent.py::_publish_runtime_descriptor`(读 `config["configurable"]["__pregel_runtime"].context` 并写入)+ graph attr 兜底 + `worker.py` 的两路读取。
 - 现状:`__pregel_runtime` 是 LangGraph 的私有实现细节;版本升级重命名/改变注入时机会静默断掉 runtime-context 路径。graph attr 兜底(`setattr(graph, ...)`)仍在,但对 CompiledGraph setattr 同样不是公开契约。降级路径正确(缺 descriptor → `observability.degraded`,不阻塞 Run),因此是脆弱点而非故障;但一次依赖升级就可能让所有 Task 静默失去 release 绑定,只有细看 health 才会发现。
 - 方向:加一条"descriptor 经 worker 真实路径可达"的集成回归(升级 LangGraph 时会红);或改用自有的显式通道(例如 assembly 返回值直接传给 worker,而不是经 config 往返)。
