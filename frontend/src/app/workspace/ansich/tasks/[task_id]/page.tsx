@@ -2,8 +2,8 @@
 
 import { AlertCircleIcon, ArrowLeftIcon } from "lucide-react";
 import Link from "next/link";
-import { useParams } from "next/navigation";
-import { useEffect } from "react";
+import { useParams, usePathname, useRouter, useSearchParams } from "next/navigation";
+import { useCallback, useEffect } from "react";
 
 import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert";
 import { Button } from "@/components/ui/button";
@@ -23,7 +23,8 @@ import {
   AnsichObservationTimeline,
   AnsichProjectionHealth,
   AnsichStepsPanel,
-  AnsichStatusBadge,
+  AnsichTaskDiagnosticStrip,
+  AnsichTaskHero,
   AnsichTaskTreePanel,
   AnsichScopeEffectsPanel,
 } from "@/components/workspace/ansich";
@@ -34,23 +35,82 @@ import {
 } from "@/components/workspace/workspace-container";
 import {
   useAnsichTask,
+  useAnsichTaskBudgets,
   useAnsichTaskCompressions,
+  useAnsichTaskSteps,
   useAnsichTaskTimeline,
+  useAnsichTaskUsage,
 } from "@/core/ansich/hooks";
-import { formatAnsichTimestamp } from "@/core/ansich/presentation";
+import {
+  formatAnsichTimestamp,
+  selectPrimarySignal,
+} from "@/core/ansich/presentation";
+import type {
+  AnsichBeliefAssertion,
+  AnsichTaskUsageValue,
+  AnsichUsageDimension,
+} from "@/core/ansich/types";
 import { useAuth } from "@/core/auth/AuthProvider";
 import { useI18n } from "@/core/i18n/hooks";
+
+type TaskView = "summary" | "decision" | "resources" | "evidence";
+const TASK_VIEWS: TaskView[] = ["summary", "decision", "resources", "evidence"];
+
+function usageValue(
+  values: AnsichTaskUsageValue[],
+  dimension: AnsichUsageDimension,
+): number | null {
+  const found = values.find((item) => item.dimension === dimension);
+  return found ? found.value : null;
+}
+
+/** Best-effort behavior classification from the untyped belief value (UI-1). */
+function extractBehaviorState(
+  behavior: AnsichBeliefAssertion | null,
+): "runaway" | "normal" | "unknown" | null {
+  if (!behavior) return null;
+  const raw = String(
+    (behavior.value.state ??
+      behavior.value.classification ??
+      behavior.value.behavior ??
+      "") as string,
+  ).toLowerCase();
+  if (raw.includes("runaway")) return "runaway";
+  if (raw === "normal" || raw === "nominal" || raw === "within") return "normal";
+  return "unknown";
+}
 
 export default function AnsichTaskDetailPage() {
   const { t, locale } = useI18n();
   const { user } = useAuth();
   const params = useParams<{ task_id: string }>();
+  const router = useRouter();
+  const pathname = usePathname();
+  const searchParams = useSearchParams();
   const taskId = params.task_id;
   const isAdmin = user?.system_role === "admin";
+
+  const rawView = searchParams.get("view");
+  const view: TaskView = TASK_VIEWS.includes(rawView as TaskView)
+    ? (rawView as TaskView)
+    : "summary";
+
+  const setView = useCallback(
+    (next: string) => {
+      const query = new URLSearchParams(searchParams.toString());
+      query.set("view", next);
+      router.replace(`${pathname}?${query.toString()}`, { scroll: false });
+    },
+    [pathname, router, searchParams],
+  );
+
   const taskQuery = useAnsichTask(taskId, isAdmin);
   const task = taskQuery.data?.task;
   const behavior = taskQuery.data?.behavior;
   const taskIsRunning = task?.control.value === "running";
+  const usageQuery = useAnsichTaskUsage(taskId, isAdmin, taskIsRunning, "local");
+  const budgetsQuery = useAnsichTaskBudgets(taskId, isAdmin, taskIsRunning);
+  const stepsQuery = useAnsichTaskSteps(taskId, isAdmin, taskIsRunning);
   const timelineQuery = useAnsichTaskTimeline(taskId, isAdmin, taskIsRunning);
   const compressionsQuery = useAnsichTaskCompressions(
     taskId,
@@ -74,6 +134,38 @@ export default function AnsichTaskDetailPage() {
   useEffect(() => {
     document.title = `${t.ansich.task} ${taskId} - ${t.pages.appName}`;
   }, [t.ansich.task, t.pages.appName, taskId]);
+
+  // Derived first-screen diagnostics (existing per-task queries only).
+  const usageValues = usageQuery.data?.values ?? [];
+  const budgetHealth = budgetsQuery.data?.health ?? [];
+  const durationMs = usageValue(usageValues, "wall_time_ms");
+  const childCount = usageValue(usageValues, "child_tasks_spawned");
+  const totalTokens = usageValue(usageValues, "total_tokens");
+  const primarySignal = task
+    ? selectPrimarySignal({
+        behaviorState: extractBehaviorState(behavior ?? null),
+        budgetHealth,
+        observability: task.observability_status,
+      })
+    : null;
+  const latestStep = stepsQuery.data?.items?.at(-1) ?? null;
+  const currentActivity = latestStep
+    ? {
+        label: `${t.ansich.step} ${latestStep.step_seq} · ${latestStep.status}`,
+      }
+    : null;
+  const impact =
+    childCount || totalTokens !== null
+      ? {
+          label:
+            totalTokens !== null
+              ? `${totalTokens.toLocaleString()} ${t.ansich.tokens}`
+              : t.ansich.evidenceInsufficient,
+          sublabel: childCount
+            ? t.ansich.childTasksCount(childCount.toLocaleString())
+            : null,
+        }
+      : null;
 
   return (
     <WorkspaceContainer>
@@ -105,153 +197,80 @@ export default function AnsichTaskDetailPage() {
             <TaskDetailSkeleton />
           ) : (
             <>
-              <header className="space-y-2">
-                <div className="flex flex-wrap items-center gap-3">
-                  <h1 className="font-mono text-xl font-semibold break-all">
-                    {task.task_id}
-                  </h1>
-                  <AnsichStatusBadge value={task.control.value} />
-                </div>
-                <p className="text-muted-foreground text-sm">
-                  {task.source_kind}: {task.source_id}
-                </p>
-              </header>
+              <AnsichTaskHero
+                task={task}
+                actor={null}
+                durationMs={durationMs}
+                childCount={childCount}
+                primarySignal={primarySignal}
+                technicalDetails={
+                  <dl className="grid gap-x-6 gap-y-2 text-xs sm:grid-cols-2">
+                    <TechRow label={t.ansich.task} value={task.task_id} />
+                    <TechRow
+                      label={t.ansich.source}
+                      value={`${task.source_kind}: ${task.source_id}`}
+                    />
+                    <TechRow
+                      label={t.ansich.resolver}
+                      value={`${task.control.selected_by.name}@${task.control.selected_by.version}`}
+                    />
+                    <TechRow
+                      label={t.ansich.fidelity}
+                      value={task.control.fidelity_class}
+                    />
+                  </dl>
+                }
+              />
 
               {health && (
                 <AnsichProjectionHealth health={health} taskId={taskId} />
               )}
 
-              <Tabs defaultValue="overview" className="space-y-4">
-                <TabsList className="h-auto flex-wrap">
-                  <TabsTrigger value="overview">
-                    {t.ansich.overview}
+              <Tabs
+                value={view}
+                onValueChange={setView}
+                className="space-y-4"
+              >
+                <TabsList variant="line">
+                  <TabsTrigger value="summary">
+                    {t.ansich.viewSummary}
                   </TabsTrigger>
-                  <TabsTrigger value="timeline">
-                    {t.ansich.timeline}
+                  <TabsTrigger value="decision">
+                    {t.ansich.viewDecisionTrace}
                   </TabsTrigger>
-                  <TabsTrigger value="steps">{t.ansich.steps}</TabsTrigger>
-                  <TabsTrigger value="budgets">{t.ansich.budgets}</TabsTrigger>
-                  <TabsTrigger value="agent-release">
-                    {t.ansich.agentRelease}
+                  <TabsTrigger value="resources">
+                    {t.ansich.viewResourcesSafety}
                   </TabsTrigger>
-                  <TabsTrigger value="scopes-effects">
-                    {t.ansich.scopesAndEffects}
-                  </TabsTrigger>
-                  <TabsTrigger value="context">
-                    {t.ansich.contextAndLineage}
+                  <TabsTrigger value="evidence">
+                    {t.ansich.viewEvidence}
                   </TabsTrigger>
                 </TabsList>
 
-                <TabsContent value="overview" className="space-y-4">
+                <TabsContent value="summary" className="space-y-4">
+                  <AnsichTaskDiagnosticStrip
+                    currentActivity={currentActivity}
+                    primarySignal={primarySignal}
+                    impact={impact}
+                  />
                   <AnsichTaskTreePanel
                     taskId={taskId}
                     polling={taskIsRunning}
                   />
-                  <Card>
-                    <CardHeader>
-                      <CardTitle>{t.ansich.currentBelief}</CardTitle>
-                      <CardDescription>
-                        {t.ansich.asOf}:{" "}
-                        {formatAnsichTimestamp(task.control.as_of, locale)}
-                      </CardDescription>
-                    </CardHeader>
-                    <CardContent className="grid gap-5 text-sm sm:grid-cols-2">
-                      <BeliefField
-                        label={t.ansich.control}
-                        value={t.ansich.status[task.control.value]}
-                      />
-                      <BeliefField
-                        label={t.ansich.fidelity}
-                        value={task.control.fidelity_class}
-                        mono
-                      />
-                      <BeliefField
-                        label={t.ansich.source}
-                        value={`${task.control.source.name}@${task.control.source.version}`}
-                        mono
-                      />
-                      <BeliefField
-                        label={t.ansich.resolver}
-                        value={`${task.control.selected_by.name}@${task.control.selected_by.version}`}
-                        mono
-                      />
-                      <div className="sm:col-span-2">
-                        <div className="text-muted-foreground mb-2 text-xs">
-                          {t.ansich.evidence}
-                        </div>
-                        <div className="flex flex-wrap gap-2">
-                          {task.control.evidence_obs_ids.map((obsId) => (
-                            <code
-                              key={obsId}
-                              className="bg-muted rounded px-2 py-1 text-xs"
-                            >
-                              {obsId}
-                            </code>
-                          ))}
-                        </div>
-                      </div>
-                    </CardContent>
-                  </Card>
-                  <Card>
-                    <CardHeader>
-                      <CardTitle>{t.ansich.currentBehavior}</CardTitle>
-                      <CardDescription>
-                        {behavior
-                          ? `${t.ansich.asOf}: ${formatAnsichTimestamp(behavior.as_of, locale)}`
-                          : t.ansich.evidenceInsufficient}
-                      </CardDescription>
-                    </CardHeader>
-                    {behavior ? (
-                      <CardContent className="space-y-4 text-sm">
-                        <div className="grid gap-5 sm:grid-cols-2">
-                          <BeliefField
-                            label={t.ansich.source}
-                            value={`${behavior.assessor.name}@${behavior.assessor.version}`}
-                            mono
-                          />
-                          <BeliefField
-                            label={t.ansich.configHash}
-                            value={behavior.config_hash}
-                            mono
-                          />
-                        </div>
-                        <pre className="bg-muted/60 overflow-x-auto rounded-md p-3 text-xs">
-                          {JSON.stringify(behavior.value, null, 2)}
-                        </pre>
-                        <div>
-                          <div className="text-muted-foreground mb-2 text-xs">
-                            {t.ansich.evidence}
-                          </div>
-                          <div className="flex flex-wrap gap-2">
-                            {behavior.evidence_obs_ids.length ? (
-                              behavior.evidence_obs_ids.map((obsId) => (
-                                <code
-                                  key={obsId}
-                                  className="bg-muted rounded px-2 py-1 text-xs"
-                                >
-                                  {obsId}
-                                </code>
-                              ))
-                            ) : (
-                              <span className="text-muted-foreground text-xs">
-                                {t.ansich.evidenceInsufficient}
-                              </span>
-                            )}
-                          </div>
-                        </div>
-                      </CardContent>
-                    ) : null}
-                  </Card>
                 </TabsContent>
 
-                <TabsContent value="scopes-effects" className="space-y-4">
+                <TabsContent value="decision">
+                  <AnsichStepsPanel taskId={taskId} polling={taskIsRunning} />
+                </TabsContent>
+
+                <TabsContent value="resources" className="space-y-4">
+                  <AnsichBudgetPanel taskId={taskId} polling={taskIsRunning} />
                   <AnsichScopeEffectsPanel
                     taskId={taskId}
                     polling={taskIsRunning}
                   />
                 </TabsContent>
 
-                <TabsContent value="timeline" className="space-y-3">
+                <TabsContent value="evidence" className="space-y-4">
                   {timelineQuery.isPending ? (
                     <Skeleton className="h-48 w-full" />
                   ) : (
@@ -259,24 +278,6 @@ export default function AnsichTaskDetailPage() {
                       observations={timelineQuery.data?.items ?? []}
                     />
                   )}
-                </TabsContent>
-
-                <TabsContent value="steps">
-                  <AnsichStepsPanel taskId={taskId} polling={taskIsRunning} />
-                </TabsContent>
-
-                <TabsContent value="budgets">
-                  <AnsichBudgetPanel taskId={taskId} polling={taskIsRunning} />
-                </TabsContent>
-
-                <TabsContent value="agent-release">
-                  <AnsichAgentReleasePanel
-                    taskId={taskId}
-                    polling={taskIsRunning}
-                  />
-                </TabsContent>
-
-                <TabsContent value="context">
                   <AnsichContextPanel
                     taskId={taskId}
                     compressionIds={compressionIds}
@@ -290,6 +291,11 @@ export default function AnsichTaskDetailPage() {
                     }
                     polling={taskIsRunning}
                   />
+                  <AnsichAgentReleasePanel
+                    taskId={taskId}
+                    polling={taskIsRunning}
+                  />
+                  <BeliefEvidenceCard behavior={behavior ?? null} />
                 </TabsContent>
               </Tabs>
             </>
@@ -298,21 +304,43 @@ export default function AnsichTaskDetailPage() {
       </WorkspaceBody>
     </WorkspaceContainer>
   );
+
+  function BeliefEvidenceCard({
+    behavior,
+  }: {
+    behavior: AnsichBeliefAssertion | null;
+  }) {
+    return (
+      <Card>
+        <CardHeader>
+          <CardTitle>{t.ansich.currentBehavior}</CardTitle>
+          <CardDescription>
+            {behavior
+              ? `${t.ansich.asOf}: ${formatAnsichTimestamp(behavior.as_of, locale)}`
+              : t.ansich.evidenceInsufficient}
+          </CardDescription>
+        </CardHeader>
+        {behavior ? (
+          <CardContent className="space-y-3 text-sm">
+            <div className="text-muted-foreground text-xs">
+              {behavior.assessor.name}@{behavior.assessor.version} ·{" "}
+              {behavior.config_hash.slice(0, 12)}
+            </div>
+            <pre className="bg-muted/60 overflow-x-auto rounded-md p-3 text-xs">
+              {JSON.stringify(behavior.value, null, 2)}
+            </pre>
+          </CardContent>
+        ) : null}
+      </Card>
+    );
+  }
 }
 
-function BeliefField({
-  label,
-  value,
-  mono = false,
-}: {
-  label: string;
-  value: string;
-  mono?: boolean;
-}) {
+function TechRow({ label, value }: { label: string; value: string }) {
   return (
-    <div>
-      <div className="text-muted-foreground mb-1 text-xs">{label}</div>
-      <div className={mono ? "font-mono break-all" : ""}>{value}</div>
+    <div className="flex gap-2">
+      <dt className="text-muted-foreground">{label}</dt>
+      <dd className="font-mono break-all">{value}</dd>
     </div>
   );
 }
