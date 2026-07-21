@@ -8,6 +8,7 @@ import {
   formatAnsichTimestamp,
   shortId,
   selectPrimarySignal,
+  isProjectionAttention,
 } from "@/core/ansich/presentation";
 import { ANSICH_PRODUCED_ALERT_TYPES } from "@/core/ansich/types";
 
@@ -186,5 +187,25 @@ describe("selectPrimarySignal", () => {
     expect(
       selectPrimarySignal({ behaviorState: "unknown", heartbeat: "unknown" }),
     ).toBeNull();
+  });
+});
+
+describe("isProjectionAttention", () => {
+  const base = {
+    status: "healthy" as const,
+    failed_jobs: 0,
+    lost_ranges: [] as unknown[],
+    storage_available: true,
+  };
+  it("is false for a fully healthy projection", () => {
+    expect(isProjectionAttention(base)).toBe(false);
+  });
+  it("is true on non-healthy status, failed jobs, lost ranges, or lost storage", () => {
+    expect(isProjectionAttention({ ...base, status: "degraded" })).toBe(true);
+    expect(isProjectionAttention({ ...base, failed_jobs: 1 })).toBe(true);
+    expect(isProjectionAttention({ ...base, lost_ranges: [{}] })).toBe(true);
+    expect(isProjectionAttention({ ...base, storage_available: false })).toBe(
+      true,
+    );
   });
 });

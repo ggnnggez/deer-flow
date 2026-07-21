@@ -138,6 +138,25 @@ export function selectPrimarySignal(
   return null;
 }
 
+/**
+ * Whether projection health warrants a page-level banner rather than a compact
+ * status line (IA §5.2): non-healthy status, any failed job, any lost range, or
+ * storage unavailable. A healthy line must never hide these.
+ */
+export function isProjectionAttention(health: {
+  status: "healthy" | "degraded" | "failed" | "stopped";
+  failed_jobs: number;
+  lost_ranges: unknown[];
+  storage_available: boolean;
+}): boolean {
+  return (
+    health.status !== "healthy" ||
+    health.failed_jobs > 0 ||
+    health.lost_ranges.length > 0 ||
+    !health.storage_available
+  );
+}
+
 export function formatDuration(milliseconds: number | null): string {
   if (milliseconds === null) return "—";
   const seconds = Math.floor(milliseconds / 1_000);

@@ -1,14 +1,30 @@
+"use client";
+
 import { ActivityIcon, AlertTriangleIcon } from "lucide-react";
 import { useState } from "react";
 
-import { Badge } from "@/components/ui/badge";
-import { Card, CardContent } from "@/components/ui/card";
-import { countLostObservations } from "@/core/ansich/presentation";
+import { Button } from "@/components/ui/button";
+import {
+  isProjectionAttention,
+  countLostObservations,
+} from "@/core/ansich/presentation";
 import type { AnsichHealth } from "@/core/ansich/types";
 import { useI18n } from "@/core/i18n/hooks";
+import { cn } from "@/lib/utils";
 
-import { AnsichFailedJobsDialog } from "./failed-jobs-dialog";
+import { AnsichSystemHealthDrawer } from "./system-health-drawer";
 
+function formatLag(lagMs: number): string {
+  if (lagMs < 1000) return `${lagMs}ms`;
+  return `${(lagMs / 1000).toFixed(1)}s`;
+}
+
+/**
+ * Projection health at L0 (IA §5.2): a compact "Data healthy · lag 1.2s"
+ * status line by default, promoted to a page-level banner when attention is
+ * warranted. The full metric wall lives in the System details drawer and never
+ * competes with task cards at page top.
+ */
 export function AnsichProjectionHealth({
   health,
   taskId,
@@ -17,116 +33,76 @@ export function AnsichProjectionHealth({
   taskId?: string;
 }) {
   const { t } = useI18n();
+  const [drawerOpen, setDrawerOpen] = useState(false);
+  const attention = isProjectionAttention(health);
   const lostCount = countLostObservations(health.lost_ranges);
-  const unhealthy = health.status !== "healthy";
-  const [failedJobsOpen, setFailedJobsOpen] = useState(false);
 
   return (
     <>
-      <Card className="gap-0 py-4">
-        <CardContent className="flex flex-wrap items-center gap-x-6 gap-y-3 px-4 sm:px-6">
-          <div className="flex items-center gap-2">
-            {unhealthy ? (
-              <AlertTriangleIcon className="size-4 text-amber-600" />
-            ) : (
-              <ActivityIcon className="size-4 text-emerald-600" />
-            )}
-            <span className="font-medium">{t.ansich.projection}</span>
-            <Badge variant={unhealthy ? "outline" : "secondary"}>
-              {t.ansich.health[health.status]}
-            </Badge>
+      {attention ? (
+        <div
+          role="status"
+          className="border-amber-500/40 bg-amber-500/10 flex flex-wrap items-center gap-x-4 gap-y-2 rounded-lg border p-3 text-sm"
+        >
+          <div className="flex items-center gap-2 font-medium text-amber-700 dark:text-amber-300">
+            <AlertTriangleIcon className="size-4" />
+            {t.ansich.projection}: {t.ansich.health[health.status]}
           </div>
-          <HealthMetric
-            label={t.ansich.queue}
-            value={`${health.queue_depth}/${health.queue_capacity}`}
-          />
-          <HealthMetric
-            label={t.ansich.queueHighWatermark}
-            value={String(health.queue_high_watermark)}
-          />
-          <HealthMetric
-            label={t.ansich.queueBytes}
-            value={`${formatBytes(health.queue_bytes)}/${formatBytes(health.queue_byte_capacity)}`}
-          />
-          <HealthMetric
-            label={t.ansich.queueByteHighWatermark}
-            value={formatBytes(health.queue_byte_high_watermark)}
-          />
-          <HealthMetric
-            label={t.ansich.watermark}
-            value={health.watermark === null ? "—" : String(health.watermark)}
-          />
-          <HealthMetric label={t.ansich.lag} value={`${health.lag_ms} ms`} />
-          <button
-            type="button"
-            onClick={() => setFailedJobsOpen(true)}
-            disabled={health.failed_jobs === 0}
-            className="flex items-baseline gap-2 text-sm disabled:cursor-default"
-          >
-            <span className="text-muted-foreground">{t.ansich.failedJobs}</span>
-            <span
-              className={
-                health.failed_jobs > 0
-                  ? "text-destructive font-mono font-medium tabular-nums underline"
-                  : "font-mono font-medium tabular-nums"
-              }
-            >
-              {health.failed_jobs}
+          <div className="text-muted-foreground flex flex-wrap items-center gap-x-3 gap-y-1 text-xs">
+            {health.failed_jobs > 0 ? (
+              <span className="text-destructive font-medium">
+                {t.ansich.failedJobs}: {health.failed_jobs}
+              </span>
+            ) : null}
+            {lostCount > 0 ? (
+              <span>
+                {t.ansich.lost}: {lostCount}
+              </span>
+            ) : null}
+            {!health.storage_available ? (
+              <span className="text-destructive font-medium">
+                {t.ansich.health.stopped}
+              </span>
+            ) : null}
+            <span>
+              {t.ansich.lag} {formatLag(health.lag_ms)}
             </span>
-          </button>
-          <HealthMetric
-            label={t.ansich.accepted}
-            value={String(health.accepted_count)}
-          />
-          <HealthMetric
-            label={t.ansich.dropped}
-            value={String(health.dropped_count)}
-          />
-          <HealthMetric label={t.ansich.lost} value={String(lostCount)} />
-          <HealthMetric
-            label={t.ansich.snapshotRequests}
-            value={`${health.snapshot_request_count} (${health.snapshot_observations_accepted}/${health.snapshot_observations_dropped})`}
-          />
-          <HealthMetric
-            label={t.ansich.snapshotItems}
-            value={String(health.snapshot_item_count)}
-          />
-          <HealthMetric
-            label={t.ansich.incompleteSnapshots}
-            value={String(health.incomplete_snapshot_count)}
-          />
-          <HealthMetric
-            label={t.ansich.missingBlocks}
-            value={String(health.missing_content_block_count)}
-          />
-        </CardContent>
-      </Card>
-      <AnsichFailedJobsDialog
-        open={failedJobsOpen}
-        onOpenChange={setFailedJobsOpen}
+          </div>
+          <Button
+            variant="outline"
+            size="sm"
+            className="ms-auto"
+            onClick={() => setDrawerOpen(true)}
+          >
+            {t.ansich.systemDetails}
+          </Button>
+        </div>
+      ) : (
+        <div className="text-muted-foreground flex items-center gap-2 text-sm">
+          <ActivityIcon className="size-4 text-emerald-600" />
+          <span className={cn("text-foreground font-medium")}>
+            {t.ansich.dataHealthy}
+          </span>
+          <span aria-hidden>·</span>
+          <span className="tabular-nums">
+            {t.ansich.lag} {formatLag(health.lag_ms)}
+          </span>
+          <Button
+            variant="ghost"
+            size="sm"
+            className="text-muted-foreground ms-1 h-auto px-1.5 py-0.5"
+            onClick={() => setDrawerOpen(true)}
+          >
+            {t.ansich.systemDetails}
+          </Button>
+        </div>
+      )}
+      <AnsichSystemHealthDrawer
+        health={health}
         taskId={taskId}
+        open={drawerOpen}
+        onOpenChange={setDrawerOpen}
       />
     </>
-  );
-}
-
-function formatBytes(bytes: number): string {
-  if (bytes < 1024) return `${bytes} B`;
-  const units = ["KiB", "MiB", "GiB"];
-  let value = bytes / 1024;
-  let unit = units[0];
-  for (let index = 1; index < units.length && value >= 1024; index += 1) {
-    value /= 1024;
-    unit = units[index];
-  }
-  return `${value >= 10 || Number.isInteger(value) ? value.toFixed(0) : value.toFixed(1)} ${unit}`;
-}
-
-function HealthMetric({ label, value }: { label: string; value: string }) {
-  return (
-    <div className="flex items-baseline gap-2 text-sm">
-      <span className="text-muted-foreground">{label}</span>
-      <span className="font-mono font-medium tabular-nums">{value}</span>
-    </div>
   );
 }
