@@ -10,7 +10,7 @@
 | ---- | ---- | ---- | ------------ | -------- | ------ |
 | U1 | Context Lineage UI 重构：总览→细节渐进式披露，local graph 树状化 | ⬜ 未修复 | Phase 10 之后、Phase 12 之前 | — | — |
 | U2 | 按来源浏览块内容（raw/model-visible 对照） | ⬜ 未修复 | Phase 11 同批（依赖 raw read 强审计） | — | — |
-| U3 | 投影 Degraded 无 failed jobs 细节，无法下钻排查 | ⬜ 未修复 | 可提前，建议随 Phase 9 顺带或独立小迭代 | — | — |
+| U3 | 投影 Degraded 无 failed jobs 细节，无法下钻排查 | ✅ 已修复 | 可提前，建议随 Phase 9 顺带或独立小迭代 | 2026-07-21 | 5b5d03a7 |
 | U4 | Context Compression 不显示执行时机（发生时间与触发 operation） | ⬜ 未修复 | 随时可做，建议与 U3 同批随 Phase 9 顺带 | — | — |
 | D1 | 缺开发文档：概念词汇表（ContentBlock/Step/…） | ⬜ 未修复 | 立即，不依赖任何 Phase | — | — |
 | D2 | 缺使用文档：仪表盘指标含义 | ⬜ 未修复 | tooltip 随时可做；正式文档归属 Phase 12 §9 | — | — |
@@ -36,7 +36,7 @@
 
 ## U3. 投影 Degraded 无 failed jobs 细节
 
-- 状态：⬜ 未修复。
+- 状态：✅ 已修复（2026-07-21）。新增 `AnsichService.list_failed_jobs`/`get_failed_job_detail`（`backend/packages/harness/deerflow/ansich/persistence/sql.py`、`backend/packages/ansich/ansich/service.py`）与三个 admin-only 路由 `GET /operations/failed-jobs`、`GET /operations/failed-jobs/{job_id}`、`POST /operations/failed-jobs/retry`（后者首次把已存在的 `retry_failed_projections` 暴露到 HTTP）；`ProjectionHealth` 的 `failed_jobs` 指标在非零时可点击，打开 `AnsichFailedJobsDialog`——Task 详情页按 taskId 过滤，Operations 页显示全局列表且按 Task 分组重试。详情展开显示 `AnsichProjectionErrorRow`/`AnsichAssessorErrorRow` 的完整 attempt 错误历史（不受重试清除影响）。重试保持按 Task 批量粒度，未做单 job 精确重试。设计文档：`docs/superpowers/specs/2026-07-21-ansich-failed-jobs-diagnostics-design.md`。
 - 现象：投影出现 Degraded 时没有详细错误显示，例如存在 failed jobs 时不能查看其细节。
 - 相关位置：`frontend/src/components/workspace/ansich/projection-health.tsx`（仅显示 `failed_jobs` 计数）；`backend/packages/ansich/ansich/service.py::get_health`（failed_jobs → degraded 判定）、`::retry_failed_projections`（已存在，约 line 824）；`backend/app/gateway/routers/ansich.py` 无 jobs 列表/详情端点。
 - 现状：健康面板显示 degraded 与 failed_jobs 计数，Context & Lineage 页在存在失败 Job 时显示"投影不可用"提示（Phase 4 加固），但都看不到是哪个 job、哪个 projector、什么错误；排查只能查数据库。

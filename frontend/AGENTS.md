@@ -101,7 +101,7 @@ failed jobs, the Context tab renders an explicit projection-unavailable warning
 instead of the ordinary no-context empty state; the wording remains cautious
 because projection health is process-wide. Projection health also renders queue
 count/byte capacity and both high-watermarks, plus snapshot
-request/item/incomplete/missing counters. Raw ContentBlock bodies are fetched
+request/item/incomplete/missing counters. When `failed_jobs` is non-zero the metric is clickable and opens `AnsichFailedJobsDialog`, which lists currently-failing projection/assessor jobs (Task-scoped on the Task detail page, global with per-Task retry grouping on the Operations page) and lazily fetches each job's full attempt-error history on expand. Raw ContentBlock bodies are fetched
 lazily after an explicit admin click and must never be placed in the polling
 response or TanStack query cache pre-emptively. Tool raw and model-visible
 payloads use separate `no-store` API calls and separate buttons; never collapse
