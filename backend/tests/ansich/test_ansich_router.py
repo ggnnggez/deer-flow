@@ -648,7 +648,9 @@ async def test_tool_call_inventory_and_raw_visible_payloads_use_separate_endpoin
         "execution_workspace",
     }
     assert "/srv/tenant" not in scopes.text
-    assert authorization.json()["authorization"]["current_decision"] == "allowed"
+    # No GuardrailMiddleware evaluated this call, so the authorization snapshot
+    # decision is unknown (H1) rather than a synthetic "allowed".
+    assert authorization.json()["authorization"]["current_decision"] == "unknown"
     assert effects.json()["effects"]["coverage"] == "partial"
     assert {item["phase"] for item in effects.json()["effects"]["effects"]} == {
         "potential",

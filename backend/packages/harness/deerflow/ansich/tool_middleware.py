@@ -33,6 +33,7 @@ from langgraph.types import Command
 from deerflow.agents.middlewares.tool_transform_meta import read_tool_transforms
 from deerflow.ansich.execution import AnsichExecutionContext, ToolInvocation
 from deerflow.ansich.middleware import execution_context_from_runtime
+from deerflow.authz.outcome import AuthorizationOutcome, pop_authorization_outcome
 from deerflow.runtime.secret_context import extract_request_secrets, read_active_secrets
 
 _PRODUCER_INSTANCE_ID = str(uuid4())
@@ -41,6 +42,10 @@ _TRANSFORM_KINDS = frozenset(get_args(ToolTransformKind))
 
 def _producer() -> Producer:
     return Producer(name="deerflow-tool-observer", version="1", instance_id=_PRODUCER_INSTANCE_ID)
+
+
+def _runtime_context(request: ToolCallRequest) -> object:
+    return getattr(getattr(request, "runtime", None), "context", None)
 
 
 def _known_secrets(request: ToolCallRequest) -> list[str]:
@@ -165,7 +170,12 @@ def _record_batch(
         return False
 
 
-def _record_started(execution: AnsichExecutionContext, invocation: ToolInvocation) -> None:
+def _record_started(
+    execution: AnsichExecutionContext,
+    invocation: ToolInvocation,
+    *,
+    authorization_outcome: AuthorizationOutcome | None = None,
+) -> None:
     registration = invocation.registration
     # Mark the real callable boundary before any observer work. If sequence
     # allocation or Collector enqueue fails, the outer visible probe must not
@@ -175,8 +185,8 @@ def _record_started(execution: AnsichExecutionContext, invocation: ToolInvocatio
     _record_authorization(
         execution,
         invocation,
-        decision="allowed",
-        reason_code="callable_boundary_entered",
+        outcome=authorization_outcome,
+        fallback_reason_code="callable_boundary_entered",
     )
     observation = ObservationEnvelope(
         kind="tool.started",
@@ -200,12 +210,28 @@ def _record_authorization(
     execution: AnsichExecutionContext,
     invocation: ToolInvocation,
     *,
-    decision: str,
-    reason_code: str,
+    outcome: AuthorizationOutcome | None,
+    fallback_reason_code: str,
 ) -> None:
     if invocation.authorization_recorded:
         return
     registration = invocation.registration
+    if outcome is not None:
+        decision = outcome.decision
+        policy_id = outcome.policy_id
+        policy_version = outcome.policy_version
+        reason_codes = outcome.reason_codes or (fallback_reason_code,)
+        details_available = outcome.details_available
+    else:
+        # No authorization layer evaluated this call (guardrails off, or the
+        # guardrail did not run for this tool). Record it honestly as unknown:
+        # the evidence code still says whether the callable was reached, but the
+        # decision no longer masquerades as an authorization verdict.
+        decision = "unknown"
+        policy_id = "deerflow-tool-middleware-chain"
+        policy_version = "1"
+        reason_codes = (fallback_reason_code,)
+        details_available = False
     snapshot_id = new_id()
     evaluated_obs_id = new_id()
     decision_obs_id = new_id()
@@ -213,12 +239,12 @@ def _record_authorization(
     snapshot = AuthorizationSnapshot(
         snapshot_id=snapshot_id,
         tool_call_id=registration.tool_call_id,
-        policy_id="deerflow-tool-middleware-chain",
-        policy_version="1",
-        policy_hash=canonical_config_hash({"policy": "deerflow-tool-middleware-chain", "version": "1"}),
+        policy_id=policy_id,
+        policy_version=policy_version,
+        policy_hash=canonical_config_hash({"policy": policy_id, "version": policy_version}),
         decision=decision,
-        details_available=False,
-        reason_codes=(reason_code,),
+        details_available=details_available,
+        reason_codes=reason_codes,
         evaluated_at=evaluated_at,
         evidence_obs_ids=(evaluated_obs_id, decision_obs_id),
     )
@@ -634,11 +660,12 @@ class AnsichVisibleToolMiddleware(AgentMiddleware):
                 invocation = execution.current_tool_invocation()
                 if invocation is not None:
                     if not invocation.started:
+                        outcome = pop_authorization_outcome(_runtime_context(request), request.tool_call.get("id"))
                         _record_authorization(
                             execution,
                             invocation,
-                            decision="denied",
-                            reason_code="short_circuited_before_callable",
+                            outcome=outcome,
+                            fallback_reason_code="short_circuited_before_callable",
                         )
                     visible_message = _tool_message(result, request)
                     _record_visible_result(
@@ -679,11 +706,12 @@ class AnsichVisibleToolMiddleware(AgentMiddleware):
                 invocation = execution.current_tool_invocation()
                 if invocation is not None:
                     if not invocation.started:
+                        outcome = pop_authorization_outcome(_runtime_context(request), request.tool_call.get("id"))
                         _record_authorization(
                             execution,
                             invocation,
-                            decision="denied",
-                            reason_code="short_circuited_before_callable",
+                            outcome=outcome,
+                            fallback_reason_code="short_circuited_before_callable",
                         )
                     visible_message = _tool_message(result, request)
                     _record_visible_result(
@@ -712,7 +740,8 @@ class AnsichRawToolMiddleware(AgentMiddleware):
         if execution is None or invocation is None:
             return handler(request)
         try:
-            _record_started(execution, invocation)
+            outcome = pop_authorization_outcome(_runtime_context(request), request.tool_call.get("id"))
+            _record_started(execution, invocation, authorization_outcome=outcome)
         except Exception:
             return handler(request)
         try:
@@ -754,7 +783,8 @@ class AnsichRawToolMiddleware(AgentMiddleware):
         if execution is None or invocation is None:
             return await handler(request)
         try:
-            _record_started(execution, invocation)
+            outcome = pop_authorization_outcome(_runtime_context(request), request.tool_call.get("id"))
+            _record_started(execution, invocation, authorization_outcome=outcome)
         except Exception:
             return await handler(request)
         try:

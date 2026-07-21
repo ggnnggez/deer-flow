@@ -49,6 +49,7 @@ from deerflow.ansich.tool_middleware import (
     _classify_transform,
     reconcile_open_tool_calls,
 )
+from deerflow.authz.outcome import AuthorizationOutcome, put_authorization_outcome
 from deerflow.config.ansich_config import AnsichConfig
 from deerflow.config.app_config import AppConfig
 from deerflow.config.sandbox_config import SandboxConfig
@@ -304,7 +305,7 @@ def test_sync_raw_probe_classifies_timeout_without_changing_the_exception(
     assert raised.value is timeout
     assert [item.kind for item in observations] == [
         "authorization.evaluated",
-        "authorization.allowed",
+        "authorization.unknown",
         "tool.started",
         "content.produced",
         "tool.timed_out",
@@ -359,7 +360,7 @@ def test_async_raw_probe_classifies_cooperative_cancellation_without_swallowing_
         assert raised.value is cancellation
         assert [item.kind for item in observations] == [
             "authorization.evaluated",
-            "authorization.allowed",
+            "authorization.unknown",
             "tool.started",
             "content.produced",
             "tool.cancelled",
@@ -967,7 +968,10 @@ def test_tool_decision_is_acting_and_next_decision_closes_with_final_answer() ->
         assert tool_call.raw_results[0].content_hash == tool_call.visible_results[0].content_hash
         assert tool_call.derivations[0].transform_kind == "unchanged"
         assert authorization is not None
-        assert authorization.current_decision == "allowed"
+        # No GuardrailMiddleware in this chain, so no real authorization layer
+        # evaluated the call: the snapshot decision is unknown (H1), not a
+        # synthetic "allowed".
+        assert authorization.current_decision == "unknown"
         assert effects is not None
         assert {effect.phase for effect in effects.effects} == {
             "potential",
@@ -1061,13 +1065,17 @@ def test_tool_short_circuit_is_denied_and_not_recorded_as_executed() -> None:
         effects = await service.get_tool_effects(tool_call.tool_call_id)
         await service.stop()
 
+        # Execution was denied by a non-guardrail gate (tool.denied terminal),
+        # so the execution-derived beliefs stay "denied"...
         assert tool_call.authorization.value == "denied"
         assert tool_call.execution.value == "denied"
         assert tool_call.visible_result.value == "available"
         assert tool_call.started_obs_id is None
         assert tool_call.raw_results == ()
         assert authorization is not None
-        assert authorization.current_decision == "denied"
+        # ...but no authorization layer evaluated the call, so the authorization
+        # snapshot decision is unknown, not a false "denied" (H1).
+        assert authorization.current_decision == "unknown"
         assert effects is not None
         assert {effect.phase for effect in effects.effects} == {
             "potential",
@@ -1754,3 +1762,88 @@ def test_tool_registry_refuses_ambiguous_binding_without_provider_id() -> None:
     )
 
     assert resolved is None
+
+
+def _snapshot_from_observations(observations):
+    for item in observations:
+        if item.kind.startswith("authorization."):
+            return item.payload["snapshot"]
+    raise AssertionError("no authorization snapshot recorded")
+
+
+def _register_call(execution, provider_call_id, tool_name):
+    return execution.register_tool_call(
+        tool_call_id=new_id(),
+        step_id=new_id(),
+        step_seq=1,
+        call_seq=1,
+        provider_call_id=provider_call_id,
+        tool_name=tool_name,
+        args_hash="a" * 64,
+        issued_obs_id=new_id(),
+    )
+
+
+def test_raw_probe_records_unknown_when_no_guardrail_outcome(monkeypatch) -> None:
+    execution = AnsichExecutionContext(task_id=new_id(), service=MagicMock())
+    registration = _register_call(execution, "prov-1", "write_file")
+    request = SimpleNamespace(
+        runtime=SimpleNamespace(context={ANSICH_EXECUTION_CONTEXT_KEY: execution}),
+        tool_call={"id": "prov-1", "name": "write_file", "args": {}},
+    )
+    observations: list = []
+    monkeypatch.setattr(tool_observer, "_record_batch", lambda e, b, *, batch_kind: observations.extend(b) or True)
+    with execution.activate_tool_invocation(registration):
+        AnsichRawToolMiddleware().wrap_tool_call(request, lambda r: ToolMessage(content="ok", tool_call_id="prov-1", name="write_file"))
+    snapshot = _snapshot_from_observations(observations)
+    assert snapshot["decision"] == "unknown"
+    assert snapshot["details_available"] is False
+
+
+def test_raw_probe_records_real_allowed_from_guardrail_outcome(monkeypatch) -> None:
+    execution = AnsichExecutionContext(task_id=new_id(), service=MagicMock())
+    registration = _register_call(execution, "prov-2", "bash")
+    context = {ANSICH_EXECUTION_CONTEXT_KEY: execution}
+    put_authorization_outcome(context, "prov-2", AuthorizationOutcome(decision="allowed", policy_id="pol.x", policy_version="7", reason_codes=("oap.allowed",)))
+    request = SimpleNamespace(runtime=SimpleNamespace(context=context), tool_call={"id": "prov-2", "name": "bash", "args": {}})
+    observations: list = []
+    monkeypatch.setattr(tool_observer, "_record_batch", lambda e, b, *, batch_kind: observations.extend(b) or True)
+    with execution.activate_tool_invocation(registration):
+        AnsichRawToolMiddleware().wrap_tool_call(request, lambda r: ToolMessage(content="ok", tool_call_id="prov-2", name="bash"))
+    snapshot = _snapshot_from_observations(observations)
+    assert snapshot["decision"] == "allowed"
+    assert snapshot["policy_id"] == "pol.x"
+    assert snapshot["policy_version"] == "7"
+    assert "oap.allowed" in snapshot["reason_codes"]
+
+
+def test_visible_probe_records_real_denied_on_short_circuit(monkeypatch) -> None:
+    execution = AnsichExecutionContext(task_id=new_id(), service=MagicMock())
+    registration = _register_call(execution, "prov-3", "bash")
+    context = {ANSICH_EXECUTION_CONTEXT_KEY: execution}
+    put_authorization_outcome(context, "prov-3", AuthorizationOutcome(decision="denied", policy_id="pol.deny", policy_version="2", reason_codes=("oap.denied",)))
+    request = SimpleNamespace(runtime=SimpleNamespace(context=context), tool_call={"id": "prov-3", "name": "bash", "args": {}})
+    observations: list = []
+    monkeypatch.setattr(tool_observer, "_record_batch", lambda e, b, *, batch_kind: observations.extend(b) or True)
+    # visible probe wraps a handler that short-circuits (never reaches raw probe -> not started)
+    with execution.activate_tool_invocation(registration):
+        AnsichVisibleToolMiddleware().wrap_tool_call(request, lambda r: ToolMessage(content="blocked", tool_call_id="prov-3", name="bash", status="error"))
+    snapshot = _snapshot_from_observations(observations)
+    assert snapshot["decision"] == "denied"
+    assert snapshot["policy_id"] == "pol.deny"
+
+
+def test_visible_probe_records_allowed_when_guardrail_allowed_but_downstream_blocked(monkeypatch) -> None:
+    # Guardrail allowed (outcome present) but a non-authz gate blocked before the raw probe.
+    execution = AnsichExecutionContext(task_id=new_id(), service=MagicMock())
+    registration = _register_call(execution, "prov-4", "write_file")
+    context = {ANSICH_EXECUTION_CONTEXT_KEY: execution}
+    put_authorization_outcome(context, "prov-4", AuthorizationOutcome(decision="allowed", policy_id="pol.allow", policy_version="1", reason_codes=("oap.allowed",)))
+    request = SimpleNamespace(runtime=SimpleNamespace(context=context), tool_call={"id": "prov-4", "name": "write_file", "args": {}})
+    observations: list = []
+    monkeypatch.setattr(tool_observer, "_record_batch", lambda e, b, *, batch_kind: observations.extend(b) or True)
+    with execution.activate_tool_invocation(registration):
+        AnsichVisibleToolMiddleware().wrap_tool_call(request, lambda r: ToolMessage(content="blocked by read-before-write", tool_call_id="prov-4", name="write_file", status="error"))
+    snapshot = _snapshot_from_observations(observations)
+    assert snapshot["decision"] == "allowed"  # NOT denied
+    assert snapshot["policy_id"] == "pol.allow"
