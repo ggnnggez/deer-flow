@@ -360,6 +360,13 @@ export interface Translations {
     watermark: string;
     lag: string;
     failedJobs: string;
+    failedJobsDialogTitle: string;
+    failedJobsDialogDescriptionGlobal: string;
+    failedJobsDialogDescriptionTask: string;
+    failedJobsEmpty: string;
+    failedJobKindLabel: Record<"projection" | "assessor", string>;
+    failedJobAttempts: string;
+    failedJobRetryTask: string;
     queue: string;
     queueHighWatermark: string;
     queueBytes: string;

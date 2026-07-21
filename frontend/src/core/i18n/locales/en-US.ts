@@ -447,6 +447,18 @@ export const enUS: Translations = {
     watermark: "Watermark",
     lag: "Lag",
     failedJobs: "Failed jobs",
+    failedJobsDialogTitle: "Failed jobs",
+    failedJobsDialogDescriptionGlobal:
+      "Projection and assessor jobs that are currently failing across all Tasks.",
+    failedJobsDialogDescriptionTask:
+      "Projection and assessor jobs that are currently failing for this Task.",
+    failedJobsEmpty: "No failed jobs.",
+    failedJobKindLabel: {
+      projection: "Projection job",
+      assessor: "Assessor job",
+    },
+    failedJobAttempts: "Attempts",
+    failedJobRetryTask: "Retry all failed jobs for this Task",
     queue: "Queue",
     queueHighWatermark: "Queue high-watermark",
     queueBytes: "Queue bytes",
