@@ -5,6 +5,9 @@ import { mockLangGraphAPI } from "./utils/mock-api";
 const TASK_ID = "8a54d86c-b524-4f18-83e8-79b729c2a695";
 const CHILD_TASK_ID = "6a54d86c-b524-4f18-83e8-79b729c2a696";
 const HISTORY_TASK_ID = "7b43c75b-a413-4e07-92d7-68a618b1f584";
+// UI-1 downgrades UUIDs to their leading 8-char segment on list rows.
+const SHORT_TASK_ID = TASK_ID.slice(0, 8);
+const SHORT_HISTORY_TASK_ID = HISTORY_TASK_ID.slice(0, 8);
 const STEP_ID = "bb24aa10-f647-4c07-959a-0594087c818c";
 const BLOCK_ID = "d62dc6fd-4a91-4d32-95ae-3be8e1ddb1a9";
 const TOOL_CALL_ID = "3d4a8ed4-3996-41cb-9181-558ca744867b";
@@ -816,14 +819,19 @@ test("admin navigates from Ansich operations to evidence-backed Task detail", as
     page.getByText("Healthy", { exact: true }).first(),
   ).toBeVisible();
   await expect(page.getByText("Queue bytes", { exact: true })).toBeVisible();
-  await page.getByRole("link", { name: new RegExp(TASK_ID) }).click();
+  await page.getByRole("link", { name: new RegExp(SHORT_TASK_ID) }).click();
 
   await page.waitForURL(`**/workspace/ansich/tasks/${TASK_ID}`);
-  await expect(page.getByRole("heading", { name: TASK_ID })).toBeVisible();
+  // Hero shows the human-recognizable source_kind, not the full UUID.
+  await expect(
+    page.getByRole("heading", { name: "deerflow_run" }),
+  ).toBeVisible();
+  // Summary is the default view: diagnostic strip + task tree.
   await expect(page.getByText("Task tree", { exact: true })).toBeVisible();
   await expect(page.getByText(CHILD_TASK_ID, { exact: true })).toBeVisible();
-  await expect(page.getByText("task-control@1", { exact: true })).toBeVisible();
-  await page.getByRole("tab", { name: "Budgets" }).click();
+
+  // Resources & safety hosts Budgets + Scopes & effects.
+  await page.getByRole("tab", { name: "Resources & safety" }).click();
   await page.getByRole("button", { name: "Inclusive usage" }).click();
   await expect(page.getByText("160", { exact: true })).toBeVisible();
   await page.getByText("Contribution sources by Task", { exact: true }).click();
@@ -831,9 +839,9 @@ test("admin navigates from Ansich operations to evidence-backed Task detail", as
   await expect(
     page.getByText("total_tokens: 60", { exact: true }),
   ).toBeVisible();
-  await page.getByRole("tab", { name: "Lifecycle timeline" }).click();
-  await expect(page.getByText("task.completed", { exact: true })).toBeVisible();
-  await page.getByRole("tab", { name: "Steps" }).click();
+
+  // Decision trace hosts the logical Steps.
+  await page.getByRole("tab", { name: "Decision trace" }).click();
   await expect(page.getByText("Step #1", { exact: true })).toBeVisible();
   await expect(page.getByText("Effective", { exact: true })).toBeVisible();
   await expect(page.getByText("Authorization", { exact: true })).toBeVisible();
@@ -842,7 +850,10 @@ test("admin navigates from Ansich operations to evidence-backed Task detail", as
   await expect(page.getByText('"raw tool output"')).toBeVisible();
   await page.getByRole("button", { name: "Load model-visible result" }).click();
   await expect(page.getByText('"sanitized tool output"')).toBeVisible();
-  await page.getByRole("tab", { name: "Context & lineage" }).click();
+
+  // Evidence hosts the lifecycle timeline, context & lineage, and agent release.
+  await page.getByRole("tab", { name: "Evidence" }).click();
+  await expect(page.getByText("task.completed", { exact: true })).toBeVisible();
   expect(lineageRequests).toBe(0);
   await page.getByRole("button", { name: "Trace sources" }).click();
   await expect(page.getByText("provenance", { exact: true })).toBeVisible();
@@ -863,7 +874,6 @@ test("admin navigates from Ansich operations to evidence-backed Task detail", as
   await expect(page.getByText("source", { exact: true })).toBeVisible();
   await page.getByRole("button", { name: "Load raw payload" }).click();
   await expect(page.getByText('"inspect me"')).toBeVisible();
-  await page.getByRole("tab", { name: "Agent release" }).click();
   await expect(
     page.getByText("provider/model-v1", { exact: true }).first(),
   ).toBeVisible();
@@ -925,16 +935,18 @@ test("operations keeps terminal Task history separate from running work", async 
   await expect(
     page.getByText("No Agent tasks are currently running."),
   ).toBeVisible();
-  await expect(page.getByText(TASK_ID)).not.toBeVisible();
+  await expect(page.getByText(SHORT_TASK_ID)).not.toBeVisible();
   await page.getByRole("tab", { name: "Task history" }).click();
-  await expect(page.getByText(TASK_ID)).toBeVisible();
-  await expect(page.getByText(HISTORY_TASK_ID)).not.toBeVisible();
+  await expect(page.getByText(SHORT_TASK_ID)).toBeVisible();
+  await expect(page.getByText(SHORT_HISTORY_TASK_ID)).not.toBeVisible();
   await page.getByRole("button", { name: "Load more" }).click();
-  await expect(page.getByText(HISTORY_TASK_ID)).toBeVisible();
-  await page.getByRole("link", { name: new RegExp(TASK_ID) }).click();
+  await expect(page.getByText(SHORT_HISTORY_TASK_ID)).toBeVisible();
+  await page.getByRole("link", { name: new RegExp(SHORT_TASK_ID) }).click();
 
   await page.waitForURL(`**/workspace/ansich/tasks/${TASK_ID}`);
-  await expect(page.getByRole("heading", { name: TASK_ID })).toBeVisible();
+  await expect(
+    page.getByRole("heading", { name: "deerflow_run" }),
+  ).toBeVisible();
 });
 
 test("operator inspects alert evidence before confirming workflow and runtime actions", async ({
@@ -1229,8 +1241,8 @@ test("context tab distinguishes failed projection from no observed context", asy
 
   await page.goto("/workspace/chats/new");
   await page.getByRole("link", { name: "Ansich" }).click();
-  await page.getByRole("link", { name: new RegExp(TASK_ID) }).click();
-  await page.getByRole("tab", { name: "Context & lineage" }).click();
+  await page.getByRole("link", { name: new RegExp(SHORT_TASK_ID) }).click();
+  await page.getByRole("tab", { name: "Evidence" }).click();
 
   await expect(
     page.getByText(
