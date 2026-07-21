@@ -7,7 +7,7 @@ from pydantic import ValidationError
 from sqlalchemy import event
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
-from deerflow.ansich.persistence.models import AnsichAssessorJobRow, Base
+from deerflow.ansich.persistence.models import AnsichAssessorErrorRow, AnsichAssessorJobRow, Base
 from deerflow.ansich.persistence.sql import SqlAnsichBackend
 
 
@@ -272,10 +272,11 @@ async def test_list_failed_jobs_merges_and_sorts_both_kinds_across_tasks(tmp_pat
             )
         )
         await service.flush_task(assessor_task_id)
+        assessor_job_id = new_id()
         async with session_factory() as session, session.begin():
             session.add(
                 AnsichAssessorJobRow(
-                    job_id=new_id(),
+                    job_id=assessor_job_id,
                     subject_id=assessor_task_id,
                     assessor_name="scope-safety",
                     assessor_version="1",
@@ -286,8 +287,36 @@ async def test_list_failed_jobs_merges_and_sorts_both_kinds_across_tasks(tmp_pat
                     last_error="ValueError: forced for merge test",
                 )
             )
+            await session.flush()
+            session.add(
+                AnsichAssessorErrorRow(
+                    error_id=new_id(),
+                    job_id=assessor_job_id,
+                    attempt=2,
+                    error_type="ValueError",
+                    message="forced for merge test",
+                    occurred_at=newer,
+                )
+            )
 
         merged = await service.list_failed_jobs()
+
+        # Close the assessor-kind gap in get_failed_job_detail: both tests
+        # above only ever exercise kind="projection". The found path uses
+        # the assessor job/error rows just inserted; the not-found path
+        # mirrors the existing projection-kind assertion in
+        # test_list_and_detail_failed_jobs_cover_both_projection_and_assessor_kinds.
+        assessor_detail = await service.get_failed_job_detail(job_id=assessor_job_id, kind="assessor")
+        assert assessor_detail is not None
+        assert assessor_detail.kind == "assessor"
+        assert assessor_detail.task_id == assessor_task_id
+        assert len(assessor_detail.errors) == 1
+        assert assessor_detail.errors[0].error_type == "ValueError"
+        assert assessor_detail.errors[0].message == "forced for merge test"
+        assert assessor_detail.errors[0].attempt == 2
+
+        missing_assessor_detail = await service.get_failed_job_detail(job_id="does-not-exist", kind="assessor")
+        assert missing_assessor_detail is None
     finally:
         await service.stop()
         await engine.dispose()
