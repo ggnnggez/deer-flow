@@ -201,6 +201,9 @@ export function useAnsichRetryFailedJobs() {
           queryKey: ["ansich", "operations", "active-tasks"],
         }),
         queryClient.invalidateQueries({ queryKey: ["ansich", "tasks"] }),
+        queryClient.invalidateQueries({
+          queryKey: ["ansich", "operations", "alerts"],
+        }),
       ]);
     },
   });
