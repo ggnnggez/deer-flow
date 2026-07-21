@@ -22,7 +22,7 @@
 - Phase 7 代码评审的跟进项登记在 [phase-7-review-followups.md](phase-7-review-followups.md)；M2（coalescing 测试套件级 flaky）已由 `e91d9f1c`/`4e5eb0fd` 修复并隔离 SQL 集成测试 settle 时序，M1（drift 裸名判定）已由 `08cd6b1c` 修复，M3（policy manifest 契约化）已由 `256d2c91` 修复，L2（descriptor 私有通道回归）已随 Phase 8 的显式 assembly/context 通道由 `79cd13b1` 完成；L1（二线 credential validator）已于 Phase 9 开工前随本次提交完成。
 - Phase 8 代码评审的跟进项登记在 [phase-8-review-followups.md](phase-8-review-followups.md)；M1（wall_time 双写者）与 M2（heartbeat contribution 写/读放大）均归属 Phase 11 前的 wall_time 通道治理,L1（吞 CancelledError）与 L2（tree N+1）随相关路径下次改动顺带处理,均不阻塞 Phase 9 开工。
 - 非评审来源的人工发现跟进项登记在 [human-followups.md](human-followups.md)；各项附施工时机评估（D1 概念词汇表立即做，U3 failed-jobs 下钻与 U4 compression 执行时机可随 Phase 9 提前，U1/U2/A1 分别归属 Phase 10 后与 Phase 11），每个 Phase 开工前复查该文件。
-- Phase 9 代码评审的跟进项登记在 [phase-9-review-followups.md](phase-9-review-followups.md)；H1（AuthorizationSnapshot 不反映真实授权系统）与 H2（失败/超时/取消终态下 observed effect 仍记为 hard fidelity）应在生产就绪门禁前修复，M1（effect class 分类法缺 filesystem_delete/permission_change）与 M2（scope-safety assessor 全量重扫）归属 Phase 11 前治理，L1/L2 为非阻塞清理项，均不阻塞 Phase 10 开工。
+- Phase 9 代码评审的跟进项登记在 [phase-9-review-followups.md](phase-9-review-followups.md)；H1（AuthorizationSnapshot 不反映真实授权系统）已由本次提交对应的 authz outcome 桥接修复，H3（entity+类型化子行 flush 顺序不保证，FK 强制开启的生产环境下确定性失败）已由 `e074bd60` 修复；H2（失败/超时/取消终态下 observed effect 仍记为 hard fidelity）应在生产就绪门禁前修复，H4（`DELETE FROM ansich_belief_assertions` 违反 FK 约束）与 H5（大 payload externalize 后 ContextSnapshot 静默投影失败）根因未查、建议尽快排查，M1（effect class 分类法缺 filesystem_delete/permission_change）与 M2（scope-safety assessor 全量重扫）归属 Phase 11 前治理，L1/L2 为非阻塞清理项，均不阻塞 Phase 10 开工。
 
 ## 固定实现边界
 

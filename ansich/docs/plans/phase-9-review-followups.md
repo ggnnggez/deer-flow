@@ -12,6 +12,9 @@
 | M2 | scope-safety assessor 每次触发都重扫任务全部 Scope 证据并重新评估每个 tool_call,而各 tool_call 结论本互相独立 | ⬜ 未修复 | — | — |
 | L1 | 目标 path 敏感过滤只识别 POSIX 绝对路径(`startswith("/")`),Windows 路径可能绕过 intent 阶段与 API 响应端两层 redaction | ⬜ 未修复 | — | — |
 | L2 | `/operations/safety-events` 把 `tool_call_id` 传给 `service.list_alerts(task_id=...)` 形参名具有误导性 | ⬜ 未修复 | — | — |
+| H3 | `AnsichEntityRow` 与其类型化子行(AuthorizationSnapshot/AgentRelease/Alert)之间无 ORM `relationship()`,同一次 flush 插入顺序不保证,FK 强制开启的生产环境下确定性失败 | ✅ 已修复 | 2026-07-22 | `e074bd60` |
+| H4 | `DELETE FROM ansich_belief_assertions` 在 `PRAGMA foreign_keys=ON` 下违反 FK 约束,根因未查 | ⬜ 未修复 | — | — |
+| H5 | 大 payload externalize 后的 ContextSnapshot 在 FK 强制开启时静默投影失败,`get_step_context` 返回 None,根因未查 | ⬜ 未修复 | — | — |
 
 ## H1. AuthorizationSnapshot 不反映任何真实授权系统
 
@@ -63,6 +66,30 @@
 - 方向:服务层 `list_alerts` 的形参改名为更中性的 `subject_id`(或在该路由调用处加注释说明"scope-safety 告警的 subject 就是 tool_call_id"),不需要变更行为。
 - 归属:非阻塞,顺手清理项。
 
+## H3. Entity + 类型化子行的 flush 顺序不保证,FK 强制开启时确定性失败
+
+- 状态:✅ 已修复(2026-07-22,`e074bd60`)。来源:排查用户真实开发库(`backend/.deer-flow/data/deerflow.db`)里 69 条永久失败(`attempts=5`,重试 4 轮均复现同一错误)的 job 时发现,不是 U3 failed-job 诊断功能本身的 bug,而是 Phase 9 上线后新数据路径首次踩中的既有投影 bug。
+- 位置:`backend/packages/harness/deerflow/ansich/persistence/sql.py` 六处"先 `session.add(AnsichEntityRow(...))`、再 `session.add(<类型化子行>)`、最后统一 `await session.flush()`"的写法——`_project_control`(entity+task)、`_project_agent_release`(payload+release,entity 部分已有 flush 但 `manifest_payload_id` 依赖漏了)、`_project_scope_snapshot`(entity+scope)、`_project_authorization_snapshot`(entity+snapshot)、`_project_tool_effect`(entity+effect)、`_persist_alert_episode`(entity+alert,以及 alert 行+evidence 行两处依赖)。
+- 现状:`AnsichEntityRow` 与这些类型化子行之间**只有裸 `ForeignKey`,没有 SQLAlchemy `relationship()`**。`backend/AGENTS.md` 明确"SQLite 生产连接强制外键"(`PRAGMA foreign_keys=ON`),但同一次 `flush()` 里 SQLAlchemy 对无 `relationship()` 关联的两个新对象**不保证**插入顺序——子表名字母序排在 `ansich_entities` 之前时(`ansich_authorization_snapshots`、`ansich_agent_releases`、`ansich_alerts`)会先尝试插子行,同一事务内 FK 校验失败并整体回滚,且不可通过重试自愈(每次都复现同一顺序)。真实库命中:`task-safety` projector(`ansich_authorization_snapshots`)66 次、`task-structural` projector(`ansich_agent_releases`)2 次、scope-safety assessor(`_persist_alert_episode` 的 `ansich_alert_evidence`)1 次。**测试套件长期没测出来的原因**:`test_sql_safety.py`/`test_sql_agent_releases.py`/`test_sql_alerts.py` 里覆盖这几条路径的测试此前都没有开 `PRAGMA foreign_keys=ON`,FK 约束在 SQLite 里是逐连接开关,不开就不校验。
+- 方向(已落地):在每处依赖的 `session.add()` 后立即插入一次 `await session.flush()`,把隐式排序依赖换成显式顺序,不依赖 ORM `relationship()`。回归覆盖:给上述三个测试文件里各自最贴近的一个已有测试打开 FK 强制,通过 `git stash` 确认改动前 RED、改动后 GREEN,再跑全量 `tests/ansich/`(323 passed,仅剩下方 H4/H5 之外的、无关的 `test_sql_budget.py` 预存 flaky)确认无回归。
+- 归属:已完成。
+
+## H4. `DELETE FROM ansich_belief_assertions` 在 FK 强制开启时违反约束
+
+- 状态:⬜ 未修复,**根因未查**——本条是修复 H3 后,为确认"同类隐患是否还有别处",对整个 `tests/ansich/` 套件做了一次全局强制 `PRAGMA foreign_keys=ON` 扫描时命中的,不在本次原始排查范围(用户只要求排查真实库里那 69 条失败 job,已随 H3 解决),尚未做 Phase 1 根因定位。
+- 位置:命中的两个测试——`test_sql_safety.py::test_phase9_safety_migration_upgrades_sqlite`(alembic 升降级测试)、`test_sql_task_lifecycle.py::test_list_tasks_uses_one_joined_query_and_keeps_page_length_with_a_missing_assertion`(模拟"缺失 assertion"退化场景)——报错均为同一条语句:`sqlite3.IntegrityError: FOREIGN KEY constraint failed [SQL: DELETE FROM ansich_belief_assertions WHERE ansich_belief_assertions.assertion_id = ?]`。两处触发路径不同但报错语句完全一致,提示是某个共享的清理/重建/降级代码路径删除 `ansich_belief_assertions` 行时,没有先删除或未正确级联仍引用该 assertion 的子行(`AnsichBeliefEvidenceRow`、`AnsichScopeConclusionRow`、`AnsichCurrentBeliefRow` 等均有 `assertion_id`/`source_assertion_id` 外键,需要逐一核实各自的 `ondelete` 设置与实际删除顺序)。
+- 现状:与 H3 是**不同性质**的 bug——H3 是"同一 flush 内两个新增 INSERT 顺序不保证",这里是 DELETE 顺序/级联配置问题,需要独立走 Phase 1 根因排查(读错误、复现、查最近改动、对比 CASCADE/RESTRICT 配置)才能定位到具体是哪个函数、哪张子表。
+- 方向:先用本次证明有效的技术复现(给相关测试引擎打开 `PRAGMA foreign_keys=ON` 并单独跑),定位到具体调用 `DELETE FROM ansich_belief_assertions` 的函数,核对该表被引用方的 `ForeignKey(..., ondelete=...)` 设置是否需要改成 `CASCADE`,或者删除代码本身需要先删子行。
+- 归属:未定,建议下一个 Ansich 迭代窗口专门排查;由于是 DELETE 路径(而非 H3 的 INSERT 路径),不确定是否影响当前默认关闭 FK 校验的部署,但 `backend/AGENTS.md` 明确生产 SQLite 连接强制外键,不能默认认为无影响。
+
+## H5. 大 payload externalize 后的 ContextSnapshot 在 FK 强制开启时静默投影失败
+
+- 状态:⬜ 未修复,**根因未查**——同 H4,发现于全局 FK 强制扫描,非本次原始排查目标。
+- 位置:`test_sql_task_lifecycle.py::test_large_content_payload_is_externalized_but_remains_lazy_queryable`(`inline_payload_max_bytes=128` 触发 payload externalize 路径)。失败现象是 `service.get_step_context(step.step_id)` 返回 `None`,而不是像 H3/H4 那样抛出可见的 `IntegrityError`——说明底层投影失败被某个 `try/except` 吞掉、只在 `ansich_projection_errors`/`_failed_jobs` 计数里留痕,断言层面表现为"数据消失"而非报错,排查时需要先用 U3 新增的 `list_failed_jobs`/`get_failed_job_detail`(或直接查 `ansich_projection_errors`)取出真实异常文本,而不是靠测试断言反推。
+- 现状:未确认是否与 H3/H4 同属"缺 flush 顺序保证"这一类,还是 Phase 2/4 的 ContextSnapshot/ContentBlob externalize 投影路径里的另一个独立问题——两者都可能,需要先复现取得真实报错文本才能判断。
+- 方向:复用 H3 定位时用过的技术(monkeypatch `_record_projection_error`/`_record_assessor_error` 打印完整 traceback,或直接读 `ansich_projection_errors.message`)取得真实异常;若确认也是 entity+子行插入顺序问题,按 H3 的模式补 flush;若是别的原因,按 Phase 1 流程另行分析。
+- 归属:未定,建议与 H4 一起排查——两者都是同一次全局 FK 扫描发现,可以合并成一次调查窗口。
+
 ## 评审中确认无需跟进的点(留档)
 
 - **敏感字段三层拦截**:`AuthorizationSnapshot._bool_only_provider_has_no_permissions`、`ToolEffect._exclude_credentials`(`backend/packages/ansich/ansich/safety.py`)与 `ObservationEnvelope._validate_subject` 的全 payload `_find_secret_field` 扫描(`contracts.py`)三层独立拦截 JWT/cookie/API key/Authorization header 类内容,经直接代码走查确认。
@@ -71,7 +98,7 @@
 - **`child_task_spawn` 不在 `_record_observed_effects` 产生**(tool_middleware.py:372-373 提前 return)——由 Phase 8 的 `TaskControlProbe.created()` 作为权威信号,正确避免了与 phase-8-review-followups.md M1(`wall_time_ms` 双写者)同类的双写陷阱。
 - **`scope_safety.py::assess_scope_safety`** 在授权决策非 `allowed` 时正确拒绝产生 `attempted_scope_violation`/`realized_scope_violation`(`allowed_scope_ids` 保持为空,`outside_intents`/`outside_observed` 因此为空)——"unknown ≠ violation" 的要求被正确落实(该分支目前因 H1 而从未被生产数据触达,但领域逻辑本身是对的)。
 - **迁移 `0020_ansich_scope_safety.py`**:upgrade/downgrade 对称,FK `CASCADE`/`RESTRICT` 语义合理,计划 §5 列出的四个索引(`(tool_call_id, evaluated_obs_id)`、`(decision, policy_id)`、`(effect_class, phase, scope_id)`、`(scope_id, tool_call_id)`)均已精确落地。
-- **SQL 投影 `_project_authorization_snapshot`/`_project_tool_effect`**:幂等、对冲突重投影会 raise、通过 `_ProjectionDependencyPending` 正确等待被引用的 ToolCall/Scope 行——投影路径本身没有 M2 描述的重复计算问题(问题只在 assessor 读路径)。
+- **SQL 投影 `_project_authorization_snapshot`/`_project_tool_effect`**:幂等、对冲突重投影会 raise、通过 `_ProjectionDependencyPending` 正确等待被引用的 ToolCall/Scope 行——投影路径本身没有 M2 描述的重复计算问题(问题只在 assessor 读路径)。⚠️ **此前该条遗漏了 flush 顺序问题,已作为 H3 登记并修复**——幂等性/依赖等待判断本身仍然成立,但当时未核实"同一次 flush 内两个新对象的插入顺序"这一独立维度。
 
 ## 计划测试矩阵缺口(随修复补齐)
 
