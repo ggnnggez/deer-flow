@@ -183,3 +183,25 @@ def test_bool_only_allow_cannot_verify_a_concrete_observed_effect_scope() -> Non
     )
 
     assert _present(result) == {"unverified_effect"}
+
+
+def test_unknown_decision_does_not_produce_policy_denial() -> None:
+    result = assess_scope_safety(
+        tool_call_id="tool-call",
+        authorization_snapshots=(_snapshot(decision="unknown"),),
+        effects=(),
+        now=datetime.now(UTC),
+    )
+    assert "policy_denial" not in _present(result)
+
+
+def test_allowed_but_blocked_call_does_not_produce_policy_denial() -> None:
+    # A guardrail-allowed call blocked downstream still records decision="allowed";
+    # scope-safety must not read that as a policy denial (H1).
+    result = assess_scope_safety(
+        tool_call_id="tool-call",
+        authorization_snapshots=(_snapshot(decision="allowed"),),
+        effects=(),
+        now=datetime.now(UTC),
+    )
+    assert "policy_denial" not in _present(result)
