@@ -15,6 +15,10 @@ import type {
   AnsichContextCompressionResponse,
   AnsichContextCompressionListResponse,
   AnsichContextResponse,
+  AnsichFailedJobDetailResponse,
+  AnsichFailedJobKind,
+  AnsichFailedJobsResponse,
+  AnsichFailedJobsRetryResponse,
   AnsichPossibleExposuresResponse,
   AnsichStepResponse,
   AnsichStepsResponse,
@@ -256,6 +260,64 @@ export async function dismissAnsichAlert(
   reason: string,
 ): Promise<AnsichAlertWorkflowResponse> {
   return changeAnsichAlertWorkflow(alertId, "dismiss", workflowVersion, reason);
+}
+
+export async function fetchAnsichFailedJobs(
+  taskId?: string,
+  limit = 100,
+): Promise<AnsichFailedJobsResponse> {
+  const query = new URLSearchParams({ limit: String(limit) });
+  if (taskId) query.set("task", taskId);
+  const response = await fetch(
+    ansichUrl(`/operations/failed-jobs?${query.toString()}`),
+  );
+  if (!response.ok) {
+    await throwAnsichApiError(
+      response,
+      `Failed to load Ansich failed jobs: ${response.statusText}`,
+    );
+  }
+  return response.json();
+}
+
+export async function fetchAnsichFailedJobDetail(
+  jobId: string,
+  kind: AnsichFailedJobKind,
+): Promise<AnsichFailedJobDetailResponse> {
+  const query = new URLSearchParams({ kind });
+  const response = await fetch(
+    ansichUrl(
+      `/operations/failed-jobs/${encodeURIComponent(jobId)}?${query.toString()}`,
+    ),
+  );
+  if (!response.ok) {
+    await throwAnsichApiError(
+      response,
+      `Failed to load Ansich failed job detail: ${response.statusText}`,
+    );
+  }
+  return response.json();
+}
+
+export async function retryAnsichFailedJobs(
+  taskId?: string,
+): Promise<AnsichFailedJobsRetryResponse> {
+  const query = new URLSearchParams();
+  if (taskId) query.set("task", taskId);
+  const suffix = query.toString() ? `?${query.toString()}` : "";
+  const response = await fetch(
+    ansichUrl(`/operations/failed-jobs/retry${suffix}`),
+    {
+      method: "POST",
+    },
+  );
+  if (!response.ok) {
+    await throwAnsichApiError(
+      response,
+      `Failed to retry Ansich failed jobs: ${response.statusText}`,
+    );
+  }
+  return response.json();
 }
 
 export async function executeAnsichTaskAction(

@@ -138,6 +138,46 @@ export interface AnsichHealth {
   missing_content_block_count: number;
 }
 
+export type AnsichFailedJobKind = "projection" | "assessor";
+
+export interface AnsichFailedJob {
+  job_id: string;
+  kind: AnsichFailedJobKind;
+  name: string;
+  version: string;
+  task_id: string;
+  status: string;
+  attempts: number;
+  last_error: string | null;
+  available_at: string;
+}
+
+export interface AnsichFailedJobError {
+  attempt: number;
+  error_type: string;
+  message: string;
+  occurred_at: string;
+}
+
+export interface AnsichFailedJobDetail extends AnsichFailedJob {
+  errors: AnsichFailedJobError[];
+}
+
+export interface AnsichFailedJobsResponse {
+  items: AnsichFailedJob[];
+  projection_status: AnsichHealth;
+}
+
+export interface AnsichFailedJobDetailResponse {
+  job: AnsichFailedJobDetail;
+  projection_status: AnsichHealth;
+}
+
+export interface AnsichFailedJobsRetryResponse {
+  retried: number;
+  projection_status: AnsichHealth;
+}
+
 export interface AnsichTaskListResponse {
   items: AnsichTask[];
   next_cursor: string | null;
