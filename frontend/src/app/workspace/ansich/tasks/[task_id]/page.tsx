@@ -25,6 +25,7 @@ import {
   AnsichStepsPanel,
   AnsichStatusBadge,
   AnsichTaskTreePanel,
+  AnsichScopeEffectsPanel,
 } from "@/components/workspace/ansich";
 import {
   WorkspaceBody,
@@ -131,6 +132,9 @@ export default function AnsichTaskDetailPage() {
                   <TabsTrigger value="agent-release">
                     {t.ansich.agentRelease}
                   </TabsTrigger>
+                  <TabsTrigger value="scopes-effects">
+                    {t.ansich.scopesAndEffects}
+                  </TabsTrigger>
                   <TabsTrigger value="context">
                     {t.ansich.contextAndLineage}
                   </TabsTrigger>
@@ -236,6 +240,13 @@ export default function AnsichTaskDetailPage() {
                       </CardContent>
                     ) : null}
                   </Card>
+                </TabsContent>
+
+                <TabsContent value="scopes-effects" className="space-y-4">
+                  <AnsichScopeEffectsPanel
+                    taskId={taskId}
+                    polling={taskIsRunning}
+                  />
                 </TabsContent>
 
                 <TabsContent value="timeline" className="space-y-3">

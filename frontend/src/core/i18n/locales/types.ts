@@ -415,6 +415,13 @@ export interface Translations {
     taskTreeDescription: string;
     taskTreeTruncated: string;
     budgets: string;
+    scopesAndEffects: string;
+    scopes: string;
+    noScopes: string;
+    effectIntent: string;
+    effectObserved: string;
+    coverage: string;
+    unknownEffectCoverage: string;
     agentRelease: string;
     noAgentRelease: string;
     releaseHash: string;
@@ -501,6 +508,9 @@ export interface Translations {
       heartbeat_missing: string;
       long_dwell: string;
       configuration_drift: string;
+      attempted_scope_violation: string;
+      realized_scope_violation: string;
+      unverified_effect: string;
     };
     alertWorkflow: {
       open: string;

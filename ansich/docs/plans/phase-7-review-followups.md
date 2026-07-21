@@ -9,7 +9,7 @@
 | M1 | drift 判定对裸模型名一律 `unknown`,最常见的自托管漂移场景永不触发 mismatch | ✅ 已修复 | 2026-07-19 | `08cd6b1c` |
 | M2 | P6 的 assessor coalescing 测试在全套件负载下时序性失败(flaky) | ✅ 已修复 | 2026-07-20 | `e91d9f1c`, `4e5eb0fd` |
 | M3 | policy manifest 覆盖依赖属性探测,计划 §3 清单未被契约化,存在静默缺项 | ✅ 已修复 | 2026-07-20 | `256d2c91` |
-| L1 | 计划 §5 的二线 credential validator 缺位(只有指纹校验,无 post-sanitization 模式检测) | ⬜ 未修复 | — | — |
+| L1 | 计划 §5 的二线 credential validator 缺位(只有指纹校验,无 post-sanitization 模式检测) | ✅ 已修复 | 2026-07-21 | 本次提交 |
 | L2 | descriptor 经 `__pregel_runtime` 私有键传递,LangGraph 升级可能静默降级 | ✅ 已修复 | 2026-07-20 | `79cd13b1` |
 
 ## M1. drift 判定对裸模型名一律 `unknown`
@@ -38,7 +38,7 @@
 
 ## L1. 二线 credential validator 缺位
 
-- 状态:⬜ 未修复。
+- 状态:✅ 已于 2026-07-21 在本次提交修复。`validate_agent_release` 与 `build_agent_release` 现在复用 Ansich 共用的保守 credential matcher，覆盖 Bearer/Basic、URL userinfo、常见 token prefix 和 credential-keyed value；普通 manifest hash 与说明文字不会因“高熵”被误报。命中只抛通用错误，不回显匹配值，既有 release resolution except 通道记录 `observability.degraded`，Task 仍继续完成。回归覆盖第三方 Tool description 穿透、Task fail-open、payload 不含伪造凭据，以及 benign hash/documentation 边界。
 - 位置:`backend/packages/ansich/ansich/release/manifest.py::validate_agent_release`(仅指纹一致性)+ `::_sanitize`。
 - 现状:计划 §5 要求"若 sanitized manifest 仍命中 credential field validator,release resolution 失败并发 observability.degraded"。现有防线:输入面 allowlist(model behavior 字段、middleware 属性清单)、字段名 denylist(`filter_secret_fields`)、known-secrets 精确值替换、runtime 地址清洗、MCP source 仅存 server name/transport——主层完整;但对最终 manifest **没有**主动的 credential 模式检测(高熵 token、URL userinfo、`Bearer ...`、`sk-` 形态),第三方工具 description/schema 里嵌入的凭据形态可以穿透落库并进 hash。resolution-failed → degraded 的失败通道已存在(`task_control.agent_release_resolved` 的 except 路径),只差把 validator 接上。
 - 方向:在 `validate_agent_release`(或 `build_agent_release` 末尾)增加保守的 credential 模式扫描(URL userinfo、Authorization 头形态、常见 key 前缀 + 高熵启发),命中即抛错走既有 degraded 通道;配"含伪造凭据的 tool description 导致 resolution 失败且 Task 继续"的回归测试。

@@ -10,6 +10,7 @@ from uuid import UUID
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from ansich.assessment.base import canonical_json_value
+from ansich.credentials import contains_credential_like_material
 from ansich.release.canonical import sha256_canonical
 
 _RUNTIME_ADDRESS = re.compile(r"(?<=\bat )0x[0-9a-fA-F]+\b")
@@ -189,6 +190,8 @@ def fingerprint_release_manifest(manifest: AgentReleaseManifest) -> AgentRelease
 def validate_agent_release(release: AgentRelease) -> None:
     if fingerprint_release_manifest(release.manifest) != release.fingerprint:
         raise ValueError("AgentRelease fingerprint does not match its sanitized manifest")
+    if contains_credential_like_material(release.manifest.model_dump(mode="python")):
+        raise ValueError("AgentRelease sanitized manifest contains credential-like material")
 
 
 def _remove_runtime_addresses(value: object) -> object:
@@ -278,10 +281,12 @@ def build_agent_release(
         runtime_build=build,
     )
     fingerprint = fingerprint_release_manifest(manifest)
-    return AgentRelease(
+    release = AgentRelease(
         manifest=manifest,
         fingerprint=fingerprint,
     )
+    validate_agent_release(release)
+    return release
 
 
 __all__ = [

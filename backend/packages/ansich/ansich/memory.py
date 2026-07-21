@@ -22,6 +22,18 @@ from ansich.release import (
     TaskAgentReleaseView,
     validate_agent_release,
 )
+from ansich.safety import (
+    AuthorizationSnapshot,
+    ScopeDescriptor,
+    TaskScopesView,
+    TaskScopeView,
+    ToolAuthorizationView,
+    ToolEffect,
+    ToolEffectsView,
+    scope_display_label,
+    scope_entity_id,
+    scope_reference_hash,
+)
 from ansich.step import ContentBlockPayloadView, ContentOccurrenceView, ContextSnapshotItemView, ContextSnapshotView, LlmAttemptView, StepView
 from ansich.task_tree import TaskSpawnView, TaskTreeDirection
 from ansich.tool import (
@@ -675,6 +687,113 @@ class InMemoryAnsichBackend:
             None,
         )
         return None if issued is None else self._tool_call_view(issued)
+
+    async def get_task_scopes(self, task_id: str) -> TaskScopesView:
+        scopes: dict[str, TaskScopeView] = {}
+        created = next(
+            (item for item in self._observations if item.task_id == task_id and item.kind == "task.created"),
+            None,
+        )
+        if created is not None and created.payload is not None:
+            for scope_kind, relation_role, field_name in (
+                ("owner", "owner", "owner_id"),
+                ("thread", "conversation", "thread_id"),
+                ("workspace", "execution_workspace", "workspace_ref"),
+                ("sandbox", "sandbox_boundary", "sandbox_ref"),
+                ("authorization", "auth_context", "authorization_ref"),
+                ("external_origin", "trigger_origin", "external_origin_ref"),
+            ):
+                raw_ref = created.payload.get(field_name)
+                if not isinstance(raw_ref, str) or not raw_ref:
+                    continue
+                ref_hash = scope_reference_hash(scope_kind, raw_ref)
+                scope_id = scope_entity_id(scope_kind, ref_hash)
+                scopes[scope_id] = TaskScopeView(
+                    scope_id=scope_id,
+                    scope_kind=scope_kind,
+                    external_ref_hash=ref_hash,
+                    display_label=scope_display_label(scope_kind, raw_ref),
+                    parent_scope_id=None,
+                    created_obs_id=created.obs_id,
+                    relation_role=relation_role,
+                    relation_obs_id=created.obs_id,
+                    inherited_from_task_id=None,
+                )
+        for item in self._observations:
+            if item.kind != "scope.snapshotted" or item.payload is None:
+                continue
+            subject_id = item.payload.get("within_scope_subject_id", item.task_id)
+            if subject_id != task_id:
+                continue
+            scope = ScopeDescriptor.model_validate(item.payload.get("scope"), strict=False)
+            relation_role = item.payload.get("relation_role")
+            if not isinstance(relation_role, str):
+                continue
+            inherited_from = item.payload.get("inherited_from_task_id")
+            scopes[scope.scope_id] = TaskScopeView(
+                **scope.model_dump(mode="python"),
+                relation_role=relation_role,
+                relation_obs_id=item.obs_id,
+                inherited_from_task_id=(inherited_from if isinstance(inherited_from, str) else None),
+            )
+        return TaskScopesView(
+            task_id=task_id,
+            scopes=tuple(
+                sorted(
+                    scopes.values(),
+                    key=lambda item: (
+                        item.scope_kind,
+                        item.display_label,
+                        item.scope_id,
+                    ),
+                )
+            ),
+        )
+
+    async def get_tool_authorization(
+        self,
+        tool_call_id: str,
+    ) -> ToolAuthorizationView | None:
+        if await self.get_tool_call(tool_call_id) is None:
+            return None
+        by_snapshot: dict[str, AuthorizationSnapshot] = {}
+        for item in self._observations:
+            if not item.kind.startswith("authorization.") or item.payload is None:
+                continue
+            snapshot = AuthorizationSnapshot.model_validate(item.payload.get("snapshot"), strict=False)
+            if snapshot.tool_call_id == tool_call_id:
+                by_snapshot[snapshot.snapshot_id] = snapshot
+        snapshots = tuple(
+            sorted(
+                by_snapshot.values(),
+                key=lambda item: (item.evaluated_at, item.snapshot_id),
+            )
+        )
+        return ToolAuthorizationView(
+            tool_call_id=tool_call_id,
+            snapshots=snapshots,
+            current_decision=(snapshots[-1].decision if snapshots else "unknown"),
+        )
+
+    async def get_tool_effects(self, tool_call_id: str) -> ToolEffectsView | None:
+        if await self.get_tool_call(tool_call_id) is None:
+            return None
+        effects = tuple(
+            ToolEffect.model_validate(item.payload.get("effect"), strict=False)
+            for item in self._observations
+            if item.kind.startswith("effect.") and item.payload is not None and isinstance(item.payload.get("effect"), dict) and item.payload["effect"].get("tool_call_id") == tool_call_id
+        )
+        if any(item.result_metadata.get("coverage") == "complete" for item in effects):
+            coverage = "complete"
+        elif effects:
+            coverage = "partial"
+        else:
+            coverage = "unknown"
+        return ToolEffectsView(
+            tool_call_id=tool_call_id,
+            effects=effects,
+            coverage=coverage,
+        )
 
     async def get_step_context(self, step_id: str) -> ContextSnapshotView | None:
         step = await self.get_step(step_id)

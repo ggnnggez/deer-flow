@@ -760,9 +760,221 @@ class AnsichScopeRow(Base):
         primary_key=True,
     )
     scope_kind: Mapped[str] = mapped_column(String(32), nullable=False)
-    scope_value: Mapped[str] = mapped_column(String(256), nullable=False)
+    scope_value: Mapped[str | None] = mapped_column(String(256))
+    external_ref_hash: Mapped[str] = mapped_column(String(64), nullable=False)
+    display_label: Mapped[str] = mapped_column(String(256), nullable=False)
+    parent_scope_id: Mapped[str | None] = mapped_column(
+        String(36),
+        ForeignKey("ansich_scopes.entity_id", ondelete="RESTRICT"),
+    )
+    created_obs_id: Mapped[str] = mapped_column(
+        String(36),
+        ForeignKey("ansich_observations.obs_id", ondelete="RESTRICT"),
+        nullable=False,
+    )
 
-    __table_args__ = (UniqueConstraint("scope_kind", "scope_value", name="uq_ansich_scope_kind_value"),)
+    __table_args__ = (
+        UniqueConstraint("scope_kind", "scope_value", name="uq_ansich_scope_kind_value"),
+        UniqueConstraint(
+            "scope_kind",
+            "external_ref_hash",
+            name="uq_ansich_scope_kind_external_ref_hash",
+        ),
+        Index("ix_ansich_scopes_parent", "parent_scope_id"),
+    )
+
+
+class AnsichAuthorizationSnapshotRow(Base):
+    __tablename__ = "ansich_authorization_snapshots"
+
+    snapshot_id: Mapped[str] = mapped_column(
+        String(36),
+        ForeignKey("ansich_entities.entity_id", ondelete="CASCADE"),
+        primary_key=True,
+    )
+    tool_call_id: Mapped[str] = mapped_column(
+        String(36),
+        ForeignKey("ansich_tool_calls.entity_id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    policy_id: Mapped[str] = mapped_column(String(256), nullable=False)
+    policy_version: Mapped[str] = mapped_column(String(128), nullable=False)
+    policy_hash: Mapped[str] = mapped_column(String(64), nullable=False)
+    decision: Mapped[str] = mapped_column(String(16), nullable=False)
+    details_available: Mapped[bool] = mapped_column(Boolean, nullable=False)
+    reason_codes_json: Mapped[list] = mapped_column(JSON, nullable=False, default=list)
+    evaluated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    evaluated_obs_id: Mapped[str] = mapped_column(
+        String(36),
+        ForeignKey("ansich_observations.obs_id", ondelete="RESTRICT"),
+        nullable=False,
+    )
+    payload_id: Mapped[str | None] = mapped_column(
+        String(36),
+        ForeignKey("ansich_payloads.payload_id", ondelete="RESTRICT"),
+    )
+
+    __table_args__ = (
+        CheckConstraint(
+            "decision IN ('allowed', 'denied', 'unknown')",
+            name="ck_ansich_authorization_decision",
+        ),
+        Index(
+            "ix_ansich_authorization_tool_evaluated",
+            "tool_call_id",
+            "evaluated_obs_id",
+        ),
+        Index(
+            "ix_ansich_authorization_decision_policy",
+            "decision",
+            "policy_id",
+        ),
+    )
+
+
+class AnsichAuthorizationScopeRow(Base):
+    __tablename__ = "ansich_authorization_scopes"
+
+    snapshot_id: Mapped[str] = mapped_column(
+        String(36),
+        ForeignKey("ansich_authorization_snapshots.snapshot_id", ondelete="CASCADE"),
+        primary_key=True,
+    )
+    scope_role: Mapped[str] = mapped_column(String(16), primary_key=True)
+    ordinal: Mapped[int] = mapped_column(Integer, primary_key=True)
+    scope_id: Mapped[str] = mapped_column(
+        String(36),
+        ForeignKey("ansich_scopes.entity_id", ondelete="RESTRICT"),
+        nullable=False,
+    )
+
+    __table_args__ = (
+        CheckConstraint(
+            "scope_role IN ('principal', 'resource')",
+            name="ck_ansich_authorization_scope_role",
+        ),
+        UniqueConstraint(
+            "snapshot_id",
+            "scope_role",
+            "scope_id",
+            name="uq_ansich_authorization_scope_membership",
+        ),
+        Index("ix_ansich_authorization_scopes_scope", "scope_id", "snapshot_id"),
+    )
+
+
+class AnsichAuthorizationPermissionRow(Base):
+    __tablename__ = "ansich_authorization_permissions"
+
+    snapshot_id: Mapped[str] = mapped_column(
+        String(36),
+        ForeignKey("ansich_authorization_snapshots.snapshot_id", ondelete="CASCADE"),
+        primary_key=True,
+    )
+    ordinal: Mapped[int] = mapped_column(Integer, primary_key=True)
+    resource: Mapped[str] = mapped_column(String(512), nullable=False)
+    action: Mapped[str] = mapped_column(String(128), nullable=False)
+    scope_id: Mapped[str | None] = mapped_column(
+        String(36),
+        ForeignKey("ansich_scopes.entity_id", ondelete="RESTRICT"),
+    )
+    effect: Mapped[str] = mapped_column(String(32), nullable=False)
+
+
+class AnsichToolCallAuthorizationRow(Base):
+    __tablename__ = "ansich_tool_call_authorizations"
+
+    tool_call_id: Mapped[str] = mapped_column(
+        String(36),
+        ForeignKey("ansich_tool_calls.entity_id", ondelete="CASCADE"),
+        primary_key=True,
+    )
+    snapshot_id: Mapped[str] = mapped_column(
+        String(36),
+        ForeignKey("ansich_authorization_snapshots.snapshot_id", ondelete="CASCADE"),
+        primary_key=True,
+    )
+    relation_obs_id: Mapped[str] = mapped_column(
+        String(36),
+        ForeignKey("ansich_observations.obs_id", ondelete="RESTRICT"),
+        nullable=False,
+    )
+
+
+class AnsichToolEffectRow(Base):
+    __tablename__ = "ansich_tool_effects"
+
+    effect_id: Mapped[str] = mapped_column(
+        String(36),
+        ForeignKey("ansich_entities.entity_id", ondelete="CASCADE"),
+        primary_key=True,
+    )
+    tool_call_id: Mapped[str] = mapped_column(
+        String(36),
+        ForeignKey("ansich_tool_calls.entity_id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    effect_class: Mapped[str] = mapped_column(String(32), nullable=False)
+    phase: Mapped[str] = mapped_column(String(16), nullable=False)
+    scope_id: Mapped[str | None] = mapped_column(
+        String(36),
+        ForeignKey("ansich_scopes.entity_id", ondelete="RESTRICT"),
+    )
+    target_hash: Mapped[str | None] = mapped_column(String(64))
+    target_preview: Mapped[str | None] = mapped_column(String(512))
+    fidelity_class: Mapped[str] = mapped_column(String(16), nullable=False)
+    source_obs_id: Mapped[str] = mapped_column(
+        String(36),
+        ForeignKey("ansich_observations.obs_id", ondelete="RESTRICT"),
+        nullable=False,
+    )
+    result_metadata_json: Mapped[dict] = mapped_column(JSON, nullable=False, default=dict)
+
+    __table_args__ = (
+        CheckConstraint(
+            "phase IN ('potential', 'intended', 'observed')",
+            name="ck_ansich_tool_effect_phase",
+        ),
+        CheckConstraint(
+            "effect_class IN ('filesystem_read', 'filesystem_write', 'filesystem_delete', 'process_execute', 'network_read', 'external_write', 'permission_change', 'child_task_spawn', 'unknown')",
+            name="ck_ansich_tool_effect_class",
+        ),
+        Index(
+            "ix_ansich_tool_effect_class_phase_scope",
+            "effect_class",
+            "phase",
+            "scope_id",
+        ),
+        Index("ix_ansich_tool_effect_scope_tool", "scope_id", "tool_call_id"),
+    )
+
+
+class AnsichScopeConclusionRow(Base):
+    __tablename__ = "ansich_scope_conclusions"
+
+    assertion_id: Mapped[str] = mapped_column(
+        String(36),
+        ForeignKey("ansich_belief_assertions.assertion_id", ondelete="CASCADE"),
+        primary_key=True,
+    )
+    tool_call_id: Mapped[str] = mapped_column(
+        String(36),
+        ForeignKey("ansich_tool_calls.entity_id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    conclusion_kind: Mapped[str] = mapped_column(String(32), nullable=False)
+
+    __table_args__ = (
+        CheckConstraint(
+            "conclusion_kind IN ('policy_denial', 'attempted_scope_violation', 'realized_scope_violation', 'unverified_effect')",
+            name="ck_ansich_scope_conclusion_kind",
+        ),
+        Index(
+            "ix_ansich_scope_conclusions_tool_kind",
+            "tool_call_id",
+            "conclusion_kind",
+        ),
+    )
 
 
 class AnsichRelationRow(Base):
@@ -784,6 +996,11 @@ class AnsichRelationRow(Base):
         String(36),
         ForeignKey("ansich_observations.obs_id", ondelete="RESTRICT"),
         nullable=False,
+    )
+    relation_role: Mapped[str | None] = mapped_column(String(32))
+    inherited_from_task_id: Mapped[str | None] = mapped_column(
+        String(36),
+        ForeignKey("ansich_tasks.entity_id", ondelete="RESTRICT"),
     )
 
     __table_args__ = (

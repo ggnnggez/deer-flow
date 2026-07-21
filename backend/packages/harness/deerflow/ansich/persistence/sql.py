@@ -27,11 +27,19 @@ from ansich import (
     PossibleExposureItemView,
     Producer,
     StepView,
+    TaskScopesView,
+    TaskScopeView,
     TaskView,
+    ToolAuthorizationView,
     ToolBelief,
     ToolCallView,
+    ToolEffect,
+    ToolEffectsView,
     ToolResultView,
     new_id,
+    scope_display_label,
+    scope_entity_id,
+    scope_reference_hash,
 )
 from ansich.alerts.episodes import (
     AlertEpisode,
@@ -63,6 +71,11 @@ from ansich.assessment.base import Assessment, EvidenceRef, canonical_config_has
 from ansich.assessment.configuration_drift import (
     CONFIGURATION_DRIFT_ASSESSOR,
     assess_configuration_drift,
+)
+from ansich.assessment.scope_safety import (
+    SCOPE_SAFETY_ASSESSOR,
+    ScopeSafetyAssessmentResult,
+    assess_scope_safety,
 )
 from ansich.assessment.tool_frequency import (
     TOOL_FREQUENCY_ASSESSOR,
@@ -112,6 +125,7 @@ from ansich.release import (
     validate_agent_release,
 )
 from ansich.release.canonical import canonical_json_bytes
+from ansich.safety import AuthorizationPermission, AuthorizationSnapshot, ScopeDescriptor
 from ansich.task_tree import TaskSpawnView, TaskTreeDirection
 from ansich.tool import ContentDerivationSourceRole, ToolTransformKind
 from ansich.usage import (
@@ -139,6 +153,9 @@ from deerflow.ansich.persistence.models import (
     AnsichAlertWorkflowEventRow,
     AnsichAssessorErrorRow,
     AnsichAssessorJobRow,
+    AnsichAuthorizationPermissionRow,
+    AnsichAuthorizationScopeRow,
+    AnsichAuthorizationSnapshotRow,
     AnsichBeliefAssertionRow,
     AnsichBeliefEvidenceRow,
     AnsichBlockProducerRow,
@@ -168,6 +185,7 @@ from deerflow.ansich.persistence.models import (
     AnsichProjectorVersionRow,
     AnsichRelationEvidenceRow,
     AnsichRelationRow,
+    AnsichScopeConclusionRow,
     AnsichScopeRow,
     AnsichStepRow,
     AnsichTaskAgentReleaseRow,
@@ -178,8 +196,10 @@ from deerflow.ansich.persistence.models import (
     AnsichTaskSpawnRow,
     AnsichTaskSummaryRow,
     AnsichTaskUsageRow,
+    AnsichToolCallAuthorizationRow,
     AnsichToolCallResultRow,
     AnsichToolCallRow,
+    AnsichToolEffectRow,
     AnsichTransitionRow,
     AnsichUsageContributionRow,
 )
@@ -232,7 +252,27 @@ _USAGE_PROJECTION_KINDS = frozenset(
         "task.heartbeat",
     }
 )
-_PROJECTORS = (("task-structural", "1"), ("task-control", "1"), ("task-step", "1"), ("task-usage", "1"), ("task-budget", "1"), ("task-heartbeat", "1"))
+_SAFETY_PROJECTION_KINDS = frozenset(
+    {
+        "scope.snapshotted",
+        "authorization.evaluated",
+        "authorization.allowed",
+        "authorization.denied",
+        "authorization.unknown",
+        "effect.potential",
+        "effect.intended",
+        "effect.observed",
+    }
+)
+_PROJECTORS = (
+    ("task-structural", "1"),
+    ("task-control", "1"),
+    ("task-step", "1"),
+    ("task-usage", "1"),
+    ("task-budget", "1"),
+    ("task-heartbeat", "1"),
+    ("task-safety", "1"),
+)
 _PROJECTOR_KINDS = {
     "task-structural": frozenset((*_CONTROL_BY_KIND, "agent_release.resolved")),
     "task-control": frozenset(_CONTROL_BY_KIND),
@@ -240,12 +280,14 @@ _PROJECTOR_KINDS = {
     "task-usage": _USAGE_PROJECTION_KINDS,
     "task-budget": frozenset({"budget.configured"}),
     "task-heartbeat": frozenset({"task.heartbeat"}),
+    "task-safety": _SAFETY_PROJECTION_KINDS,
 }
 _ASSESSOR_VERSIONS = {
     ACTION_REPETITION_ASSESSOR.name: ACTION_REPETITION_ASSESSOR.version,
     TOOL_FREQUENCY_ASSESSOR.name: TOOL_FREQUENCY_ASSESSOR.version,
     ABSOLUTE_LIMIT_ASSESSOR.name: ABSOLUTE_LIMIT_ASSESSOR.version,
     CONFIGURATION_DRIFT_ASSESSOR.name: CONFIGURATION_DRIFT_ASSESSOR.version,
+    SCOPE_SAFETY_ASSESSOR.name: SCOPE_SAFETY_ASSESSOR.version,
 }
 _USAGE_DIMENSION_ORDER = {
     "input_tokens": 0,
@@ -294,6 +336,8 @@ def _assessors_after_projection(
         )
     if projector_name in {"task-usage", "task-budget", "task-heartbeat"}:
         names.add(ABSOLUTE_LIMIT_ASSESSOR.name)
+    if projector_name == "task-safety":
+        names.add(SCOPE_SAFETY_ASSESSOR.name)
     if (projector_name == "task-structural" and observation_kind == "agent_release.resolved") or (projector_name == "task-step" and observation_kind == "llm.responded"):
         names.add(CONFIGURATION_DRIFT_ASSESSOR.name)
     if projector_name == "task-control" and observation_kind in {
@@ -791,6 +835,8 @@ class SqlAnsichBackend:
                             observation,
                             ingest_seq=ingest_seq,
                         )
+                    elif projector_name == "task-safety":
+                        await self._project_safety(session, observation)
                     else:
                         raise ValueError(f"unknown Ansich projector: {projector_name}")
                     for assessor_name, assessor_version in _assessors_after_projection(
@@ -896,6 +942,7 @@ class SqlAnsichBackend:
                 AnsichOperatorActionRow,
                 AnsichAssessorErrorRow,
                 AnsichAssessorJobRow,
+                AnsichScopeConclusionRow,
                 AnsichTaskHeartbeatRow,
                 AnsichActiveTaskReadModelRow,
                 AnsichTaskBudgetRow,
@@ -916,6 +963,11 @@ class SqlAnsichBackend:
                 AnsichContextStateRow,
                 AnsichContentBlockDerivationRow,
                 AnsichBlockProducerRow,
+                AnsichToolEffectRow,
+                AnsichToolCallAuthorizationRow,
+                AnsichAuthorizationPermissionRow,
+                AnsichAuthorizationScopeRow,
+                AnsichAuthorizationSnapshotRow,
                 AnsichToolCallResultRow,
                 AnsichToolCallRow,
                 AnsichContentOccurrenceRow,
@@ -1319,6 +1371,38 @@ class SqlAnsichBackend:
                                 source_assertion_id=assertion.assertion_id,
                                 now=now,
                             )
+                    elif assessor_name == SCOPE_SAFETY_ASSESSOR.name:
+                        results = await self._assess_scope_safety_at(
+                            session,
+                            task_id=task_id,
+                            evidence_watermark=evidence_watermark,
+                            now=now,
+                        )
+                        for result in results:
+                            for assessment in result.conclusions:
+                                assertion, assertion_changed = await self._persist_assessment(
+                                    session,
+                                    assessment,
+                                )
+                                changed += int(assertion_changed)
+                                conclusion = await session.get(
+                                    AnsichScopeConclusionRow,
+                                    assertion.assertion_id,
+                                )
+                                if conclusion is None:
+                                    session.add(
+                                        AnsichScopeConclusionRow(
+                                            assertion_id=assertion.assertion_id,
+                                            tool_call_id=assessment.subject_id,
+                                            conclusion_kind=str(assessment.value["conclusion"]),
+                                        )
+                                    )
+                                changed += await self._reconcile_alerts_for_assessment(
+                                    session,
+                                    assessment=assessment,
+                                    source_assertion_id=assertion.assertion_id,
+                                    now=now,
+                                )
                     else:
                         raise ValueError(f"unknown Ansich assessor: {assessor_name}")
                     summary = await session.get(AnsichTaskSummaryRow, task_id)
@@ -1342,6 +1426,53 @@ class SqlAnsichBackend:
             except Exception as exc:
                 await self._record_assessor_error(job_id, attempt, exc)
         return changed
+
+    async def _assess_scope_safety_at(
+        self,
+        session: AsyncSession,
+        *,
+        task_id: str,
+        evidence_watermark: int,
+        now: datetime,
+    ) -> tuple[ScopeSafetyAssessmentResult, ...]:
+        rows = list(
+            (
+                await session.execute(
+                    select(AnsichObservationRow)
+                    .where(
+                        AnsichObservationRow.task_id == task_id,
+                        AnsichObservationRow.ingest_seq <= evidence_watermark,
+                        AnsichObservationRow.kind.in_(_SAFETY_PROJECTION_KINDS),
+                    )
+                    .order_by(AnsichObservationRow.ingest_seq)
+                )
+            ).scalars()
+        )
+        snapshots_by_tool: dict[str, dict[str, AuthorizationSnapshot]] = {}
+        effects_by_tool: dict[str, dict[str, ToolEffect]] = {}
+        for row in rows:
+            payload = row.payload_json or {}
+            if row.kind.startswith("authorization."):
+                snapshot = AuthorizationSnapshot.model_validate(payload.get("snapshot"), strict=False)
+                snapshots_by_tool.setdefault(snapshot.tool_call_id, {})[snapshot.snapshot_id] = snapshot
+            elif row.kind.startswith("effect."):
+                effect = ToolEffect.model_validate(payload.get("effect"), strict=False)
+                effects_by_tool.setdefault(effect.tool_call_id, {})[effect.effect_id] = effect
+        tool_call_ids = sorted(snapshots_by_tool.keys() | effects_by_tool.keys())
+        return tuple(
+            assess_scope_safety(
+                tool_call_id=tool_call_id,
+                authorization_snapshots=tuple(
+                    sorted(
+                        snapshots_by_tool.get(tool_call_id, {}).values(),
+                        key=lambda item: (item.evaluated_at, item.snapshot_id),
+                    )
+                ),
+                effects=tuple(effects_by_tool.get(tool_call_id, {}).values()),
+                now=now,
+            )
+            for tool_call_id in tool_call_ids
+        )
 
     async def _assess_configuration_drift_at(
         self,
@@ -2802,7 +2933,7 @@ class SqlAnsichBackend:
             if task is None or summary is None:
                 return None
             thread_id = await session.scalar(
-                select(AnsichScopeRow.scope_value)
+                select(AnsichScopeRow.display_label)
                 .join(
                     AnsichRelationRow,
                     AnsichRelationRow.object_id == AnsichScopeRow.entity_id,
@@ -3759,7 +3890,7 @@ class SqlAnsichBackend:
                         )
                     ).scalars()
                 )
-                scopes = {row.scope_kind: row.scope_value for row in scope_rows}
+                scopes = {row.scope_kind: row.display_label for row in scope_rows}
                 step = await session.scalar(
                     select(AnsichStepRow)
                     .where(
@@ -4123,6 +4254,166 @@ class SqlAnsichBackend:
         async with self._session_factory() as session:
             row = await session.get(AnsichToolCallRow, tool_call_id)
             return None if row is None else await self._tool_call_view(session, row)
+
+    async def get_task_scopes(self, task_id: str) -> TaskScopesView:
+        async with self._session_factory() as session:
+            rows = list(
+                (
+                    await session.execute(
+                        select(AnsichScopeRow, AnsichRelationRow)
+                        .join(
+                            AnsichRelationRow,
+                            AnsichRelationRow.object_id == AnsichScopeRow.entity_id,
+                        )
+                        .where(
+                            AnsichRelationRow.subject_id == task_id,
+                            AnsichRelationRow.predicate == "within_scope",
+                        )
+                        .order_by(
+                            AnsichScopeRow.scope_kind,
+                            AnsichScopeRow.display_label,
+                            AnsichScopeRow.entity_id,
+                        )
+                    )
+                ).all()
+            )
+        return TaskScopesView(
+            task_id=task_id,
+            scopes=tuple(
+                TaskScopeView(
+                    scope_id=scope.entity_id,
+                    scope_kind=scope.scope_kind,
+                    external_ref_hash=scope.external_ref_hash,
+                    display_label=scope.display_label,
+                    parent_scope_id=scope.parent_scope_id,
+                    created_obs_id=scope.created_obs_id,
+                    relation_role=relation.relation_role,
+                    relation_obs_id=relation.asserted_obs_id,
+                    inherited_from_task_id=relation.inherited_from_task_id,
+                )
+                for scope, relation in rows
+                if relation.relation_role is not None
+            ),
+        )
+
+    async def get_tool_authorization(
+        self,
+        tool_call_id: str,
+    ) -> ToolAuthorizationView | None:
+        async with self._session_factory() as session:
+            if await session.get(AnsichToolCallRow, tool_call_id) is None:
+                return None
+            pairs = list(
+                (
+                    await session.execute(
+                        select(
+                            AnsichAuthorizationSnapshotRow,
+                            AnsichToolCallAuthorizationRow,
+                        )
+                        .join(
+                            AnsichToolCallAuthorizationRow,
+                            AnsichToolCallAuthorizationRow.snapshot_id == AnsichAuthorizationSnapshotRow.snapshot_id,
+                        )
+                        .where(AnsichToolCallAuthorizationRow.tool_call_id == tool_call_id)
+                        .order_by(
+                            AnsichAuthorizationSnapshotRow.evaluated_at,
+                            AnsichAuthorizationSnapshotRow.snapshot_id,
+                        )
+                    )
+                ).all()
+            )
+            snapshots: list[AuthorizationSnapshot] = []
+            for row, binding in pairs:
+                scope_rows = list(
+                    (
+                        await session.execute(
+                            select(AnsichAuthorizationScopeRow)
+                            .where(AnsichAuthorizationScopeRow.snapshot_id == row.snapshot_id)
+                            .order_by(
+                                AnsichAuthorizationScopeRow.scope_role,
+                                AnsichAuthorizationScopeRow.ordinal,
+                            )
+                        )
+                    ).scalars()
+                )
+                permission_rows = list((await session.execute(select(AnsichAuthorizationPermissionRow).where(AnsichAuthorizationPermissionRow.snapshot_id == row.snapshot_id).order_by(AnsichAuthorizationPermissionRow.ordinal))).scalars())
+                evidence_obs_ids = tuple(dict.fromkeys((row.evaluated_obs_id, binding.relation_obs_id)))
+                snapshots.append(
+                    AuthorizationSnapshot(
+                        snapshot_id=row.snapshot_id,
+                        tool_call_id=row.tool_call_id,
+                        principal_scope_ids=tuple(item.scope_id for item in scope_rows if item.scope_role == "principal"),
+                        policy_id=row.policy_id,
+                        policy_version=row.policy_version,
+                        policy_hash=row.policy_hash,
+                        decision=row.decision,
+                        details_available=row.details_available,
+                        effective_permissions=tuple(
+                            AuthorizationPermission(
+                                resource=item.resource,
+                                action=item.action,
+                                scope_id=item.scope_id,
+                                effect=item.effect,
+                            )
+                            for item in permission_rows
+                        ),
+                        resource_scope_ids=tuple(item.scope_id for item in scope_rows if item.scope_role == "resource"),
+                        reason_codes=tuple(row.reason_codes_json),
+                        evaluated_at=_as_utc(row.evaluated_at),
+                        evidence_obs_ids=evidence_obs_ids,
+                    )
+                )
+        return ToolAuthorizationView(
+            tool_call_id=tool_call_id,
+            snapshots=tuple(snapshots),
+            current_decision=(snapshots[-1].decision if snapshots else "unknown"),
+        )
+
+    async def get_tool_effects(
+        self,
+        tool_call_id: str,
+    ) -> ToolEffectsView | None:
+        async with self._session_factory() as session:
+            if await session.get(AnsichToolCallRow, tool_call_id) is None:
+                return None
+            rows = list(
+                (
+                    await session.execute(
+                        select(AnsichToolEffectRow)
+                        .where(AnsichToolEffectRow.tool_call_id == tool_call_id)
+                        .order_by(
+                            AnsichToolEffectRow.source_obs_id,
+                            AnsichToolEffectRow.effect_id,
+                        )
+                    )
+                ).scalars()
+            )
+        effects = tuple(
+            ToolEffect(
+                effect_id=row.effect_id,
+                tool_call_id=row.tool_call_id,
+                effect_class=row.effect_class,
+                phase=row.phase,
+                scope_id=row.scope_id,
+                target_hash=row.target_hash,
+                target_preview=row.target_preview,
+                fidelity_class=row.fidelity_class,
+                source_obs_id=row.source_obs_id,
+                result_metadata=dict(row.result_metadata_json),
+            )
+            for row in rows
+        )
+        if any(item.result_metadata.get("coverage") == "complete" for item in effects):
+            coverage = "complete"
+        elif effects:
+            coverage = "partial"
+        else:
+            coverage = "unknown"
+        return ToolEffectsView(
+            tool_call_id=tool_call_id,
+            effects=effects,
+            coverage=coverage,
+        )
 
     async def get_step_context(self, step_id: str) -> ContextSnapshotView | None:
         async with self._session_factory() as session:
@@ -6575,22 +6866,41 @@ class SqlAnsichBackend:
         if observation.payload is None:
             return
         scopes = (
-            ("owner", observation.payload.get("owner_id")),
-            ("thread", observation.payload.get("thread_id")),
-            ("workspace", observation.payload.get("workspace_ref")),
-            ("sandbox", observation.payload.get("sandbox_ref")),
+            ("owner", "owner", observation.payload.get("owner_id")),
+            ("thread", "conversation", observation.payload.get("thread_id")),
+            (
+                "workspace",
+                "execution_workspace",
+                observation.payload.get("workspace_ref"),
+            ),
+            (
+                "sandbox",
+                "sandbox_boundary",
+                observation.payload.get("sandbox_ref"),
+            ),
+            (
+                "authorization",
+                "auth_context",
+                observation.payload.get("authorization_ref"),
+            ),
+            (
+                "external_origin",
+                "trigger_origin",
+                observation.payload.get("external_origin_ref"),
+            ),
         )
-        for scope_kind, raw_scope_value in scopes:
+        for scope_kind, relation_role, raw_scope_value in scopes:
             if not isinstance(raw_scope_value, str) or not raw_scope_value:
                 continue
+            external_ref_hash = scope_reference_hash(scope_kind, raw_scope_value)
             scope = await session.scalar(
                 select(AnsichScopeRow).where(
                     AnsichScopeRow.scope_kind == scope_kind,
-                    AnsichScopeRow.scope_value == raw_scope_value,
+                    AnsichScopeRow.external_ref_hash == external_ref_hash,
                 )
             )
             if scope is None:
-                scope_id = new_id()
+                scope_id = scope_entity_id(scope_kind, external_ref_hash)
                 session.add(
                     AnsichEntityRow(
                         entity_id=scope_id,
@@ -6601,7 +6911,11 @@ class SqlAnsichBackend:
                 scope = AnsichScopeRow(
                     entity_id=scope_id,
                     scope_kind=scope_kind,
-                    scope_value=raw_scope_value,
+                    scope_value=None,
+                    external_ref_hash=external_ref_hash,
+                    display_label=scope_display_label(scope_kind, raw_scope_value),
+                    parent_scope_id=None,
+                    created_obs_id=observation.obs_id,
                 )
                 session.add(scope)
                 await session.flush()
@@ -6619,9 +6933,15 @@ class SqlAnsichBackend:
                     predicate="within_scope",
                     object_id=scope.entity_id,
                     asserted_obs_id=observation.obs_id,
+                    relation_role=relation_role,
+                    inherited_from_task_id=None,
                 )
                 session.add(relation)
                 await session.flush()
+            elif relation.relation_role not in {None, relation_role}:
+                raise ValueError("within_scope relation role conflicts with existing edge")
+            elif relation.relation_role is None:
+                relation.relation_role = relation_role
             evidence = await session.get(
                 AnsichRelationEvidenceRow,
                 (relation.relation_id, observation.obs_id),
@@ -6634,3 +6954,295 @@ class SqlAnsichBackend:
                         ordinal=0,
                     )
                 )
+
+    async def _project_safety(
+        self,
+        session: AsyncSession,
+        observation: ObservationEnvelope,
+    ) -> None:
+        if observation.kind == "scope.snapshotted":
+            await self._project_scope_snapshot(session, observation)
+        elif observation.kind.startswith("authorization."):
+            await self._project_authorization_snapshot(session, observation)
+        elif observation.kind.startswith("effect."):
+            await self._project_tool_effect(session, observation)
+
+    async def _project_scope_snapshot(
+        self,
+        session: AsyncSession,
+        observation: ObservationEnvelope,
+    ) -> None:
+        payload = observation.payload or {}
+        scope = ScopeDescriptor.model_validate(payload.get("scope"), strict=False)
+        if scope.created_obs_id != observation.obs_id:
+            raise ValueError("Scope created_obs_id must identify scope.snapshotted")
+        if scope.parent_scope_id is not None and await session.get(AnsichScopeRow, scope.parent_scope_id) is None:
+            raise _ProjectionDependencyPending(f"Scope {scope.scope_id} is waiting for parent {scope.parent_scope_id}")
+        entity = await session.get(AnsichEntityRow, scope.scope_id)
+        row = await session.get(AnsichScopeRow, scope.scope_id)
+        if entity is None:
+            session.add(
+                AnsichEntityRow(
+                    entity_id=scope.scope_id,
+                    entity_type="scope",
+                    discovered_obs_id=observation.obs_id,
+                )
+            )
+        if row is None:
+            row = AnsichScopeRow(
+                entity_id=scope.scope_id,
+                scope_kind=scope.scope_kind,
+                scope_value=None,
+                external_ref_hash=scope.external_ref_hash,
+                display_label=scope.display_label,
+                parent_scope_id=scope.parent_scope_id,
+                created_obs_id=observation.obs_id,
+            )
+            session.add(row)
+        elif (
+            row.scope_kind,
+            row.external_ref_hash,
+            row.display_label,
+            row.parent_scope_id,
+        ) != (
+            scope.scope_kind,
+            scope.external_ref_hash,
+            scope.display_label,
+            scope.parent_scope_id,
+        ):
+            raise ValueError("Scope identity conflicts with existing descriptor")
+        await session.flush()
+
+        relation_role = payload.get("relation_role")
+        if not isinstance(relation_role, str):
+            return
+        subject_id = payload.get("within_scope_subject_id", observation.task_id)
+        if not isinstance(subject_id, str):
+            raise ValueError("scope.snapshotted within_scope subject must be a string")
+        if await session.get(AnsichEntityRow, subject_id) is None:
+            raise _ProjectionDependencyPending(f"Scope {scope.scope_id} is waiting for subject {subject_id}")
+        inherited_from = payload.get("inherited_from_task_id")
+        if inherited_from is not None and not isinstance(inherited_from, str):
+            raise ValueError("scope inherited_from_task_id must be a string")
+        relation = await session.scalar(
+            select(AnsichRelationRow).where(
+                AnsichRelationRow.subject_id == subject_id,
+                AnsichRelationRow.predicate == "within_scope",
+                AnsichRelationRow.object_id == scope.scope_id,
+            )
+        )
+        if relation is None:
+            relation = AnsichRelationRow(
+                relation_id=new_id(),
+                subject_id=subject_id,
+                predicate="within_scope",
+                object_id=scope.scope_id,
+                asserted_obs_id=observation.obs_id,
+                relation_role=relation_role,
+                inherited_from_task_id=inherited_from,
+            )
+            session.add(relation)
+            await session.flush()
+        elif (
+            relation.relation_role,
+            relation.inherited_from_task_id,
+        ) != (relation_role, inherited_from):
+            raise ValueError("within_scope relation conflicts with existing role")
+        if (
+            await session.get(
+                AnsichRelationEvidenceRow,
+                (relation.relation_id, observation.obs_id),
+            )
+            is None
+        ):
+            session.add(
+                AnsichRelationEvidenceRow(
+                    relation_id=relation.relation_id,
+                    obs_id=observation.obs_id,
+                    ordinal=0,
+                )
+            )
+
+    async def _project_authorization_snapshot(
+        self,
+        session: AsyncSession,
+        observation: ObservationEnvelope,
+    ) -> None:
+        snapshot = AuthorizationSnapshot.model_validate((observation.payload or {}).get("snapshot"), strict=False)
+        if await session.get(AnsichToolCallRow, snapshot.tool_call_id) is None:
+            raise _ProjectionDependencyPending(f"AuthorizationSnapshot {snapshot.snapshot_id} is waiting for ToolCall")
+        referenced_scope_ids = (
+            *snapshot.principal_scope_ids,
+            *snapshot.resource_scope_ids,
+            *(permission.scope_id for permission in snapshot.effective_permissions if permission.scope_id is not None),
+        )
+        for scope_id in dict.fromkeys(referenced_scope_ids):
+            if await session.get(AnsichScopeRow, scope_id) is None:
+                raise _ProjectionDependencyPending(f"AuthorizationSnapshot {snapshot.snapshot_id} is waiting for Scope {scope_id}")
+
+        entity = await session.get(AnsichEntityRow, snapshot.snapshot_id)
+        row = await session.get(AnsichAuthorizationSnapshotRow, snapshot.snapshot_id)
+        if entity is None:
+            session.add(
+                AnsichEntityRow(
+                    entity_id=snapshot.snapshot_id,
+                    entity_type="authorization_snapshot",
+                    discovered_obs_id=observation.obs_id,
+                )
+            )
+        if row is None:
+            row = AnsichAuthorizationSnapshotRow(
+                snapshot_id=snapshot.snapshot_id,
+                tool_call_id=snapshot.tool_call_id,
+                policy_id=snapshot.policy_id,
+                policy_version=snapshot.policy_version,
+                policy_hash=snapshot.policy_hash,
+                decision=snapshot.decision,
+                details_available=snapshot.details_available,
+                reason_codes_json=list(snapshot.reason_codes),
+                evaluated_at=snapshot.evaluated_at,
+                evaluated_obs_id=observation.obs_id,
+                payload_id=None,
+            )
+            session.add(row)
+        elif (
+            row.tool_call_id,
+            row.policy_id,
+            row.policy_version,
+            row.policy_hash,
+            row.decision,
+            row.details_available,
+            tuple(row.reason_codes_json),
+            _as_utc(row.evaluated_at),
+        ) != (
+            snapshot.tool_call_id,
+            snapshot.policy_id,
+            snapshot.policy_version,
+            snapshot.policy_hash,
+            snapshot.decision,
+            snapshot.details_available,
+            snapshot.reason_codes,
+            snapshot.evaluated_at,
+        ):
+            raise ValueError("AuthorizationSnapshot conflicts with existing immutable row")
+        await session.flush()
+
+        for scope_role, scope_ids in (
+            ("principal", snapshot.principal_scope_ids),
+            ("resource", snapshot.resource_scope_ids),
+        ):
+            for ordinal, scope_id in enumerate(scope_ids):
+                key = (snapshot.snapshot_id, scope_role, ordinal)
+                existing_scope = await session.get(AnsichAuthorizationScopeRow, key)
+                if existing_scope is None:
+                    session.add(
+                        AnsichAuthorizationScopeRow(
+                            snapshot_id=snapshot.snapshot_id,
+                            scope_role=scope_role,
+                            ordinal=ordinal,
+                            scope_id=scope_id,
+                        )
+                    )
+                elif existing_scope.scope_id != scope_id:
+                    raise ValueError("Authorization scope ordinal is immutable")
+        for ordinal, permission in enumerate(snapshot.effective_permissions):
+            key = (snapshot.snapshot_id, ordinal)
+            existing_permission = await session.get(AnsichAuthorizationPermissionRow, key)
+            permission_value = (
+                permission.resource,
+                permission.action,
+                permission.scope_id,
+                permission.effect,
+            )
+            if existing_permission is None:
+                session.add(
+                    AnsichAuthorizationPermissionRow(
+                        snapshot_id=snapshot.snapshot_id,
+                        ordinal=ordinal,
+                        resource=permission.resource,
+                        action=permission.action,
+                        scope_id=permission.scope_id,
+                        effect=permission.effect,
+                    )
+                )
+            elif (
+                existing_permission.resource,
+                existing_permission.action,
+                existing_permission.scope_id,
+                existing_permission.effect,
+            ) != permission_value:
+                raise ValueError("Authorization permission ordinal is immutable")
+
+        binding = await session.get(
+            AnsichToolCallAuthorizationRow,
+            (snapshot.tool_call_id, snapshot.snapshot_id),
+        )
+        if binding is None:
+            session.add(
+                AnsichToolCallAuthorizationRow(
+                    tool_call_id=snapshot.tool_call_id,
+                    snapshot_id=snapshot.snapshot_id,
+                    relation_obs_id=observation.obs_id,
+                )
+            )
+        elif observation.kind != "authorization.evaluated":
+            binding.relation_obs_id = observation.obs_id
+
+    async def _project_tool_effect(
+        self,
+        session: AsyncSession,
+        observation: ObservationEnvelope,
+    ) -> None:
+        effect = ToolEffect.model_validate((observation.payload or {}).get("effect"), strict=False)
+        if await session.get(AnsichToolCallRow, effect.tool_call_id) is None:
+            raise _ProjectionDependencyPending(f"Effect {effect.effect_id} is waiting for ToolCall")
+        if effect.scope_id is not None and await session.get(AnsichScopeRow, effect.scope_id) is None:
+            raise _ProjectionDependencyPending(f"Effect {effect.effect_id} is waiting for Scope {effect.scope_id}")
+        entity = await session.get(AnsichEntityRow, effect.effect_id)
+        row = await session.get(AnsichToolEffectRow, effect.effect_id)
+        if entity is None:
+            session.add(
+                AnsichEntityRow(
+                    entity_id=effect.effect_id,
+                    entity_type="effect",
+                    discovered_obs_id=observation.obs_id,
+                )
+            )
+        effect_value = (
+            effect.tool_call_id,
+            effect.effect_class,
+            effect.phase,
+            effect.scope_id,
+            effect.target_hash,
+            effect.target_preview,
+            effect.fidelity_class,
+            effect.source_obs_id,
+            effect.result_metadata,
+        )
+        if row is None:
+            session.add(
+                AnsichToolEffectRow(
+                    effect_id=effect.effect_id,
+                    tool_call_id=effect.tool_call_id,
+                    effect_class=effect.effect_class,
+                    phase=effect.phase,
+                    scope_id=effect.scope_id,
+                    target_hash=effect.target_hash,
+                    target_preview=effect.target_preview,
+                    fidelity_class=effect.fidelity_class,
+                    source_obs_id=effect.source_obs_id,
+                    result_metadata_json=effect.result_metadata,
+                )
+            )
+        elif (
+            row.tool_call_id,
+            row.effect_class,
+            row.phase,
+            row.scope_id,
+            row.target_hash,
+            row.target_preview,
+            row.fidelity_class,
+            row.source_obs_id,
+            row.result_metadata_json,
+        ) != effect_value:
+            raise ValueError("ToolEffect conflicts with existing immutable row")

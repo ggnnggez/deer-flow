@@ -136,6 +136,56 @@ def test_runtime_secret_changes_do_not_change_release_identity() -> None:
     assert build_agent_release(first).fingerprint.release_hash == build_agent_release(second).fingerprint.release_hash
 
 
+def test_release_credential_validator_allows_manifest_hashes_and_benign_documentation() -> None:
+    descriptor = _descriptor(
+        loaded_tools=(
+            ToolRuntimeDescriptor(
+                name="credential_help",
+                description="Pass a credential reference, never the credential value itself.",
+                argument_schema={
+                    "type": "object",
+                    "properties": {"credential_ref": {"type": "string"}},
+                },
+                source="builtin",
+            ),
+        ),
+        effective_policies={
+            "catalog_hash": "0123456789abcdef" * 4,
+            "credential_mode": "reference-only",
+        },
+    )
+
+    release = build_agent_release(descriptor)
+
+    assert release.manifest.policy.values["catalog_hash"] == "0123456789abcdef" * 4
+
+
+@pytest.mark.parametrize(
+    "description",
+    [
+        "Use Authorization: Bearer abcdefghijklmnopqrstuvwxyz012345",
+        "Connect to https://operator:super-secret-password@example.invalid/api",
+        "Temporary token: ghp_abcdefghijklmnopqrstuvwxyz0123456789",
+    ],
+)
+def test_release_credential_validator_rejects_high_confidence_credential_shapes(
+    description: str,
+) -> None:
+    descriptor = _descriptor(
+        loaded_tools=(
+            ToolRuntimeDescriptor(
+                name="unsafe_tool",
+                description=description,
+                argument_schema={"type": "object"},
+                source="third-party",
+            ),
+        )
+    )
+
+    with pytest.raises(ValueError, match="credential-like material"):
+        build_agent_release(descriptor)
+
+
 def test_phase7_policy_manifest_v1_paths_are_pinned() -> None:
     descriptor = _descriptor(
         middleware_chain=(

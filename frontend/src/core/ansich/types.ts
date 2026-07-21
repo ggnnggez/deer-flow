@@ -312,6 +312,9 @@ export const ANSICH_PRODUCED_ALERT_TYPES = [
   "heartbeat_missing",
   "long_dwell",
   "configuration_drift",
+  "attempted_scope_violation",
+  "realized_scope_violation",
+  "unverified_effect",
 ] as const;
 
 export type AnsichAlertType = (typeof ANSICH_PRODUCED_ALERT_TYPES)[number];
@@ -746,6 +749,83 @@ export interface AnsichContextCompressionListResponse {
 
 export interface AnsichToolCallResponse {
   tool_call: AnsichToolCall;
+  projection_status: AnsichHealth;
+}
+
+export interface AnsichTaskScope {
+  scope_id: string;
+  scope_kind:
+    | "owner"
+    | "thread"
+    | "workspace"
+    | "sandbox"
+    | "authorization"
+    | "external_origin";
+  external_ref_hash: string;
+  display_label: string;
+  parent_scope_id: string | null;
+  created_obs_id: string;
+  relation_role: string;
+  relation_obs_id: string;
+  inherited_from_task_id: string | null;
+}
+
+export interface AnsichTaskScopesResponse {
+  scopes: { task_id: string; scopes: AnsichTaskScope[] };
+  projection_status: AnsichHealth;
+}
+
+export interface AnsichAuthorizationPermission {
+  resource: string;
+  action: string;
+  scope_id: string | null;
+  effect: string;
+}
+
+export interface AnsichAuthorizationSnapshot {
+  snapshot_id: string;
+  tool_call_id: string;
+  principal_scope_ids: string[];
+  policy_id: string;
+  policy_version: string;
+  policy_hash: string;
+  decision: "allowed" | "denied" | "unknown";
+  details_available: boolean;
+  effective_permissions: AnsichAuthorizationPermission[];
+  resource_scope_ids: string[];
+  reason_codes: string[];
+  evaluated_at: string;
+  evidence_obs_ids: string[];
+}
+
+export interface AnsichToolAuthorizationResponse {
+  authorization: {
+    tool_call_id: string;
+    snapshots: AnsichAuthorizationSnapshot[];
+    current_decision: "allowed" | "denied" | "unknown";
+  } | null;
+  projection_status: AnsichHealth;
+}
+
+export interface AnsichToolEffect {
+  effect_id: string;
+  tool_call_id: string;
+  effect_class: string;
+  phase: "potential" | "intended" | "observed";
+  scope_id: string | null;
+  target_hash: string | null;
+  target_preview: string | null;
+  fidelity_class: string;
+  source_obs_id: string;
+  result_metadata: Record<string, unknown>;
+}
+
+export interface AnsichToolEffectsResponse {
+  effects: {
+    tool_call_id: string;
+    effects: AnsichToolEffect[];
+    coverage: "complete" | "partial" | "unknown";
+  } | null;
   projection_status: AnsichHealth;
 }
 

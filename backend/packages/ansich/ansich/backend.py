@@ -13,6 +13,7 @@ from ansich.lineage import ContentBlockView, LineageDirection, PossibleExposureI
 from ansich.operations import ActiveTaskView, HeartbeatBelief
 from ansich.operator import OperatorActionView, TaskActionTarget
 from ansich.release import AgentReleaseDetailView, AgentReleaseSummaryView, TaskAgentReleaseView
+from ansich.safety import TaskScopesView, ToolAuthorizationView, ToolEffectsView
 from ansich.step import ContentBlockPayloadView, ContentOccurrenceView, ContextSnapshotView, LlmAttemptView, StepView
 from ansich.task_tree import TaskSpawnView, TaskTreeDirection
 from ansich.tool import ContentDerivationView, ToolCallView
@@ -207,6 +208,12 @@ class AnsichBackend(Protocol):
     async def get_step(self, step_id: str) -> StepView | None: ...
 
     async def get_tool_call(self, tool_call_id: str) -> ToolCallView | None: ...
+
+    async def get_task_scopes(self, task_id: str) -> TaskScopesView: ...
+
+    async def get_tool_authorization(self, tool_call_id: str) -> ToolAuthorizationView | None: ...
+
+    async def get_tool_effects(self, tool_call_id: str) -> ToolEffectsView | None: ...
 
     async def get_step_context(self, step_id: str) -> ContextSnapshotView | None: ...
 

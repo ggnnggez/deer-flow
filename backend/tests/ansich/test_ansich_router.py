@@ -594,6 +594,8 @@ async def test_tool_call_inventory_and_raw_visible_payloads_use_separate_endpoin
             source_id="run-tool-api",
             occurred_at=datetime.now(UTC),
             source_event_id="run:run-tool-api:created",
+            owner_id="owner-api",
+            attributes={"workspace_ref": "/srv/tenant/private-workspace"},
         )
     )
     await service.flush_task(task_id)
@@ -623,6 +625,9 @@ async def test_tool_call_inventory_and_raw_visible_payloads_use_separate_endpoin
             inventory = await client.get(f"/api/ansich/tool-calls/{tool_call_id}")
             raw = await client.get(f"/api/ansich/tool-calls/{tool_call_id}/raw-result")
             visible = await client.get(f"/api/ansich/tool-calls/{tool_call_id}/visible-result")
+            scopes = await client.get(f"/api/ansich/tasks/{task_id}/scopes")
+            authorization = await client.get(f"/api/ansich/tool-calls/{tool_call_id}/authorization")
+            effects = await client.get(f"/api/ansich/tool-calls/{tool_call_id}/effects")
     finally:
         await service.stop()
 
@@ -637,6 +642,19 @@ async def test_tool_call_inventory_and_raw_visible_payloads_use_separate_endpoin
     assert visible.headers["cache-control"] == "no-store"
     assert "Ansich raw tool result accessed" in caplog.text
     assert "Ansich visible tool result accessed" in caplog.text
+    assert scopes.status_code == 200
+    assert {item["relation_role"] for item in scopes.json()["scopes"]["scopes"]} == {
+        "owner",
+        "execution_workspace",
+    }
+    assert "/srv/tenant" not in scopes.text
+    assert authorization.json()["authorization"]["current_decision"] == "allowed"
+    assert effects.json()["effects"]["coverage"] == "partial"
+    assert {item["phase"] for item in effects.json()["effects"]["effects"]} == {
+        "potential",
+        "intended",
+        "observed",
+    }
 
 
 @pytest.mark.anyio
@@ -905,6 +923,10 @@ async def test_regular_user_is_forbidden_from_ansich_operations():
         children_response = await client.get(f"/api/ansich/tasks/{new_id()}/children")
         tree_response = await client.get(f"/api/ansich/tasks/{new_id()}/tree")
         budgets_response = await client.get(f"/api/ansich/tasks/{new_id()}/budgets")
+        scopes_response = await client.get(f"/api/ansich/tasks/{new_id()}/scopes")
+        authorization_response = await client.get(f"/api/ansich/tool-calls/{new_id()}/authorization")
+        effects_response = await client.get(f"/api/ansich/tool-calls/{new_id()}/effects")
+        safety_response = await client.get("/api/ansich/operations/safety-events")
 
     assert response.status_code == 403
     assert raw_response.status_code == 403
@@ -920,6 +942,10 @@ async def test_regular_user_is_forbidden_from_ansich_operations():
     assert children_response.status_code == 403
     assert tree_response.status_code == 403
     assert budgets_response.status_code == 403
+    assert scopes_response.status_code == 403
+    assert authorization_response.status_code == 403
+    assert effects_response.status_code == 403
+    assert safety_response.status_code == 403
 
 
 @pytest.mark.anyio

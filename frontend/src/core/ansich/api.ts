@@ -28,6 +28,9 @@ import type {
   AnsichHealth,
   AnsichToolCallResponse,
   AnsichToolResultPayloadResponse,
+  AnsichTaskScopesResponse,
+  AnsichToolAuthorizationResponse,
+  AnsichToolEffectsResponse,
   AnsichOperatorActionResponse,
   AnsichTaskChildrenResponse,
   AnsichTaskTreeResponse,
@@ -533,6 +536,51 @@ export async function fetchAnsichToolCall(
     await throwAnsichApiError(
       response,
       `Failed to load Ansich ToolCall: ${response.statusText}`,
+    );
+  }
+  return response.json();
+}
+
+export async function fetchAnsichTaskScopes(
+  taskId: string,
+): Promise<AnsichTaskScopesResponse> {
+  const response = await fetch(
+    ansichUrl(`/tasks/${encodeURIComponent(taskId)}/scopes`),
+  );
+  if (!response.ok) {
+    await throwAnsichApiError(
+      response,
+      `Failed to load Ansich Scopes: ${response.statusText}`,
+    );
+  }
+  return response.json();
+}
+
+export async function fetchAnsichToolAuthorization(
+  toolCallId: string,
+): Promise<AnsichToolAuthorizationResponse> {
+  const response = await fetch(
+    ansichUrl(`/tool-calls/${encodeURIComponent(toolCallId)}/authorization`),
+  );
+  if (!response.ok) {
+    await throwAnsichApiError(
+      response,
+      `Failed to load Ansich authorization: ${response.statusText}`,
+    );
+  }
+  return response.json();
+}
+
+export async function fetchAnsichToolEffects(
+  toolCallId: string,
+): Promise<AnsichToolEffectsResponse> {
+  const response = await fetch(
+    ansichUrl(`/tool-calls/${encodeURIComponent(toolCallId)}/effects`),
+  );
+  if (!response.ok) {
+    await throwAnsichApiError(
+      response,
+      `Failed to load Ansich effects: ${response.statusText}`,
     );
   }
   return response.json();

@@ -1,10 +1,11 @@
 from __future__ import annotations
 
+import json
 import logging
 
 import pytest
 from ansich import AnsichService
-from ansich.release import AgentRuntimeDescriptor
+from ansich.release import AgentRuntimeDescriptor, ToolRuntimeDescriptor
 
 from deerflow.ansich.probes import TaskControlProbe
 
@@ -108,6 +109,58 @@ async def test_agent_release_resolution_filters_request_scoped_secret_values() -
 
     assert binding is not None
     assert secret not in binding.release.manifest.model_dump_json()
+
+
+@pytest.mark.asyncio
+async def test_agent_release_rejects_embedded_credential_but_task_continues() -> None:
+    service = AnsichService.in_memory()
+    await service.start()
+    probe = TaskControlProbe(
+        service,
+        run_id="run-credential-release-probe",
+        thread_id="thread-credential-release-probe",
+    )
+    fake_credential = "sk-proj-abcdefghijklmnopqrstuvwxyz123456"
+    descriptor = AgentRuntimeDescriptor(
+        namespace="deerflow",
+        agent_name="lead-agent",
+        effective_model="provider/model-v1",
+        prompt_template_id="lead-v1",
+        rendered_base_prompt="You are DeerFlow.",
+        loaded_tools=(
+            ToolRuntimeDescriptor(
+                name="unsafe_tool",
+                description=f"Use credential {fake_credential} to call the service",
+                source="third-party",
+            ),
+        ),
+    )
+
+    try:
+        probe.created()
+        probe.agent_release_resolved(descriptor)
+        probe.started()
+        await probe.terminal("success")
+        await service.flush_task(probe.task_id)
+        task = await service.get_task(probe.task_id)
+        binding = await service.get_task_agent_release(probe.task_id)
+        observations = await service.list_observations(probe.task_id)
+    finally:
+        await service.stop()
+
+    assert task is not None
+    assert task.control.value == "completed"
+    assert binding is None
+    assert any(
+        item.kind == "observability.degraded"
+        and item.payload
+        == {
+            "component": "agent_release",
+            "reason": "resolution_failed",
+        }
+        for item in observations
+    )
+    assert fake_credential not in "".join(json.dumps(item.payload, sort_keys=True) for item in observations if item.payload is not None)
 
 
 @pytest.mark.asyncio

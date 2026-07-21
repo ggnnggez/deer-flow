@@ -125,7 +125,7 @@ def test_phase8_task_tree_migration_upgrades_sqlite(tmp_path) -> None:
     finally:
         engine.dispose()
 
-    assert revision == "0019_ansich_task_tree_usage"
+    assert revision == "0020_ansich_scope_safety"
     assert {"ansich_task_spawns", "ansich_task_ancestry"} <= table_names
     assert "aggregate_task_id" in contribution_columns
     assert "task_id" not in contribution_columns
@@ -306,7 +306,8 @@ async def test_child_task_created_projects_typed_spawn_and_direct_ancestry(tmp_p
                     await session.execute(
                         select(
                             AnsichScopeRow.scope_kind,
-                            AnsichScopeRow.scope_value,
+                            AnsichScopeRow.display_label,
+                            AnsichRelationRow.relation_role,
                         )
                         .join(
                             AnsichRelationRow,
@@ -334,10 +335,10 @@ async def test_child_task_created_projects_typed_spawn_and_direct_ancestry(tmp_p
     assert children[0].established_obs_id == child_created.obs_id
     assert children[0].subagent_name == "researcher"
     assert scopes == {
-        ("owner", "operator-1"),
-        ("thread", "thread-1"),
-        ("workspace", "/workspace/thread-1"),
-        ("sandbox", "sandbox-thread-1"),
+        ("owner", "operator-1", "owner"),
+        ("thread", "thread-1", "conversation"),
+        ("workspace", "thread-1", "execution_workspace"),
+        ("sandbox", "sandbox-thread-1", "sandbox_boundary"),
     }
 
 

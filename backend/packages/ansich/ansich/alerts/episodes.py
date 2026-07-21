@@ -18,6 +18,9 @@ AlertType = Literal[
     "heartbeat_missing",
     "long_dwell",
     "configuration_drift",
+    "attempted_scope_violation",
+    "realized_scope_violation",
+    "unverified_effect",
     "observability_degradation",
     "projection_failure",
 ]
@@ -423,6 +426,25 @@ def alert_conditions_from_assessment(
                 stable_condition_key="provider-model",
                 active=value == "mismatch",
                 severity="warning",
+            ),
+        )
+    if assessment.field_name.startswith("scope_safety:"):
+        conclusion = str(assessment.value.get("conclusion", "unknown"))
+        if conclusion not in {
+            "attempted_scope_violation",
+            "realized_scope_violation",
+            "unverified_effect",
+        }:
+            return ()
+        severity: AlertSeverity = "critical" if conclusion == "realized_scope_violation" else "warning"
+        return (
+            _condition(
+                assessment,
+                source_assertion_id=source_assertion_id,
+                alert_type=conclusion,  # type: ignore[arg-type]
+                stable_condition_key=conclusion,
+                active=value == "present",
+                severity=severity,
             ),
         )
     return ()

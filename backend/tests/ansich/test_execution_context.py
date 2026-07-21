@@ -303,9 +303,12 @@ def test_sync_raw_probe_classifies_timeout_without_changing_the_exception(
 
     assert raised.value is timeout
     assert [item.kind for item in observations] == [
+        "authorization.evaluated",
+        "authorization.allowed",
         "tool.started",
         "content.produced",
         "tool.timed_out",
+        "effect.observed",
     ]
 
 
@@ -355,9 +358,12 @@ def test_async_raw_probe_classifies_cooperative_cancellation_without_swallowing_
 
         assert raised.value is cancellation
         assert [item.kind for item in observations] == [
+            "authorization.evaluated",
+            "authorization.allowed",
             "tool.started",
             "content.produced",
             "tool.cancelled",
+            "effect.observed",
         ]
 
     asyncio.run(scenario())
@@ -939,6 +945,8 @@ def test_tool_decision_is_acting_and_next_decision_closes_with_final_answer() ->
         observations = await service.list_observations(task_id)
         steps = await service.list_steps(task_id)
         tool_call = await service.get_tool_call(steps[0].tool_calls[0].tool_call_id)
+        authorization = await service.get_tool_authorization(steps[0].tool_calls[0].tool_call_id)
+        effects = await service.get_tool_effects(steps[0].tool_calls[0].tool_call_id)
         await service.stop()
 
         assert [(step.step_seq, step.status, step.result) for step in steps] == [
@@ -958,6 +966,15 @@ def test_tool_decision_is_acting_and_next_decision_closes_with_final_answer() ->
         assert tool_call.visible_result.value == "available"
         assert tool_call.raw_results[0].content_hash == tool_call.visible_results[0].content_hash
         assert tool_call.derivations[0].transform_kind == "unchanged"
+        assert authorization is not None
+        assert authorization.current_decision == "allowed"
+        assert effects is not None
+        assert {effect.phase for effect in effects.effects} == {
+            "potential",
+            "intended",
+            "observed",
+        }
+        assert {effect.effect_class for effect in effects.effects} == {"unknown"}
         assert [
             observation.kind
             for observation in observations
@@ -1040,6 +1057,8 @@ def test_tool_short_circuit_is_denied_and_not_recorded_as_executed() -> None:
         )
         await service.flush_task(task_id)
         tool_call = (await service.list_steps(task_id))[0].tool_calls[0]
+        authorization = await service.get_tool_authorization(tool_call.tool_call_id)
+        effects = await service.get_tool_effects(tool_call.tool_call_id)
         await service.stop()
 
         assert tool_call.authorization.value == "denied"
@@ -1047,6 +1066,13 @@ def test_tool_short_circuit_is_denied_and_not_recorded_as_executed() -> None:
         assert tool_call.visible_result.value == "available"
         assert tool_call.started_obs_id is None
         assert tool_call.raw_results == ()
+        assert authorization is not None
+        assert authorization.current_decision == "denied"
+        assert effects is not None
+        assert {effect.phase for effect in effects.effects} == {
+            "potential",
+            "intended",
+        }
 
     asyncio.run(scenario())
 
@@ -1295,7 +1321,8 @@ def test_started_probe_failure_does_not_reclassify_executed_tool_as_denied(
 
         def fail_first_tool_boundary_sequence() -> int:
             nonlocal failed_started_probe
-            if execution.current_tool_invocation() is not None and not failed_started_probe:
+            invocation = execution.current_tool_invocation()
+            if invocation is not None and invocation.started and not failed_started_probe:
                 failed_started_probe = True
                 raise RuntimeError("started probe failed")
             return original_next_sequence()

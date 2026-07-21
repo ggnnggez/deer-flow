@@ -125,6 +125,8 @@ class ToolInvocation:
     raw_terminal_kind: str | None = None
     raw_terminal_obs_id: str | None = None
     raw_recorded: bool = False
+    authorization_recorded: bool = False
+    effect_intent_recorded: bool = False
 
 
 class AnsichExecutionContext:

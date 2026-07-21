@@ -19,6 +19,7 @@ from ansich.memory import InMemoryAnsichBackend
 from ansich.operations import ActiveStepView, ActiveTaskView, HeartbeatBelief
 from ansich.operator import OperatorActionView, TaskActionTarget
 from ansich.release import AgentReleaseDetailView, AgentReleaseSummaryView, TaskAgentReleaseView
+from ansich.safety import TaskScopesView, ToolAuthorizationView, ToolEffectsView
 from ansich.step import ContentBlockPayloadView, ContentOccurrenceView, ContextSnapshotView, LlmAttemptView, StepView
 from ansich.task_tree import (
     TaskSpawnView,
@@ -736,6 +737,21 @@ class AnsichService:
 
     async def get_tool_call(self, tool_call_id: str) -> ToolCallView | None:
         return await self._backend.get_tool_call(tool_call_id)
+
+    async def get_task_scopes(self, task_id: str) -> TaskScopesView:
+        return await self._backend.get_task_scopes(task_id)
+
+    async def get_tool_authorization(
+        self,
+        tool_call_id: str,
+    ) -> ToolAuthorizationView | None:
+        return await self._backend.get_tool_authorization(tool_call_id)
+
+    async def get_tool_effects(
+        self,
+        tool_call_id: str,
+    ) -> ToolEffectsView | None:
+        return await self._backend.get_tool_effects(tool_call_id)
 
     async def get_step_context(self, step_id: str) -> ContextSnapshotView | None:
         return await self._backend.get_step_context(step_id)

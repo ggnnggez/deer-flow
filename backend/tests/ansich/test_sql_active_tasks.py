@@ -373,4 +373,4 @@ def test_phase5_operations_migration_upgrades_sqlite(tmp_path):
         "ansich_usage_contributions",
         "ansich_active_task_read_model",
     } <= tables
-    assert revision == "0019_ansich_task_tree_usage"
+    assert revision == "0020_ansich_scope_safety"

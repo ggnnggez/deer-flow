@@ -16,6 +16,9 @@ export function getAlertPresentationCategory(
     case "tool_frequency":
     case "long_dwell":
     case "configuration_drift":
+    case "attempted_scope_violation":
+    case "realized_scope_violation":
+    case "unverified_effect":
       return "operational";
     case "heartbeat_missing":
       return "liveness";

@@ -398,6 +398,16 @@ def test_task_tool_creates_distinct_child_ansich_context_from_spawning_tool(monk
         "workspace_ref": "/tmp/workspace",
         "sandbox_ref": "local",
     }
+    observed_spawn = next(call.args[0] for call in service.record.call_args_list if call.args[0].kind == "effect.observed")
+    assert observed_spawn.task_id == parent_task_id
+    assert observed_spawn.step_id == spawning_step_id
+    assert observed_spawn.payload["effect"]["tool_call_id"] == spawning_tool_call_id
+    assert observed_spawn.payload["effect"]["effect_class"] == "child_task_spawn"
+    assert observed_spawn.payload["effect"]["phase"] == "observed"
+    assert observed_spawn.payload["effect"]["fidelity_class"] == "hard"
+    assert observed_spawn.payload["effect"]["result_metadata"] == {
+        "child_task_id": child_execution.task_id,
+    }
 
 
 def test_child_ansich_context_failure_is_degraded_but_delegation_continues(monkeypatch):

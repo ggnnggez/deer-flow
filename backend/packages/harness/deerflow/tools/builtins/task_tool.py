@@ -9,7 +9,7 @@ from hashlib import sha256
 from typing import TYPE_CHECKING, Annotated, Any, cast
 from uuid import UUID
 
-from ansich import ObservationEnvelope, Producer
+from ansich import ObservationEnvelope, Producer, ToolEffect, new_id
 from ansich.serialization import (
     ANSICH_PRODUCER_ENTITY_ID_KEY,
     ANSICH_PRODUCER_KIND_KEY,
@@ -258,6 +258,11 @@ def _create_child_ansich_context(
         flush_on_terminal=False,
     )
     child_probe.created()
+    _record_child_task_spawn_effect(
+        parent_execution,
+        child_task_id=child_task_id,
+        subagent_name=subagent_name,
+    )
     return (
         AnsichExecutionContext(
             task_id=child_task_id,
@@ -265,6 +270,62 @@ def _create_child_ansich_context(
         ),
         child_probe,
     )
+
+
+def _record_child_task_spawn_effect(
+    parent_execution: Any,
+    *,
+    child_task_id: str,
+    subagent_name: str,
+) -> None:
+    """Record the hard spawn fact at the child Task creation boundary."""
+
+    service = getattr(parent_execution, "service", None)
+    task_id = getattr(parent_execution, "task_id", None)
+    invocation = parent_execution.current_tool_invocation()
+    if service is None or not isinstance(task_id, str) or invocation is None:
+        return
+    registration = invocation.registration
+    try:
+        obs_id = new_id()
+        effect = ToolEffect(
+            effect_id=new_id(),
+            tool_call_id=registration.tool_call_id,
+            effect_class="child_task_spawn",
+            phase="observed",
+            target_hash=sha256(child_task_id.encode()).hexdigest(),
+            target_preview=f"subagent:{subagent_name}"[:512],
+            fidelity_class="hard",
+            source_obs_id=obs_id,
+            result_metadata={"child_task_id": child_task_id},
+        )
+        service.record(
+            ObservationEnvelope(
+                obs_id=obs_id,
+                kind="effect.observed",
+                occurred_at=datetime.now(UTC),
+                task_id=task_id,
+                step_id=registration.step_id,
+                subject_type="effect",
+                subject_id=effect.effect_id,
+                producer=Producer(
+                    name="deerflow-subagent-observability",
+                    version="1",
+                    instance_id=task_id,
+                ),
+                producer_seq=parent_execution.next_producer_seq(),
+                source_event_id=(f"task:{task_id}:tool:{registration.tool_call_id}:child:{child_task_id}:spawned"),
+                correlation_id=task_id,
+                causation_obs_id=registration.issued_obs_id,
+                payload={"effect": effect.model_dump(mode="json")},
+            )
+        )
+    except Exception:
+        logger.warning(
+            "Could not record child Task spawn effect for tool %s",
+            registration.tool_call_id,
+            exc_info=True,
+        )
 
 
 def _record_child_ansich_degradation(

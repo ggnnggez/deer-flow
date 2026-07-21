@@ -4,11 +4,13 @@ import binascii
 import hashlib
 import json
 import logging
+import posixpath
 from datetime import datetime
 from typing import Literal
 
 from ansich.alerts import AlertWorkflowConflict
 from ansich.contracts import ControlValue, TaskLifecycleScope
+from ansich.credentials import contains_credential_like_material
 from ansich.release import (
     AgentRelease,
     AgentReleaseFingerprint,
@@ -403,6 +405,9 @@ async def list_alerts(
         "heartbeat_missing",
         "long_dwell",
         "configuration_drift",
+        "attempted_scope_violation",
+        "realized_scope_violation",
+        "unverified_effect",
     ]
     | None = Query(default=None, alias="type"),
     workflow_state: Literal[
@@ -1008,6 +1013,31 @@ async def get_task(task_id: str, request: Request) -> dict:
     }
 
 
+@router.get("/tasks/{task_id}/scopes")
+async def get_task_scopes(task_id: str, request: Request) -> dict:
+    await require_admin_user(request, detail=_ADMIN_REQUIRED)
+    service = _service_or_503(request)
+    _ensure_queryable(service)
+    try:
+        if await service.get_task(task_id) is None:
+            raise HTTPException(status_code=404, detail="Ansich Task not found")
+        scopes = await service.get_task_scopes(task_id)
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise HTTPException(
+            status_code=503,
+            detail={
+                "message": "Ansich Scope query failed",
+                "projection_status": _projection_status(service),
+            },
+        ) from exc
+    return {
+        "scopes": scopes.model_dump(mode="json"),
+        "projection_status": _projection_status(service),
+    }
+
+
 @router.get("/tasks/{task_id}/timeline")
 async def get_task_timeline(
     task_id: str,
@@ -1179,6 +1209,121 @@ async def get_tool_call(tool_call_id: str, request: Request) -> dict:
     tool_call = await _tool_call_or_404(service, tool_call_id)
     return {
         "tool_call": tool_call.model_dump(mode="json"),
+        "projection_status": _projection_status(service),
+    }
+
+
+@router.get("/tool-calls/{tool_call_id}/authorization")
+async def get_tool_authorization(tool_call_id: str, request: Request) -> dict:
+    await require_admin_user(request, detail=_ADMIN_REQUIRED)
+    service = _service_or_503(request)
+    _ensure_queryable(service)
+    await _tool_call_or_404(service, tool_call_id)
+    try:
+        authorization = await service.get_tool_authorization(tool_call_id)
+    except Exception as exc:
+        raise HTTPException(
+            status_code=503,
+            detail={
+                "message": "Ansich authorization query failed",
+                "projection_status": _projection_status(service),
+            },
+        ) from exc
+    return {
+        "authorization": (None if authorization is None else authorization.model_dump(mode="json")),
+        "projection_status": _projection_status(service),
+    }
+
+
+def _safe_effect_payload(effect) -> dict:
+    payload = effect.model_dump(mode="json")
+    preview = payload.get("target_preview")
+    if not isinstance(preview, str):
+        return payload
+    if contains_credential_like_material(preview):
+        payload["target_preview"] = "<redacted>"
+    elif preview.startswith("/"):
+        payload["target_preview"] = f"<absolute>/{posixpath.basename(posixpath.normpath(preview))}"
+    return payload
+
+
+@router.get("/tool-calls/{tool_call_id}/effects")
+async def get_tool_effects(tool_call_id: str, request: Request) -> dict:
+    await require_admin_user(request, detail=_ADMIN_REQUIRED)
+    service = _service_or_503(request)
+    _ensure_queryable(service)
+    await _tool_call_or_404(service, tool_call_id)
+    try:
+        effects = await service.get_tool_effects(tool_call_id)
+    except Exception as exc:
+        raise HTTPException(
+            status_code=503,
+            detail={
+                "message": "Ansich effect query failed",
+                "projection_status": _projection_status(service),
+            },
+        ) from exc
+    return {
+        "effects": (
+            None
+            if effects is None
+            else {
+                "tool_call_id": effects.tool_call_id,
+                "coverage": effects.coverage,
+                "effects": [_safe_effect_payload(item) for item in effects.effects],
+            }
+        ),
+        "projection_status": _projection_status(service),
+    }
+
+
+@router.get("/operations/safety-events")
+async def list_safety_events(
+    request: Request,
+    workflow_state: Literal[
+        "open",
+        "acknowledged",
+        "dismissed",
+        "resolved",
+    ]
+    | None = Query(default=None, alias="state"),
+    tool_call_id: str | None = Query(default=None, alias="tool_call"),
+    limit: int = Query(default=100, ge=1, le=500),
+) -> dict:
+    await require_admin_user(request, detail=_ADMIN_REQUIRED)
+    service = _service_or_503(request)
+    _ensure_queryable(service)
+    try:
+        pages = await asyncio.gather(
+            *(
+                service.list_alerts(
+                    limit=limit,
+                    alert_type=alert_type,
+                    workflow_state=workflow_state,
+                    task_id=tool_call_id,
+                )
+                for alert_type in (
+                    "attempted_scope_violation",
+                    "realized_scope_violation",
+                    "unverified_effect",
+                )
+            )
+        )
+    except Exception as exc:
+        raise HTTPException(
+            status_code=503,
+            detail={
+                "message": "Ansich safety event query failed",
+                "projection_status": _projection_status(service),
+            },
+        ) from exc
+    items = sorted(
+        (item for page in pages for item in page),
+        key=lambda item: (item.updated_at, item.alert_id),
+        reverse=True,
+    )[:limit]
+    return {
+        "items": [item.model_dump(mode="json") for item in items],
         "projection_status": _projection_status(service),
     }
 

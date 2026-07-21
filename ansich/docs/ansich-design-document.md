@@ -717,7 +717,7 @@ budget.configured | budget.consumed
 
 scope.snapshotted | authorization.evaluated |
 authorization.allowed | authorization.denied | authorization.unknown |
-effect.observed
+effect.potential | effect.intended | effect.observed
 
 evaluation.recorded | operator.action_requested |
 operator.action_succeeded | operator.action_failed |
@@ -867,7 +867,11 @@ ansich_task_ancestry
 ansich_relations
 ansich_relation_evidence
 ansich_authorization_snapshots
+ansich_authorization_scopes
+ansich_authorization_permissions
+ansich_tool_call_authorizations
 ansich_tool_effects
+ansich_scope_conclusions
 ```
 
 High-volume ordered/graph relations have typed tables. `spawned` is typed because

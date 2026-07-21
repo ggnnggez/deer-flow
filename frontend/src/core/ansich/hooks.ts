@@ -24,6 +24,9 @@ import {
   fetchAnsichTaskAgentRelease,
   fetchAnsichTasks,
   fetchAnsichTaskTree,
+  fetchAnsichTaskScopes,
+  fetchAnsichToolAuthorization,
+  fetchAnsichToolEffects,
 } from "./api";
 import type {
   AnsichActiveTaskListResponse,
@@ -398,6 +401,54 @@ export function useAnsichTaskBudgets(
     queryKey: ["ansich", "tasks", taskId, "budgets"],
     queryFn: () => fetchAnsichTaskBudgets(taskId),
     enabled: enabled && Boolean(taskId),
+    retry: false,
+    refetchInterval: () =>
+      polling && pageIsVisible() ? REFRESH_INTERVAL_MS : false,
+    refetchIntervalInBackground: false,
+  });
+}
+
+export function useAnsichTaskScopes(
+  taskId: string,
+  enabled = true,
+  polling = true,
+) {
+  return useQuery({
+    queryKey: ["ansich", "tasks", taskId, "scopes"],
+    queryFn: () => fetchAnsichTaskScopes(taskId),
+    enabled: enabled && Boolean(taskId),
+    retry: false,
+    refetchInterval: () =>
+      polling && pageIsVisible() ? REFRESH_INTERVAL_MS : false,
+    refetchIntervalInBackground: false,
+  });
+}
+
+export function useAnsichToolAuthorization(
+  toolCallId: string,
+  enabled = true,
+  polling = true,
+) {
+  return useQuery({
+    queryKey: ["ansich", "tool-calls", toolCallId, "authorization"],
+    queryFn: () => fetchAnsichToolAuthorization(toolCallId),
+    enabled: enabled && Boolean(toolCallId),
+    retry: false,
+    refetchInterval: () =>
+      polling && pageIsVisible() ? REFRESH_INTERVAL_MS : false,
+    refetchIntervalInBackground: false,
+  });
+}
+
+export function useAnsichToolEffects(
+  toolCallId: string,
+  enabled = true,
+  polling = true,
+) {
+  return useQuery({
+    queryKey: ["ansich", "tool-calls", toolCallId, "effects"],
+    queryFn: () => fetchAnsichToolEffects(toolCallId),
+    enabled: enabled && Boolean(toolCallId),
     retry: false,
     refetchInterval: () =>
       polling && pageIsVisible() ? REFRESH_INTERVAL_MS : false,

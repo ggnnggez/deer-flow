@@ -97,7 +97,7 @@ def test_phase7_release_migration_upgrades_sqlite(tmp_path) -> None:
     finally:
         engine.dispose()
 
-    assert revision == "0019_ansich_task_tree_usage"
+    assert revision == "0020_ansich_scope_safety"
     assert {
         "ansich_agent_releases",
         "ansich_agent_release_components",

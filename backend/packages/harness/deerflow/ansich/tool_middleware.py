@@ -2,13 +2,21 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import posixpath
 import time
 from collections.abc import Awaitable, Callable, Mapping
 from datetime import UTC, datetime
 from typing import get_args
 from uuid import uuid4
 
-from ansich import ObservationEnvelope, Producer, new_id
+from ansich import (
+    AuthorizationSnapshot,
+    ObservationEnvelope,
+    Producer,
+    ToolEffect,
+    canonical_config_hash,
+    new_id,
+)
 from ansich.serialization import (
     ANSICH_PRODUCER_ENTITY_ID_KEY,
     ANSICH_PRODUCER_KIND_KEY,
@@ -164,6 +172,12 @@ def _record_started(execution: AnsichExecutionContext, invocation: ToolInvocatio
     # misclassify a call that did run as a policy denial.
     invocation.started = True
     invocation.started_at = time.monotonic()
+    _record_authorization(
+        execution,
+        invocation,
+        decision="allowed",
+        reason_code="callable_boundary_entered",
+    )
     observation = ObservationEnvelope(
         kind="tool.started",
         occurred_at=datetime.now(UTC),
@@ -180,6 +194,210 @@ def _record_started(execution: AnsichExecutionContext, invocation: ToolInvocatio
     )
     invocation.started_obs_id = observation.obs_id
     _record_batch(execution, [observation], batch_kind="tool_execution")
+
+
+def _record_authorization(
+    execution: AnsichExecutionContext,
+    invocation: ToolInvocation,
+    *,
+    decision: str,
+    reason_code: str,
+) -> None:
+    if invocation.authorization_recorded:
+        return
+    registration = invocation.registration
+    snapshot_id = new_id()
+    evaluated_obs_id = new_id()
+    decision_obs_id = new_id()
+    evaluated_at = datetime.now(UTC)
+    snapshot = AuthorizationSnapshot(
+        snapshot_id=snapshot_id,
+        tool_call_id=registration.tool_call_id,
+        policy_id="deerflow-tool-middleware-chain",
+        policy_version="1",
+        policy_hash=canonical_config_hash({"policy": "deerflow-tool-middleware-chain", "version": "1"}),
+        decision=decision,
+        details_available=False,
+        reason_codes=(reason_code,),
+        evaluated_at=evaluated_at,
+        evidence_obs_ids=(evaluated_obs_id, decision_obs_id),
+    )
+    common = {
+        "occurred_at": evaluated_at,
+        "task_id": execution.task_id,
+        "step_id": registration.step_id,
+        "subject_type": "authorization_snapshot",
+        "subject_id": snapshot_id,
+        "producer": _producer(),
+        "correlation_id": execution.task_id,
+        "payload": {"snapshot": snapshot.model_dump(mode="json")},
+    }
+    evaluated = ObservationEnvelope(
+        obs_id=evaluated_obs_id,
+        kind="authorization.evaluated",
+        producer_seq=execution.next_producer_seq(),
+        source_event_id=f"tool:{registration.tool_call_id}:authorization:evaluated",
+        causation_obs_id=registration.issued_obs_id,
+        **common,
+    )
+    decided = ObservationEnvelope(
+        obs_id=decision_obs_id,
+        kind=f"authorization.{decision}",  # type: ignore[arg-type]
+        producer_seq=execution.next_producer_seq(),
+        source_event_id=f"tool:{registration.tool_call_id}:authorization:{decision}",
+        causation_obs_id=evaluated_obs_id,
+        **common,
+    )
+    _record_batch(
+        execution,
+        [evaluated, decided],
+        batch_kind="tool_authorization",
+    )
+    invocation.authorization_recorded = True
+
+
+def _effect_class(tool_name: str) -> str:
+    normalized = tool_name.lower().strip("_")
+    if normalized in {"read_file", "view_file"} or normalized.endswith("read_file"):
+        return "filesystem_read"
+    if normalized in {"write_file", "edit_file"} or normalized.endswith("write_file"):
+        return "filesystem_write"
+    if normalized == "bash" or normalized.endswith("bash_tool"):
+        return "process_execute"
+    if normalized == "task" or normalized.endswith("task_tool"):
+        return "child_task_spawn"
+    if "search" in normalized or normalized in {"fetch", "http_get", "web"}:
+        return "network_read"
+    return "unknown"
+
+
+def _effect_target_preview(request: ToolCallRequest) -> str:
+    args = request.tool_call.get("args")
+    if not isinstance(args, Mapping):
+        return f"tool:{request.tool_call.get('name') or 'unknown'}"
+    for key in ("path", "file_path"):
+        value = args.get(key)
+        if isinstance(value, str) and value:
+            normalized = posixpath.normpath(value.replace("\\", "/"))
+            if normalized.startswith("/"):
+                return f"<absolute>/{posixpath.basename(normalized)}"
+            return normalized[:512]
+    return f"tool:{request.tool_call.get('name') or 'unknown'}"
+
+
+def _effect_observation(
+    execution: AnsichExecutionContext,
+    invocation: ToolInvocation,
+    *,
+    effect_class: str,
+    phase: str,
+    fidelity_class: str,
+    target_hash: str | None,
+    target_preview: str | None,
+    ordinal: int = 0,
+    causation_obs_id: str | None = None,
+) -> ObservationEnvelope:
+    registration = invocation.registration
+    obs_id = new_id()
+    effect = ToolEffect(
+        effect_id=new_id(),
+        tool_call_id=registration.tool_call_id,
+        effect_class=effect_class,
+        phase=phase,
+        scope_id=None,
+        target_hash=target_hash,
+        target_preview=target_preview,
+        fidelity_class=fidelity_class,
+        source_obs_id=obs_id,
+        result_metadata={},
+    )
+    return ObservationEnvelope(
+        obs_id=obs_id,
+        kind=f"effect.{phase}",  # type: ignore[arg-type]
+        occurred_at=datetime.now(UTC),
+        task_id=execution.task_id,
+        step_id=registration.step_id,
+        subject_type="effect",
+        subject_id=effect.effect_id,
+        producer=_producer(),
+        producer_seq=execution.next_producer_seq(),
+        source_event_id=(f"tool:{registration.tool_call_id}:effect:{phase}:{effect_class}:{ordinal}"),
+        correlation_id=execution.task_id,
+        causation_obs_id=causation_obs_id or registration.issued_obs_id,
+        payload={"effect": effect.model_dump(mode="json")},
+    )
+
+
+def _record_effect_intent(
+    execution: AnsichExecutionContext,
+    invocation: ToolInvocation,
+    request: ToolCallRequest,
+) -> None:
+    if invocation.effect_intent_recorded:
+        return
+    effect_class = _effect_class(invocation.registration.tool_name)
+    observations = [
+        _effect_observation(
+            execution,
+            invocation,
+            effect_class=effect_class,
+            phase="potential",
+            fidelity_class="declared",
+            target_hash=None,
+            target_preview=f"tool:{invocation.registration.tool_name}",
+        ),
+        _effect_observation(
+            execution,
+            invocation,
+            effect_class=effect_class,
+            phase="intended",
+            fidelity_class="inferred",
+            target_hash=invocation.registration.args_hash,
+            target_preview=_effect_target_preview(request),
+            ordinal=1,
+        ),
+    ]
+    _record_batch(execution, observations, batch_kind="tool_effect_intent")
+    invocation.effect_intent_recorded = True
+
+
+def _record_observed_effects(
+    execution: AnsichExecutionContext,
+    invocation: ToolInvocation,
+) -> None:
+    effect_class = _effect_class(invocation.registration.tool_name)
+    # The task tool owns this hard fact: a successful tool return does not by
+    # itself prove that the child Task was created.  Its creation boundary
+    # emits child_task_spawn only after TaskControlProbe.created().
+    if effect_class == "child_task_spawn":
+        return
+    observations = [
+        _effect_observation(
+            execution,
+            invocation,
+            effect_class=effect_class,
+            phase="observed",
+            fidelity_class=("unknown" if effect_class == "unknown" else "hard"),
+            target_hash=invocation.registration.args_hash,
+            target_preview=f"tool:{invocation.registration.tool_name}",
+            causation_obs_id=invocation.raw_terminal_obs_id,
+        )
+    ]
+    if effect_class == "process_execute":
+        observations.append(
+            _effect_observation(
+                execution,
+                invocation,
+                effect_class="unknown",
+                phase="observed",
+                fidelity_class="unknown",
+                target_hash=invocation.registration.args_hash,
+                target_preview="bash internal effects",
+                ordinal=1,
+                causation_obs_id=invocation.raw_terminal_obs_id,
+            )
+        )
+    _record_batch(execution, observations, batch_kind="tool_effect_observed")
 
 
 def _record_raw_result(
@@ -247,6 +465,7 @@ def _record_raw_result(
     invocation.raw_recorded = accepted
     if accepted:
         execution.mark_tool_terminal(registration.tool_call_id)
+        _record_observed_effects(execution, invocation)
 
 
 def _classify_transform(
@@ -404,10 +623,23 @@ class AnsichVisibleToolMiddleware(AgentMiddleware):
         if registration is None:
             return handler(request)
         with execution.activate_tool_invocation(registration):
+            try:
+                invocation = execution.current_tool_invocation()
+                if invocation is not None:
+                    _record_effect_intent(execution, invocation, request)
+            except Exception:
+                pass
             result = handler(request)
             try:
                 invocation = execution.current_tool_invocation()
                 if invocation is not None:
+                    if not invocation.started:
+                        _record_authorization(
+                            execution,
+                            invocation,
+                            decision="denied",
+                            reason_code="short_circuited_before_callable",
+                        )
                     visible_message = _tool_message(result, request)
                     _record_visible_result(
                         execution,
@@ -436,10 +668,23 @@ class AnsichVisibleToolMiddleware(AgentMiddleware):
         if registration is None:
             return await handler(request)
         with execution.activate_tool_invocation(registration):
+            try:
+                invocation = execution.current_tool_invocation()
+                if invocation is not None:
+                    _record_effect_intent(execution, invocation, request)
+            except Exception:
+                pass
             result = await handler(request)
             try:
                 invocation = execution.current_tool_invocation()
                 if invocation is not None:
+                    if not invocation.started:
+                        _record_authorization(
+                            execution,
+                            invocation,
+                            decision="denied",
+                            reason_code="short_circuited_before_callable",
+                        )
                     visible_message = _tool_message(result, request)
                     _record_visible_result(
                         execution,

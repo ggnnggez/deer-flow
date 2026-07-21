@@ -91,6 +91,9 @@ describe("Ansich presentation", () => {
       "heartbeat_missing",
       "long_dwell",
       "configuration_drift",
+      "attempted_scope_violation",
+      "realized_scope_violation",
+      "unverified_effect",
     ]);
     expect(getAlertPresentationCategory("exact_repetition")).toBe("runaway");
     expect(getAlertPresentationCategory("budget_exceeded")).toBe("runaway");
@@ -98,6 +101,15 @@ describe("Ansich presentation", () => {
     expect(getAlertPresentationCategory("long_dwell")).toBe("operational");
     expect(getAlertPresentationCategory("heartbeat_missing")).toBe("liveness");
     expect(getAlertPresentationCategory("configuration_drift")).toBe(
+      "operational",
+    );
+    expect(getAlertPresentationCategory("attempted_scope_violation")).toBe(
+      "operational",
+    );
+    expect(getAlertPresentationCategory("realized_scope_violation")).toBe(
+      "operational",
+    );
+    expect(getAlertPresentationCategory("unverified_effect")).toBe(
       "operational",
     );
   });

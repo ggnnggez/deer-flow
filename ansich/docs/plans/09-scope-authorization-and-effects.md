@@ -1,5 +1,11 @@
 # Phase 9 — Scope、授权与副作用审计
 
+## 实现状态（2026-07-21）
+
+已形成可运行的本地纵向切片：P7-L1 二线 credential validator 已接入 release resolution；Scope 使用 stable external-ref hash、受控 label、parent 与带 role/evidence 的 `within_scope`；AuthorizationSnapshot、permission/scope membership、ToolCall binding 与 potential/intended/observed Effect 均有严格领域契约和 `0020_ansich_scope_safety` typed SQL 投影。DeerFlow Tool middleware 在 callable boundary 区分 allow/deny，并以 fail-open 方式记录 effect；`scope-safety@1.0.0` 在严格 observation watermark 下维护四类 present/cleared conclusion，attempted/realized/unverified 复用 Alert episode。管理员 API 与 Task 详情 “Scopes & effects” 页签已落地，unknown coverage 不会显示为无副作用。
+
+本地验收已覆盖 SQLite upgrade/downgrade/replay、PostgreSQL DDL 编译、领域/SQL/API/probe 回归（353 项）以及前端 lint/typecheck 与单元测试（667 项）。真实 PostgreSQL 升级矩阵、关闭 Ansich 的开销基准和生产 paper drill 仍是最终生产就绪门禁；MCP 显式 effect metadata、外部写 adapter 的更细 resource canonicalization 以及 raw target 强审计读取继续按 Phase 11 加固边界推进。
+
 ## 1. 交付目标
 
 本阶段完成 D4 Safety Audit所需的数据链：一个 Task/Step/ToolCall处于哪些 Scope；Tool发出了什么 effect intent；当时有效权限是什么；授权层允许/拒绝/未知；实际观测到了什么副作用。

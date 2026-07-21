@@ -42,6 +42,19 @@ from ansich.release import (
     AgentRuntimeDescriptor,
     TaskAgentReleaseView,
 )
+from ansich.safety import (
+    AuthorizationPermission,
+    AuthorizationSnapshot,
+    ScopeDescriptor,
+    TaskScopesView,
+    TaskScopeView,
+    ToolAuthorizationView,
+    ToolEffect,
+    ToolEffectsView,
+    scope_display_label,
+    scope_entity_id,
+    scope_reference_hash,
+)
 from ansich.service import AnsichService
 from ansich.step import ContentBlockPayloadView, ContentOccurrenceView, ContextSnapshotItemView, ContextSnapshotView, LlmAttemptView, StepView
 from ansich.task_tree import (
@@ -71,6 +84,8 @@ __all__ = [
     "AgentReleaseSummaryView",
     "AgentRuntimeDescriptor",
     "AssessorDescriptor",
+    "AuthorizationPermission",
+    "AuthorizationSnapshot",
     "AuthorityClass",
     "BeliefAssertion",
     "ContentBlockPayloadView",
@@ -101,7 +116,10 @@ __all__ = [
     "Producer",
     "RecordReceipt",
     "ResolvedBelief",
+    "ScopeDescriptor",
     "TaskLifecycleScope",
+    "TaskScopesView",
+    "TaskScopeView",
     "TaskAncestryView",
     "TaskAgentReleaseView",
     "TaskSpawnView",
@@ -114,10 +132,16 @@ __all__ = [
     "TaskUsageValue",
     "TaskUsageView",
     "ToolBelief",
+    "ToolAuthorizationView",
     "ToolCallView",
+    "ToolEffect",
+    "ToolEffectsView",
     "ToolResultView",
     "StepView",
     "canonical_config_hash",
     "new_id",
     "resolve_current_belief",
+    "scope_display_label",
+    "scope_entity_id",
+    "scope_reference_hash",
 ]

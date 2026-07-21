@@ -42,6 +42,18 @@ OperatorObservationKind = Literal[
     "operator.alert_acknowledged",
     "operator.alert_dismissed",
 ]
+ScopeObservationKind = Literal["scope.snapshotted"]
+AuthorizationObservationKind = Literal[
+    "authorization.evaluated",
+    "authorization.allowed",
+    "authorization.denied",
+    "authorization.unknown",
+]
+EffectObservationKind = Literal[
+    "effect.potential",
+    "effect.intended",
+    "effect.observed",
+]
 UsageDimension = Literal[
     "input_tokens",
     "output_tokens",
@@ -61,6 +73,9 @@ ObservationKind = (
     | ToolObservationKind
     | BudgetObservationKind
     | OperatorObservationKind
+    | ScopeObservationKind
+    | AuthorizationObservationKind
+    | EffectObservationKind
     | Literal[
         "agent_release.resolved",
         "task.heartbeat",
@@ -176,6 +191,9 @@ class ObservationEnvelope(BaseModel):
         "context_compression",
         "agent_release",
         "alert",
+        "scope",
+        "authorization_snapshot",
+        "effect",
     ] = "task"
     subject_id: str
     fidelity_class: Literal["hard"] = "hard"
@@ -220,6 +238,36 @@ class ObservationEnvelope(BaseModel):
             raise ValueError("Alert workflow observation subject_type must be alert")
         elif self.kind.startswith("operator.action_") and (self.subject_type != "task" or self.subject_id != self.task_id):
             raise ValueError("Operator action observation subject must identify task_id")
+        elif self.kind == "scope.snapshotted":
+            from ansich.safety import ScopeDescriptor
+
+            if self.subject_type != "scope":
+                raise ValueError("scope observation subject_type must be scope")
+            scope = ScopeDescriptor.model_validate((self.payload or {}).get("scope"), strict=False)
+            if scope.scope_id != self.subject_id:
+                raise ValueError("scope observation subject must identify payload scope")
+        elif self.kind.startswith("authorization."):
+            from ansich.safety import AuthorizationSnapshot
+
+            if self.subject_type != "authorization_snapshot":
+                raise ValueError("authorization observation subject_type must be authorization_snapshot")
+            snapshot = AuthorizationSnapshot.model_validate((self.payload or {}).get("snapshot"), strict=False)
+            if snapshot.snapshot_id != self.subject_id:
+                raise ValueError("authorization observation subject must identify payload snapshot")
+            if self.kind != "authorization.evaluated":
+                expected_kind = f"authorization.{snapshot.decision}"
+                if self.kind != expected_kind:
+                    raise ValueError("authorization observation kind does not match snapshot decision")
+        elif self.kind.startswith("effect."):
+            from ansich.safety import ToolEffect
+
+            if self.subject_type != "effect":
+                raise ValueError("effect observation subject_type must be effect")
+            effect = ToolEffect.model_validate((self.payload or {}).get("effect"), strict=False)
+            if effect.effect_id != self.subject_id:
+                raise ValueError("effect observation subject must identify payload effect")
+            if self.kind != f"effect.{effect.phase}":
+                raise ValueError("effect observation kind does not match effect phase")
         if self.kind == "task.heartbeat":
             payload = self.payload or {}
             elapsed_ms = payload.get("elapsed_ms")
