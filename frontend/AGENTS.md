@@ -87,8 +87,28 @@ a collapsible Task tree to Overview, local/inclusive Usage scope selection and a
 source-Task breakdown to Budgets, and child producer links in Context lineage.
 History requests `root_only=true` so delegated children are discovered through
 their parent tree rather than duplicated as top-level history rows. These views
-must not derive end-user progress percentages or fake Step counts. Task detail has Overview,
-Budgets, Timeline, Steps, Context, and Agent Release tabs. Logical Steps fold
+must not derive end-user progress percentages or fake Step counts. **UI-1
+information architecture** (`ansich/docs/ansich-ui-information-architecture.md`):
+Task detail leads with a sticky hero (human-recognizable `actor · source_kind ·
+short-id`, control + duration + highest-priority signal; full UUID/source/resolver
+fold into Technical details) and a three-block diagnostic strip (current activity /
+why attention / impact) whose primary signal is a presentation selection over
+existing backend-resolved beliefs (`selectPrimarySignal`, not a new authority rule —
+the versioned resolver is UI-2). The seven flat tabs collapse into four
+question-oriented entry points with URL view state (`?view=summary|decision|resources|evidence`):
+Summary (diagnostic strip + Task tree), Decision trace (logical Steps), Resources &
+safety (Budgets + Scopes & effects), and Evidence (timeline + context & lineage +
+Agent release, all lazy/no-store). Projection health renders as a compact
+`Data healthy · lag` line promoted to a page-level banner on
+degraded/failed/lost-range/storage-unavailable; the full metric wall lives in the
+`System details` drawer. UUIDs on list rows and the hero downgrade to their leading
+8-char segment (`AnsichShortId`), full value behind copy/tooltip. Alert detail is
+ordered by action priority (summary → severity/workflow/active → impact → operator
+actions → why-triggered evidence → observation timeline) with rule/version/config
+hash/workflow history folded into Technical evidence. Deferred to UI-2+: the
+Operations authoritative Attention Queue, aggregate `operations/overview` /
+`diagnostic-summary` read models, the versioned primary-signal resolver, and the
+graphical causal trace. Logical Steps fold
 provider retries into attempts and render internal system operations separately;
 each ToolCall renders an ordered four-stage accountability chain (Issued,
 Authorization, Execution, Visible to model). Unknown authorization/execution is
