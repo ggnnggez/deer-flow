@@ -104,6 +104,7 @@ from ansich.contracts import (
 )
 from ansich.control import should_select_control_candidate
 from ansich.heartbeat import TaskHeartbeatView
+from ansich.jobs import FailedJobDetailView, FailedJobErrorView, FailedJobKind, FailedJobSummaryView
 from ansich.lineage import LineageDirection
 from ansich.operations import (
     ActiveStepView,
@@ -1064,6 +1065,117 @@ class SqlAnsichBackend:
         await self._refresh_failed_job_count()
         await self._refresh_context_metrics()
         return len(job_ids) + len(assessor_job_ids)
+
+    async def list_failed_jobs(
+        self,
+        *,
+        task_id: str | None = None,
+        limit: int = 100,
+    ) -> list[FailedJobSummaryView]:
+        async with self._session_factory() as session:
+            projection_stmt = (
+                select(
+                    AnsichProjectionJobRow.job_id,
+                    AnsichProjectionJobRow.projector_name,
+                    AnsichProjectionJobRow.projector_version,
+                    AnsichProjectionJobRow.status,
+                    AnsichProjectionJobRow.attempts,
+                    AnsichProjectionJobRow.last_error,
+                    AnsichProjectionJobRow.available_at,
+                    AnsichObservationRow.task_id,
+                )
+                .join(AnsichObservationRow, AnsichObservationRow.obs_id == AnsichProjectionJobRow.obs_id)
+                .where(AnsichProjectionJobRow.status == "failed")
+            )
+            if task_id is not None:
+                projection_stmt = projection_stmt.where(AnsichObservationRow.task_id == task_id)
+            projection_rows = (await session.execute(projection_stmt)).all()
+
+            assessor_stmt = select(
+                AnsichAssessorJobRow.job_id,
+                AnsichAssessorJobRow.assessor_name,
+                AnsichAssessorJobRow.assessor_version,
+                AnsichAssessorJobRow.status,
+                AnsichAssessorJobRow.attempts,
+                AnsichAssessorJobRow.last_error,
+                AnsichAssessorJobRow.available_at,
+                AnsichAssessorJobRow.subject_id,
+            ).where(AnsichAssessorJobRow.status == "failed")
+            if task_id is not None:
+                assessor_stmt = assessor_stmt.where(AnsichAssessorJobRow.subject_id == task_id)
+            assessor_rows = (await session.execute(assessor_stmt)).all()
+
+        summaries = [
+            FailedJobSummaryView(
+                job_id=row.job_id,
+                kind="projection",
+                name=row.projector_name,
+                version=row.projector_version,
+                task_id=row.task_id,
+                status=row.status,
+                attempts=row.attempts,
+                last_error=row.last_error,
+                available_at=row.available_at,
+            )
+            for row in projection_rows
+        ] + [
+            FailedJobSummaryView(
+                job_id=row.job_id,
+                kind="assessor",
+                name=row.assessor_name,
+                version=row.assessor_version,
+                task_id=row.subject_id,
+                status=row.status,
+                attempts=row.attempts,
+                last_error=row.last_error,
+                available_at=row.available_at,
+            )
+            for row in assessor_rows
+        ]
+        summaries.sort(key=lambda item: (item.available_at, item.job_id), reverse=True)
+        return summaries[:limit]
+
+    async def get_failed_job_detail(
+        self,
+        *,
+        job_id: str,
+        kind: FailedJobKind,
+    ) -> FailedJobDetailView | None:
+        async with self._session_factory() as session:
+            if kind == "projection":
+                job = await session.get(AnsichProjectionJobRow, job_id)
+                if job is None:
+                    return None
+                job_task_id = await session.scalar(select(AnsichObservationRow.task_id).where(AnsichObservationRow.obs_id == job.obs_id))
+                name, version = job.projector_name, job.projector_version
+                error_rows = (await session.execute(select(AnsichProjectionErrorRow).where(AnsichProjectionErrorRow.job_id == job_id).order_by(AnsichProjectionErrorRow.occurred_at))).scalars()
+            else:
+                job = await session.get(AnsichAssessorJobRow, job_id)
+                if job is None:
+                    return None
+                job_task_id = job.subject_id
+                name, version = job.assessor_name, job.assessor_version
+                error_rows = (await session.execute(select(AnsichAssessorErrorRow).where(AnsichAssessorErrorRow.job_id == job_id).order_by(AnsichAssessorErrorRow.occurred_at))).scalars()
+            return FailedJobDetailView(
+                job_id=job.job_id,
+                kind=kind,
+                name=name,
+                version=version,
+                task_id=job_task_id,
+                status=job.status,
+                attempts=job.attempts,
+                last_error=job.last_error,
+                available_at=job.available_at,
+                errors=tuple(
+                    FailedJobErrorView(
+                        attempt=error.attempt,
+                        error_type=error.error_type,
+                        message=error.message,
+                        occurred_at=error.occurred_at,
+                    )
+                    for error in error_rows
+                ),
+            )
 
     async def _claim_projection_job(
         self,

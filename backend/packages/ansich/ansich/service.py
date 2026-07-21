@@ -14,6 +14,7 @@ from ansich.compression import ContextCompressionSummaryView, ContextCompression
 from ansich.context_state import ContextStateView
 from ansich.contracts import AnsichHealth, ControlValue, FlushResult, LostRange, ObservationEnvelope, Producer, RecordReceipt, TaskLifecycleScope, TaskView
 from ansich.heartbeat import TaskHeartbeatView
+from ansich.jobs import FailedJobDetailView, FailedJobKind, FailedJobSummaryView
 from ansich.lineage import ContentLineageView, LineageDirection, PossibleExposureView, find_possible_exposures, traverse_content_lineage
 from ansich.memory import InMemoryAnsichBackend
 from ansich.operations import ActiveStepView, ActiveTaskView, HeartbeatBelief
@@ -846,6 +847,28 @@ class AnsichService:
             return int(await retry_failed(task_id=task_id))
         async with projection_lock:
             return int(await retry_failed(task_id=task_id))
+
+    async def list_failed_jobs(
+        self,
+        *,
+        task_id: str | None = None,
+        limit: int = 100,
+    ) -> list[FailedJobSummaryView]:
+        list_failed = getattr(self._backend, "list_failed_jobs", None)
+        if not callable(list_failed):
+            return []
+        return list(await list_failed(task_id=task_id, limit=limit))
+
+    async def get_failed_job_detail(
+        self,
+        *,
+        job_id: str,
+        kind: FailedJobKind,
+    ) -> FailedJobDetailView | None:
+        get_detail = getattr(self._backend, "get_failed_job_detail", None)
+        if not callable(get_detail):
+            return None
+        return await get_detail(job_id=job_id, kind=kind)
 
     async def stop(self) -> None:
         if not self._running:
