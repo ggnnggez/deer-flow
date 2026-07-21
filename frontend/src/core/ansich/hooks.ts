@@ -12,6 +12,8 @@ import {
   compareAnsichAgentReleases,
   fetchAnsichAlert,
   fetchAnsichAlerts,
+  fetchAnsichFailedJobDetail,
+  fetchAnsichFailedJobs,
   fetchAnsichStepContext,
   fetchAnsichActiveTasks,
   fetchAnsichAgentReleases,
@@ -27,11 +29,13 @@ import {
   fetchAnsichTaskScopes,
   fetchAnsichToolAuthorization,
   fetchAnsichToolEffects,
+  retryAnsichFailedJobs,
 } from "./api";
 import type {
   AnsichActiveTaskListResponse,
   AnsichAlertListResponse,
   AnsichContextCompressionListResponse,
+  AnsichFailedJobKind,
   AnsichTaskLifecycleScope,
   AnsichTaskListResponse,
   AnsichTaskAgentReleaseResponse,
@@ -146,6 +150,57 @@ export function useAnsichAlertWorkflow() {
         queryClient.invalidateQueries({
           queryKey: ["ansich", "operations", "alerts", input.alertId],
         }),
+      ]);
+    },
+  });
+}
+
+export function useAnsichFailedJobs(
+  taskId: string | undefined,
+  limit = 100,
+  enabled = true,
+) {
+  return useQuery({
+    queryKey: [
+      "ansich",
+      "operations",
+      "failed-jobs",
+      taskId ?? null,
+      { limit },
+    ],
+    queryFn: () => fetchAnsichFailedJobs(taskId, limit),
+    enabled,
+    retry: false,
+  });
+}
+
+export function useAnsichFailedJobDetail(
+  jobId: string,
+  kind: AnsichFailedJobKind,
+  enabled = true,
+) {
+  return useQuery({
+    queryKey: ["ansich", "operations", "failed-jobs", jobId, kind],
+    queryFn: () => fetchAnsichFailedJobDetail(jobId, kind),
+    enabled: enabled && Boolean(jobId),
+    retry: false,
+  });
+}
+
+export function useAnsichRetryFailedJobs() {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: (input: { taskId?: string }) =>
+      retryAnsichFailedJobs(input.taskId),
+    onSettled: async () => {
+      await Promise.all([
+        queryClient.invalidateQueries({
+          queryKey: ["ansich", "operations", "failed-jobs"],
+        }),
+        queryClient.invalidateQueries({
+          queryKey: ["ansich", "operations", "active-tasks"],
+        }),
+        queryClient.invalidateQueries({ queryKey: ["ansich", "tasks"] }),
       ]);
     },
   });
