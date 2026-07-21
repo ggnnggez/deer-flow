@@ -2313,6 +2313,10 @@ class SqlAnsichBackend:
                     discovered_obs_id=alert.evidence[0].obs_id,
                 )
             )
+            # No ORM relationship() links AnsichEntityRow to AnsichAlertRow,
+            # so SQLAlchemy's flush does not guarantee this INSERT precedes
+            # the FK-dependent one below; flush explicitly to enforce order.
+            await session.flush()
             row = AnsichAlertRow(
                 entity_id=alert.alert_id,
                 alert_key=alert.alert_key,
@@ -2336,6 +2340,10 @@ class SqlAnsichBackend:
                 dismissal_reason=alert.dismissal_reason,
             )
             session.add(row)
+            # AnsichAlertEvidenceRow.alert_id has no ORM relationship() back
+            # to AnsichAlertRow either, so the evidence inserts below are not
+            # guaranteed to be ordered after this row's INSERT; flush first.
+            await session.flush()
         else:
             row.source_assertion_id = alert.source_assertion_id
             row.rule_name = alert.rule.name
@@ -5266,6 +5274,10 @@ class SqlAnsichBackend:
                     discovered_obs_id=observation.obs_id,
                 )
             )
+            # No ORM relationship() links AnsichEntityRow to AnsichTaskRow, so
+            # SQLAlchemy's flush does not guarantee this INSERT precedes the
+            # FK-dependent one below; flush explicitly to enforce the order.
+            await session.flush()
         if task is None:
             task = AnsichTaskRow(
                 entity_id=observation.task_id,
@@ -5467,6 +5479,11 @@ class SqlAnsichBackend:
                         body=manifest_bytes,
                     )
                 )
+                # No ORM relationship() links AnsichPayloadRow to
+                # AnsichAgentReleaseRow, so SQLAlchemy's flush does not
+                # guarantee this INSERT precedes the FK-dependent one below;
+                # flush explicitly to enforce the order.
+                await session.flush()
             elif manifest_payload.body != manifest_bytes:
                 raise ValueError("AgentRelease manifest payload is immutable")
             row = AnsichAgentReleaseRow(
@@ -7100,6 +7117,10 @@ class SqlAnsichBackend:
                     discovered_obs_id=observation.obs_id,
                 )
             )
+            # No ORM relationship() links AnsichEntityRow to AnsichScopeRow, so
+            # SQLAlchemy's flush does not guarantee this INSERT precedes the
+            # FK-dependent one below; flush explicitly to enforce the order.
+            await session.flush()
         if row is None:
             row = AnsichScopeRow(
                 entity_id=scope.scope_id,
@@ -7202,6 +7223,12 @@ class SqlAnsichBackend:
                     discovered_obs_id=observation.obs_id,
                 )
             )
+            # No ORM relationship() links AnsichEntityRow to
+            # AnsichAuthorizationSnapshotRow, so SQLAlchemy's flush does not
+            # guarantee this INSERT precedes the FK-dependent one below;
+            # flush explicitly to enforce the order (see root-cause note in
+            # ansich/docs/plans/human-followups.md).
+            await session.flush()
         if row is None:
             row = AnsichAuthorizationSnapshotRow(
                 snapshot_id=snapshot.snapshot_id,
@@ -7320,6 +7347,11 @@ class SqlAnsichBackend:
                     discovered_obs_id=observation.obs_id,
                 )
             )
+            # No ORM relationship() links AnsichEntityRow to
+            # AnsichToolEffectRow, so SQLAlchemy's flush does not guarantee
+            # this INSERT precedes the FK-dependent one below; flush
+            # explicitly to enforce the order.
+            await session.flush()
         effect_value = (
             effect.tool_call_id,
             effect.effect_class,
