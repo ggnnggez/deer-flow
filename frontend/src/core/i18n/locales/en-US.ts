@@ -656,6 +656,7 @@ export const enUS: Translations = {
       failed: "Failed",
       stopped: "Stopped",
     },
+    active: "Active",
     technicalEvidence: "Technical evidence",
     technicalDetails: "Technical details",
     systemDetails: "System details",

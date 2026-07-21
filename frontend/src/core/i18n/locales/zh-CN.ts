@@ -636,6 +636,7 @@ export const zhCN: Translations = {
       failed: "失败",
       stopped: "已停止",
     },
+    active: "活跃",
     technicalEvidence: "技术证据",
     technicalDetails: "技术详情",
     systemDetails: "系统详情",

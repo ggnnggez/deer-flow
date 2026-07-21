@@ -555,6 +555,7 @@ export interface Translations {
       failed: string;
       stopped: string;
     };
+    active: string;
     technicalEvidence: string;
     technicalDetails: string;
     systemDetails: string;

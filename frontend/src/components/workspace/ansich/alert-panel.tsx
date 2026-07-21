@@ -34,6 +34,7 @@ import type {
 import { useI18n } from "@/core/i18n/hooks";
 
 import { AnsichObservationTimeline } from "./observation-timeline";
+import { AnsichTechnicalEvidence } from "./technical-evidence";
 
 type AlertAction = "acknowledge" | "dismiss" | "interrupt" | "rollback";
 
@@ -231,65 +232,30 @@ function AlertDetailDialog({
             </Alert>
           ) : detail ? (
             <div className="space-y-6">
-              <div className="grid gap-3 rounded-lg border p-4 text-sm sm:grid-cols-2 lg:grid-cols-3">
-                <DetailField
-                  label={t.ansich.alertType}
-                  value={t.ansich.alertTypeLabel[detail.alert.alert_type]}
-                />
-                <DetailField
-                  label={t.ansich.category}
-                  value={
-                    t.ansich.alertCategory[
-                      getAlertPresentationCategory(detail.alert.alert_type)
-                    ]
-                  }
-                />
-                <DetailField
-                  label={t.ansich.workflow}
-                  value={t.ansich.alertWorkflow[detail.alert.workflow_state]}
-                />
-                <DetailField
-                  label={t.ansich.severity}
-                  value={t.ansich.alertSeverity[detail.alert.severity]}
-                />
-                <DetailField
-                  label={t.ansich.episode}
-                  value={String(detail.alert.episode)}
-                />
-                <DetailField
-                  label={t.ansich.evidenceCount}
-                  value={String(detail.alert.evidence_count)}
-                />
-                <DetailField
-                  label={t.ansich.rule}
-                  value={`${detail.alert.rule.name}@${detail.alert.rule.version}`}
-                  mono
-                />
-                <DetailField
-                  label={t.ansich.configHash}
-                  value={detail.alert.rule_config_hash}
-                  mono
-                />
-                <DetailField
-                  label={t.ansich.asOf}
-                  value={formatAnsichTimestamp(detail.alert.as_of, locale)}
-                />
-                {detail.alert.resolution_reason ? (
-                  <DetailField
-                    label={t.ansich.resolutionReason}
-                    value={detail.alert.resolution_reason}
-                  />
-                ) : null}
-                {detail.alert.dismissal_reason ? (
-                  <DetailField
-                    label={t.ansich.dismissalReason}
-                    value={detail.alert.dismissal_reason}
-                  />
-                ) : null}
+              {/* 1. Event summary + 2. severity / workflow / active */}
+              <div className="space-y-2">
+                <h3 className="text-base font-semibold">
+                  {t.ansich.alertTypeLabel[detail.alert.alert_type]}
+                </h3>
+                <div className="flex flex-wrap items-center gap-2">
+                  <AlertSeverityBadge severity={detail.alert.severity} />
+                  <Badge variant="outline">
+                    {t.ansich.alertWorkflow[detail.alert.workflow_state]}
+                  </Badge>
+                  {detail.alert.workflow_state === "open" ? (
+                    <Badge
+                      variant="outline"
+                      className="border-blue-500/40 bg-blue-500/10 text-blue-700 dark:text-blue-300"
+                    >
+                      {t.ansich.active}
+                    </Badge>
+                  ) : null}
+                </div>
               </div>
 
-              <div className="flex flex-wrap gap-2">
-                <Button variant="outline" asChild>
+              {/* 3. impact / current activity — the owning Task */}
+              <div className="flex flex-wrap items-center gap-2">
+                <Button variant="outline" size="sm" asChild>
                   <Link
                     href={`/workspace/ansich/tasks/${encodeURIComponent(detail.alert.subject_id)}`}
                   >
@@ -297,9 +263,11 @@ function AlertDetailDialog({
                     <ExternalLinkIcon />
                   </Link>
                 </Button>
+                {/* 4. operator actions */}
                 {detail.available_actions.map((action) => (
                   <Button
                     key={action}
+                    size="sm"
                     variant={action === "rollback" ? "destructive" : "outline"}
                     disabled={mutationPending}
                     onClick={() => selectAction(action)}
@@ -309,50 +277,105 @@ function AlertDetailDialog({
                 ))}
               </div>
 
+              {/* 5. why it triggered — source belief */}
               <BeliefSection
                 title={t.ansich.sourceBelief}
                 beliefs={[detail.source_belief]}
               />
-              <BeliefSection
-                title={t.ansich.currentBehavior}
-                beliefs={detail.current_beliefs.filter(
-                  (belief) => belief.field_name === "behavior",
-                )}
-              />
 
+              {/* 6. observation timeline */}
               <section className="space-y-3">
                 <h3 className="font-semibold">{t.ansich.evidence}</h3>
                 <AnsichObservationTimeline observations={detail.evidence} />
               </section>
 
-              <section className="space-y-3">
-                <h3 className="font-semibold">{t.ansich.workflowHistory}</h3>
-                {detail.workflow_history.length ? (
-                  <ol className="space-y-2">
-                    {detail.workflow_history.map((event) => (
-                      <li
-                        key={event.event_id}
-                        className="grid gap-2 rounded-lg border p-3 text-sm sm:grid-cols-[1fr_auto]"
-                      >
-                        <span>
-                          {event.action}:{" "}
-                          {t.ansich.alertWorkflow[event.from_state]} →{" "}
-                          {t.ansich.alertWorkflow[event.to_state]}
-                          {event.reason ? ` · ${event.reason}` : ""}
-                        </span>
-                        <span className="text-muted-foreground text-xs">
-                          {event.operator_id
-                            ? `${t.ansich.operator}: ${event.operator_id} · `
-                            : ""}
-                          {formatAnsichTimestamp(event.occurred_at, locale)}
-                        </span>
-                      </li>
-                    ))}
-                  </ol>
-                ) : (
-                  <div className="text-muted-foreground text-sm">—</div>
-                )}
-              </section>
+              {/* 7. rule / version / config hash / workflow history — folded */}
+              <AnsichTechnicalEvidence>
+                <div className="space-y-6">
+                  <div className="grid gap-3 rounded-lg border p-4 text-sm sm:grid-cols-2 lg:grid-cols-3">
+                    <DetailField
+                      label={t.ansich.category}
+                      value={
+                        t.ansich.alertCategory[
+                          getAlertPresentationCategory(detail.alert.alert_type)
+                        ]
+                      }
+                    />
+                    <DetailField
+                      label={t.ansich.episode}
+                      value={String(detail.alert.episode)}
+                    />
+                    <DetailField
+                      label={t.ansich.evidenceCount}
+                      value={String(detail.alert.evidence_count)}
+                    />
+                    <DetailField
+                      label={t.ansich.rule}
+                      value={`${detail.alert.rule.name}@${detail.alert.rule.version}`}
+                      mono
+                    />
+                    <DetailField
+                      label={t.ansich.configHash}
+                      value={detail.alert.rule_config_hash}
+                      mono
+                    />
+                    <DetailField
+                      label={t.ansich.asOf}
+                      value={formatAnsichTimestamp(detail.alert.as_of, locale)}
+                    />
+                    {detail.alert.resolution_reason ? (
+                      <DetailField
+                        label={t.ansich.resolutionReason}
+                        value={detail.alert.resolution_reason}
+                      />
+                    ) : null}
+                    {detail.alert.dismissal_reason ? (
+                      <DetailField
+                        label={t.ansich.dismissalReason}
+                        value={detail.alert.dismissal_reason}
+                      />
+                    ) : null}
+                  </div>
+
+                  <BeliefSection
+                    title={t.ansich.currentBehavior}
+                    beliefs={detail.current_beliefs.filter(
+                      (belief) => belief.field_name === "behavior",
+                    )}
+                  />
+
+                  <section className="space-y-3">
+                    <h3 className="font-semibold">
+                      {t.ansich.workflowHistory}
+                    </h3>
+                    {detail.workflow_history.length ? (
+                      <ol className="space-y-2">
+                        {detail.workflow_history.map((event) => (
+                          <li
+                            key={event.event_id}
+                            className="grid gap-2 rounded-lg border p-3 text-sm sm:grid-cols-[1fr_auto]"
+                          >
+                            <span>
+                              {event.action}:{" "}
+                              {t.ansich.alertWorkflow[event.from_state]} →{" "}
+                              {t.ansich.alertWorkflow[event.to_state]}
+                              {event.reason ? ` · ${event.reason}` : ""}
+                            </span>
+                            <span className="text-muted-foreground text-xs">
+                              {event.operator_id
+                                ? `${t.ansich.operator}: ${event.operator_id} · `
+                                : ""}
+                              {formatAnsichTimestamp(event.occurred_at, locale)}
+                            </span>
+                          </li>
+                        ))}
+                      </ol>
+                    ) : (
+                      <div className="text-muted-foreground text-sm">—</div>
+                    )}
+                  </section>
+                </div>
+              </AnsichTechnicalEvidence>
             </div>
           ) : null}
         </DialogContent>
