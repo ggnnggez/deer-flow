@@ -21,6 +21,7 @@
 - Phase 6 代码评审的跟进项登记在 [phase-6-review-followups.md](phase-6-review-followups.md)；L3（wall_time 覆盖语义）已由 `b910ba82` 修复，M1（assessor job 合并）与 L1（对账读放大）已由 `4f5ec989` 修复；L4 已由 `0a38a96d` 明确延后到 Phase 11 并隐藏未生产类型。Phase 7 开工前置项已清；L2（孤儿 requested action 回收）仍按原归属留到 Phase 11 前。
 - Phase 7 代码评审的跟进项登记在 [phase-7-review-followups.md](phase-7-review-followups.md)；M2（coalescing 测试套件级 flaky）已由 `e91d9f1c`/`4e5eb0fd` 修复并隔离 SQL 集成测试 settle 时序，M1（drift 裸名判定）已由 `08cd6b1c` 修复，M3（policy manifest 契约化）已由 `256d2c91` 修复，L2（descriptor 私有通道回归）已随 Phase 8 的显式 assembly/context 通道由 `79cd13b1` 完成；L1（二线 credential validator）已于 Phase 9 开工前随本次提交完成。
 - Phase 8 代码评审的跟进项登记在 [phase-8-review-followups.md](phase-8-review-followups.md)；M1（wall_time 双写者）与 M2（heartbeat contribution 写/读放大）均归属 Phase 11 前的 wall_time 通道治理,L1（吞 CancelledError）与 L2（tree N+1）随相关路径下次改动顺带处理,均不阻塞 Phase 9 开工。
+- 非评审来源的人工发现跟进项登记在 [human-followups.md](human-followups.md)；各项附施工时机评估（D1 概念词汇表立即做，U3 failed-jobs 下钻与 U4 compression 执行时机可随 Phase 9 提前，U1/U2/A1 分别归属 Phase 10 后与 Phase 11），每个 Phase 开工前复查该文件。
 
 ## 固定实现边界
 

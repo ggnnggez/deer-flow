@@ -1,5 +1,8 @@
 # Ansich — DeerFlow Agent Observability System Design (v0.2 Draft)
 
+For structural (class/component) diagrams of the implementation described here, see
+[ansich-architecture-uml.md](ansich-architecture-uml.md).
+
 ---
 
 ## 0. Purpose, Scope, and Status
