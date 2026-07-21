@@ -2,7 +2,7 @@ import { ChevronRightIcon } from "lucide-react";
 import Link from "next/link";
 
 import { Badge } from "@/components/ui/badge";
-import { formatDuration } from "@/core/ansich/presentation";
+import { formatDuration, shortId } from "@/core/ansich/presentation";
 import type {
   AnsichActiveTask,
   AnsichBudgetHealthBelief,
@@ -40,10 +40,14 @@ export function AnsichActiveTaskRow({ task }: { task: AnsichActiveTask }) {
     >
       <div className="min-w-0 space-y-1">
         <div className="truncate font-mono text-sm" title={task.task_id}>
-          {task.task_id}
+          {shortId(task.task_id)}
         </div>
-        <div className="text-muted-foreground truncate text-xs">
-          {task.owner_id ?? t.ansich.evidenceInsufficient} · {task.run_id}
+        <div
+          className="text-muted-foreground truncate text-xs"
+          title={task.run_id}
+        >
+          {task.owner_id ?? t.ansich.evidenceInsufficient} ·{" "}
+          {shortId(task.run_id)}
         </div>
       </div>
       <div className="min-w-0">

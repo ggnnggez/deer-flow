@@ -1,7 +1,7 @@
 import { ChevronRightIcon } from "lucide-react";
 import Link from "next/link";
 
-import { formatAnsichTimestamp } from "@/core/ansich/presentation";
+import { formatAnsichTimestamp, shortId } from "@/core/ansich/presentation";
 import type { AnsichTask } from "@/core/ansich/types";
 import { useI18n } from "@/core/i18n/hooks";
 
@@ -20,7 +20,7 @@ export function AnsichTaskRow({ task }: { task: AnsichTask }) {
           {t.ansich.task}
         </div>
         <div className="truncate font-mono text-sm" title={task.task_id}>
-          {task.task_id}
+          {shortId(task.task_id)}
         </div>
       </div>
       <div className="min-w-0">
