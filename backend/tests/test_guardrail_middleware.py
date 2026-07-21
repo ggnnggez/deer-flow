@@ -8,6 +8,7 @@ from unittest.mock import MagicMock
 import pytest
 from langgraph.errors import GraphBubbleUp
 
+from deerflow.authz.outcome import pop_authorization_outcome
 from deerflow.guardrails.builtin import AllowlistProvider
 from deerflow.guardrails.middleware import GuardrailMiddleware
 from deerflow.guardrails.provider import GuardrailDecision, GuardrailReason, GuardrailRequest
@@ -723,3 +724,46 @@ class TestGuardrailsConfig:
             assert config.enabled is True
         finally:
             reset_guardrails_config()
+
+
+class TestGuardrailWritesAuthorizationOutcome:
+    def test_allow_writes_allowed_outcome_with_policy_identity(self):
+        mw = GuardrailMiddleware(_AllowAllProvider())
+        req = _make_tool_call_request(call_id="c1")
+        mw.wrap_tool_call(req, MagicMock())
+        outcome = pop_authorization_outcome(req.runtime.context, "c1")
+        assert outcome is not None
+        assert outcome.decision == "allowed"
+        assert outcome.reason_codes == ("oap.allowed",)
+        assert outcome.policy_id  # non-empty resolved identity
+        assert outcome.details_available is False
+        assert outcome.effective_permissions == ()
+
+    def test_deny_writes_denied_outcome_with_real_policy_id(self):
+        mw = GuardrailMiddleware(_DenyAllProvider())
+        req = _make_tool_call_request(call_id="c2")
+        mw.wrap_tool_call(req, MagicMock())
+        outcome = pop_authorization_outcome(req.runtime.context, "c2")
+        assert outcome is not None
+        assert outcome.decision == "denied"
+        assert outcome.policy_id == "test.deny.v1"
+        assert "oap.denied" in outcome.reason_codes
+
+    def test_fail_closed_provider_error_writes_denied_outcome(self):
+        mw = GuardrailMiddleware(_ExplodingProvider(), fail_closed=True)
+        req = _make_tool_call_request(call_id="c3")
+        mw.wrap_tool_call(req, MagicMock())
+        outcome = pop_authorization_outcome(req.runtime.context, "c3")
+        assert outcome is not None and outcome.decision == "denied"
+        assert "oap.evaluator_error" in outcome.reason_codes
+
+    def test_async_allow_writes_allowed_outcome(self):
+        mw = GuardrailMiddleware(_AllowAllProvider())
+        req = _make_tool_call_request(call_id="c4")
+
+        async def handler(_req):
+            return MagicMock()
+
+        asyncio.run(mw.awrap_tool_call(req, handler))
+        outcome = pop_authorization_outcome(req.runtime.context, "c4")
+        assert outcome is not None and outcome.decision == "allowed"

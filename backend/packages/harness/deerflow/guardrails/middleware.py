@@ -12,6 +12,7 @@ from langgraph.errors import GraphBubbleUp
 from langgraph.prebuilt.tool_node import ToolCallRequest
 from langgraph.types import Command
 
+from deerflow.authz.outcome import AuthorizationOutcome, put_authorization_outcome
 from deerflow.authz.principal import normalize_authz_attributes
 from deerflow.guardrails.provider import GuardrailDecision, GuardrailProvider, GuardrailReason, GuardrailRequest
 
@@ -91,6 +92,21 @@ class GuardrailMiddleware(AgentMiddleware[AgentState]):
             status="error",
         )
 
+    def _build_authorization_outcome(self, decision: GuardrailDecision) -> AuthorizationOutcome:
+        params = self.release_policy_parameters()
+        policy = params.get("policy", {}) if isinstance(params, dict) else {}
+        policy_id = decision.policy_id or str(policy.get("id") or "unknown")
+        policy_version = str(policy.get("version") or "unknown")
+        reason_codes = tuple(reason.code for reason in decision.reasons if reason.code)
+        return AuthorizationOutcome(
+            decision="allowed" if decision.allow else "denied",
+            policy_id=policy_id,
+            policy_version=policy_version,
+            reason_codes=reason_codes,
+            details_available=False,
+            effective_permissions=(),
+        )
+
     def _record_guardrail_event(
         self,
         context: dict,
@@ -165,6 +181,7 @@ class GuardrailMiddleware(AgentMiddleware[AgentState]):
                     action="deny_tool_call",
                     provider_error=True,
                 )
+                put_authorization_outcome(context, request.tool_call.get("id"), self._build_authorization_outcome(decision))
                 return self._build_denied_message(request, decision)
             else:
                 decision = GuardrailDecision(allow=True, reasons=[GuardrailReason(code="oap.evaluator_error", message="guardrail provider error (fail-open)")])
@@ -175,7 +192,9 @@ class GuardrailMiddleware(AgentMiddleware[AgentState]):
                     action="allow_tool_call_after_provider_error",
                     provider_error=True,
                 )
+                put_authorization_outcome(context, request.tool_call.get("id"), self._build_authorization_outcome(decision))
                 return handler(request)
+        put_authorization_outcome(context, request.tool_call.get("id"), self._build_authorization_outcome(decision))
         if not decision.allow:
             logger.warning("Guardrail denied: tool=%s policy=%s code=%s", gr.tool_name, decision.policy_id, decision.reasons[0].code if decision.reasons else "unknown")
             self._record_guardrail_event(
@@ -212,6 +231,7 @@ class GuardrailMiddleware(AgentMiddleware[AgentState]):
                     action="deny_tool_call",
                     provider_error=True,
                 )
+                put_authorization_outcome(context, request.tool_call.get("id"), self._build_authorization_outcome(decision))
                 return self._build_denied_message(request, decision)
             else:
                 decision = GuardrailDecision(allow=True, reasons=[GuardrailReason(code="oap.evaluator_error", message="guardrail provider error (fail-open)")])
@@ -222,7 +242,9 @@ class GuardrailMiddleware(AgentMiddleware[AgentState]):
                     action="allow_tool_call_after_provider_error",
                     provider_error=True,
                 )
+                put_authorization_outcome(context, request.tool_call.get("id"), self._build_authorization_outcome(decision))
                 return await handler(request)
+        put_authorization_outcome(context, request.tool_call.get("id"), self._build_authorization_outcome(decision))
         if not decision.allow:
             logger.warning("Guardrail denied: tool=%s policy=%s code=%s", gr.tool_name, decision.policy_id, decision.reasons[0].code if decision.reasons else "unknown")
             self._record_guardrail_event(
