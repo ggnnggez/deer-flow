@@ -815,10 +815,11 @@ test("admin navigates from Ansich operations to evidence-backed Task detail", as
   await page.getByRole("link", { name: "Ansich" }).click();
   await page.waitForURL("**/workspace/ansich/operations");
   await expect(page.getByRole("heading", { name: "Operations" })).toBeVisible();
-  await expect(
-    page.getByText("Healthy", { exact: true }).first(),
-  ).toBeVisible();
+  // Projection health is a compact line; the full metric wall is in the drawer.
+  await expect(page.getByText("Data healthy")).toBeVisible();
+  await page.getByRole("button", { name: "System details" }).first().click();
   await expect(page.getByText("Queue bytes", { exact: true })).toBeVisible();
+  await page.keyboard.press("Escape");
   await page.getByRole("link", { name: new RegExp(SHORT_TASK_ID) }).click();
 
   await page.waitForURL(`**/workspace/ansich/tasks/${TASK_ID}`);
