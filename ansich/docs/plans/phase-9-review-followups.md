@@ -6,7 +6,7 @@
 
 | 编号 | 摘要 | 状态 | 修复时间 | Commit |
 | ---- | ---- | ---- | -------- | ------ |
-| H1 | AuthorizationSnapshot 不反映任何真实授权系统:`policy_id`/`policy_version` 硬编码常量,`decision` 只有 `allowed`/`denied` 两个值,`unknown` 在生产路径上永不产生 | ⬜ 未修复 | — | — |
+| H1 | AuthorizationSnapshot 不反映任何真实授权系统:`policy_id`/`policy_version` 硬编码常量,`decision` 只有 `allowed`/`denied` 两个值,`unknown` 在生产路径上永不产生 | ✅ 已修复 | 2026-07-21 | `fa1e0ae7`/`90db5180`/`52594604` |
 | H2 | raw 结果终态为 `tool.failed`/`tool.timed_out`/`tool.cancelled` 时,observed effect 仍无条件以 `fidelity_class="hard"` 记录 | ⬜ 未修复 | — | — |
 | M1 | `_effect_class` 分类法缺 `filesystem_delete`/`permission_change`(bash `rm`、chmod 等无法归类为专属 effect class) | ⬜ 未修复 | — | — |
 | M2 | scope-safety assessor 每次触发都重扫任务全部 Scope 证据并重新评估每个 tool_call,而各 tool_call 结论本互相独立 | ⬜ 未修复 | — | — |
@@ -15,7 +15,8 @@
 
 ## H1. AuthorizationSnapshot 不反映任何真实授权系统
 
-- 状态:⬜ 未修复。
+- 状态:✅ 已修复(2026-07-21,`fa1e0ae7`/`90db5180`/`52594604`)。新增中立契约 `deerflow.authz.outcome`(`AuthorizationOutcome` + `__`前缀 context key `__authorization_outcome`):`GuardrailMiddleware` 在 allow/deny/provider-error 各分支于 `handler`/denied 之前把真实决策(`policy_id`/`policy_version`/`decision`/`reason_codes`)写入 `runtime.context`,Ansich 两个探针(raw 的 `_record_started`、visible 的 `not started` 短路)pop-on-read 消费并据此构造 snapshot。**无真实授权层时(guardrails 关闭或未对该 tool 求值)记 `decision="unknown"`**——首次让 `unknown` 走进生产路径,并消除「ReadBeforeWrite/ToolProgress 等非授权短路被冒充成 `policy_denial`」的假阳性。`details_available` 仍恒 `false`、`effective_permissions` 仍为空(`GuardrailDecision` 不暴露结构化权限,符合计划 §3;结构化权限留给接入真实 authz adapter 时扩展)。回归覆盖:`tests/test_authorization_outcome.py`、`tests/test_guardrail_middleware.py::TestGuardrailWritesAuthorizationOutcome`、`tests/ansich/test_execution_context.py`(真实 allowed/denied、无授权 unknown、放行但被下游拦截仍记 allowed)、`tests/ansich/test_scope_safety_assessment.py`(unknown/allowed 不产 `policy_denial`)。
+- 原始诊断(留档):
 - 位置:`backend/packages/harness/deerflow/ansich/tool_middleware.py::_record_authorization`(tool_middleware.py:199-256)。`policy_id="deerflow-tool-middleware-chain"`、`policy_version="1"`、`details_available=False`、`effective_permissions=()` 在两个调用点(`_record_started` line 175-180 决策恒为 `"allowed"`;`AnsichVisibleToolMiddleware.wrap_tool_call` line 636-642 在 `not invocation.started` 时决策恒为 `"denied"`,`reason_code="short_circuited_before_callable"`)都是同一套硬编码常量,不读取任何真实授权来源。全仓库对 `deerflow.ansich` 下 import `GuardrailMiddleware`/`GuardrailRequest`/授权 adapter 的检索为空。
 - 现状:计划 §3 明确要求 snapshot 应"在 Tool decision/execution 前,从 `deerflow.authz.adapter/provider`、sandbox policy、MCP/tool allowlist 和 run context 构造"。但当前实现只用"是否到达真实 callable 边界"这一个二值信号推断 `decision`——即使中间件链里 `GuardrailMiddleware`(backend/AGENTS.md 中间件链 #9,`guardrails.enabled` 时启用)对同一次调用产生了真实的 policy id、reason、effective permissions 并返回 deny,Ansich 记录的仍是与之无关的合成 `policy_id`。`decision="unknown"` 虽然在 schema(`contracts.py`/`safety.py`)与 `scope_safety.py` 判定逻辑中都被支持,但在生产代码路径里从未被构造过(`grep decision="unknown"` 只命中 `test_scope_safety_assessment.py` 里手工构造的领域测试)。
 - 风险:运营者在 "Authorization" 面板或 `policy_denial`/`attempted_scope_violation` 告警里看到的 policy 身份是完全合成的、与实际生效的 RBAC/Guardrail 决策脱节;一旦后续接入真实 authz adapter(参考 `docs/plans/2026-07-10-pluggable-authorization-rfc.md`),现有 `policy_id`/`policy_hash` 历史数据将与新数据语义不可比。
@@ -74,7 +75,7 @@
 
 ## 计划测试矩阵缺口(随修复补齐)
 
-- H1:`decision="unknown"` 在生产代码路径(而非手工构造的领域测试)零覆盖;`tool_middleware.py` 新增记录函数没有独立于 `AnsichExecutionContext`/`AnsichService` 集成路径之外的单元测试文件。
+- ~~H1:`decision="unknown"` 在生产代码路径(而非手工构造的领域测试)零覆盖;`tool_middleware.py` 新增记录函数没有独立于 `AnsichExecutionContext`/`AnsichService` 集成路径之外的单元测试文件。~~ **已补齐(2026-07-21)**:`test_authorization_outcome.py` 独立单元覆盖桥接契约;`test_execution_context.py::test_raw_probe_records_unknown_when_no_guardrail_outcome` 让 `decision="unknown"` 首次在生产探针路径被断言。
 - H2:失败/超时/取消终态下具名工具(`write_file`/`bash` 等,而非 `_effect_class` 恒返回 `unknown` 的 `timeout_tool`)的 observed effect fidelity 零覆盖。
 - M1:`filesystem_delete`、`permission_change` 两个 effect class 零生产路径、零测试覆盖。
 - M2:贡献/证据数增长时 scope-safety 重估工作量不随任务历史线性增长——尚无性能护栏测试(参考 phase-6-review-followups.md M1 的 SQL 监听回归写法)。

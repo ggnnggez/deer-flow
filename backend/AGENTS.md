@@ -384,7 +384,14 @@ budget/sanitization. Ansich IDs plus `(step_id, call_seq)` are authoritative;
 provider IDs are non-unique lookup hints. Raw/visible result blocks are linked by
 typed derivations, terminal conflicts retain assertions and degrade Task
 observability, and worker-finally reconciliation writes `unknown_terminal`
-before the Task terminal. Task summaries count issued separately from executed,
+before the Task terminal. The authorization snapshot bridges the real
+`GuardrailMiddleware` decision (policy id/version/decision/reason codes) through
+the neutral `deerflow.authz.outcome` context contract (a `__`-prefixed per-run
+context key written by the guardrail and popped by the Ansich probes); when no
+authorization layer evaluated the call it records `decision="unknown"` with
+`details_available=false` rather than a synthetic allow/deny, so a non-authz
+short-circuit (ReadBeforeWrite/ToolProgress) is never mistaken for a policy
+denial. Task summaries count issued separately from executed,
 so denied or evidence-free calls never become successful execution. Restored
 workers hydrate persisted ToolCalls into the run context before continuing.
 Phase 4 freezes the exact message-occurrence inventory before summarization and
