@@ -555,6 +555,29 @@ export interface Translations {
       failed: string;
       stopped: string;
     };
+    technicalEvidence: string;
+    technicalDetails: string;
+    systemDetails: string;
+    dataHealthy: string;
+    copyTaskId: string;
+    currentActivity: string;
+    whyAttention: string;
+    impact: string;
+    childTasksCount: (count: string) => string;
+    viewSummary: string;
+    viewDecisionTrace: string;
+    viewResourcesSafety: string;
+    viewEvidence: string;
+    signal: {
+      behavior: string;
+      budgetExceeded: string;
+      scopeRealized: string;
+      scopeAttempted: string;
+      heartbeatStale: string;
+      observabilityDegraded: string;
+      budgetWarning: string;
+      healthy: string;
+    };
   };
 
   // Agents

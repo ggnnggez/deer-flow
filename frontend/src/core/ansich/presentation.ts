@@ -61,6 +61,83 @@ export function getBudgetPresentation(
   };
 }
 
+/**
+ * Shorten a UUID/hash to its leading segment for L1 display. The full value
+ * stays reachable via Copy / Technical details (IA §4.2 "downgrade, not delete").
+ */
+export function shortId(id: string, length = 8): string {
+  if (id.length <= length) return id;
+  return id.slice(0, length);
+}
+
+export type AnsichSignalSeverity = "critical" | "warning" | "info" | "none";
+
+export type AnsichPrimarySignalKind =
+  | "behavior"
+  | "budget"
+  | "scope"
+  | "heartbeat"
+  | "observability"
+  | "healthy";
+
+export interface AnsichPrimarySignal {
+  severity: AnsichSignalSeverity;
+  kind: AnsichPrimarySignalKind;
+}
+
+export interface PrimarySignalInputs {
+  behaviorState?: "runaway" | "normal" | "unknown" | null;
+  budgetHealth?: ReadonlyArray<{
+    value: "unknown" | "within" | "warning" | "exceeded";
+  }>;
+  scopeSafety?: { realizedViolation?: boolean; attemptedViolation?: boolean };
+  heartbeat?: "unknown" | "fresh" | "stale" | null;
+  observability?: "healthy" | "degraded";
+}
+
+/**
+ * Select the single primary signal to surface for a Task, by a fixed priority
+ * over signals that the backend has already resolved (IA §5.3). This is a
+ * presentation selection, NOT a new authority rule: it never invents severity,
+ * only ranks existing typed beliefs/health. UI-2 replaces it with a versioned
+ * backend resolver. Returns null when no usable evidence exists — the caller
+ * must render "Insufficient evidence", never a green healthy placeholder
+ * (IA §6.2 / §7.3).
+ */
+export function selectPrimarySignal(
+  inputs: PrimarySignalInputs,
+): AnsichPrimarySignal | null {
+  const budgets = inputs.budgetHealth ?? [];
+  const hasExceeded = budgets.some((item) => item.value === "exceeded");
+  const hasWarning = budgets.some((item) => item.value === "warning");
+
+  if (inputs.behaviorState === "runaway") {
+    return { severity: "critical", kind: "behavior" };
+  }
+  if (hasExceeded) return { severity: "critical", kind: "budget" };
+  if (inputs.scopeSafety?.realizedViolation) {
+    return { severity: "critical", kind: "scope" };
+  }
+  if (inputs.scopeSafety?.attemptedViolation) {
+    return { severity: "warning", kind: "scope" };
+  }
+  if (inputs.heartbeat === "stale") {
+    return { severity: "warning", kind: "heartbeat" };
+  }
+  if (inputs.observability === "degraded") {
+    return { severity: "warning", kind: "observability" };
+  }
+  if (hasWarning) return { severity: "warning", kind: "budget" };
+
+  // Healthy requires positive evidence; unknown/missing is not healthy.
+  const positiveEvidence =
+    budgets.some((item) => item.value === "within") ||
+    inputs.heartbeat === "fresh" ||
+    inputs.observability === "healthy";
+  if (positiveEvidence) return { severity: "none", kind: "healthy" };
+  return null;
+}
+
 export function formatDuration(milliseconds: number | null): string {
   if (milliseconds === null) return "—";
   const seconds = Math.floor(milliseconds / 1_000);

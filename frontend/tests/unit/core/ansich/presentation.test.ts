@@ -6,6 +6,8 @@ import {
   countLostObservations,
   getBudgetPresentation,
   formatAnsichTimestamp,
+  shortId,
+  selectPrimarySignal,
 } from "@/core/ansich/presentation";
 import { ANSICH_PRODUCED_ALERT_TYPES } from "@/core/ansich/types";
 
@@ -112,5 +114,77 @@ describe("Ansich presentation", () => {
     expect(getAlertPresentationCategory("unverified_effect")).toBe(
       "operational",
     );
+  });
+});
+
+describe("shortId", () => {
+  it("truncates a long UUID to the leading segment", () => {
+    expect(shortId("a82f1234-5678-90ab-cdef-000000000000")).toBe("a82f1234");
+  });
+  it("returns short values unchanged", () => {
+    expect(shortId("abc")).toBe("abc");
+    expect(shortId("")).toBe("");
+  });
+  it("respects a custom length", () => {
+    expect(shortId("a82f1234-5678", 4)).toBe("a82f");
+  });
+});
+
+describe("selectPrimarySignal", () => {
+  it("ranks behavior runaway above an exceeded budget", () => {
+    expect(
+      selectPrimarySignal({
+        behaviorState: "runaway",
+        budgetHealth: [{ value: "exceeded" }],
+      }),
+    ).toEqual({ severity: "critical", kind: "behavior" });
+  });
+
+  it("reports an exceeded budget as critical when behavior is normal", () => {
+    expect(
+      selectPrimarySignal({
+        behaviorState: "normal",
+        budgetHealth: [{ value: "within" }, { value: "exceeded" }],
+      }),
+    ).toEqual({ severity: "critical", kind: "budget" });
+  });
+
+  it("reports a realized scope violation as critical", () => {
+    expect(
+      selectPrimarySignal({ scopeSafety: { realizedViolation: true } }),
+    ).toEqual({ severity: "critical", kind: "scope" });
+  });
+
+  it("ranks a stale heartbeat above a budget warning", () => {
+    expect(
+      selectPrimarySignal({
+        heartbeat: "stale",
+        budgetHealth: [{ value: "warning" }],
+      }),
+    ).toEqual({ severity: "warning", kind: "heartbeat" });
+  });
+
+  it("reports degraded observability as a warning", () => {
+    expect(selectPrimarySignal({ observability: "degraded" })).toEqual({
+      severity: "warning",
+      kind: "observability",
+    });
+  });
+
+  it("reports healthy only from positive evidence", () => {
+    expect(
+      selectPrimarySignal({
+        observability: "healthy",
+        heartbeat: "fresh",
+        budgetHealth: [{ value: "within" }],
+      }),
+    ).toEqual({ severity: "none", kind: "healthy" });
+  });
+
+  it("returns null (insufficient evidence) when nothing is known", () => {
+    expect(selectPrimarySignal({})).toBeNull();
+    expect(
+      selectPrimarySignal({ behaviorState: "unknown", heartbeat: "unknown" }),
+    ).toBeNull();
   });
 });
