@@ -1328,6 +1328,82 @@ async def list_safety_events(
     }
 
 
+@router.get("/operations/failed-jobs")
+async def list_failed_jobs(
+    request: Request,
+    task_id: str | None = Query(default=None, alias="task"),
+    limit: int = Query(default=100, ge=1, le=500),
+) -> dict:
+    await require_admin_user(request, detail=_ADMIN_REQUIRED)
+    service = _service_or_503(request)
+    _ensure_queryable(service)
+    try:
+        jobs = await service.list_failed_jobs(task_id=task_id, limit=limit)
+    except Exception as exc:
+        raise HTTPException(
+            status_code=503,
+            detail={
+                "message": "Ansich failed-job query failed",
+                "projection_status": _projection_status(service),
+            },
+        ) from exc
+    return {
+        "items": [item.model_dump(mode="json") for item in jobs],
+        "projection_status": _projection_status(service),
+    }
+
+
+@router.get("/operations/failed-jobs/{job_id}")
+async def get_failed_job_detail(
+    job_id: str,
+    request: Request,
+    kind: Literal["projection", "assessor"] = Query(...),
+) -> dict:
+    await require_admin_user(request, detail=_ADMIN_REQUIRED)
+    service = _service_or_503(request)
+    _ensure_queryable(service)
+    try:
+        detail = await service.get_failed_job_detail(job_id=job_id, kind=kind)
+    except Exception as exc:
+        raise HTTPException(
+            status_code=503,
+            detail={
+                "message": "Ansich failed-job detail query failed",
+                "projection_status": _projection_status(service),
+            },
+        ) from exc
+    if detail is None:
+        raise HTTPException(status_code=404, detail="Ansich failed job not found")
+    return {
+        "job": detail.model_dump(mode="json"),
+        "projection_status": _projection_status(service),
+    }
+
+
+@router.post("/operations/failed-jobs/retry")
+async def retry_failed_jobs(
+    request: Request,
+    task_id: str | None = Query(default=None, alias="task"),
+) -> dict:
+    await require_admin_user(request, detail=_ADMIN_REQUIRED)
+    service = _service_or_503(request)
+    _ensure_queryable(service)
+    try:
+        retried = await service.retry_failed_projections(task_id=task_id)
+    except Exception as exc:
+        raise HTTPException(
+            status_code=503,
+            detail={
+                "message": "Ansich failed-job retry failed",
+                "projection_status": _projection_status(service),
+            },
+        ) from exc
+    return {
+        "retried": retried,
+        "projection_status": _projection_status(service),
+    }
+
+
 async def _get_tool_result_payload(
     *,
     tool_call_id: str,

@@ -13,6 +13,8 @@ from langchain_core.language_models import BaseChatModel
 from langchain_core.messages import AIMessage, HumanMessage
 from langchain_core.outputs import ChatGeneration, ChatResult
 from langchain_core.tools import tool
+from sqlalchemy import event
+from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
 from app.gateway.auth.models import User
 from app.gateway.routers import ansich as ansich_router
@@ -20,6 +22,8 @@ from deerflow.agents.middlewares.summarization_middleware import DeerFlowSummari
 from deerflow.ansich import create_embedded_ansich_service
 from deerflow.ansich.execution import ANSICH_EXECUTION_CONTEXT_KEY, AnsichExecutionContext
 from deerflow.ansich.middleware import AnsichAttemptMiddleware, AnsichDecisionMiddleware
+from deerflow.ansich.persistence.models import Base
+from deerflow.ansich.persistence.sql import SqlAnsichBackend
 from deerflow.ansich.tool_middleware import AnsichRawToolMiddleware, AnsichVisibleToolMiddleware
 from deerflow.config.ansich_config import AnsichConfig
 
@@ -1008,3 +1012,149 @@ async def test_timeline_polling_response_never_carries_raw_content_bodies():
         assert "body" not in item["payload"]
         assert "content_hash" in item["payload"]
     assert "inspect me" not in response.text
+
+
+@pytest.mark.anyio
+async def test_failed_jobs_endpoints_require_admin():
+    service = AnsichService.in_memory()
+    await service.start()
+    app = make_authed_test_app(user_factory=regular_user)
+    app.state.ansich_service = service
+    app.include_router(ansich_router.router)
+
+    try:
+        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+            list_response = await client.get("/api/ansich/operations/failed-jobs")
+            detail_response = await client.get(f"/api/ansich/operations/failed-jobs/{new_id()}?kind=projection")
+            retry_response = await client.post("/api/ansich/operations/failed-jobs/retry")
+    finally:
+        await service.stop()
+
+    assert list_response.status_code == 403
+    assert detail_response.status_code == 403
+    assert retry_response.status_code == 403
+
+
+@pytest.mark.anyio
+async def test_failed_job_detail_404_for_unknown_job():
+    service = AnsichService.in_memory()
+    await service.start()
+    app = make_authed_test_app(user_factory=admin_user)
+    app.state.ansich_service = service
+    app.include_router(ansich_router.router)
+
+    try:
+        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+            response = await client.get(f"/api/ansich/operations/failed-jobs/{new_id()}?kind=projection")
+            list_response = await client.get("/api/ansich/operations/failed-jobs")
+    finally:
+        await service.stop()
+
+    assert response.status_code == 404
+    assert list_response.status_code == 200
+    assert list_response.json()["items"] == []
+
+
+@pytest.mark.anyio
+async def test_failed_jobs_list_detail_and_retry_over_http(tmp_path):
+    engine = create_async_engine(f"sqlite+aiosqlite:///{tmp_path / 'ansich-router-failed-jobs.db'}")
+
+    @event.listens_for(engine.sync_engine, "connect")
+    def _enable_foreign_keys(dbapi_connection, _connection_record):
+        cursor = dbapi_connection.cursor()
+        cursor.execute("PRAGMA foreign_keys=ON")
+        cursor.close()
+
+    session_factory = async_sessionmaker(engine, expire_on_commit=False)
+    async with engine.begin() as connection:
+        await connection.run_sync(Base.metadata.create_all)
+    backend = SqlAnsichBackend(session_factory, projector_dependency_timeout_seconds=0)
+    service = AnsichService(backend, flush_interval_ms=60_000)
+    await service.start()
+    task_id = new_id()
+    step_id = new_id()
+    producer = Producer(name="router-failed-job-test", version="1", instance_id="test")
+    observed_at = datetime.now(UTC)
+    app = make_authed_test_app(user_factory=admin_user)
+    app.state.ansich_service = service
+    app.include_router(ansich_router.router)
+
+    try:
+        # A step.started observation for a Task that does not exist yet makes
+        # both the "task-step" and "task-usage" projection jobs (step.started
+        # is a registered kind for each — see _STEP_PROJECTION_KINDS and
+        # _USAGE_PROJECTION_KINDS in sql.py) dependency-pending, then fail once
+        # the (zero-second) dependency timeout elapses — two real failed
+        # projection jobs from the one observation, same fixture and same job
+        # count as
+        # test_failed_job_diagnostics.py::test_list_and_detail_failed_jobs_cover_both_projection_and_assessor_kinds.
+        service.record(
+            ObservationEnvelope(
+                kind="step.started",
+                occurred_at=observed_at,
+                task_id=task_id,
+                step_id=step_id,
+                subject_type="step",
+                subject_id=step_id,
+                producer=producer,
+                producer_seq=1,
+                source_event_id="router-failed-job:step:started",
+                correlation_id=task_id,
+                payload={"step_seq": 1, "actor_kind": "lead_agent"},
+            )
+        )
+        await service.flush_task(task_id)
+
+        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+            list_response = await client.get(f"/api/ansich/operations/failed-jobs?task={task_id}")
+            assert list_response.status_code == 200
+            items = list_response.json()["items"]
+            assert len(items) == 2
+            job = items[0]
+            assert job["kind"] == "projection"
+            assert job["task_id"] == task_id
+
+            detail_response = await client.get(f"/api/ansich/operations/failed-jobs/{job['job_id']}?kind=projection")
+            assert detail_response.status_code == 200
+            assert detail_response.json()["job"]["errors"]
+
+            service.record(
+                ObservationEnvelope.task_lifecycle(
+                    kind="task.created",
+                    task_id=task_id,
+                    source_kind="deerflow_run",
+                    source_id="run-router-failed-job",
+                    occurred_at=observed_at,
+                    source_event_id="router-failed-job:task:created",
+                )
+            )
+            await service.flush_task(task_id)
+            retry_response = await client.post(f"/api/ansich/operations/failed-jobs/retry?task={task_id}")
+            assert retry_response.status_code == 200
+            assert retry_response.json()["retried"] == 2
+
+            after_response = await client.get(f"/api/ansich/operations/failed-jobs?task={task_id}")
+            assert after_response.json()["items"] == []
+    finally:
+        await service.stop()
+        await engine.dispose()
+
+
+@pytest.mark.anyio
+async def test_failed_jobs_endpoints_503_when_storage_unavailable():
+    service = create_embedded_ansich_service(AnsichConfig(enabled=True), None)
+    assert service is not None
+    await service.start()
+    app = make_authed_test_app(user_factory=admin_user)
+    app.state.ansich_service = service
+    app.include_router(ansich_router.router)
+
+    try:
+        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+            list_response = await client.get("/api/ansich/operations/failed-jobs")
+            retry_response = await client.post("/api/ansich/operations/failed-jobs/retry")
+    finally:
+        await service.stop()
+
+    assert list_response.status_code == 503
+    assert retry_response.status_code == 503
