@@ -6,6 +6,7 @@ export { AnsichBudgetPanel } from "./budget-panel";
 export { AnsichTaskTreePanel } from "./task-tree-panel";
 export { AnsichScopeEffectsPanel } from "./scope-effects-panel";
 export { AnsichProjectionHealth } from "./projection-health";
+export { AnsichFailedJobsDialog } from "./failed-jobs-dialog";
 export { AnsichStatusBadge } from "./status-badge";
 export { AnsichContextPanel, AnsichStepsPanel } from "./step-explorer";
 export { AnsichTaskRow } from "./task-row";

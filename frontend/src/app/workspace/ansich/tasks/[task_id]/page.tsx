@@ -117,7 +117,9 @@ export default function AnsichTaskDetailPage() {
                 </p>
               </header>
 
-              {health && <AnsichProjectionHealth health={health} />}
+              {health && (
+                <AnsichProjectionHealth health={health} taskId={taskId} />
+              )}
 
               <Tabs defaultValue="overview" className="space-y-4">
                 <TabsList className="h-auto flex-wrap">
