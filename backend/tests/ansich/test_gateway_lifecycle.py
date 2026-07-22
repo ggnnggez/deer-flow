@@ -41,7 +41,7 @@ async def test_gateway_runtime_starts_and_stops_enabled_ansich_without_sql(monke
     app = FastAPI()
     config = SimpleNamespace(
         ansich=AnsichConfig(enabled=True),
-        database=SimpleNamespace(backend="memory"),
+        database=SimpleNamespace(backend="memory", checkpoint_channel_mode="full"),
         run_events=SimpleNamespace(backend="memory"),
         stream_bridge=SimpleNamespace(recovered_stream_cleanup_delay_seconds=60.0),
         run_ownership=SimpleNamespace(heartbeat_enabled=False),

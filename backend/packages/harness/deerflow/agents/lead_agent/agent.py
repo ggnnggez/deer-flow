@@ -13,8 +13,12 @@ middleware reachable from this graph (e.g. ``TitleMiddleware``) — MUST pass
 Forgetting that flag emits duplicate spans (one rooted at the graph, one at
 the model) AND prevents the Langfuse handler's ``propagate_attributes``
 path from firing, so ``session_id`` / ``user_id`` never reach the trace.
-The four current sites are: bootstrap agent, default agent, summarization
-middleware, and the async path inside ``TitleMiddleware``. Any new in-graph
+The five current sites are: bootstrap agent, default agent, summarization
+middleware, the async path inside ``TitleMiddleware``, and the skill security
+scanner reached from the ``skill_manage`` tool (``skills/security_scanner.py``'s
+``scan_skill_content``, which is dual-use: ``_scan_or_raise`` in
+``tools/skill_manage_tool.py`` is the in-graph choke point and passes the flag,
+while its standalone callers keep the default). Any new in-graph
 ``create_chat_model`` call must add to this list and pass the flag.
 """
 
@@ -31,6 +35,7 @@ from langchain_core.runnables import RunnableConfig
 
 from deerflow.agents.lead_agent.prompt import apply_prompt_template
 from deerflow.agents.middlewares.clarification_middleware import ClarificationMiddleware
+from deerflow.agents.middlewares.configured_extensions import load_configured_extension_middlewares
 from deerflow.agents.middlewares.loop_detection_middleware import LoopDetectionMiddleware
 from deerflow.agents.middlewares.memory_middleware import MemoryMiddleware
 from deerflow.agents.middlewares.safety_finish_reason_middleware import SafetyFinishReasonMiddleware
@@ -42,12 +47,18 @@ from deerflow.agents.middlewares.todo_middleware import TodoMiddleware
 from deerflow.agents.middlewares.token_usage_middleware import TokenUsageMiddleware
 from deerflow.agents.middlewares.tool_error_handling_middleware import build_lead_runtime_middlewares
 from deerflow.agents.middlewares.view_image_middleware import ViewImageMiddleware
-from deerflow.agents.thread_state import ThreadState
+from deerflow.agents.thread_state import get_thread_state_schema, normalize_middleware_state_schemas
 from deerflow.config.agents_config import load_agent_config, validate_agent_name
 from deerflow.config.app_config import AppConfig, get_app_config
 from deerflow.config.memory_config import should_use_memory_tools
 from deerflow.config.subagents_config import DEFAULT_MAX_TOTAL_SUBAGENTS_PER_RUN
 from deerflow.models import create_chat_model
+from deerflow.runtime.checkpoint_mode import (
+    INTERNAL_CHECKPOINT_MODE_KEY,
+    freeze_checkpoint_channel_mode,
+    frozen_checkpoint_channel_mode,
+    inject_checkpoint_mode,
+)
 from deerflow.skills.types import Skill
 from deerflow.tracing import build_tracing_callbacks
 
@@ -114,6 +125,22 @@ def _subagent_release_policy(
     policy["type_allowlist"] = type_allowlist
     policy["runtime_limits"] = runtime_limits
     return policy
+
+
+def _resolve_runtime_option(cfg: dict, key: str, agent_value, default):
+    """Resolve a runtime option with ``request > agent config > default`` precedence.
+
+    ``key in cfg`` (not ``cfg.get(key)``) distinguishes "request omitted the
+    field" from "request set it to a falsy value", so a request-supplied
+    ``thinking_enabled: false`` is honored instead of falling through to the
+    agent default. ``agent_value`` is used only when it is not ``None`` (a
+    custom agent's unset field means "do not override" — issue #4336).
+    """
+    if key in cfg:
+        return cfg[key]
+    if agent_value is not None:
+        return agent_value
+    return default
 
 
 def _append_memory_tools_without_name_conflicts(tools: list) -> None:
@@ -447,6 +474,10 @@ def build_middlewares(
     if custom_middlewares:
         middlewares.extend(custom_middlewares)
 
+    configured_middlewares = load_configured_extension_middlewares(resolved_app_config)
+    if configured_middlewares:
+        middlewares.extend(configured_middlewares)
+
     # A provider may return an empty AIMessage after tool execution. Retry the
     # final response once, then persist a visible error fallback rather than
     # allowing LangChain's no-tool-call router to end a silent successful run.
@@ -454,9 +485,9 @@ def build_middlewares(
 
     # SafetyFinishReasonMiddleware — suppress tool execution when the provider
     # safety-terminated the response. Registered after the terminal-response
-    # and custom middlewares so LangChain's reverse-order after_model dispatch
-    # runs Safety first; cleared tool_calls then flow through the remaining
-    # accounting/terminal guards without firing extra alarms.
+    # and custom/configured middlewares so LangChain's reverse-order after_model
+    # dispatch runs Safety first; cleared tool_calls then flow through the
+    # remaining accounting/terminal guards without firing extra alarms.
     safety_config = resolved_app_config.safety_finish_reason
     if safety_config.enabled:
         middlewares.append(SafetyFinishReasonMiddleware.from_config(safety_config))
@@ -514,14 +545,36 @@ def assemble_lead_agent(
     """
     runtime_config = _get_runtime_config(config)
     runtime_app_config = runtime_config.get("app_config")
-    return _assemble_lead_agent(
-        config,
-        app_config=app_config or runtime_app_config or get_app_config(),
-    )
+    resolved_app_config = app_config or runtime_app_config
+    if not isinstance(resolved_app_config, AppConfig):
+        resolved_app_config = get_app_config()
+    # Mode selection precedence, pinned by test_checkpoint_mode.py:
+    # - First freeze: the app config owns the process mode; a client-supplied
+    #   configurable key is ignored so a direct LangGraph request cannot
+    #   reconfigure (or crash) a fresh process.
+    # - Once frozen: an internally injected key (run worker / gateway) or the
+    #   app config must match the frozen mode; ``freeze_checkpoint_channel_mode``
+    #   fails closed on any mismatch, so neither a forged key nor a config.yaml
+    #   change can silently reconfigure the process.
+    frozen_mode = frozen_checkpoint_channel_mode()
+    if frozen_mode is None:
+        requested_mode = resolved_app_config.database.checkpoint_channel_mode
+    else:
+        requested_mode = (config.get("configurable", {}) or {}).get(
+            INTERNAL_CHECKPOINT_MODE_KEY,
+            resolved_app_config.database.checkpoint_channel_mode,
+        )
+    mode = freeze_checkpoint_channel_mode(requested_mode)
+    inject_checkpoint_mode(config, mode)
+    return _assemble_lead_agent(config, app_config=resolved_app_config)
 
 
 def _make_lead_agent(config: RunnableConfig, *, app_config: AppConfig):
-    return assemble_lead_agent(config, app_config=app_config).graph
+    """Internal graph-only entry: skips the mode freeze and reads the
+    checkpoint mode straight from ``config.configurable`` (mirrors the
+    pre-assembly ``_make_lead_agent`` contract pinned by
+    test_lead_agent_model_resolution.py's internal tests)."""
+    return _assemble_lead_agent(config, app_config=app_config).graph
 
 
 def _complete_assembly(
@@ -575,6 +628,10 @@ def _assemble_lead_agent(config: RunnableConfig, *, app_config: AppConfig) -> Le
 
     cfg = _get_runtime_config(config)
     resolved_app_config = app_config
+    mode = (config.get("configurable", {}) or {}).get(
+        INTERNAL_CHECKPOINT_MODE_KEY,
+        resolved_app_config.database.checkpoint_channel_mode,
+    )
 
     # Extract user_id for user-scoped skill loading.
     # LangGraph gateway injects user_id into config["configurable"];
@@ -584,8 +641,6 @@ def _assemble_lead_agent(config: RunnableConfig, *, app_config: AppConfig) -> Le
     runtime_user_id = cfg.get("user_id")
     resolved_user_id = str(runtime_user_id) if runtime_user_id else get_effective_user_id()
 
-    thinking_enabled = cfg.get("thinking_enabled", True)
-    reasoning_effort = cfg.get("reasoning_effort", None)
     requested_model_name: str | None = cfg.get("model_name") or cfg.get("model")
     is_plan_mode = cfg.get("is_plan_mode", False)
     subagent_enabled = cfg.get("subagent_enabled", False)
@@ -599,6 +654,19 @@ def _assemble_lead_agent(config: RunnableConfig, *, app_config: AppConfig) -> Le
     available_skills = _available_skill_names(agent_config, is_bootstrap)
     # Custom agent model from agent config (if any), or None to let _resolve_model_name pick the default
     agent_model_name = agent_config.model if agent_config and agent_config.model else None
+
+    # thinking / reasoning precedence: request > custom agent default > runtime
+    # default (issue #4336). See ``_resolve_runtime_option`` for the falsy-vs-unset
+    # handling.
+    agent_thinking = getattr(agent_config, "thinking_enabled", None) if agent_config else None
+    agent_reasoning = getattr(agent_config, "reasoning_effort", None) if agent_config else None
+    thinking_enabled = bool(_resolve_runtime_option(cfg, "thinking_enabled", agent_thinking, True))
+    reasoning_effort = _resolve_runtime_option(cfg, "reasoning_effort", agent_reasoning, None)
+
+    # Per-agent sampling overrides (temperature / max_tokens) layered on top of
+    # the resolved model profile (issue #4336). None when the agent set none.
+    agent_model_settings = getattr(agent_config, "model_settings", None) if agent_config else None
+    agent_model_overrides = agent_model_settings.model_dump(exclude_none=True) if agent_model_settings else None
 
     # Final model name resolution: request → agent config → global default, with fallback for unknown names
     model_name = _resolve_model_name(requested_model_name or agent_model_name, app_config=resolved_app_config)
@@ -714,9 +782,9 @@ def _assemble_lead_agent(config: RunnableConfig, *, app_config: AppConfig) -> Le
         graph = create_agent(
             model=model,
             tools=final_tools,
-            middleware=middlewares,
+            middleware=normalize_middleware_state_schemas(middlewares, mode),
             system_prompt=system_prompt,
-            state_schema=ThreadState,
+            state_schema=get_thread_state_schema(mode),
         )
         return _complete_assembly(
             config=config,
@@ -799,6 +867,7 @@ def _assemble_lead_agent(config: RunnableConfig, *, app_config: AppConfig) -> Le
         reasoning_effort=reasoning_effort,
         app_config=resolved_app_config,
         attach_tracing=False,
+        model_overrides=agent_model_overrides,
     )
     middlewares = build_middlewares(
         config,
@@ -825,9 +894,9 @@ def _assemble_lead_agent(config: RunnableConfig, *, app_config: AppConfig) -> Le
     graph = create_agent(
         model=model,
         tools=final_tools,
-        middleware=middlewares,
+        middleware=normalize_middleware_state_schemas(middlewares, mode),
         system_prompt=system_prompt,
-        state_schema=ThreadState,
+        state_schema=get_thread_state_schema(mode),
     )
     return _complete_assembly(
         config=config,
