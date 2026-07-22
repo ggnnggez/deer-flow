@@ -626,7 +626,15 @@ def _state_accessor_graph(agent_factory: Any, assistant_id: str | None, mode: st
         return cached[2]
     if len(_state_accessor_graph_cache) >= _STATE_ACCESSOR_GRAPH_CACHE_MAX:
         _state_accessor_graph_cache.clear()
-    graph = agent_factory(config=config)
+    agent_result = agent_factory(config=config)
+    try:
+        from deerflow.agents.lead_agent.agent import LeadAgentAssembly
+
+        graph = agent_result.graph if isinstance(agent_result, LeadAgentAssembly) else agent_result
+    except Exception:
+        # Third-party/custom graph factories keep the historical graph-only
+        # contract even if importing the lead assembly type fails.
+        graph = agent_result
     _state_accessor_graph_cache[key] = (agent_factory, app_config, graph)
     return graph
 

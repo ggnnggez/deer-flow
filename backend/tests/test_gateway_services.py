@@ -613,6 +613,49 @@ def test_build_checkpoint_state_accessor_uses_frozen_mode_and_binds_runtime_pers
         assert config["configurable"]["checkpoint_id"] == checkpoint_id
 
 
+def test_build_checkpoint_state_accessor_accepts_lead_agent_assembly_factory(_stub_app_config):
+    """Checkpoint reads accept the descriptor-carrying Gateway factory result."""
+    from types import SimpleNamespace
+    from unittest.mock import patch
+
+    from app.gateway.services import build_checkpoint_state_accessor
+    from deerflow.agents.lead_agent.agent import LeadAgentAssembly
+    from deerflow.config.app_config import get_app_config
+
+    class FakeGraph:
+        checkpointer = None
+        store = None
+
+    graph = FakeGraph()
+    assembly = LeadAgentAssembly(graph=graph, descriptor=object())
+
+    def fake_factory(*, config):
+        return assembly
+
+    checkpointer = object()
+    store = object()
+    ctx = SimpleNamespace(
+        checkpointer=checkpointer,
+        store=store,
+        checkpoint_channel_mode="full",
+        app_config=get_app_config(),
+    )
+    request = SimpleNamespace(state=SimpleNamespace(checkpoint_channel_mode="full"))
+
+    with (
+        patch("app.gateway.services.get_run_context", return_value=ctx),
+        patch("app.gateway.services.resolve_agent_factory", return_value=fake_factory),
+    ):
+        accessor, _config = build_checkpoint_state_accessor(
+            request,
+            thread_id="thread-with-assembly-factory",
+        )
+
+    assert accessor.graph is graph
+    assert graph.checkpointer is checkpointer
+    assert graph.store is store
+
+
 def test_build_run_config_configurable_custom_agent_dual_writes_agent_name():
     """Regression for issue #3549: even when the caller uses the legacy
     ``configurable`` path, ``agent_name`` must also land in
