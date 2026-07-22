@@ -12,6 +12,7 @@ export { AnsichTechnicalEvidence } from "./technical-evidence";
 export { AnsichSignalBadge } from "./signal-badge";
 export { AnsichTaskHero } from "./task-hero";
 export { AnsichTaskDiagnosticStrip } from "./task-diagnostic-strip";
+export { AnsichEvidenceSection } from "./evidence-section";
 export { AnsichFailedJobsDialog } from "./failed-jobs-dialog";
 export { AnsichStatusBadge } from "./status-badge";
 export { AnsichContextPanel, AnsichStepsPanel } from "./step-explorer";

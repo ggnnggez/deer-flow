@@ -7,19 +7,13 @@ import { useCallback, useEffect } from "react";
 
 import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert";
 import { Button } from "@/components/ui/button";
-import {
-  Card,
-  CardContent,
-  CardDescription,
-  CardHeader,
-  CardTitle,
-} from "@/components/ui/card";
 import { Skeleton } from "@/components/ui/skeleton";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import {
   AnsichContextPanel,
   AnsichAgentReleasePanel,
   AnsichBudgetPanel,
+  AnsichEvidenceSection,
   AnsichObservationTimeline,
   AnsichProjectionHealth,
   AnsichStepsPanel,
@@ -270,32 +264,48 @@ export default function AnsichTaskDetailPage() {
                   />
                 </TabsContent>
 
-                <TabsContent value="evidence" className="space-y-4">
-                  {timelineQuery.isPending ? (
-                    <Skeleton className="h-48 w-full" />
-                  ) : (
-                    <AnsichObservationTimeline
-                      observations={timelineQuery.data?.items ?? []}
+                <TabsContent value="evidence" className="space-y-3">
+                  <AnsichEvidenceSection
+                    title={t.ansich.timeline}
+                    defaultOpen
+                  >
+                    {timelineQuery.isPending ? (
+                      <Skeleton className="h-48 w-full" />
+                    ) : (
+                      <AnsichObservationTimeline
+                        observations={timelineQuery.data?.items ?? []}
+                      />
+                    )}
+                  </AnsichEvidenceSection>
+                  <AnsichEvidenceSection
+                    title={t.ansich.contextAndLineage}
+                    defaultOpen
+                  >
+                    <AnsichContextPanel
+                      taskId={taskId}
+                      compressionIds={compressionIds}
+                      compressionError={
+                        compressionsQuery.error?.message ?? null
+                      }
+                      compressionHasNextPage={compressionsQuery.hasNextPage}
+                      compressionLoadingMore={
+                        compressionsQuery.isFetchingNextPage
+                      }
+                      onLoadMoreCompressions={() =>
+                        void compressionsQuery.fetchNextPage()
+                      }
+                      polling={taskIsRunning}
                     />
-                  )}
-                  <AnsichContextPanel
-                    taskId={taskId}
-                    compressionIds={compressionIds}
-                    compressionError={compressionsQuery.error?.message ?? null}
-                    compressionHasNextPage={compressionsQuery.hasNextPage}
-                    compressionLoadingMore={
-                      compressionsQuery.isFetchingNextPage
-                    }
-                    onLoadMoreCompressions={() =>
-                      void compressionsQuery.fetchNextPage()
-                    }
-                    polling={taskIsRunning}
-                  />
-                  <AnsichAgentReleasePanel
-                    taskId={taskId}
-                    polling={taskIsRunning}
-                  />
-                  <BeliefEvidenceCard behavior={behavior ?? null} />
+                  </AnsichEvidenceSection>
+                  <AnsichEvidenceSection title={t.ansich.agentRelease}>
+                    <AnsichAgentReleasePanel
+                      taskId={taskId}
+                      polling={taskIsRunning}
+                    />
+                  </AnsichEvidenceSection>
+                  <AnsichEvidenceSection title={t.ansich.currentBehavior}>
+                    <BeliefEvidenceCard behavior={behavior ?? null} />
+                  </AnsichEvidenceSection>
                 </TabsContent>
               </Tabs>
             </>
@@ -310,28 +320,24 @@ export default function AnsichTaskDetailPage() {
   }: {
     behavior: AnsichBeliefAssertion | null;
   }) {
+    if (!behavior) {
+      return (
+        <div className="text-muted-foreground text-sm">
+          {t.ansich.evidenceInsufficient}
+        </div>
+      );
+    }
     return (
-      <Card>
-        <CardHeader>
-          <CardTitle>{t.ansich.currentBehavior}</CardTitle>
-          <CardDescription>
-            {behavior
-              ? `${t.ansich.asOf}: ${formatAnsichTimestamp(behavior.as_of, locale)}`
-              : t.ansich.evidenceInsufficient}
-          </CardDescription>
-        </CardHeader>
-        {behavior ? (
-          <CardContent className="space-y-3 text-sm">
-            <div className="text-muted-foreground text-xs">
-              {behavior.assessor.name}@{behavior.assessor.version} ·{" "}
-              {behavior.config_hash.slice(0, 12)}
-            </div>
-            <pre className="bg-muted/60 overflow-x-auto rounded-md p-3 text-xs">
-              {JSON.stringify(behavior.value, null, 2)}
-            </pre>
-          </CardContent>
-        ) : null}
-      </Card>
+      <div className="space-y-3 text-sm">
+        <div className="text-muted-foreground text-xs">
+          {t.ansich.asOf}: {formatAnsichTimestamp(behavior.as_of, locale)} ·{" "}
+          {behavior.assessor.name}@{behavior.assessor.version} ·{" "}
+          {behavior.config_hash.slice(0, 12)}
+        </div>
+        <pre className="bg-muted/60 overflow-x-auto rounded-md p-3 text-xs">
+          {JSON.stringify(behavior.value, null, 2)}
+        </pre>
+      </div>
     );
   }
 }

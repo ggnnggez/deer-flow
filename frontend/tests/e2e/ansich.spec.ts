@@ -875,6 +875,8 @@ test("admin navigates from Ansich operations to evidence-backed Task detail", as
   await expect(page.getByText("source", { exact: true })).toBeVisible();
   await page.getByRole("button", { name: "Load raw payload" }).click();
   await expect(page.getByText('"inspect me"')).toBeVisible();
+  // Agent release is a collapsed Evidence subsection; expand it.
+  await page.getByRole("button", { name: "Agent release" }).click();
   await expect(
     page.getByText("provider/model-v1", { exact: true }).first(),
   ).toBeVisible();
