@@ -15,6 +15,8 @@
 | H3 | `AnsichEntityRow` 与其类型化子行(AuthorizationSnapshot/AgentRelease/Alert)之间无 ORM `relationship()`,同一次 flush 插入顺序不保证,FK 强制开启的生产环境下确定性失败 | ✅ 已修复 | 2026-07-22 | `e074bd60` |
 | H4 | `DELETE FROM ansich_belief_assertions` 在 `PRAGMA foreign_keys=ON` 下违反 FK 约束,根因未查 | ⬜ 未修复 | — | — |
 | H5 | 大 payload externalize 后的 ContextSnapshot 在 FK 强制开启时静默投影失败,`get_step_context` 返回 None,根因未查 | ⬜ 未修复 | — | — |
+| H6 | `_persist_assessment` 插入 `AnsichBeliefAssertionRow` 前不检查 `subject_id` 对应的 Entity 是否已存在,scope-safety(`subject_id`=tool_call_id)在其 ToolCall 尚未投影时硬失败 5 次耗尽重试,而非像 projector 一样优雅走 `_ProjectionDependencyPending` | ⬜ 未修复 | — | — |
+| H7 | Collector 有界队列 fail-open 丢弃 `step.started`(高置信度,无法对本次实例实锤),导致该 Step 后续全部 projection 级联永久 `failed`;`dropped_count`/`lost_ranges` 不落盘,事后不可追溯 | ⬜ 未修复 | — | — |
 
 ## H1. AuthorizationSnapshot 不反映任何真实授权系统
 
@@ -89,6 +91,25 @@
 - 现状:未确认是否与 H3/H4 同属"缺 flush 顺序保证"这一类,还是 Phase 2/4 的 ContextSnapshot/ContentBlob externalize 投影路径里的另一个独立问题——两者都可能,需要先复现取得真实报错文本才能判断。
 - 方向:复用 H3 定位时用过的技术(monkeypatch `_record_projection_error`/`_record_assessor_error` 打印完整 traceback,或直接读 `ansich_projection_errors.message`)取得真实异常;若确认也是 entity+子行插入顺序问题,按 H3 的模式补 flush;若是别的原因,按 Phase 1 流程另行分析。
 - 归属:未定,建议与 H4 一起排查——两者都是同一次全局 FK 扫描发现,可以合并成一次调查窗口。
+
+## H6. `_persist_assessment` 缺少 subject Entity 存在性检查,scope-safety 硬失败而非优雅等待
+
+- 状态:⬜ 未修复。来源:排查用户真实开发库某个具体 Task(`2832a0c9-713f-49c9-85b2-c79b3e621058`)的失败 job 时定位到,是 H3 修复后**新出现的一条独立因果链**,不是 H3/H4/H5 的重复。
+- 位置:`backend/packages/harness/deerflow/ansich/persistence/sql.py::_persist_assessment`(约 sql.py:1931 起)。该函数被全部 assessor(`action-repetition`/`tool-frequency`/`absolute-limits`/`configuration-drift`/`scope-safety`)共用,构造并 `session.add()` 一个新 `AnsichBeliefAssertionRow(subject_id=assessment.subject_id, ...)` 前,**不像各 projector 那样先 `session.get(AnsichEntityRow, subject_id)` 做依赖检查、缺失时 `raise _ProjectionDependencyPending`**,而是直接插入。`AnsichBeliefAssertionRow.subject_id` 有 `ForeignKey("ansich_entities.entity_id", ondelete="CASCADE")`(models.py:1033)。
+- 现状:对 task 级 assessor(action-repetition 等),`subject_id` 就是 task_id,Task 的 Entity 行在 `task.created` 时极早创建,这个洞长期不暴露。但 scope-safety assessor 的 `subject_id` 是 **tool_call_id**(sql.py `_run_assessor` 里 `AnsichScopeConclusionRow(tool_call_id=assessment.subject_id, ...)` 印证),ToolCall 的 Entity 行要等它自己的 `tool.issued` 投影完成才存在。一旦这个 ToolCall 因为别的原因(例如 H7)迟迟没被投影,scope-safety assessor 仍会按 watermark 正常被触发,`INSERT INTO ansich_belief_assertions` 直接撞上 FK 约束,**5 次重试全部同样失败、耗尽 attempts 上限、不可能通过重试自愈**——跟真正的"证据还没到"这种应该走 `_ProjectionDependencyPending` 优雅等待的场景,在结果上被错误地当成了硬失败。真实复现:上述 Task 的 scope-safety assessor 5 条失败 job,报错均为 `INSERT INTO ansich_belief_assertions ... FOREIGN KEY constraint failed`。
+- 方向:在 `_persist_assessment` 开头补 `if await session.get(AnsichEntityRow, assessment.subject_id) is None: raise _ProjectionDependencyPending(...)`,与各 projector 的既有模式保持一致;因为该函数是全 assessor 共用的,这个检查对 task 级 assessor 是无成本的(Entity 早就存在,`session.get` 立刻命中)。配"scope-safety 在其 ToolCall 尚未投影时优雅等待而非硬失败,依赖到位后能自愈"的回归测试。
+- 归属:未定;建议与 H7 一起排查——H6 是 H7 级联失败链条的下游表现之一(如果 H7 修复后 ToolCall 投影不再卡住,H6 描述的场景会更少触发,但 H6 本身作为"assessor 缺依赖检查"的通用防御仍然值得独立修,不应只依赖上游不再出问题)。
+
+## H7. Step 的 `step.started` 观测缺失,导致该 Step 全部后续 projection 级联永久失败
+
+- 状态:⬜ 未修复,根因**高置信度定位、无法对本次具体实例做实锤复核**(见下)。来源同 H6,同一个 Task 内发现。
+- 现象:Task `2832a0c9-713f-49c9-85b2-c79b3e621058` 里 step `d57df823-fe04-49ed-b727-4fd00a15949d` 的观测序列(按 `ingest_seq` 排序)第一条直接是 `llm.requested`(ingest_seq 2878),**完全没有 `kind='step.started'` 的观测**——不是投影失败,是这条观测在 `ansich_observations` 表里根本不存在。该 step 的 `llm.requested` 载荷 `actor_kind="subagent"`,确认是真实 Step(非 system operation,后者本就不产生 `step.started`,见下方排除项)。`task-step` projector 处理该 step 的 `llm.requested` 时因此报 `_ProjectionDependencyPending: step.started has not been projected: d57df823-...`,等了 4 小时以上(远超 `projector_dependency_timeout_seconds` 默认 300s)后不可逆地进入 `failed`(`attempts=0`,证明它一直在正常等待、不是执行报错)。级联:这条 job 卡住 → 同一 step 后续的 `llm.responded`/`tool.issued`/`tool.started`/`tool.returned_raw`/`effect.*`/`authorization.*` 全部因排在它之后而连带 `failed` → `tool.issued` 卡住导致该 ToolCall 的 Entity 行从未创建 → scope-safety assessor 撞上 H6。
+- 排查过程与结论:
+  1. **已排除:探针未被调用**。`AnsichDecisionMiddleware.wrap_model_call`/`awrap_model_call`(`middleware.py:50-100`)对每次真实 Agent 决策都无条件调用 `_record_step_started`;`_record_step_started`(`middleware.py:342-359`)只在 `call.step_id is None or call.step_seq is None` 时提前 return——而这只发生在 `actor_kind="system_operation"`(`execution.py::begin_call` 显式把 system operation 的 `step_id`/`step_seq` 设为 `None`,这是设计如此,给内部 title/summarization/memory 调用用的)。本例 `actor_kind="subagent"` 时 `begin_call` 必然分配真实 `step_id=new_id()`/`step_seq=<int>`,不会走提前 return 分支——探针代码本身逻辑正确,没有跳过这个 Step。
+  2. **高置信度根因:Collector 有界队列 fail-open 丢弃**。`_record_step_started` 通过 `_record()`(`middleware.py:904-909`)调用 `execution.service.record(observation)`,`_record()` 把返回值直接丢弃、任何异常都吞掉返回。`AnsichService.record_batch`(`packages/ansich/ansich/service.py:146-183`)在 `queue_full`(`len(self._queue) + len(batch) > self._capacity`)、`queue_bytes_full`(队列字节水位超限)等条件下会调用 `_record_batch_loss` 记账后返回 `accepted=False`,**不抛异常**——`_record()` 根本不检查这个返回值。也就是说:代码路径上唯一能在"探针被正确调用、observation 构造正确"的前提下仍然完全不留痕迹的机制,就是这个有界队列的 fail-open 丢弃,与现象(无异常、无残留、无投影错误行,单纯"这条观测不存在")完全吻合。该 step 前后紧邻多条 `content.produced`/`context.snapshotted` 大 payload 观测(全库 `snapshot_visible_bytes` 达 7.4MB),时间点上具备造成队列瞬时打满的条件。
+  3. **无法实锤复核的原因**:`AnsichService._dropped_count`/`_lost_ranges` 是纯内存态(`service.py:87/93`),从不落盘;产生这次失败的 Gateway 进程已经重启(当前 `logs/gateway.log` 最早记录是今天 15:18:20,晚于 09:09 的事发时间),历史丢弃计数已经不可追溯,因此这是"代码路径唯一自洽解释 + 无法针对这一具体实例拿到丢弃计数实锤"的结论,不是 100% 确证。
+- 方向:① 不应该改 fail-open 语义本身——采集失败绝不能阻塞真实 Agent 执行,这个设计原则是对的;② 但目前 `dropped_count`/`lost_ranges` 只在进程内存里、进程重启就丢失,导致这类"到底是不是丢弃导致"的问题事后完全不可判断,建议至少把 loss 事件写一条持久化的轻量记录(哪怕只是日志,不必是新表),方便下次复现时能确认而不是靠代码走查推断;③ 中期可考虑把 `dropped_count`/`lost_ranges` 接入 U3 已有的 failed-job 诊断面,让"这个 Task 在这个时间点是否发生过丢弃"和"这个 job 为什么卡住"能在同一个界面关联起来看。
+- 归属:未定;由于机制上确认是"有界队列在设计上就会丢弃"而非代码 bug,不属于需要紧急修复的缺陷,但持久化 loss 可观测性这件事值得尽快做,否则同类问题会反复变成"猜测、无法实锤"。
 
 ## 评审中确认无需跟进的点(留档)
 
