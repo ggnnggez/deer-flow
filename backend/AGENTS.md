@@ -473,6 +473,11 @@ The polled Operations Task list uses one portable CTE + outer-join query over
 TaskSummary/current assertion/ordered evidence; pagination happens before
 evidence fan-out, and an isolated missing assertion yields a degraded row rather
 than a short page.
+Observed ToolEffect fidelity is `hard` only when the raw tool terminal is
+`tool.returned_raw` and the effect class is known. Failed, timed-out, cancelled,
+and unknown-class observed effects retain evidence with `unknown` fidelity, so
+scope-safety cannot treat an incomplete call as proof that its side effect
+completed.
 Phase 3 Tool probes record intent before tool middleware, raw execution inside
 `ToolErrorHandlingMiddleware`, and the final model-visible result outside output
 budget/sanitization. Ansich IDs plus `(step_id, call_seq)` are authoritative;

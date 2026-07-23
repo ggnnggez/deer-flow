@@ -370,6 +370,104 @@ def test_async_raw_probe_classifies_cooperative_cancellation_without_swallowing_
     asyncio.run(scenario())
 
 
+@pytest.mark.parametrize(
+    ("tool_name", "error_type", "expected_terminal_kind"),
+    [
+        pytest.param(
+            "write_file",
+            RuntimeError,
+            "tool.failed",
+            id="write-file-failed",
+        ),
+        pytest.param(
+            "write_file",
+            TimeoutError,
+            "tool.timed_out",
+            id="write-file-timed-out",
+        ),
+        pytest.param(
+            "write_file",
+            asyncio.CancelledError,
+            "tool.cancelled",
+            id="write-file-cancelled",
+        ),
+        pytest.param(
+            "bash",
+            RuntimeError,
+            "tool.failed",
+            id="bash-failed",
+        ),
+        pytest.param(
+            "bash",
+            TimeoutError,
+            "tool.timed_out",
+            id="bash-timed-out",
+        ),
+        pytest.param(
+            "bash",
+            asyncio.CancelledError,
+            "tool.cancelled",
+            id="bash-cancelled",
+        ),
+    ],
+)
+def test_named_tool_failure_terminal_effects_are_not_hard_fidelity(
+    monkeypatch,
+    tool_name: str,
+    error_type: type[BaseException],
+    expected_terminal_kind: str,
+) -> None:
+    async def scenario() -> None:
+        execution = AnsichExecutionContext(task_id=new_id(), service=MagicMock())
+        provider_call_id = f"provider-{tool_name}-{expected_terminal_kind}"
+        registration = execution.register_tool_call(
+            tool_call_id=new_id(),
+            step_id=new_id(),
+            step_seq=1,
+            call_seq=1,
+            provider_call_id=provider_call_id,
+            tool_name=tool_name,
+            args_hash="a" * 64,
+            issued_obs_id=new_id(),
+        )
+        request = SimpleNamespace(
+            runtime=SimpleNamespace(
+                context={ANSICH_EXECUTION_CONTEXT_KEY: execution},
+            ),
+            tool_call={
+                "id": provider_call_id,
+                "name": tool_name,
+                "args": {},
+            },
+        )
+        observations = []
+
+        def capture_batch(execution, batch, *, batch_kind):
+            observations.extend(batch)
+            return True
+
+        monkeypatch.setattr(tool_observer, "_record_batch", capture_batch)
+        terminal_error = error_type("tool did not complete")
+
+        async def raise_terminal_error(request):
+            raise terminal_error
+
+        with execution.activate_tool_invocation(registration):
+            with pytest.raises(error_type) as raised:
+                await AnsichRawToolMiddleware().awrap_tool_call(
+                    request,
+                    raise_terminal_error,
+                )
+
+        assert raised.value is terminal_error
+        assert expected_terminal_kind in {observation.kind for observation in observations}
+        observed_effects = [observation.payload["effect"] for observation in observations if observation.kind == "effect.observed"]
+        assert observed_effects
+        assert all(effect["fidelity_class"] != "hard" for effect in observed_effects)
+
+    asyncio.run(scenario())
+
+
 def test_content_occurrence_identity_is_deterministic_and_only_skips_after_durable_confirmation() -> None:
     task_id = "00000000-0000-4000-8000-000000000001"
     first_context = AnsichExecutionContext(task_id=task_id)

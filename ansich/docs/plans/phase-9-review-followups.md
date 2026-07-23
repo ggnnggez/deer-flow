@@ -7,14 +7,14 @@
 | 编号 | 摘要 | 状态 | 修复时间 | Commit |
 | ---- | ---- | ---- | -------- | ------ |
 | H1 | AuthorizationSnapshot 不反映任何真实授权系统:`policy_id`/`policy_version` 硬编码常量,`decision` 只有 `allowed`/`denied` 两个值,`unknown` 在生产路径上永不产生 | ✅ 已修复 | 2026-07-21 | `fa1e0ae7`/`90db5180`/`52594604` |
-| H2 | raw 结果终态为 `tool.failed`/`tool.timed_out`/`tool.cancelled` 时,observed effect 仍无条件以 `fidelity_class="hard"` 记录 | ⬜ 未修复 | — | — |
+| H2 | raw 结果终态为 `tool.failed`/`tool.timed_out`/`tool.cancelled` 时,observed effect 仍无条件以 `fidelity_class="hard"` 记录 | ✅ 已修复 | 2026-07-23 | 本次变更(待提交) |
 | M1 | `_effect_class` 分类法缺 `filesystem_delete`/`permission_change`(bash `rm`、chmod 等无法归类为专属 effect class) | ⬜ 未修复 | — | — |
 | M2 | scope-safety assessor 每次触发都重扫任务全部 Scope 证据并重新评估每个 tool_call,而各 tool_call 结论本互相独立 | ⬜ 未修复 | — | — |
 | L1 | 目标 path 敏感过滤只识别 POSIX 绝对路径(`startswith("/")`),Windows 路径可能绕过 intent 阶段与 API 响应端两层 redaction | ⬜ 未修复 | — | — |
 | L2 | `/operations/safety-events` 把 `tool_call_id` 传给 `service.list_alerts(task_id=...)` 形参名具有误导性 | ⬜ 未修复 | — | — |
 | H3 | `AnsichEntityRow` 与其类型化子行(AuthorizationSnapshot/AgentRelease/Alert)之间无 ORM `relationship()`,同一次 flush 插入顺序不保证,FK 强制开启的生产环境下确定性失败 | ✅ 已修复 | 2026-07-22 | `e074bd60` |
-| H4 | `DELETE FROM ansich_belief_assertions` 在 `PRAGMA foreign_keys=ON` 下违反 FK 约束 | ✅ 已修复 | 2026-07-23 | 本次变更(待提交) |
-| H5 | 大 payload externalize 后的 ContextSnapshot 在 FK 强制开启时静默失败,`get_step_context` 返回 None | ✅ 已修复 | 2026-07-23 | 本次变更(待提交) |
+| H4 | `DELETE FROM ansich_belief_assertions` 在 `PRAGMA foreign_keys=ON` 下违反 FK 约束 | ✅ 已修复 | 2026-07-23 | `b9c1f9e8` |
+| H5 | 大 payload externalize 后的 ContextSnapshot 在 FK 强制开启时静默失败,`get_step_context` 返回 None | ✅ 已修复 | 2026-07-23 | `b9c1f9e8` |
 | H6 | `_persist_assessment` 插入 `AnsichBeliefAssertionRow` 前不检查 `subject_id` 对应的 Entity 是否已存在,scope-safety(`subject_id`=tool_call_id)在其 ToolCall 尚未投影时硬失败 5 次耗尽重试,而非像 projector 一样优雅走 `_ProjectionDependencyPending` | ⬜ 未修复 | — | — |
 | H7 | Collector 有界队列 fail-open 丢弃 `step.started`(高置信度,无法对本次实例实锤),导致该 Step 后续全部 projection 级联永久 `failed`;`dropped_count`/`lost_ranges` 不落盘,事后不可追溯 | ⬜ 未修复 | — | — |
 
@@ -30,7 +30,8 @@
 
 ## H2. raw 结果失败/超时/取消时,observed effect 仍以 `fidelity_class="hard"` 记录
 
-- 状态:⬜ 未修复。
+- 状态:✅ 已修复(2026-07-23,本次变更待提交)。按 TDD 先新增生产中间件路径回归,覆盖 `write_file`/`bash` × `tool.failed`/`tool.timed_out`/`tool.cancelled` 六种组合,确认修复前每种组合的 `effect.observed` 都至少包含一条 `fidelity_class="hard"`。`_record_observed_effects` 现在只在 `invocation.raw_terminal_kind == "tool.returned_raw"` 且 effect class 已知时记录 `hard`;失败、超时、取消以及未知 effect class 一律降级为既有的 `unknown`,保留 observed 证据但不再把"调用结束"误断言为"副作用已完成"。最终全量 `backend/tests/ansich/` 为 330 passed。
+- 原始诊断(留档):
 - 位置:`tool_middleware.py::_record_observed_effects`(tool_middleware.py:364-400)固定 `fidelity_class=("unknown" if effect_class == "unknown" else "hard")`,从不检查 `invocation.raw_terminal_kind`;调用方 `_record_raw_result`(tool_middleware.py:403-468)在 `accepted` 时无条件调用它,而 `raw_terminal_kind` 可以是 `tool.failed`/`tool.timed_out`/`tool.cancelled`(见 `AnsichRawToolMiddleware.wrap_tool_call`/`awrap_tool_call` 的异常分支,tool_middleware.py:723/765,均汇入 `_record_raw_result`)。
 - 现状:`write_file` 因权限错误或沙箱超时而中途失败,`_effect_class("write_file")` 仍归类为 `filesystem_write`,于是记录一条 `fidelity_class="hard"` 的 `effect.observed{filesystem_write}`——即便写入可能根本没有完成。计划 §4/§6 明确 effect fidelity 是 `scope-safety@1` 判定 `realized_scope_violation`(critical 级告警)的直接依据,过度确信的 `hard` fidelity 会在失败调用上产生假阳性"已越权"结论。当前唯一覆盖该函数的测试(`test_execution_context.py` 里两个 `timeout_tool` 用例)用的 `tool_name="timeout_tool"`,而 `_effect_class` 把它归类为 `"unknown"`——即分支必然落到 `fidelity_class="unknown"`,永远测不到具名工具(`write_file`/`bash` 等)在失败终态下被错误标记为 `"hard"` 的路径。
 - 方向:在 `_record_observed_effects` 增加 `invocation.raw_terminal_kind == "tool.returned_raw"` 的门控,非正常返回时 fidelity 降级(如 `"unverified"` 或既有的 `"unknown"`)。补一条"具名工具在 failed/timed_out/cancelled 终态下不产出 hard fidelity effect"的回归测试,覆盖 `write_file`/`bash` 而非仅 `timeout_tool`。
@@ -78,7 +79,7 @@
 
 ## H4. `DELETE FROM ansich_belief_assertions` 在 FK 强制开启时违反约束
 
-- 状态:✅ 已修复(2026-07-23,本次变更待提交)。给两条相关测试启用 `PRAGMA foreign_keys=ON` 后稳定复现;逐一核对全部 assertion 引用方与命中数据,确认 `ansich_current_beliefs`、`ansich_belief_evidence`、`ansich_scope_conclusions` 已是 `ON DELETE CASCADE`,实际阻断删除的是 `ansich_task_summaries.assertion_id` 的默认 `NO ACTION`。该列是可重建读模型指针,现有 `list_tasks` 契约又明确要求 assertion 缺失时保留 Task、返回 degraded,因此修复为 nullable + `ON DELETE SET NULL`,而不是级联删除 TaskSummary。新增 `0021_ansich_summary_assertion_fk` 可逆迁移(降级前丢弃已无法恢复 assertion 指针的 NULL summary,随后恢复旧约束),并让 Phase 9 迁移升降级测试全程在 FK 强制下使用合法父行。回归覆盖 create-all schema 的缺失 assertion 退化读取与 Alembic upgrade/downgrade schema;最终全量 `backend/tests/ansich/` 为 324 passed。
+- 状态:✅ 已修复(2026-07-23,`b9c1f9e8`)。给两条相关测试启用 `PRAGMA foreign_keys=ON` 后稳定复现;逐一核对全部 assertion 引用方与命中数据,确认 `ansich_current_beliefs`、`ansich_belief_evidence`、`ansich_scope_conclusions` 已是 `ON DELETE CASCADE`,实际阻断删除的是 `ansich_task_summaries.assertion_id` 的默认 `NO ACTION`。该列是可重建读模型指针,现有 `list_tasks` 契约又明确要求 assertion 缺失时保留 Task、返回 degraded,因此修复为 nullable + `ON DELETE SET NULL`,而不是级联删除 TaskSummary。新增 `0021_ansich_summary_assertion_fk` 可逆迁移(降级前丢弃已无法恢复 assertion 指针的 NULL summary,随后恢复旧约束),并让 Phase 9 迁移升降级测试全程在 FK 强制下使用合法父行。回归覆盖 create-all schema 的缺失 assertion 退化读取与 Alembic upgrade/downgrade schema;最终全量 `backend/tests/ansich/` 为 324 passed。
 - 原始诊断(留档):
 - 位置:命中的两个测试——`test_sql_safety.py::test_phase9_safety_migration_upgrades_sqlite`(alembic 升降级测试)、`test_sql_task_lifecycle.py::test_list_tasks_uses_one_joined_query_and_keeps_page_length_with_a_missing_assertion`(模拟"缺失 assertion"退化场景)——报错均为同一条语句:`sqlite3.IntegrityError: FOREIGN KEY constraint failed [SQL: DELETE FROM ansich_belief_assertions WHERE ansich_belief_assertions.assertion_id = ?]`。两处触发路径不同但报错语句完全一致,提示是某个共享的清理/重建/降级代码路径删除 `ansich_belief_assertions` 行时,没有先删除或未正确级联仍引用该 assertion 的子行(`AnsichBeliefEvidenceRow`、`AnsichScopeConclusionRow`、`AnsichCurrentBeliefRow` 等均有 `assertion_id`/`source_assertion_id` 外键,需要逐一核实各自的 `ondelete` 设置与实际删除顺序)。
 - 现状:与 H3 是**不同性质**的 bug——H3 是"同一 flush 内两个新增 INSERT 顺序不保证",这里是 DELETE 顺序/级联配置问题,需要独立走 Phase 1 根因排查(读错误、复现、查最近改动、对比 CASCADE/RESTRICT 配置)才能定位到具体是哪个函数、哪张子表。
@@ -87,7 +88,7 @@
 
 ## H5. 大 payload externalize 后的 ContextSnapshot 在 FK 强制开启时静默投影失败
 
-- 状态:✅ 已修复(2026-07-23,本次变更待提交)。给目标测试启用 `PRAGMA foreign_keys=ON` 后先读 `ansich_projection_errors`,结果为空;同时数据库只有 `task.created`/`step.started`,证明失败尚未进入 projector,推翻了下方"投影异常被吞"的原假设。临时截获持久化边界取得真实异常:`sqlite3.IntegrityError: FOREIGN KEY constraint failed [SQL: INSERT INTO ansich_observations ... payload_ref_id ...]`,命中 externalized `llm.requested`。根因是 `persist_and_project` 同一事务内 add `AnsichPayloadRow` 后未显式 flush,随即插入引用它的 `AnsichObservationRow`;FK-on 下父行尚不可见,异常又被 `AnsichService._persist_items` 按 fail-open 语义折叠成 `storage_failure`/observation loss,所以表面才是 Step/ContextSnapshot 消失。修复是在 externalized observation payload 写入后显式 `await session.flush()` 再插 observation;目标用例现在同时锁定 FK-on、payload externalize、ContextSnapshot 可查询与原文懒加载;最终全量 `backend/tests/ansich/` 为 324 passed。
+- 状态:✅ 已修复(2026-07-23,`b9c1f9e8`)。给目标测试启用 `PRAGMA foreign_keys=ON` 后先读 `ansich_projection_errors`,结果为空;同时数据库只有 `task.created`/`step.started`,证明失败尚未进入 projector,推翻了下方"投影异常被吞"的原假设。临时截获持久化边界取得真实异常:`sqlite3.IntegrityError: FOREIGN KEY constraint failed [SQL: INSERT INTO ansich_observations ... payload_ref_id ...]`,命中 externalized `llm.requested`。根因是 `persist_and_project` 同一事务内 add `AnsichPayloadRow` 后未显式 flush,随即插入引用它的 `AnsichObservationRow`;FK-on 下父行尚不可见,异常又被 `AnsichService._persist_items` 按 fail-open 语义折叠成 `storage_failure`/observation loss,所以表面才是 Step/ContextSnapshot 消失。修复是在 externalized observation payload 写入后显式 `await session.flush()` 再插 observation;目标用例现在同时锁定 FK-on、payload externalize、ContextSnapshot 可查询与原文懒加载;最终全量 `backend/tests/ansich/` 为 324 passed。
 - 原始诊断(留档):
 - 位置:`test_sql_task_lifecycle.py::test_large_content_payload_is_externalized_but_remains_lazy_queryable`(`inline_payload_max_bytes=128` 触发 payload externalize 路径)。失败现象是 `service.get_step_context(step.step_id)` 返回 `None`,而不是像 H3/H4 那样抛出可见的 `IntegrityError`——说明底层投影失败被某个 `try/except` 吞掉、只在 `ansich_projection_errors`/`_failed_jobs` 计数里留痕,断言层面表现为"数据消失"而非报错,排查时需要先用 U3 新增的 `list_failed_jobs`/`get_failed_job_detail`(或直接查 `ansich_projection_errors`)取出真实异常文本,而不是靠测试断言反推。
 - 现状:未确认是否与 H3/H4 同属"缺 flush 顺序保证"这一类,还是 Phase 2/4 的 ContextSnapshot/ContentBlob externalize 投影路径里的另一个独立问题——两者都可能,需要先复现取得真实报错文本才能判断。
@@ -126,7 +127,7 @@
 ## 计划测试矩阵缺口(随修复补齐)
 
 - ~~H1:`decision="unknown"` 在生产代码路径(而非手工构造的领域测试)零覆盖;`tool_middleware.py` 新增记录函数没有独立于 `AnsichExecutionContext`/`AnsichService` 集成路径之外的单元测试文件。~~ **已补齐(2026-07-21)**:`test_authorization_outcome.py` 独立单元覆盖桥接契约;`test_execution_context.py::test_raw_probe_records_unknown_when_no_guardrail_outcome` 让 `decision="unknown"` 首次在生产探针路径被断言。
-- H2:失败/超时/取消终态下具名工具(`write_file`/`bash` 等,而非 `_effect_class` 恒返回 `unknown` 的 `timeout_tool`)的 observed effect fidelity 零覆盖。
+- ~~H2:失败/超时/取消终态下具名工具(`write_file`/`bash` 等,而非 `_effect_class` 恒返回 `unknown` 的 `timeout_tool`)的 observed effect fidelity 零覆盖。~~ **已补齐(2026-07-23)**:`test_named_tool_failure_terminal_effects_are_not_hard_fidelity` 覆盖两个具名工具与三种非成功终态的完整组合。
 - M1:`filesystem_delete`、`permission_change` 两个 effect class 零生产路径、零测试覆盖。
 - M2:贡献/证据数增长时 scope-safety 重估工作量不随任务历史线性增长——尚无性能护栏测试(参考 phase-6-review-followups.md M1 的 SQL 监听回归写法)。
 - API/UI:`test_ansich_router.py` 本次仅新增 26 行覆盖 4 个新端点,不足以独立确认 `_safe_effect_payload` 的敏感模式/绝对路径两个分支都被真实触达;建议补充针对性用例,尤其是 L1 的 Windows 路径分支。

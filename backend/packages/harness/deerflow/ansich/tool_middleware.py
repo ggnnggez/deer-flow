@@ -397,13 +397,14 @@ def _record_observed_effects(
     # emits child_task_spawn only after TaskControlProbe.created().
     if effect_class == "child_task_spawn":
         return
+    fidelity_class = "hard" if (invocation.raw_terminal_kind == "tool.returned_raw" and effect_class != "unknown") else "unknown"
     observations = [
         _effect_observation(
             execution,
             invocation,
             effect_class=effect_class,
             phase="observed",
-            fidelity_class=("unknown" if effect_class == "unknown" else "hard"),
+            fidelity_class=fidelity_class,
             target_hash=invocation.registration.args_hash,
             target_preview=f"tool:{invocation.registration.tool_name}",
             causation_obs_id=invocation.raw_terminal_obs_id,
