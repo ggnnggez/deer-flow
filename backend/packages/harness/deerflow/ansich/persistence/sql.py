@@ -704,6 +704,7 @@ class SqlAnsichBackend:
                                 body=encoded_payload,
                             )
                         )
+                        await session.flush()
                         payload_json = None
                 session.add(
                     AnsichObservationRow(

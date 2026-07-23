@@ -1272,7 +1272,13 @@ class AnsichTaskSummaryRow(Base):
     control_value: Mapped[str] = mapped_column(String(32), nullable=False)
     control_as_of: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
     last_evidence_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
-    assertion_id: Mapped[str] = mapped_column(String(36), ForeignKey("ansich_belief_assertions.assertion_id"), nullable=False)
+    assertion_id: Mapped[str | None] = mapped_column(
+        String(36),
+        ForeignKey(
+            "ansich_belief_assertions.assertion_id",
+            ondelete="SET NULL",
+        ),
+    )
     projection_watermark: Mapped[int] = mapped_column(BigInteger, nullable=False)
     observability_status: Mapped[str] = mapped_column(String(16), nullable=False, default="healthy")
     tool_calls_issued: Mapped[int] = mapped_column(BigInteger, nullable=False, default=0)

@@ -716,6 +716,13 @@ async def test_list_tasks_uses_one_joined_query_and_keeps_page_length_with_a_mis
     tmp_path,
 ):
     engine = create_async_engine(f"sqlite+aiosqlite:///{tmp_path / 'ansich-task-list-query.db'}")
+
+    @event.listens_for(engine.sync_engine, "connect")
+    def _enable_foreign_keys(dbapi_connection, _connection_record):
+        cursor = dbapi_connection.cursor()
+        cursor.execute("PRAGMA foreign_keys=ON")
+        cursor.close()
+
     session_factory = async_sessionmaker(engine, expire_on_commit=False)
     async with engine.begin() as connection:
         await connection.run_sync(Base.metadata.create_all)
@@ -925,7 +932,7 @@ def test_projection_dependency_deadline_migration_upgrades_sqlite(tmp_path) -> N
         engine.dispose()
 
     assert "dependency_pending_since" in column_names
-    assert revision == "0020_ansich_scope_safety"
+    assert revision == "0021_ansich_summary_assertion_fk"
     assert len(revision) <= 32
 
 
@@ -1220,6 +1227,13 @@ async def test_step_attempt_and_context_are_queryable_after_projection(tmp_path)
 @pytest.mark.anyio
 async def test_large_content_payload_is_externalized_but_remains_lazy_queryable(tmp_path):
     engine = create_async_engine(f"sqlite+aiosqlite:///{tmp_path / 'ansich-large-payload.db'}")
+
+    @event.listens_for(engine.sync_engine, "connect")
+    def _enable_foreign_keys(dbapi_connection, _connection_record):
+        cursor = dbapi_connection.cursor()
+        cursor.execute("PRAGMA foreign_keys=ON")
+        cursor.close()
+
     session_factory = async_sessionmaker(engine, expire_on_commit=False)
     async with engine.begin() as connection:
         await connection.run_sync(Base.metadata.create_all)

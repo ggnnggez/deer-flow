@@ -17,6 +17,7 @@ from ansich import (
 from sqlalchemy import create_engine, event, func, inspect, select, text
 from sqlalchemy.dialects import postgresql
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
+from sqlalchemy.pool import Pool
 from sqlalchemy.schema import CreateTable
 
 from deerflow.ansich import create_sql_ansich_service
@@ -24,9 +25,12 @@ from deerflow.ansich.persistence.models import (
     AnsichAuthorizationPermissionRow,
     AnsichAuthorizationSnapshotRow,
     AnsichCurrentBeliefRow,
+    AnsichEntityRow,
+    AnsichObservationRow,
     AnsichRelationRow,
     AnsichScopeConclusionRow,
     AnsichScopeRow,
+    AnsichTaskSummaryRow,
     AnsichToolCallAuthorizationRow,
     AnsichToolEffectRow,
 )
@@ -73,17 +77,99 @@ def test_phase9_safety_migration_upgrades_sqlite(tmp_path) -> None:
     config.set_main_option("sqlalchemy.url", f"sqlite+aiosqlite:///{database_path}")
     config.config_file_name = None
 
-    alembic_command.upgrade(config, "head")
+    def _enable_foreign_keys(dbapi_connection, _connection_record):
+        cursor = dbapi_connection.cursor()
+        cursor.execute("PRAGMA foreign_keys=ON")
+        cursor.close()
+
+    event.listen(Pool, "connect", _enable_foreign_keys)
+    try:
+        alembic_command.upgrade(config, "head")
+    finally:
+        event.remove(Pool, "connect", _enable_foreign_keys)
 
     engine = create_engine(f"sqlite:///{database_path}")
+
+    @event.listens_for(engine, "connect")
+    def _enable_verification_foreign_keys(
+        dbapi_connection,
+        _connection_record,
+    ):
+        _enable_foreign_keys(dbapi_connection, _connection_record)
+
     try:
         database_inspector = inspect(engine)
         table_names = set(database_inspector.get_table_names())
         scope_columns = {column["name"] for column in database_inspector.get_columns("ansich_scopes")}
         relation_columns = {column["name"] for column in database_inspector.get_columns("ansich_relations")}
+        summary_columns = {column["name"]: column for column in database_inspector.get_columns("ansich_task_summaries")}
+        summary_assertion_fk = next(foreign_key for foreign_key in database_inspector.get_foreign_keys("ansich_task_summaries") if foreign_key["constrained_columns"] == ["assertion_id"])
         with engine.connect() as connection:
             revision = connection.scalar(text("SELECT version_num FROM alembic_version"))
         with engine.begin() as connection:
+            observed_at = datetime(2026, 7, 23, tzinfo=UTC)
+            connection.execute(
+                AnsichObservationRow.__table__.insert(),
+                (
+                    {
+                        "obs_id": "00000000-0000-4000-8000-000000000201",
+                        "schema_version": 1,
+                        "kind": "task.created",
+                        "occurred_at": observed_at,
+                        "recorded_at": observed_at,
+                        "task_id": "00000000-0000-4000-8000-000000000301",
+                        "step_id": None,
+                        "subject_type": "task",
+                        "subject_id": "00000000-0000-4000-8000-000000000301",
+                        "fidelity_class": "hard",
+                        "producer_name": "migration-test",
+                        "producer_version": "1",
+                        "producer_instance_id": "migration-test",
+                        "producer_seq": 1,
+                        "source_event_id": "migration-test:scope-a",
+                        "correlation_id": "migration-test",
+                        "causation_obs_id": None,
+                        "payload_json": {},
+                        "payload_ref_id": None,
+                    },
+                    {
+                        "obs_id": "00000000-0000-4000-8000-000000000202",
+                        "schema_version": 1,
+                        "kind": "task.created",
+                        "occurred_at": observed_at,
+                        "recorded_at": observed_at,
+                        "task_id": "00000000-0000-4000-8000-000000000302",
+                        "step_id": None,
+                        "subject_type": "task",
+                        "subject_id": "00000000-0000-4000-8000-000000000302",
+                        "fidelity_class": "hard",
+                        "producer_name": "migration-test",
+                        "producer_version": "1",
+                        "producer_instance_id": "migration-test",
+                        "producer_seq": 2,
+                        "source_event_id": "migration-test:scope-b",
+                        "correlation_id": "migration-test",
+                        "causation_obs_id": None,
+                        "payload_json": {},
+                        "payload_ref_id": None,
+                    },
+                ),
+            )
+            connection.execute(
+                AnsichEntityRow.__table__.insert(),
+                (
+                    {
+                        "entity_id": "00000000-0000-4000-8000-000000000101",
+                        "entity_type": "scope",
+                        "discovered_obs_id": "00000000-0000-4000-8000-000000000201",
+                    },
+                    {
+                        "entity_id": "00000000-0000-4000-8000-000000000102",
+                        "entity_type": "scope",
+                        "discovered_obs_id": "00000000-0000-4000-8000-000000000202",
+                    },
+                ),
+            )
             connection.execute(
                 text(
                     """
@@ -112,7 +198,7 @@ def test_phase9_safety_migration_upgrades_sqlite(tmp_path) -> None:
     finally:
         engine.dispose()
 
-    assert revision == "0020_ansich_scope_safety"
+    assert revision == "0021_ansich_summary_assertion_fk"
     assert {
         "ansich_authorization_snapshots",
         "ansich_authorization_scopes",
@@ -123,8 +209,14 @@ def test_phase9_safety_migration_upgrades_sqlite(tmp_path) -> None:
     } <= table_names
     assert {"external_ref_hash", "display_label", "parent_scope_id", "created_obs_id"} <= scope_columns
     assert {"relation_role", "inherited_from_task_id"} <= relation_columns
+    assert summary_columns[AnsichTaskSummaryRow.assertion_id.name]["nullable"] is True
+    assert summary_assertion_fk["options"]["ondelete"] == "SET NULL"
 
-    alembic_command.downgrade(config, "0019_ansich_task_tree_usage")
+    event.listen(Pool, "connect", _enable_foreign_keys)
+    try:
+        alembic_command.downgrade(config, "0019_ansich_task_tree_usage")
+    finally:
+        event.remove(Pool, "connect", _enable_foreign_keys)
     engine = create_engine(f"sqlite:///{database_path}")
     try:
         downgraded_scope_columns = {column["name"] for column in inspect(engine).get_columns("ansich_scopes")}

@@ -443,8 +443,13 @@ operator retry path instead of polling forever.
 SQLite production connections enforce foreign keys, so typed child projections
 must flush their `ansich_entities` parent before an autoflush can insert the
 child row; Ansich SQL tests that cover this path must enable
-`PRAGMA foreign_keys=ON`. Persisted failed-job counts are restored when the
-service starts. `AnsichService.retry_failed_projections(task_id=...)` is the
+`PRAGMA foreign_keys=ON`. Externalized Observation payloads likewise flush their
+`ansich_payloads` parent before inserting the referencing Observation.
+Task-summary assertion pointers are nullable with `ON DELETE SET NULL`, so a
+missing derived assertion preserves the paginated Task row and marks it
+degraded instead of violating the FK or deleting the summary. Persisted
+failed-job counts are restored when the service starts.
+`AnsichService.retry_failed_projections(task_id=...)` is the
 non-destructive recovery boundary: it requeues durable failed jobs, preserves
 their error evidence, and late ContextSnapshot success repairs both the LLM
 attempt and an already-closed Step's effective snapshot pointer.
@@ -1040,6 +1045,8 @@ This invokes `alembic revision --autogenerate` against the live ORM models. Revi
 - `migrations/versions/0017_ansich_alerts.py` — Phase 6 assessor jobs/errors, versioned assertion provenance, Alert episodes/workflow/read model, and idempotent operator-action audit
 - `migrations/versions/0018_ansich_agent_releases.py` — Phase 7 immutable AgentRelease manifests/component summaries and one starting release binding per Task
 - `migrations/versions/0019_ansich_task_tree_usage.py` — Phase 8 typed parent/child Task spawns and ancestry closure, source-aware usage contributions, and local/inclusive usage summaries
+- `migrations/versions/0020_ansich_scope_safety.py` — Phase 9 typed Scope, authorization, ToolEffect, and scope-safety conclusion storage
+- `migrations/versions/0021_ansich_summary_assertion_fk.py` — nullable Task-summary assertion pointer with `ON DELETE SET NULL` for degraded missing-assertion reads
 - `persistence/bootstrap.py` — `bootstrap_schema(engine, backend=...)`, the three-branch decision + locking
 - Tests: `tests/test_persistence_bootstrap.py` (branches), `tests/test_persistence_bootstrap_concurrency.py` (concurrency), `tests/test_persistence_bootstrap_regression.py` (issue #3682), `tests/test_persistence_migrations_env.py` (filter), `tests/blocking_io/test_persistence_bootstrap.py` (asyncio.to_thread anchor)
 

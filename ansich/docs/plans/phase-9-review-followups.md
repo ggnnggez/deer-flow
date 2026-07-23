@@ -13,8 +13,8 @@
 | L1 | 目标 path 敏感过滤只识别 POSIX 绝对路径(`startswith("/")`),Windows 路径可能绕过 intent 阶段与 API 响应端两层 redaction | ⬜ 未修复 | — | — |
 | L2 | `/operations/safety-events` 把 `tool_call_id` 传给 `service.list_alerts(task_id=...)` 形参名具有误导性 | ⬜ 未修复 | — | — |
 | H3 | `AnsichEntityRow` 与其类型化子行(AuthorizationSnapshot/AgentRelease/Alert)之间无 ORM `relationship()`,同一次 flush 插入顺序不保证,FK 强制开启的生产环境下确定性失败 | ✅ 已修复 | 2026-07-22 | `e074bd60` |
-| H4 | `DELETE FROM ansich_belief_assertions` 在 `PRAGMA foreign_keys=ON` 下违反 FK 约束,根因未查 | ⬜ 未修复 | — | — |
-| H5 | 大 payload externalize 后的 ContextSnapshot 在 FK 强制开启时静默投影失败,`get_step_context` 返回 None,根因未查 | ⬜ 未修复 | — | — |
+| H4 | `DELETE FROM ansich_belief_assertions` 在 `PRAGMA foreign_keys=ON` 下违反 FK 约束 | ✅ 已修复 | 2026-07-23 | 本次变更(待提交) |
+| H5 | 大 payload externalize 后的 ContextSnapshot 在 FK 强制开启时静默失败,`get_step_context` 返回 None | ✅ 已修复 | 2026-07-23 | 本次变更(待提交) |
 | H6 | `_persist_assessment` 插入 `AnsichBeliefAssertionRow` 前不检查 `subject_id` 对应的 Entity 是否已存在,scope-safety(`subject_id`=tool_call_id)在其 ToolCall 尚未投影时硬失败 5 次耗尽重试,而非像 projector 一样优雅走 `_ProjectionDependencyPending` | ⬜ 未修复 | — | — |
 | H7 | Collector 有界队列 fail-open 丢弃 `step.started`(高置信度,无法对本次实例实锤),导致该 Step 后续全部 projection 级联永久 `failed`;`dropped_count`/`lost_ranges` 不落盘,事后不可追溯 | ⬜ 未修复 | — | — |
 
@@ -78,7 +78,8 @@
 
 ## H4. `DELETE FROM ansich_belief_assertions` 在 FK 强制开启时违反约束
 
-- 状态:⬜ 未修复,**根因未查**——本条是修复 H3 后,为确认"同类隐患是否还有别处",对整个 `tests/ansich/` 套件做了一次全局强制 `PRAGMA foreign_keys=ON` 扫描时命中的,不在本次原始排查范围(用户只要求排查真实库里那 69 条失败 job,已随 H3 解决),尚未做 Phase 1 根因定位。
+- 状态:✅ 已修复(2026-07-23,本次变更待提交)。给两条相关测试启用 `PRAGMA foreign_keys=ON` 后稳定复现;逐一核对全部 assertion 引用方与命中数据,确认 `ansich_current_beliefs`、`ansich_belief_evidence`、`ansich_scope_conclusions` 已是 `ON DELETE CASCADE`,实际阻断删除的是 `ansich_task_summaries.assertion_id` 的默认 `NO ACTION`。该列是可重建读模型指针,现有 `list_tasks` 契约又明确要求 assertion 缺失时保留 Task、返回 degraded,因此修复为 nullable + `ON DELETE SET NULL`,而不是级联删除 TaskSummary。新增 `0021_ansich_summary_assertion_fk` 可逆迁移(降级前丢弃已无法恢复 assertion 指针的 NULL summary,随后恢复旧约束),并让 Phase 9 迁移升降级测试全程在 FK 强制下使用合法父行。回归覆盖 create-all schema 的缺失 assertion 退化读取与 Alembic upgrade/downgrade schema;最终全量 `backend/tests/ansich/` 为 324 passed。
+- 原始诊断(留档):
 - 位置:命中的两个测试——`test_sql_safety.py::test_phase9_safety_migration_upgrades_sqlite`(alembic 升降级测试)、`test_sql_task_lifecycle.py::test_list_tasks_uses_one_joined_query_and_keeps_page_length_with_a_missing_assertion`(模拟"缺失 assertion"退化场景)——报错均为同一条语句:`sqlite3.IntegrityError: FOREIGN KEY constraint failed [SQL: DELETE FROM ansich_belief_assertions WHERE ansich_belief_assertions.assertion_id = ?]`。两处触发路径不同但报错语句完全一致,提示是某个共享的清理/重建/降级代码路径删除 `ansich_belief_assertions` 行时,没有先删除或未正确级联仍引用该 assertion 的子行(`AnsichBeliefEvidenceRow`、`AnsichScopeConclusionRow`、`AnsichCurrentBeliefRow` 等均有 `assertion_id`/`source_assertion_id` 外键,需要逐一核实各自的 `ondelete` 设置与实际删除顺序)。
 - 现状:与 H3 是**不同性质**的 bug——H3 是"同一 flush 内两个新增 INSERT 顺序不保证",这里是 DELETE 顺序/级联配置问题,需要独立走 Phase 1 根因排查(读错误、复现、查最近改动、对比 CASCADE/RESTRICT 配置)才能定位到具体是哪个函数、哪张子表。
 - 方向:先用本次证明有效的技术复现(给相关测试引擎打开 `PRAGMA foreign_keys=ON` 并单独跑),定位到具体调用 `DELETE FROM ansich_belief_assertions` 的函数,核对该表被引用方的 `ForeignKey(..., ondelete=...)` 设置是否需要改成 `CASCADE`,或者删除代码本身需要先删子行。
@@ -86,7 +87,8 @@
 
 ## H5. 大 payload externalize 后的 ContextSnapshot 在 FK 强制开启时静默投影失败
 
-- 状态:⬜ 未修复,**根因未查**——同 H4,发现于全局 FK 强制扫描,非本次原始排查目标。
+- 状态:✅ 已修复(2026-07-23,本次变更待提交)。给目标测试启用 `PRAGMA foreign_keys=ON` 后先读 `ansich_projection_errors`,结果为空;同时数据库只有 `task.created`/`step.started`,证明失败尚未进入 projector,推翻了下方"投影异常被吞"的原假设。临时截获持久化边界取得真实异常:`sqlite3.IntegrityError: FOREIGN KEY constraint failed [SQL: INSERT INTO ansich_observations ... payload_ref_id ...]`,命中 externalized `llm.requested`。根因是 `persist_and_project` 同一事务内 add `AnsichPayloadRow` 后未显式 flush,随即插入引用它的 `AnsichObservationRow`;FK-on 下父行尚不可见,异常又被 `AnsichService._persist_items` 按 fail-open 语义折叠成 `storage_failure`/observation loss,所以表面才是 Step/ContextSnapshot 消失。修复是在 externalized observation payload 写入后显式 `await session.flush()` 再插 observation;目标用例现在同时锁定 FK-on、payload externalize、ContextSnapshot 可查询与原文懒加载;最终全量 `backend/tests/ansich/` 为 324 passed。
+- 原始诊断(留档):
 - 位置:`test_sql_task_lifecycle.py::test_large_content_payload_is_externalized_but_remains_lazy_queryable`(`inline_payload_max_bytes=128` 触发 payload externalize 路径)。失败现象是 `service.get_step_context(step.step_id)` 返回 `None`,而不是像 H3/H4 那样抛出可见的 `IntegrityError`——说明底层投影失败被某个 `try/except` 吞掉、只在 `ansich_projection_errors`/`_failed_jobs` 计数里留痕,断言层面表现为"数据消失"而非报错,排查时需要先用 U3 新增的 `list_failed_jobs`/`get_failed_job_detail`(或直接查 `ansich_projection_errors`)取出真实异常文本,而不是靠测试断言反推。
 - 现状:未确认是否与 H3/H4 同属"缺 flush 顺序保证"这一类,还是 Phase 2/4 的 ContextSnapshot/ContentBlob externalize 投影路径里的另一个独立问题——两者都可能,需要先复现取得真实报错文本才能判断。
 - 方向:复用 H3 定位时用过的技术(monkeypatch `_record_projection_error`/`_record_assessor_error` 打印完整 traceback,或直接读 `ansich_projection_errors.message`)取得真实异常;若确认也是 entity+子行插入顺序问题,按 H3 的模式补 flush;若是别的原因,按 Phase 1 流程另行分析。
