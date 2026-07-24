@@ -377,6 +377,22 @@ export interface Translations {
     queueHighWatermark: string;
     queueBytes: string;
     queueByteHighWatermark: string;
+    systemMetricDescriptions: {
+      queue: string;
+      queueHighWatermark: string;
+      queueBytes: string;
+      queueByteHighWatermark: string;
+      watermark: string;
+      lag: string;
+      failedJobs: string;
+      accepted: string;
+      dropped: string;
+      lost: string;
+      snapshotRequests: string;
+      snapshotItems: string;
+      incompleteSnapshots: string;
+      missingBlocks: string;
+    };
     snapshotRequests: string;
     snapshotItems: string;
     contextAndLineage: string;

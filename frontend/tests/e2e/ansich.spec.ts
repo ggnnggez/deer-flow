@@ -819,6 +819,27 @@ test("admin navigates from Ansich operations to evidence-backed Task detail", as
   await expect(page.getByText("Data healthy")).toBeVisible();
   await page.getByRole("button", { name: "System details" }).first().click();
   await expect(page.getByText("Queue bytes", { exact: true })).toBeVisible();
+  await page
+    .getByRole("button", {
+      name: "Current Observations waiting in the in-process persistence queue. Sustained values near capacity indicate writer backpressure.",
+    })
+    .hover();
+  await expect(
+    page.getByRole("tooltip", {
+      name: "Current Observations waiting in the in-process persistence queue. Sustained values near capacity indicate writer backpressure.",
+    }),
+  ).toBeVisible();
+  for (const description of [
+    "Highest Observation count reached by the in-process queue since this Gateway process started. Values near capacity indicate past congestion.",
+    "Largest Observation ingest sequence successfully projected by this process. It is a processing position, not a completion percentage, and failed jobs may leave gaps below it.",
+    "Projection and assessor jobs currently in the failed state. Select the value to inspect errors and retry by Task.",
+    "Model-context snapshot capture batches attempted since this Gateway process started. The value in parentheses is accepted/dropped Observations, not successful/failed requests.",
+    "Unresolved ContentBlock references across persisted context snapshots and states. This counts references, not necessarily unique blocks.",
+  ]) {
+    await expect(page.getByRole("button", { name: description })).toBeVisible();
+  }
+  await page.keyboard.press("Escape");
+  await expect(page.getByRole("tooltip")).toBeHidden();
   await page.keyboard.press("Escape");
   await page.getByRole("link", { name: new RegExp(SHORT_TASK_ID) }).click();
 

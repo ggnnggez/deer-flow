@@ -437,7 +437,7 @@ export const zhCN: Translations = {
     projection: "投影状态",
     watermark: "水位",
     lag: "延迟",
-    failedJobs: "失败任务",
+    failedJobs: "失败 Job",
     failedJobsDialogTitle: "失败 Job",
     failedJobsDialogDescriptionGlobal: "当前所有 Task 中正在失败的投影与评估 Job。",
     failedJobsDialogDescriptionTask: "当前这个 Task 正在失败的投影与评估 Job。",
@@ -452,6 +452,36 @@ export const zhCN: Translations = {
     queueHighWatermark: "队列最高水位",
     queueBytes: "队列字节",
     queueByteHighWatermark: "队列字节最高水位",
+    systemMetricDescriptions: {
+      queue:
+        "当前在进程内等待持久化的 Observation 数量。持续接近容量表示写入端存在背压。",
+      queueHighWatermark:
+        "本次 Gateway 进程启动以来，进程内队列达到过的最大 Observation 数量。接近容量表示曾发生拥塞。",
+      queueBytes:
+        "进程内队列当前持有的规范序列化字节数。字节上限用于防止少量超大 Observation 耗尽内存。",
+      queueByteHighWatermark:
+        "本次 Gateway 进程启动以来，队列达到过的最大序列化字节数。接近字节容量表示曾有大载荷压力。",
+      watermark:
+        "本进程已成功完成投影的最大 Observation ingest_seq。它是处理位置，不是完成百分比；更低序列仍可能存在失败 Job。",
+      lag:
+        "最新已记录 Observation 与最新成功投影 Observation 之间的近似时间差。持续增长表示投影正在积压。",
+      failedJobs:
+        "当前处于失败状态的投影 Job 和评估 Job。点击数值可查看错误，并按 Task 重试。",
+      accepted:
+        "本次 Gateway 进程启动以来，被接收入进程内队列的 Observation 数量。接收不等于已持久化或成功投影。",
+      dropped:
+        "本次 Gateway 进程启动以来，被 Collector 拒绝的 Observation 数量，例如队列超限或存储不可用。非零表示证据可能缺失。",
+      lost:
+        "根据已记录丢失区间计算出的缺失 Observation 总数。非零时，受影响的证据化结论可能降级为 unknown。",
+      snapshotRequests:
+        "本次 Gateway 进程启动以来尝试采集的模型上下文快照批次。括号内是接受/丢弃的 Observation 数，不是成功/失败请求数。",
+      snapshotItems:
+        "持久化上下文快照中表示的有序内容条目总数。一次模型请求通常包含多个条目。",
+      incompleteSnapshots:
+        "仍引用至少一个不可用 ContentBlock 的持久化上下文快照数。缺失内容晚到后可以恢复为完整。",
+      missingBlocks:
+        "持久化上下文快照和状态中尚未解析的 ContentBlock 引用数。它统计引用，不一定是去重后的内容块数。",
+    },
     snapshotRequests: "快照请求",
     snapshotItems: "快照条目",
     contextAndLineage: "上下文与谱系",

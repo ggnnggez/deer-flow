@@ -1,5 +1,6 @@
 "use client";
 
+import { CircleHelpIcon } from "lucide-react";
 import { useState } from "react";
 
 import {
@@ -9,6 +10,11 @@ import {
   SheetHeader,
   SheetTitle,
 } from "@/components/ui/sheet";
+import {
+  Tooltip,
+  TooltipContent,
+  TooltipTrigger,
+} from "@/components/ui/tooltip";
 import { countLostObservations } from "@/core/ansich/presentation";
 import type { AnsichHealth } from "@/core/ansich/types";
 import { useI18n } from "@/core/i18n/hooks";
@@ -61,69 +67,95 @@ export function AnsichSystemHealthDrawer({
             <HealthMetric
               label={t.ansich.queue}
               value={`${health.queue_depth}/${health.queue_capacity}`}
+              description={t.ansich.systemMetricDescriptions.queue}
             />
             <HealthMetric
               label={t.ansich.queueHighWatermark}
               value={String(health.queue_high_watermark)}
+              description={
+                t.ansich.systemMetricDescriptions.queueHighWatermark
+              }
             />
             <HealthMetric
               label={t.ansich.queueBytes}
               value={`${formatBytes(health.queue_bytes)}/${formatBytes(health.queue_byte_capacity)}`}
+              description={t.ansich.systemMetricDescriptions.queueBytes}
             />
             <HealthMetric
               label={t.ansich.queueByteHighWatermark}
               value={formatBytes(health.queue_byte_high_watermark)}
+              description={
+                t.ansich.systemMetricDescriptions.queueByteHighWatermark
+              }
             />
             <HealthMetric
               label={t.ansich.watermark}
               value={
                 health.watermark === null ? "—" : String(health.watermark)
               }
+              description={t.ansich.systemMetricDescriptions.watermark}
             />
-            <HealthMetric label={t.ansich.lag} value={`${health.lag_ms} ms`} />
-            <button
-              type="button"
-              onClick={() => setFailedJobsOpen(true)}
-              disabled={health.failed_jobs === 0}
-              className="flex items-baseline gap-2 text-left text-sm disabled:cursor-default"
-            >
-              <span className="text-muted-foreground">
+            <HealthMetric
+              label={t.ansich.lag}
+              value={`${health.lag_ms} ms`}
+              description={t.ansich.systemMetricDescriptions.lag}
+            />
+            <div className="flex flex-col gap-0.5 text-sm">
+              <span className="text-muted-foreground flex items-center gap-1 text-xs">
                 {t.ansich.failedJobs}
+                <MetricHelp
+                  description={t.ansich.systemMetricDescriptions.failedJobs}
+                />
               </span>
-              <span
+              <button
+                type="button"
+                onClick={() => setFailedJobsOpen(true)}
+                disabled={health.failed_jobs === 0}
                 className={
                   health.failed_jobs > 0
-                    ? "text-destructive font-mono font-medium tabular-nums underline"
-                    : "font-mono font-medium tabular-nums"
+                    ? "text-destructive w-fit font-mono font-medium tabular-nums underline"
+                    : "w-fit cursor-default font-mono font-medium tabular-nums"
                 }
               >
                 {health.failed_jobs}
-              </span>
-            </button>
+              </button>
+            </div>
             <HealthMetric
               label={t.ansich.accepted}
               value={String(health.accepted_count)}
+              description={t.ansich.systemMetricDescriptions.accepted}
             />
             <HealthMetric
               label={t.ansich.dropped}
               value={String(health.dropped_count)}
+              description={t.ansich.systemMetricDescriptions.dropped}
             />
-            <HealthMetric label={t.ansich.lost} value={String(lostCount)} />
+            <HealthMetric
+              label={t.ansich.lost}
+              value={String(lostCount)}
+              description={t.ansich.systemMetricDescriptions.lost}
+            />
             <HealthMetric
               label={t.ansich.snapshotRequests}
               value={`${health.snapshot_request_count} (${health.snapshot_observations_accepted}/${health.snapshot_observations_dropped})`}
+              description={t.ansich.systemMetricDescriptions.snapshotRequests}
             />
             <HealthMetric
               label={t.ansich.snapshotItems}
               value={String(health.snapshot_item_count)}
+              description={t.ansich.systemMetricDescriptions.snapshotItems}
             />
             <HealthMetric
               label={t.ansich.incompleteSnapshots}
               value={String(health.incomplete_snapshot_count)}
+              description={
+                t.ansich.systemMetricDescriptions.incompleteSnapshots
+              }
             />
             <HealthMetric
               label={t.ansich.missingBlocks}
               value={String(health.missing_content_block_count)}
+              description={t.ansich.systemMetricDescriptions.missingBlocks}
             />
           </div>
         </SheetContent>
@@ -137,11 +169,39 @@ export function AnsichSystemHealthDrawer({
   );
 }
 
-function HealthMetric({ label, value }: { label: string; value: string }) {
+function HealthMetric({
+  label,
+  value,
+  description,
+}: {
+  label: string;
+  value: string;
+  description?: string;
+}) {
   return (
     <div className="flex flex-col gap-0.5 text-sm">
-      <span className="text-muted-foreground text-xs">{label}</span>
+      <span className="text-muted-foreground flex items-center gap-1 text-xs">
+        {label}
+        {description ? <MetricHelp description={description} /> : null}
+      </span>
       <span className="font-mono font-medium tabular-nums">{value}</span>
     </div>
+  );
+}
+
+function MetricHelp({ description }: { description: string }) {
+  return (
+    <Tooltip>
+      <TooltipTrigger asChild>
+        <button
+          type="button"
+          aria-label={description}
+          className="hover:text-foreground focus-visible:ring-ring rounded-sm outline-none focus-visible:ring-2"
+        >
+          <CircleHelpIcon className="size-3.5" aria-hidden />
+        </button>
+      </TooltipTrigger>
+      <TooltipContent className="max-w-72">{description}</TooltipContent>
+    </Tooltip>
   );
 }

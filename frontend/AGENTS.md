@@ -101,7 +101,10 @@ safety (Budgets + Scopes & effects), and Evidence (timeline + context & lineage 
 Agent release, all lazy/no-store). Projection health renders as a compact
 `Data healthy · lag` line promoted to a page-level banner on
 degraded/failed/lost-range/storage-unavailable; the full metric wall lives in the
-`System details` drawer. UUIDs on list rows and the hero downgrade to their leading
+`System details` drawer. Every metric label in that drawer has a keyboard-focusable
+help trigger whose localized tooltip explains the metric's definition and diagnostic
+meaning; failed-job help stays separate from the clickable failed-job value. UUIDs on
+list rows and the hero downgrade to their leading
 8-char segment (`AnsichShortId`), full value behind copy/tooltip. Alert detail is
 ordered by action priority (summary → severity/workflow/active → impact → operator
 actions → why-triggered evidence → observation timeline) with rule/version/config
