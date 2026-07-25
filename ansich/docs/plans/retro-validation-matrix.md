@@ -961,7 +961,7 @@ git commit -m "docs(ansich): record retro validation matrix results and conclusi
 | A | #3320 / #4041 | 强通过 | **强通过** ✅ 命中 | `task.control.value == "completed"`（DeerFlow 的错误裁决）与 `StepView.status == result == "model_failed"`（Ansich 的独立判断）同时可读，构成矛盾证据。无需新增任何代码。 |
 | B | #3684 | 不确定 | **强通过** ✅ | 已实测确实发生 id 复用（两次快照 `message_id` 均为 `reused-human-id`）。`source_identity` 相同（`message:reused-human-id:occurrence:1:content:0`），但 `content_hash` 与 `block_id` 均不同——即内容身份基于 hash 而非 message id，覆盖没有被折叠。**副产品**：#3684 的异常特征可被精确表达为"同 `source_identity`、不同 `content_hash`"，这是一个现成的检出条件。 |
 | C | #4176 | 部分失败（预期内） | **诚实性强通过 / 能力边界确认** | `get_tool_effects` 返回非 None，`coverage == "unknown"`，`effects == ()`——没有证据时既不谎称 complete，也不凭空产出 effect，文档写的限制**确实按文档行为**。但要分清两件事：Ansich 能诚实地说"我不知道 bash 干了什么"，**不代表**它能回答 #4176 的根问题（`outputs/*.json` 是否生成）。后者按设计就在范围外，需要 bash 侧 instrumentation 才可能。 |
-| D | #3875 | 强通过 | _待填_ | _待填_ |
+| D | #3875 | 强通过 | **强通过** ✅ 命中 | 父 Task `local.total_tokens == 0`、`inclusive.total_tokens == 4_404_500`，`get_task_usage_breakdown(scope="inclusive").sources` 直接点名子 Task。#3875 的"lead 只发了 1 次 dispatch，99.7% token 在子 agent"这个结论可直接读出，无需人工算比例。 |
 | E | #3113 | 强通过 | _待填_ | _待填_ |
 | F | #3645 | 弱通过 | _待填_ | _待填_ |
 
