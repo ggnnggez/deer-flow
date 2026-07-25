@@ -51,7 +51,7 @@ from deerflow.persistence.migrations._helpers import _normalize_default
 asyncio_test = pytest.mark.asyncio
 
 
-HEAD = "0019_ansich_task_tree_usage"
+HEAD = "0021_ansich_summary_assertion_fk"
 BASELINE = "0001_baseline"
 
 
@@ -1064,7 +1064,7 @@ class TestDecideState:
 # ---------------------------------------------------------------------------
 
 
-def test_head_revision_is_ansich_task_tree_usage_revision() -> None:
+def test_head_revision_is_ansich_summary_assertion_fk_revision() -> None:
     assert _get_head_revision() == HEAD
 
 

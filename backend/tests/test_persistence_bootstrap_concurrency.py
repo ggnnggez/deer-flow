@@ -28,7 +28,7 @@ from deerflow.persistence.bootstrap import bootstrap_schema
 pytestmark = pytest.mark.asyncio
 
 
-HEAD = "0019_ansich_task_tree_usage"
+HEAD = "0021_ansich_summary_assertion_fk"
 
 
 def _url(tmp_path: Path) -> str:
