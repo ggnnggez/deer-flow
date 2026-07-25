@@ -41,12 +41,44 @@ def _scope_entity_id(scope_kind: str, external_ref_hash: str) -> str:
     return str(UUID(bytes=digest[:16], version=4))
 
 
+def _has_column(table: str, column: str) -> bool:
+    inspector = sa.inspect(op.get_bind())
+    if not inspector.has_table(table):
+        return False
+    return column in {existing["name"] for existing in inspector.get_columns(table)}
+
+
+def _create_table(name: str, *elements: sa.SchemaItem) -> None:
+    """Create a table unless a full ``create_all`` already produced it."""
+
+    if not sa.inspect(op.get_bind()).has_table(name):
+        op.create_table(name, *elements)
+
+
+def _create_index(name: str, table_name: str, columns: list[str]) -> None:
+    inspector = sa.inspect(op.get_bind())
+    if not inspector.has_table(table_name):
+        return
+    if name not in {index["name"] for index in inspector.get_indexes(table_name)}:
+        op.create_index(name, table_name, columns)
+
+
 def upgrade() -> None:
-    with op.batch_alter_table("ansich_scopes") as batch:
-        batch.add_column(sa.Column("external_ref_hash", sa.String(64)))
-        batch.add_column(sa.Column("display_label", sa.String(256)))
-        batch.add_column(sa.Column("parent_scope_id", sa.String(36)))
-        batch.add_column(sa.Column("created_obs_id", sa.String(36)))
+    # A database provisioned by a full ``Base.metadata.create_all`` -- the empty
+    # bootstrap branch, or a legacy DB whose ``alembic_version`` was lost and is
+    # re-stamped at 0001 -- already carries every column, constraint, and table
+    # this revision adds. Guard each schema step with an existence check, the
+    # same style 0013-0019 use, so the revision is a no-op there instead of
+    # failing with "duplicate column name: external_ref_hash".
+    scopes_need_columns = not _has_column("ansich_scopes", "external_ref_hash")
+    relations_need_columns = not _has_column("ansich_relations", "relation_role")
+
+    if scopes_need_columns:
+        with op.batch_alter_table("ansich_scopes") as batch:
+            batch.add_column(sa.Column("external_ref_hash", sa.String(64)))
+            batch.add_column(sa.Column("display_label", sa.String(256)))
+            batch.add_column(sa.Column("parent_scope_id", sa.String(36)))
+            batch.add_column(sa.Column("created_obs_id", sa.String(36)))
 
     connection = op.get_bind()
     legacy_scopes = connection.execute(
@@ -152,41 +184,43 @@ def upgrade() -> None:
             {"entity_id": old_scope_id},
         )
 
-    with op.batch_alter_table("ansich_scopes") as batch:
-        batch.alter_column("scope_value", existing_type=sa.String(256), nullable=True)
-        batch.alter_column("external_ref_hash", existing_type=sa.String(64), nullable=False)
-        batch.alter_column("display_label", existing_type=sa.String(256), nullable=False)
-        batch.alter_column("created_obs_id", existing_type=sa.String(36), nullable=False)
-        batch.create_foreign_key(
-            "fk_ansich_scope_parent",
-            "ansich_scopes",
-            ["parent_scope_id"],
-            ["entity_id"],
-            ondelete="RESTRICT",
-        )
-        batch.create_foreign_key(
-            "fk_ansich_scope_created_obs",
-            "ansich_observations",
-            ["created_obs_id"],
-            ["obs_id"],
-            ondelete="RESTRICT",
-        )
-        batch.create_unique_constraint(
-            "uq_ansich_scope_kind_external_ref_hash",
-            ["scope_kind", "external_ref_hash"],
-        )
-        batch.create_index("ix_ansich_scopes_parent", ["parent_scope_id"])
+    if scopes_need_columns:
+        with op.batch_alter_table("ansich_scopes") as batch:
+            batch.alter_column("scope_value", existing_type=sa.String(256), nullable=True)
+            batch.alter_column("external_ref_hash", existing_type=sa.String(64), nullable=False)
+            batch.alter_column("display_label", existing_type=sa.String(256), nullable=False)
+            batch.alter_column("created_obs_id", existing_type=sa.String(36), nullable=False)
+            batch.create_foreign_key(
+                "fk_ansich_scope_parent",
+                "ansich_scopes",
+                ["parent_scope_id"],
+                ["entity_id"],
+                ondelete="RESTRICT",
+            )
+            batch.create_foreign_key(
+                "fk_ansich_scope_created_obs",
+                "ansich_observations",
+                ["created_obs_id"],
+                ["obs_id"],
+                ondelete="RESTRICT",
+            )
+            batch.create_unique_constraint(
+                "uq_ansich_scope_kind_external_ref_hash",
+                ["scope_kind", "external_ref_hash"],
+            )
+            batch.create_index("ix_ansich_scopes_parent", ["parent_scope_id"])
 
-    with op.batch_alter_table("ansich_relations") as batch:
-        batch.add_column(sa.Column("relation_role", sa.String(32)))
-        batch.add_column(sa.Column("inherited_from_task_id", sa.String(36)))
-        batch.create_foreign_key(
-            "fk_ansich_relation_inherited_task",
-            "ansich_tasks",
-            ["inherited_from_task_id"],
-            ["entity_id"],
-            ondelete="RESTRICT",
-        )
+    if relations_need_columns:
+        with op.batch_alter_table("ansich_relations") as batch:
+            batch.add_column(sa.Column("relation_role", sa.String(32)))
+            batch.add_column(sa.Column("inherited_from_task_id", sa.String(36)))
+            batch.create_foreign_key(
+                "fk_ansich_relation_inherited_task",
+                "ansich_tasks",
+                ["inherited_from_task_id"],
+                ["entity_id"],
+                ondelete="RESTRICT",
+            )
 
     connection.execute(
         sa.text(
@@ -209,7 +243,7 @@ def upgrade() -> None:
         )
     )
 
-    op.create_table(
+    _create_table(
         "ansich_authorization_snapshots",
         sa.Column("snapshot_id", sa.String(36), nullable=False),
         sa.Column("tool_call_id", sa.String(36), nullable=False),
@@ -232,17 +266,17 @@ def upgrade() -> None:
         sa.ForeignKeyConstraint(["payload_id"], ["ansich_payloads.payload_id"], ondelete="RESTRICT"),
         sa.PrimaryKeyConstraint("snapshot_id"),
     )
-    op.create_index(
+    _create_index(
         "ix_ansich_authorization_tool_evaluated",
         "ansich_authorization_snapshots",
         ["tool_call_id", "evaluated_obs_id"],
     )
-    op.create_index(
+    _create_index(
         "ix_ansich_authorization_decision_policy",
         "ansich_authorization_snapshots",
         ["decision", "policy_id"],
     )
-    op.create_table(
+    _create_table(
         "ansich_authorization_scopes",
         sa.Column("snapshot_id", sa.String(36), nullable=False),
         sa.Column("scope_role", sa.String(16), nullable=False),
@@ -266,12 +300,12 @@ def upgrade() -> None:
             name="uq_ansich_authorization_scope_membership",
         ),
     )
-    op.create_index(
+    _create_index(
         "ix_ansich_authorization_scopes_scope",
         "ansich_authorization_scopes",
         ["scope_id", "snapshot_id"],
     )
-    op.create_table(
+    _create_table(
         "ansich_authorization_permissions",
         sa.Column("snapshot_id", sa.String(36), nullable=False),
         sa.Column("ordinal", sa.Integer(), nullable=False),
@@ -287,7 +321,7 @@ def upgrade() -> None:
         sa.ForeignKeyConstraint(["scope_id"], ["ansich_scopes.entity_id"], ondelete="RESTRICT"),
         sa.PrimaryKeyConstraint("snapshot_id", "ordinal"),
     )
-    op.create_table(
+    _create_table(
         "ansich_tool_call_authorizations",
         sa.Column("tool_call_id", sa.String(36), nullable=False),
         sa.Column("snapshot_id", sa.String(36), nullable=False),
@@ -301,7 +335,7 @@ def upgrade() -> None:
         sa.ForeignKeyConstraint(["relation_obs_id"], ["ansich_observations.obs_id"], ondelete="RESTRICT"),
         sa.PrimaryKeyConstraint("tool_call_id", "snapshot_id"),
     )
-    op.create_table(
+    _create_table(
         "ansich_tool_effects",
         sa.Column("effect_id", sa.String(36), nullable=False),
         sa.Column("tool_call_id", sa.String(36), nullable=False),
@@ -327,17 +361,17 @@ def upgrade() -> None:
         sa.ForeignKeyConstraint(["source_obs_id"], ["ansich_observations.obs_id"], ondelete="RESTRICT"),
         sa.PrimaryKeyConstraint("effect_id"),
     )
-    op.create_index(
+    _create_index(
         "ix_ansich_tool_effect_class_phase_scope",
         "ansich_tool_effects",
         ["effect_class", "phase", "scope_id"],
     )
-    op.create_index(
+    _create_index(
         "ix_ansich_tool_effect_scope_tool",
         "ansich_tool_effects",
         ["scope_id", "tool_call_id"],
     )
-    op.create_table(
+    _create_table(
         "ansich_scope_conclusions",
         sa.Column("assertion_id", sa.String(36), nullable=False),
         sa.Column("tool_call_id", sa.String(36), nullable=False),
@@ -354,7 +388,7 @@ def upgrade() -> None:
         sa.ForeignKeyConstraint(["tool_call_id"], ["ansich_tool_calls.entity_id"], ondelete="CASCADE"),
         sa.PrimaryKeyConstraint("assertion_id"),
     )
-    op.create_index(
+    _create_index(
         "ix_ansich_scope_conclusions_tool_kind",
         "ansich_scope_conclusions",
         ["tool_call_id", "conclusion_kind"],
