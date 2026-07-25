@@ -23,6 +23,7 @@
 - Phase 8 代码评审的跟进项登记在 [phase-8-review-followups.md](phase-8-review-followups.md)；M1（wall_time 双写者）与 M2（heartbeat contribution 写/读放大）均归属 Phase 11 前的 wall_time 通道治理,L1（吞 CancelledError）与 L2（tree N+1）随相关路径下次改动顺带处理,均不阻塞 Phase 9 开工。
 - 非评审来源的人工发现跟进项登记在 [human-followups.md](human-followups.md)；各项附施工时机评估（D1 概念词汇表立即做，U3 failed-jobs 下钻与 U4 compression 执行时机可随 Phase 9 提前，U1/U2/A1 分别归属 Phase 10 后与 Phase 11），每个 Phase 开工前复查该文件。
 - Phase 9 代码评审的跟进项登记在 [phase-9-review-followups.md](phase-9-review-followups.md)；H1（AuthorizationSnapshot 不反映真实授权系统）已由本次提交对应的 authz outcome 桥接修复，H3（entity+类型化子行 flush 顺序不保证，FK 强制开启的生产环境下确定性失败）已由 `e074bd60` 修复；H2（失败/超时/取消终态下 observed effect 仍记为 hard fidelity）应在生产就绪门禁前修复，H4（`DELETE FROM ansich_belief_assertions` 违反 FK 约束）与 H5（大 payload externalize 后 ContextSnapshot 静默投影失败）根因未查、建议尽快排查，M1（effect class 分类法缺 filesystem_delete/permission_change）与 M2（scope-safety assessor 全量重扫）归属 Phase 11 前治理，L1/L2 为非阻塞清理项，均不阻塞 Phase 10 开工。
+- 回溯验证矩阵登记在 [retro-validation-matrix.md](retro-validation-matrix.md)：六个故障注入用例分别对应 upstream 已关闭 issue（#3320/#4041、#3684、#4176、#3875、#3113、#3645），检验 Observation→Belief 是否足以独立判定这六类错误。预测在跑测试**之前**已预注册，结果表记录实际判定与差异。结论：零失败项，一笔弱通过（#3645 缺 by-model 聚合查询，证据齐全），一处能力边界确认（bash 无 instrumentation，`coverage="unknown"` 属设计使然）。测试位于 `backend/tests/ansich/test_retro_*.py`，共享 harness 在 `backend/tests/support/ansich_retro.py`。
 
 ## 固定实现边界
 
