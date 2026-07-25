@@ -501,7 +501,7 @@ export const zhCN: Translations = {
     block: "内容块",
     transformation: "转换",
     ordering: "顺序关系",
-    snapshotOrdinal: "快照序号",
+    snapshotOrdinal: "快照内位置",
     compressions: "上下文压缩",
     noCompressions: "尚未观测到成功的上下文压缩。",
     loadCompression: "读取压缩详情",

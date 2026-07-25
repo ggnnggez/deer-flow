@@ -518,7 +518,7 @@ export const enUS: Translations = {
     block: "Block",
     transformation: "Transformation",
     ordering: "Ordering",
-    snapshotOrdinal: "Snapshot ordinal",
+    snapshotOrdinal: "Position in snapshot",
     compressions: "Context compressions",
     noCompressions: "No successful context compressions were observed.",
     loadCompression: "Load compression",

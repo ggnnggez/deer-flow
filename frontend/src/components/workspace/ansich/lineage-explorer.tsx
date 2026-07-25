@@ -145,7 +145,6 @@ function LineageResult({ result }: { result: TraceResult }) {
                 <th className="p-2">{t.ansich.step}</th>
                 <th className="p-2">{t.ansich.block}</th>
                 <th className="p-2">{t.ansich.snapshotOrdinal}</th>
-                <th className="p-2">{t.ansich.ordering}</th>
               </tr>
             </thead>
             <tbody>
@@ -159,9 +158,6 @@ function LineageResult({ result }: { result: TraceResult }) {
                     {shortId(item.descendant_block_id)}
                   </td>
                   <td className="p-2">#{item.snapshot_ordinal}</td>
-                  <td className="p-2">
-                    <Badge variant="outline">{item.ordering}</Badge>
-                  </td>
                 </tr>
               ))}
             </tbody>
