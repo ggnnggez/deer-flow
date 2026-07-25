@@ -959,7 +959,7 @@ git commit -m "docs(ansich): record retro validation matrix results and conclusi
 | 用例 | issue | 事前预测 | 实际判定 | 实际观测值 / 备注 |
 |---|---|---|---|---|
 | A | #3320 / #4041 | 强通过 | **强通过** ✅ 命中 | `task.control.value == "completed"`（DeerFlow 的错误裁决）与 `StepView.status == result == "model_failed"`（Ansich 的独立判断）同时可读，构成矛盾证据。无需新增任何代码。 |
-| B | #3684 | 不确定 | _待填_ | _待填_ |
+| B | #3684 | 不确定 | **强通过** ✅ | 已实测确实发生 id 复用（两次快照 `message_id` 均为 `reused-human-id`）。`source_identity` 相同（`message:reused-human-id:occurrence:1:content:0`），但 `content_hash` 与 `block_id` 均不同——即内容身份基于 hash 而非 message id，覆盖没有被折叠。**副产品**：#3684 的异常特征可被精确表达为"同 `source_identity`、不同 `content_hash`"，这是一个现成的检出条件。 |
 | C | #4176 | 部分失败（预期内） | _待填_ | _待填_ |
 | D | #3875 | 强通过 | _待填_ | _待填_ |
 | E | #3113 | 强通过 | _待填_ | _待填_ |
