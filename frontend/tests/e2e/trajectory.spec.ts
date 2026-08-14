@@ -31,6 +31,7 @@ const TOOL_MESSAGES = [
     name: "bash",
     tool_call_id: "call-trajectory",
     content: "README.md\npackage.json",
+    status: "error",
   },
   {
     id: "ai-answer-trajectory",
@@ -63,17 +64,25 @@ test("switches from Chat to the basic trajectory ledger", async ({ page }) => {
       .getByText("150 tk", { exact: true }),
   ).toBeVisible();
   await expect(trajectory.getByText("7.0s", { exact: true })).toBeVisible();
+  await expect(
+    trajectory.getByRole("heading", { name: /Step 1.*Failed/ }),
+  ).toBeVisible();
 
-  await trajectory.getByRole("button", { name: /bash/i }).click();
+  await trajectory.getByRole("button", { name: /bash.*Failed/i }).click();
   const details = page.getByLabel("Record details");
   await expect(details.getByText("rg --files", { exact: true })).toBeVisible();
   await expect(details.getByText("README.md", { exact: false })).toBeVisible();
+  await expect(
+    details.getByText("call-trajectory", { exact: true }),
+  ).toBeVisible();
 
   await trajectory
     .getByRole("searchbox", { name: "Search trajectory" })
     .fill("package.json");
   await expect(trajectory.getByText("Inspect the repository")).toHaveCount(0);
-  await expect(trajectory.getByRole("button", { name: /bash/i })).toBeVisible();
+  await expect(
+    trajectory.getByRole("button", { name: /bash.*Failed/i }),
+  ).toBeVisible();
 });
 
 test("virtualizes a long trajectory ledger", async ({ page }) => {

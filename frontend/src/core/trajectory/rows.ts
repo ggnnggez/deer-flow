@@ -1,4 +1,8 @@
-import type { TrajectoryRecord, TrajectoryTurn } from "./types";
+import type {
+  TrajectoryRecord,
+  TrajectoryRecordStatus,
+  TrajectoryTurn,
+} from "./types";
 
 export type TrajectoryRow =
   | {
@@ -11,6 +15,14 @@ export type TrajectoryRow =
       type: "record";
       turn: TrajectoryTurn;
       record: TrajectoryRecord;
+    }
+  | {
+      id: string;
+      type: "step";
+      turn: TrajectoryTurn;
+      step: number;
+      status: TrajectoryRecordStatus;
+      records: readonly TrajectoryRecord[];
     };
 
 export interface TrajectoryRowOptions {
@@ -29,6 +41,19 @@ function matches(record: TrajectoryRecord, query: string) {
     .join("\n")
     .toLocaleLowerCase();
   return searchable.includes(query);
+}
+
+function stepStatus(records: readonly TrajectoryRecord[]) {
+  if (records.some((record) => record.status === "error")) {
+    return "error";
+  }
+  if (records.some((record) => record.status === "running")) {
+    return "running";
+  }
+  if (records.some((record) => record.status === "incomplete")) {
+    return "incomplete";
+  }
+  return "complete";
 }
 
 /** Flatten turns into the stable row sequence consumed by the virtual list. */
@@ -50,7 +75,22 @@ export function buildTrajectoryRows(
     if (!normalizedQuery && collapsedTurnIds.has(turn.id)) {
       continue;
     }
+    let currentStep: number | undefined;
     for (const record of records) {
+      if (record.step !== undefined && record.step !== currentStep) {
+        currentStep = record.step;
+        const stepRecords = records.filter(
+          (candidate) => candidate.step === currentStep,
+        );
+        rows.push({
+          id: `step:${turn.id}:${currentStep}`,
+          type: "step",
+          turn,
+          step: currentStep,
+          status: stepStatus(stepRecords),
+          records: stepRecords,
+        });
+      }
       rows.push({
         id: `record:${record.id}`,
         type: "record",

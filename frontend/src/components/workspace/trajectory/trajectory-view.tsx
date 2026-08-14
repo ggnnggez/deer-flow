@@ -3,10 +3,13 @@
 import type { Message } from "@langchain/langgraph-sdk";
 import { useVirtualizer } from "@tanstack/react-virtual";
 import {
+  AlertCircleIcon,
   BotIcon,
+  CheckCircle2Icon,
   ChevronDownIcon,
   ChevronRightIcon,
   Clock3Icon,
+  CircleDashedIcon,
   Loader2Icon,
   SearchIcon,
   SettingsIcon,
@@ -32,6 +35,7 @@ import {
   projectTrajectory,
   type TrajectoryRecord,
   type TrajectoryRecordKind,
+  type TrajectoryRecordStatus,
 } from "@/core/trajectory";
 import { cn } from "@/lib/utils";
 
@@ -44,6 +48,41 @@ const RECORD_ICONS: Record<TrajectoryRecordKind, ReactNode> = {
   tool: <WrenchIcon className="size-3.5" />,
   user: <UserIcon className="size-3.5" />,
 };
+
+function RecordStatus({ status }: { status: TrajectoryRecordStatus }) {
+  const { t } = useI18n();
+  const label =
+    status === "error"
+      ? t.trajectory.failed
+      : status === "running"
+        ? t.trajectory.running
+        : status === "incomplete"
+          ? t.trajectory.incomplete
+          : t.trajectory.complete;
+  return (
+    <span
+      className={cn(
+        "inline-flex items-center gap-1 text-[10px] font-medium",
+        status === "error" && "text-destructive",
+        status === "running" && "text-amber-600 dark:text-amber-400",
+        status === "incomplete" && "text-muted-foreground",
+        status === "complete" && "text-emerald-600 dark:text-emerald-400",
+      )}
+      data-status={status}
+    >
+      {status === "error" ? (
+        <AlertCircleIcon className="size-3" />
+      ) : status === "running" ? (
+        <Loader2Icon className="size-3 animate-spin" />
+      ) : status === "incomplete" ? (
+        <CircleDashedIcon className="size-3" />
+      ) : (
+        <CheckCircle2Icon className="size-3" />
+      )}
+      {label}
+    </span>
+  );
+}
 
 function formatTokenCount(value: number) {
   return value.toLocaleString();
@@ -75,7 +114,13 @@ function RecordDetails({
         </span>
         <div className="min-w-0 flex-1 truncate text-sm font-medium">
           {record.label}
+          {record.step !== undefined && (
+            <span className="text-muted-foreground ml-2 text-xs font-normal">
+              {t.trajectory.step(record.step)}
+            </span>
+          )}
         </div>
+        {record.status && <RecordStatus status={record.status} />}
         <Button
           aria-label={t.common.close}
           size="icon-sm"
@@ -86,6 +131,35 @@ function RecordDetails({
         </Button>
       </header>
       <div className="min-h-0 flex-1 space-y-5 overflow-auto p-4 text-sm">
+        <section>
+          <h3 className="text-muted-foreground mb-2 text-xs font-medium uppercase">
+            {t.trajectory.overview}
+          </h3>
+          <dl className="bg-muted/35 divide-border divide-y rounded-lg border px-3">
+            {[
+              [t.trajectory.kind, record.kind.toUpperCase()],
+              ...(record.step === undefined
+                ? []
+                : [[t.trajectory.stepLabel, String(record.step)]]),
+              ...(record.messageId
+                ? [[t.trajectory.messageId, record.messageId]]
+                : []),
+              ...(record.toolCallId
+                ? [[t.trajectory.toolCallId, record.toolCallId]]
+                : []),
+            ].map(([label, value]) => (
+              <div
+                key={label}
+                className="grid grid-cols-[7rem_minmax(0,1fr)] gap-3 py-2"
+              >
+                <dt className="text-muted-foreground text-xs">{label}</dt>
+                <dd className="truncate font-mono text-xs" title={value}>
+                  {value}
+                </dd>
+              </div>
+            ))}
+          </dl>
+        </section>
         {record.usage && (
           <section>
             <h3 className="text-muted-foreground mb-2 text-xs font-medium uppercase">
@@ -146,7 +220,10 @@ export function TrajectoryView({
   messages: Message[];
 }) {
   const { t } = useI18n();
-  const turns = useMemo(() => projectTrajectory(messages), [messages]);
+  const turns = useMemo(
+    () => projectTrajectory(messages, { isStreaming }),
+    [isStreaming, messages],
+  );
   const [query, setQuery] = useState("");
   const [collapsedTurnIds, setCollapsedTurnIds] = useState<ReadonlySet<string>>(
     () => new Set(),
@@ -169,7 +246,12 @@ export function TrajectoryView({
   const olderAnchor = useRef<number | null>(null);
   const virtualizer = useVirtualizer({
     count: rows.length,
-    estimateSize: (index) => (rows[index]?.type === "turn" ? 42 : 76),
+    estimateSize: (index) =>
+      rows[index]?.type === "turn"
+        ? 42
+        : rows[index]?.type === "step"
+          ? 32
+          : 76,
     getItemKey: (index) => rows[index]?.id ?? index,
     getScrollElement: () => scrollerRef.current,
     overscan: ROW_OVERSCAN,
@@ -375,6 +457,22 @@ export function TrajectoryView({
                           )}
                         </span>
                       </button>
+                    ) : row.type === "step" ? (
+                      <div
+                        aria-level={3}
+                        className="bg-background/95 flex h-8 items-center gap-2 border-b px-6 backdrop-blur"
+                        role="heading"
+                      >
+                        <span className="text-[11px] font-semibold">
+                          {t.trajectory.step(row.step)}
+                        </span>
+                        <span className="text-muted-foreground text-[10px]">
+                          {t.trajectory.records(row.records.length)}
+                        </span>
+                        <span className="ml-auto">
+                          <RecordStatus status={row.status} />
+                        </span>
+                      </div>
                     ) : (
                       <button
                         aria-pressed={selectedRecordId === row.record.id}
@@ -407,7 +505,12 @@ export function TrajectoryView({
                             </span>
                           )}
                           {row.record.kind === "tool" && (
-                            <TerminalIcon className="size-3" />
+                            <>
+                              {row.record.status && (
+                                <RecordStatus status={row.record.status} />
+                              )}
+                              <TerminalIcon className="size-3" />
+                            </>
                           )}
                         </span>
                       </button>

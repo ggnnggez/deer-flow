@@ -41,11 +41,19 @@ function turnDuration(message: Message) {
     : undefined;
 }
 
+export interface ProjectTrajectoryOptions {
+  isStreaming?: boolean;
+}
+
 /** Project the message stream into user-visible Trajectory turns. */
-export function projectTrajectory(messages: Message[]): TrajectoryTurn[] {
+export function projectTrajectory(
+  messages: Message[],
+  { isStreaming = false }: ProjectTrajectoryOptions = {},
+): TrajectoryTurn[] {
   const turns: TrajectoryTurn[] = [];
   const tools = new Map<string, TrajectoryRecord>();
   let current: TrajectoryTurn | undefined;
+  let currentStep = 0;
 
   const ensureTurn = () => {
     if (current) {
@@ -66,6 +74,7 @@ export function projectTrajectory(messages: Message[]): TrajectoryTurn[] {
     }
     if (message.type === "human" && current?.records.length) {
       current = undefined;
+      currentStep = 0;
     }
     const turn = ensureTurn();
     const id = messageId(message, index);
@@ -82,6 +91,7 @@ export function projectTrajectory(messages: Message[]): TrajectoryTurn[] {
     }
 
     if (message.type === "ai") {
+      const step = ++currentStep;
       const usage = getUsageMetadata(message) ?? undefined;
       const answer = textOfMessage(message);
       const reasoning = extractReasoningContentFromMessage(message);
@@ -91,6 +101,8 @@ export function projectTrajectory(messages: Message[]): TrajectoryTurn[] {
         label: "ASSISTANT",
         content: answer?.trim() ? answer : (reasoning ?? ""),
         messageId: id,
+        status: "complete",
+        step,
         ...(usage ? { usage } : {}),
       });
       if (usage) {
@@ -107,6 +119,8 @@ export function projectTrajectory(messages: Message[]): TrajectoryTurn[] {
           kind: "tool",
           label: call.name,
           content: toolCallContent(call.args),
+          status: isStreaming ? "running" : "incomplete",
+          step,
           ...(call.id ? { toolCallId: call.id } : {}),
           toolName: call.name,
         };
@@ -124,6 +138,7 @@ export function projectTrajectory(messages: Message[]): TrajectoryTurn[] {
         typeof callId === "string" ? tools.get(callId) : undefined;
       if (existing) {
         existing.result = textOfMessage(message) ?? "";
+        existing.status = message.status === "error" ? "error" : "complete";
         continue;
       }
       const toolName =
@@ -136,6 +151,8 @@ export function projectTrajectory(messages: Message[]): TrajectoryTurn[] {
         label: toolName,
         content: "",
         result: textOfMessage(message) ?? "",
+        status: message.status === "error" ? "error" : "complete",
+        ...(currentStep > 0 ? { step: currentStep } : {}),
         ...(callId ? { toolCallId: callId } : {}),
         toolName,
       });

@@ -68,6 +68,8 @@ describe("projectTrajectory", () => {
             label: "ASSISTANT",
             content: "I will inspect it.",
             messageId: "ai-1",
+            status: "complete",
+            step: 1,
             usage: { inputTokens: 120, outputTokens: 30, totalTokens: 150 },
           },
           {
@@ -76,6 +78,8 @@ describe("projectTrajectory", () => {
             label: "bash",
             content: "rg --files",
             result: "README.md\npackage.json",
+            status: "complete",
+            step: 1,
             toolCallId: "call-1",
             toolName: "bash",
           },
@@ -85,6 +89,8 @@ describe("projectTrajectory", () => {
             label: "ASSISTANT",
             content: "The repository contains a README and package manifest.",
             messageId: "ai-2",
+            status: "complete",
+            step: 2,
             usage: { inputTokens: 180, outputTokens: 45, totalTokens: 225 },
           },
         ],
@@ -145,5 +151,65 @@ describe("projectTrajectory", () => {
     expect(projectTrajectory(messages)[0]?.records[1]?.content).toBe(
       "I should inspect the failing command first.",
     );
+  });
+
+  it("numbers model steps and reports each tool lifecycle from recorded results", () => {
+    const messages = [
+      { id: "human-status", type: "human", content: "Run the checks" },
+      {
+        id: "ai-status-1",
+        type: "ai",
+        content: "I will run both checks.",
+        tool_calls: [
+          { id: "call-failed", name: "bash", args: { command: "pnpm lint" } },
+          { id: "call-running", name: "bash", args: { command: "pnpm test" } },
+        ],
+      },
+      {
+        id: "tool-failed",
+        type: "tool",
+        tool_call_id: "call-failed",
+        content: "ESLint found one error",
+        status: "error",
+      },
+      {
+        id: "ai-status-2",
+        type: "ai",
+        content: "I am checking the failure.",
+      },
+    ] as Message[];
+
+    const records = projectTrajectory(messages, { isStreaming: true })[0]
+      ?.records;
+    expect(
+      records?.map(({ kind, step, status }) => ({ kind, step, status })),
+    ).toEqual([
+      { kind: "user", step: undefined, status: undefined },
+      { kind: "assistant", step: 1, status: "complete" },
+      { kind: "tool", step: 1, status: "error" },
+      { kind: "tool", step: 1, status: "running" },
+      { kind: "assistant", step: 2, status: "complete" },
+    ]);
+  });
+
+  it("does not describe a settled tool call without a result as running", () => {
+    const messages = [
+      { id: "human-incomplete", type: "human", content: "Run it" },
+      {
+        id: "ai-incomplete",
+        type: "ai",
+        content: "",
+        tool_calls: [
+          { id: "call-incomplete", name: "bash", args: { command: "sleep 1" } },
+        ],
+      },
+    ] as Message[];
+
+    expect(projectTrajectory(messages)[0]?.records[2]?.status).toBe(
+      "incomplete",
+    );
+    expect(
+      projectTrajectory(messages, { isStreaming: true })[0]?.records[2]?.status,
+    ).toBe("running");
   });
 });

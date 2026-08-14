@@ -107,15 +107,24 @@ export interface Translations {
     empty: string;
     noMatches: string;
     turn: (number: number) => string;
+    step: (number: number) => string;
+    stepLabel: string;
     records: (count: number) => string;
     seconds: (seconds: number) => string;
     inputTokens: string;
     outputTokens: string;
     totalTokens: string;
     details: string;
+    overview: string;
+    kind: string;
+    messageId: string;
+    toolCallId: string;
     request: string;
     result: string;
     running: string;
+    complete: string;
+    failed: string;
+    incomplete: string;
   };
 
   // Input Box

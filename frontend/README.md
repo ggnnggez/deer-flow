@@ -75,7 +75,7 @@ pnpm start
 └── /chats/[thread_id]   # A specific chat page
 ```
 
-Conversation pages provide Chat and Trajectory views over the same LangGraph message history. Trajectory groups messages into user turns, joins tool calls with their results, shows available token usage and duration metadata, supports search and turn folding, and virtualizes long histories in the browser. The basic view does not synthesize timing or prompt data that the backend did not record.
+Conversation pages provide Chat and Trajectory views over the same LangGraph message history. Trajectory groups messages into user turns and model steps, joins tool calls with their results, distinguishes completed, failed, running, and incomplete calls, shows available token usage and duration metadata, supports search and turn folding, and virtualizes long histories in the browser. A missing tool result is shown as running only while the thread is streaming; otherwise it is incomplete. The view does not synthesize timing or prompt data that the backend did not record.
 
 ## Configuration
 
