@@ -5,7 +5,8 @@ RunEventStore. It standardizes callback data into RunEvent records and
 handles token usage accumulation.
 
 Key design decisions:
-- on_llm_new_token is NOT implemented -- only complete messages via on_llm_end
+- on_llm_new_token records only the first streamed-token latency; complete messages
+  remain persisted via on_llm_end
 - on_chat_model_start captures structured prompts as llm_request (OpenAI format) and
   extracts the first human message for run.input, because it is more reliable than
   on_chain_start (fires on every node) — messages here are fully structured.
@@ -66,6 +67,7 @@ class RunJournal(BaseCallbackHandler):
         flush_threshold: int = 20,
         progress_reporter: Callable[[dict], Awaitable[None]] | None = None,
         progress_flush_interval: float = 5.0,
+        monotonic_clock: Callable[[], float] = time.monotonic,
     ):
         super().__init__()
         self.run_id = run_id
@@ -75,6 +77,7 @@ class RunJournal(BaseCallbackHandler):
         self._flush_threshold = flush_threshold
         self._progress_reporter = progress_reporter
         self._progress_flush_interval = progress_flush_interval
+        self._monotonic_clock = monotonic_clock
 
         # Write buffer
         self._buffer: list[dict] = []
@@ -113,6 +116,8 @@ class RunJournal(BaseCallbackHandler):
 
         # Latency tracking
         self._llm_start_times: dict[str, float] = {}  # langchain run_id -> start time
+        self._llm_ttft_ms: dict[str, int] = {}  # langchain run_id -> time to first streamed token
+        self._tool_start_times: dict[str, float] = {}  # langchain run_id -> start time
 
         # LLM request/response tracking
         self._llm_call_index = 0
@@ -205,7 +210,7 @@ class RunJournal(BaseCallbackHandler):
         and the content is never compressed by checkpoint trimming.
         """
         rid = str(run_id)
-        self._llm_start_times[rid] = time.monotonic()
+        self._llm_start_times[rid] = self._monotonic_clock()
         self._llm_call_index += 1
         self._seen_llm_starts.add(rid)
 
@@ -238,7 +243,17 @@ class RunJournal(BaseCallbackHandler):
 
     def on_llm_start(self, serialized: dict, prompts: list[str], *, run_id: UUID, parent_run_id: UUID | None = None, tags: list[str] | None = None, metadata: dict[str, Any] | None = None, **kwargs: Any) -> None:
         # Fallback: on_chat_model_start is preferred. This just tracks latency.
-        self._llm_start_times[str(run_id)] = time.monotonic()
+        self._llm_start_times[str(run_id)] = self._monotonic_clock()
+
+    def on_llm_new_token(self, token: str, *, run_id: UUID, **kwargs: Any) -> None:
+        """Record the first streamed-token latency for one model call."""
+        rid = str(run_id)
+        if rid in self._llm_ttft_ms:
+            return
+        start = self._llm_start_times.get(rid)
+        if start is None:
+            return
+        self._llm_ttft_ms[rid] = max(0, int((self._monotonic_clock() - start) * 1000))
 
     def on_llm_end(
         self,
@@ -265,7 +280,8 @@ class RunJournal(BaseCallbackHandler):
             # Latency
             rid = str(run_id)
             start = self._llm_start_times.pop(rid, None)
-            latency_ms = int((time.monotonic() - start) * 1000) if start else None
+            latency_ms = int((self._monotonic_clock() - start) * 1000) if start is not None else None
+            ttft_ms = self._llm_ttft_ms.pop(rid, None)
 
             # Token usage from message
             usage = getattr(message, "usage_metadata", None)
@@ -300,6 +316,7 @@ class RunJournal(BaseCallbackHandler):
                     "caller": caller,
                     "usage": usage_dict,
                     "latency_ms": latency_ms,
+                    "ttft_ms": ttft_ms,
                     "llm_call_index": call_index,
                 },
             )
@@ -341,32 +358,41 @@ class RunJournal(BaseCallbackHandler):
             self._counted_message_llm_run_ids.add(str(run_id))
 
     def on_llm_error(self, error: BaseException, *, run_id: UUID, **kwargs: Any) -> None:
-        self._llm_start_times.pop(str(run_id), None)
+        rid = str(run_id)
+        self._llm_start_times.pop(rid, None)
+        self._llm_ttft_ms.pop(rid, None)
         self._put(event_type="llm.error", category="trace", content=str(error))
 
     def on_tool_start(self, serialized, input_str, *, run_id, parent_run_id=None, tags=None, metadata=None, inputs=None, **kwargs):
-        """Handle tool start event, cache tool call ID for later correlation"""
-        tool_call_id = str(run_id)
-        logger.debug("Tool start for node %s, tool_call_id=%s, tags=%s", run_id, tool_call_id, tags)
+        """Record the actual start time for one Tool callback."""
+        callback_run_id = str(run_id)
+        self._tool_start_times[callback_run_id] = self._monotonic_clock()
+        logger.debug("Tool start for node %s, tags=%s", run_id, tags)
 
     def on_tool_end(self, output, *, run_id, parent_run_id=None, **kwargs):
         """Handle tool end event, append message and clear node data"""
+        start = self._tool_start_times.pop(str(run_id), None)
+        latency_ms = max(0, int((self._monotonic_clock() - start) * 1000)) if start is not None else None
         try:
             if isinstance(output, ToolMessage):
                 msg = cast(ToolMessage, output)
-                self._persist_tool_result_message(msg)
+                self._persist_tool_result_message(msg, latency_ms=latency_ms)
             elif isinstance(output, Command):
                 cmd = cast(Command, output)
                 messages = cmd.update.get("messages", [])
                 for message in messages:
                     if isinstance(message, BaseMessage):
-                        self._persist_tool_result_message(message)
+                        self._persist_tool_result_message(message, latency_ms=latency_ms)
                     else:
                         logger.warning(f"on_tool_end {run_id}: command update message is not BaseMessage: {type(message)}")
             else:
                 logger.warning(f"on_tool_end {run_id}: output is not ToolMessage: {type(output)}")
         finally:
             logger.debug("Tool end for node %s", run_id)
+
+    def on_tool_error(self, error: BaseException, *, run_id: UUID, **kwargs: Any) -> None:
+        """Discard timing state when a Tool callback terminates without a result."""
+        self._tool_start_times.pop(str(run_id), None)
 
     # -- Internal methods --
 
@@ -402,8 +428,13 @@ class RunJournal(BaseCallbackHandler):
             name = self._tool_call_value(tool_call, "name")
             self._current_run_tool_call_names[tool_call_id] = str(name or "")
 
-    def _persist_tool_result_message(self, message: BaseMessage) -> None:
-        self._put(event_type="llm.tool.result", category="message", content=message.model_dump())
+    def _persist_tool_result_message(self, message: BaseMessage, *, latency_ms: int | None = None) -> None:
+        self._put(
+            event_type="llm.tool.result",
+            category="message",
+            content=message.model_dump(),
+            metadata={"latency_ms": latency_ms},
+        )
         identity = self._message_identity(message)
         if identity:
             self._persisted_tool_message_identities.add(identity)

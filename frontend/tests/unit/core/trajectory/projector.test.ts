@@ -212,4 +212,42 @@ describe("projectTrajectory", () => {
       projectTrajectory(messages, { isStreaming: true })[0]?.records[2]?.status,
     ).toBe("running");
   });
+
+  it("projects recorded assistant and tool timing without estimation", () => {
+    const assistantTiming = {
+      started_at: 1_000,
+      first_token_at: 1_250,
+      completed_at: 2_000,
+      duration_ms: 1_000,
+      ttft_ms: 250,
+    };
+    const toolTiming = {
+      started_at: 2_100,
+      completed_at: 2_900,
+      duration_ms: 800,
+    };
+    const messages = [
+      { id: "human-timing", type: "human", content: "Run it" },
+      {
+        id: "ai-timing",
+        type: "ai",
+        content: "",
+        additional_kwargs: { trajectory_timing: assistantTiming },
+        tool_calls: [
+          { id: "call-timing", name: "bash", args: { command: "pnpm test" } },
+        ],
+      },
+      {
+        id: "tool-timing",
+        type: "tool",
+        tool_call_id: "call-timing",
+        content: "passed",
+        additional_kwargs: { trajectory_timing: toolTiming },
+      },
+    ] as Message[];
+
+    const records = projectTrajectory(messages)[0]?.records;
+    expect(records?.[1]?.timing).toEqual(assistantTiming);
+    expect(records?.[2]?.timing).toEqual(toolTiming);
+  });
 });

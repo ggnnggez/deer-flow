@@ -96,6 +96,33 @@ test("mergeMessages lets live thread messages replace overlapping history", () =
   ]);
 });
 
+test("mergeMessages preserves journal timing when a live copy replaces history", () => {
+  const timing = {
+    started_at: 1_000,
+    first_token_at: 1_200,
+    completed_at: 2_000,
+    duration_ms: 1_000,
+    ttft_ms: 200,
+  };
+  const history = {
+    id: "ai-timing",
+    type: "ai",
+    content: "answer",
+    additional_kwargs: { trajectory_timing: timing },
+  } as Message;
+  const live = {
+    id: "ai-timing",
+    type: "ai",
+    content: "answer",
+    additional_kwargs: { streamed: true },
+  } as Message;
+
+  expect(mergeMessages([history], [live], [])[0]?.additional_kwargs).toEqual({
+    streamed: true,
+    trajectory_timing: timing,
+  });
+});
+
 test("mergeMessages keeps a protected pre-compression input at its canonical position", () => {
   const canonicalInput = {
     id: "input-1",
@@ -631,6 +658,36 @@ test("buildVisibleHistoryMessages attaches run_id to each content message (#3779
   const result = buildVisibleHistoryMessages(rows, new Set());
 
   expect((result[0] as { run_id?: string }).run_id).toBe("run-1");
+});
+
+test("buildVisibleHistoryMessages carries recorded AI timing into trajectory metadata", () => {
+  const rows: RunMessage[] = [
+    {
+      run_id: "run-timing",
+      content: {
+        id: "ai-timing",
+        type: "ai",
+        content: "answer",
+        additional_kwargs: {},
+      } as Message,
+      metadata: {
+        caller: "lead_agent",
+        latency_ms: 2_000,
+        ttft_ms: 500,
+      },
+      created_at: "2026-06-26T00:00:03.000Z",
+    },
+  ];
+
+  const result = buildVisibleHistoryMessages(rows, new Set());
+
+  expect(result[0]?.additional_kwargs?.trajectory_timing).toEqual({
+    started_at: 1_782_432_001_000,
+    first_token_at: 1_782_432_001_500,
+    completed_at: 1_782_432_003_000,
+    duration_ms: 2_000,
+    ttft_ms: 500,
+  });
 });
 
 // Regression coverage for #3825: after context summarization the backend emits

@@ -15,6 +15,7 @@ DeerFlow is a LangGraph-based AI super agent system with a full-stack architectu
 **Runtime**:
 - `make dev`, Docker dev, and production all run the agent runtime in Gateway via `RunManager` + `run_agent()` + `StreamBridge` (`packages/harness/deerflow/runtime/`). Nginx exposes that runtime at `/api/langgraph/*` and rewrites it to Gateway's native `/api/*` routers.
 - Scheduled-task executions must reuse that same Gateway run lifecycle. The scheduler may decide *when* work runs, but it must dispatch through the existing run path rather than introducing a parallel execution stack.
+- `RunJournal` measures model calls from model-start to model-end and records the first streamed-token callback as `llm.ai.response.metadata.ttft_ms`; it measures tool callbacks from tool-start to tool-end as `llm.tool.result.metadata.latency_ms`. Run-event `created_at` is the completion anchor for both intervals. Error callbacks must discard their matching monotonic-clock state, and consumers must leave absent measurements unknown.
 
 **Project Structure**:
 ```

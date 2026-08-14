@@ -25,6 +25,7 @@ import { isSidecarThread, SIDECAR_METADATA_KEY } from "../sidecar/thread";
 import { useUpdateSubtask } from "../tasks/context";
 import { taskEventToSubtaskUpdate } from "../tasks/lifecycle";
 import { messageToStep } from "../tasks/steps";
+import { trajectoryTimingOfRunMessage } from "../trajectory/timing";
 import type { UploadedFileInfo } from "../uploads";
 import { promptInputFilePartToFile, uploadFiles } from "../uploads";
 
@@ -164,6 +165,7 @@ function dedupeMessagesByIdentity(messages: Message[]): Message[] {
   // independent tracing/task semantics should use a distinct id or a custom
   // stream/state channel instead of relying on message dedupe preservation.
   const preservedTurnDurations = new Map<string, number>();
+  const preservedTrajectoryTimings = new Map<string, unknown>();
   messages.forEach((message, index) => {
     const identity = messageIdentity(message);
     if (identity) {
@@ -175,6 +177,12 @@ function dedupeMessagesByIdentity(messages: Message[]): Message[] {
         preservedTurnDurations.set(
           identity,
           message.additional_kwargs.turn_duration as number,
+        );
+      }
+      if (message.additional_kwargs?.trajectory_timing !== undefined) {
+        preservedTrajectoryTimings.set(
+          identity,
+          message.additional_kwargs.trajectory_timing,
         );
       }
     }
@@ -194,20 +202,27 @@ function dedupeMessagesByIdentity(messages: Message[]): Message[] {
     })
     .map((message) => {
       const identity = messageIdentity(message);
-      if (
-        identity &&
-        preservedTurnDurations.has(identity) &&
-        message.additional_kwargs?.turn_duration === undefined
-      ) {
-        return {
-          ...message,
-          additional_kwargs: {
-            ...message.additional_kwargs,
-            turn_duration: preservedTurnDurations.get(identity),
-          },
-        } as Message;
+      if (!identity) {
+        return message;
       }
-      return message;
+      const preservedDuration = preservedTurnDurations.get(identity);
+      const preservedTiming = preservedTrajectoryTimings.get(identity);
+      const needsDuration =
+        preservedDuration !== undefined &&
+        message.additional_kwargs?.turn_duration === undefined;
+      const needsTiming =
+        preservedTiming !== undefined &&
+        message.additional_kwargs?.trajectory_timing === undefined;
+      return needsDuration || needsTiming
+        ? ({
+            ...message,
+            additional_kwargs: {
+              ...message.additional_kwargs,
+              ...(needsDuration ? { turn_duration: preservedDuration } : {}),
+              ...(needsTiming ? { trajectory_timing: preservedTiming } : {}),
+            },
+          } as Message)
+        : message;
     });
 }
 
@@ -251,10 +266,21 @@ export function buildVisibleHistoryMessages(
     // Carry the owning run_id onto the content message so historical subtask
     // cards can fetch their persisted step history on expand (#3779). run_id
     // lives on the RunMessage wrapper and would otherwise be dropped here.
-    ...visibleRows.map((message) => ({
-      ...message.content,
-      run_id: message.run_id,
-    })),
+    ...visibleRows.map((message) => {
+      const trajectoryTiming = trajectoryTimingOfRunMessage(message);
+      return {
+        ...message.content,
+        run_id: message.run_id,
+        ...(trajectoryTiming
+          ? {
+              additional_kwargs: {
+                ...message.content.additional_kwargs,
+                trajectory_timing: trajectoryTiming,
+              },
+            }
+          : {}),
+      };
+    }),
   ]);
 }
 
@@ -316,12 +342,19 @@ export function mergeMessages(
   optimisticMessages: Message[],
 ): Message[] {
   const savedTurnDurations = new Map<string, number>();
+  const savedTrajectoryTimings = new Map<string, unknown>();
   for (const msg of historyMessages) {
     const identity = messageIdentity(msg);
     if (identity && msg.additional_kwargs?.turn_duration !== undefined) {
       savedTurnDurations.set(
         identity,
         msg.additional_kwargs.turn_duration as number,
+      );
+    }
+    if (identity && msg.additional_kwargs?.trajectory_timing !== undefined) {
+      savedTrajectoryTimings.set(
+        identity,
+        msg.additional_kwargs.trajectory_timing,
       );
     }
   }
@@ -412,20 +445,27 @@ export function mergeMessages(
 
   return merged.map((message) => {
     const identity = messageIdentity(message);
-    if (
-      identity &&
-      savedTurnDurations.has(identity) &&
-      message.additional_kwargs?.turn_duration === undefined
-    ) {
-      return {
-        ...message,
-        additional_kwargs: {
-          ...message.additional_kwargs,
-          turn_duration: savedTurnDurations.get(identity),
-        },
-      } as Message;
+    if (!identity) {
+      return message;
     }
-    return message;
+    const savedDuration = savedTurnDurations.get(identity);
+    const savedTiming = savedTrajectoryTimings.get(identity);
+    const needsDuration =
+      savedDuration !== undefined &&
+      message.additional_kwargs?.turn_duration === undefined;
+    const needsTiming =
+      savedTiming !== undefined &&
+      message.additional_kwargs?.trajectory_timing === undefined;
+    return needsDuration || needsTiming
+      ? ({
+          ...message,
+          additional_kwargs: {
+            ...message.additional_kwargs,
+            ...(needsDuration ? { turn_duration: savedDuration } : {}),
+            ...(needsTiming ? { trajectory_timing: savedTiming } : {}),
+          },
+        } as Message)
+      : message;
   });
 }
 

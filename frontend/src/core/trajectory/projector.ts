@@ -7,6 +7,7 @@ import {
 } from "@/core/messages/utils";
 import { textOfMessage } from "@/core/threads/utils";
 
+import { trajectoryTimingOfMessage } from "./timing";
 import type { TrajectoryRecord, TrajectoryTurn } from "./types";
 
 function addUsage(current: TokenUsage | undefined, usage: TokenUsage) {
@@ -93,6 +94,7 @@ export function projectTrajectory(
     if (message.type === "ai") {
       const step = ++currentStep;
       const usage = getUsageMetadata(message) ?? undefined;
+      const timing = trajectoryTimingOfMessage(message);
       const answer = textOfMessage(message);
       const reasoning = extractReasoningContentFromMessage(message);
       turn.records.push({
@@ -103,6 +105,7 @@ export function projectTrajectory(
         messageId: id,
         status: "complete",
         step,
+        ...(timing ? { timing } : {}),
         ...(usage ? { usage } : {}),
       });
       if (usage) {
@@ -139,12 +142,14 @@ export function projectTrajectory(
       if (existing) {
         existing.result = textOfMessage(message) ?? "";
         existing.status = message.status === "error" ? "error" : "complete";
+        existing.timing = trajectoryTimingOfMessage(message);
         continue;
       }
       const toolName =
         typeof message.name === "string" && message.name
           ? message.name
           : "tool";
+      const timing = trajectoryTimingOfMessage(message);
       turn.records.push({
         id: `tool:${callId || id}`,
         kind: "tool",
@@ -153,6 +158,7 @@ export function projectTrajectory(
         result: textOfMessage(message) ?? "",
         status: message.status === "error" ? "error" : "complete",
         ...(currentStep > 0 ? { step: currentStep } : {}),
+        ...(timing ? { timing } : {}),
         ...(callId ? { toolCallId: callId } : {}),
         toolName,
       });

@@ -1,5 +1,7 @@
 import type { TokenUsage } from "@/core/messages/usage";
 
+import type { TrajectoryTiming } from "./timing";
+
 export type TrajectoryRecordKind = "assistant" | "system" | "tool" | "user";
 export type TrajectoryRecordStatus =
   | "complete"
@@ -16,6 +18,7 @@ export interface TrajectoryRecord {
   result?: string;
   status?: TrajectoryRecordStatus;
   step?: number;
+  timing?: TrajectoryTiming;
   toolCallId?: string;
   toolName?: string;
   usage?: TokenUsage;

@@ -125,6 +125,11 @@ export interface Translations {
     complete: string;
     failed: string;
     incomplete: string;
+    timeline: string;
+    timingUnavailable: string;
+    ttft: string;
+    generation: string;
+    toolExecution: string;
   };
 
   // Input Box

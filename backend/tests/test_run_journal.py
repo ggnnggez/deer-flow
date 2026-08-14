@@ -188,6 +188,31 @@ class TestLlmCallbacks:
         assert "latency_ms" in llm_resp["metadata"]
         assert llm_resp["metadata"]["latency_ms"] is not None
 
+    @pytest.mark.anyio
+    async def test_first_stream_token_records_ttft_on_the_completed_response(
+        self,
+    ):
+        store = MemoryRunEventStore()
+        run_id = uuid4()
+        clock = iter([10.0, 10.25, 11.0])
+        j = RunJournal(
+            "r1",
+            "t1",
+            store,
+            flush_threshold=100,
+            monotonic_clock=lambda: next(clock),
+        )
+
+        j.on_chat_model_start({}, [[]], run_id=run_id, tags=["lead_agent"])
+        j.on_llm_new_token("H", run_id=run_id)
+        j.on_llm_end(_make_llm_response("Hello"), run_id=run_id, parent_run_id=None, tags=["lead_agent"])
+        await j.flush()
+
+        events = await store.list_events("t1", "r1")
+        response = next(event for event in events if event["event_type"] == "llm.ai.response")
+        assert response["metadata"]["ttft_ms"] == 250
+        assert response["metadata"]["latency_ms"] == 1000
+
 
 class TestLifecycleCallbacks:
     @pytest.mark.anyio
@@ -229,6 +254,34 @@ class TestToolCallbacks:
         assert len(messages) == 1
         assert messages[0]["event_type"] == "llm.tool.result"
         assert messages[0]["content"]["type"] == "tool"
+
+    @pytest.mark.anyio
+    async def test_tool_result_records_actual_execution_latency(self):
+        from langchain_core.messages import ToolMessage
+
+        store = MemoryRunEventStore()
+        callback_run_id = uuid4()
+        clock = iter([20.0, 20.6])
+        j = RunJournal(
+            "r1",
+            "t1",
+            store,
+            flush_threshold=100,
+            monotonic_clock=lambda: next(clock),
+        )
+        j.on_tool_start(
+            {"name": "bash"},
+            '{"command":"pnpm test"}',
+            run_id=callback_run_id,
+        )
+        j.on_tool_end(
+            ToolMessage(content="passed", tool_call_id="call-1", name="bash"),
+            run_id=callback_run_id,
+        )
+        await j.flush()
+
+        messages = await store.list_messages("t1")
+        assert messages[0]["metadata"]["latency_ms"] == 600
 
     @pytest.mark.anyio
     async def test_tool_end_with_command_unwraps_tool_message(self, journal_setup):

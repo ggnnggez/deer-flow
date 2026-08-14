@@ -32,12 +32,15 @@ import { Input } from "@/components/ui/input";
 import { useI18n } from "@/core/i18n/hooks";
 import {
   buildTrajectoryRows,
+  deriveTrajectoryTimeline,
   projectTrajectory,
   type TrajectoryRecord,
   type TrajectoryRecordKind,
   type TrajectoryRecordStatus,
 } from "@/core/trajectory";
 import { cn } from "@/lib/utils";
+
+import { TrajectoryTimeline } from "./trajectory-timeline";
 
 const ROW_OVERSCAN = 12;
 const BOTTOM_FOLLOW_THRESHOLD = 24;
@@ -224,6 +227,7 @@ export function TrajectoryView({
     () => projectTrajectory(messages, { isStreaming }),
     [isStreaming, messages],
   );
+  const timeline = useMemo(() => deriveTrajectoryTimeline(turns), [turns]);
   const [query, setQuery] = useState("");
   const [collapsedTurnIds, setCollapsedTurnIds] = useState<ReadonlySet<string>>(
     () => new Set(),
@@ -257,6 +261,16 @@ export function TrajectoryView({
     overscan: ROW_OVERSCAN,
   });
 
+  const selectRecord = (recordId: string) => {
+    setSelectedRecordId(recordId);
+    const index = rows.findIndex(
+      (row) => row.type === "record" && row.record.id === recordId,
+    );
+    if (index >= 0) {
+      virtualizer.scrollToIndex(index, { align: "center" });
+    }
+  };
+
   useEffect(() => {
     if (selectedRecordId !== null && selectedRecord === null) {
       setSelectedRecordId(null);
@@ -286,10 +300,6 @@ export function TrajectoryView({
   const allCollapsed =
     turns.length > 0 && collapsedTurnIds.size === turns.length;
   const visibleItems = virtualizer.getVirtualItems();
-  const totalDuration = turns.reduce(
-    (sum, turn) => sum + Math.max(turn.durationSeconds ?? 1, 1),
-    0,
-  );
 
   return (
     <section
@@ -330,27 +340,11 @@ export function TrajectoryView({
       </div>
 
       {turns.length > 0 && (
-        <div
-          aria-label={`${t.trajectory.title} overview`}
-          className="bg-muted/30 flex h-8 shrink-0 gap-px border-b px-3 py-2"
-          role="img"
-        >
-          {turns.map((turn) => (
-            <span
-              key={turn.id}
-              className="bg-primary/45 min-w-px rounded-sm"
-              style={{
-                flexGrow:
-                  Math.max(turn.durationSeconds ?? 1, 1) / totalDuration,
-              }}
-              title={`${t.trajectory.turn(turn.number)} · ${
-                turn.durationSeconds === undefined
-                  ? t.trajectory.running
-                  : t.trajectory.seconds(turn.durationSeconds)
-              }`}
-            />
-          ))}
-        </div>
+        <TrajectoryTimeline
+          model={timeline}
+          selectedRecordId={selectedRecordId}
+          onSelect={selectRecord}
+        />
       )}
 
       <div
@@ -478,7 +472,7 @@ export function TrajectoryView({
                         aria-pressed={selectedRecordId === row.record.id}
                         className="hover:bg-muted/45 aria-pressed:bg-primary/5 grid min-h-16 w-full grid-cols-[7rem_minmax(0,1fr)_auto] items-start gap-3 border-b px-3 py-2.5 text-left sm:grid-cols-[8rem_minmax(0,1fr)_auto]"
                         type="button"
-                        onClick={() => setSelectedRecordId(row.record.id)}
+                        onClick={() => selectRecord(row.record.id)}
                       >
                         <span className="text-muted-foreground flex min-w-0 items-center gap-1.5 text-[11px] font-semibold">
                           {RECORD_ICONS[row.record.kind]}

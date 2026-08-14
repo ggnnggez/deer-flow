@@ -141,6 +141,11 @@ export const zhCN: Translations = {
     complete: "已完成",
     failed: "失败",
     incomplete: "未完成",
+    timeline: "轨迹时间轴",
+    timingUnavailable: "当前加载的记录没有精确时间数据。",
+    ttft: "首 Token",
+    generation: "生成",
+    toolExecution: "工具",
   },
 
   // Input Box

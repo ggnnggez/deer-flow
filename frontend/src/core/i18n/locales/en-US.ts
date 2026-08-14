@@ -142,6 +142,11 @@ export const enUS: Translations = {
     complete: "Complete",
     failed: "Failed",
     incomplete: "Incomplete",
+    timeline: "Trajectory timeline",
+    timingUnavailable: "Precise timing is unavailable for the loaded records.",
+    ttft: "TTFT",
+    generation: "Generation",
+    toolExecution: "Tool",
   },
 
   // Input Box

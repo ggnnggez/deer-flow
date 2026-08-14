@@ -12,6 +12,15 @@ const TOOL_MESSAGES = [
     id: "ai-tool-trajectory",
     type: "ai",
     content: "I will inspect it.",
+    additional_kwargs: {
+      trajectory_timing: {
+        started_at: 1_000,
+        first_token_at: 1_250,
+        completed_at: 2_000,
+        duration_ms: 1_000,
+        ttft_ms: 250,
+      },
+    },
     tool_calls: [
       {
         id: "call-trajectory",
@@ -32,16 +41,34 @@ const TOOL_MESSAGES = [
     tool_call_id: "call-trajectory",
     content: "README.md\npackage.json",
     status: "error",
+    additional_kwargs: {
+      trajectory_timing: {
+        started_at: 2_100,
+        completed_at: 2_900,
+        duration_ms: 800,
+      },
+    },
   },
   {
     id: "ai-answer-trajectory",
     type: "ai",
     content: "The repository contains a README and package manifest.",
-    additional_kwargs: { turn_duration: 7 },
+    additional_kwargs: {
+      turn_duration: 7,
+      trajectory_timing: {
+        started_at: 3_000,
+        first_token_at: 3_200,
+        completed_at: 3_600,
+        duration_ms: 600,
+        ttft_ms: 200,
+      },
+    },
   },
 ];
 
-test("switches from Chat to the basic trajectory ledger", async ({ page }) => {
+test("switches from Chat to the measured trajectory swimlane", async ({
+  page,
+}) => {
   mockLangGraphAPI(page, {
     threads: [
       {
@@ -67,6 +94,24 @@ test("switches from Chat to the basic trajectory ledger", async ({ page }) => {
   await expect(
     trajectory.getByRole("heading", { name: /Step 1.*Failed/ }),
   ).toBeVisible();
+
+  const timeline = trajectory.getByRole("region", {
+    name: "Trajectory timeline",
+  });
+  await expect(timeline).toBeVisible();
+  await expect(timeline.getByText("ASSISTANT", { exact: true })).toBeVisible();
+  await expect(
+    timeline.getByText("TOOL · bash", { exact: true }),
+  ).toBeVisible();
+  await expect(
+    timeline.getByRole("button", {
+      name: "ASSISTANT · Step 1 · 1.0 s · TTFT 250 ms",
+    }),
+  ).toBeVisible();
+  await timeline
+    .getByRole("button", { name: "bash · Step 1 · 800 ms" })
+    .click();
+  await expect(page.getByLabel("Record details")).toBeVisible();
 
   await trajectory.getByRole("button", { name: /bash.*Failed/i }).click();
   const details = page.getByLabel("Record details");
