@@ -29,6 +29,11 @@ import { ThreadTitle } from "@/components/workspace/thread-title";
 import { TodoList } from "@/components/workspace/todo-list";
 import { TokenUsageIndicator } from "@/components/workspace/token-usage-indicator";
 import { Tooltip } from "@/components/workspace/tooltip";
+import {
+  ConversationViewToggle,
+  TrajectoryView,
+  type ConversationView,
+} from "@/components/workspace/trajectory";
 import { useActiveGoal } from "@/components/workspace/use-active-goal";
 import { useAgent } from "@/core/agents";
 import { useI18n } from "@/core/i18n/hooks";
@@ -68,6 +73,8 @@ export default function AgentChatPage() {
   // the thread. `isWelcomeMode` controls only the centered welcome layout, so
   // it can flip immediately on submit without triggering eager history loads.
   const [isWelcomeMode, setIsWelcomeMode] = useState(isNewThread);
+  const [conversationView, setConversationView] =
+    useState<ConversationView>("chat");
   const [settings, setSettings] = useThreadSettings(threadId);
   const [localSettings, setLocalSettings] = useLocalSettings();
   const { tokenUsageEnabled } = useModels();
@@ -85,6 +92,9 @@ export default function AgentChatPage() {
 
   useEffect(() => {
     setIsWelcomeMode(isNewThread);
+    if (isNewThread) {
+      setConversationView("chat");
+    }
   }, [isNewThread]);
 
   const {
@@ -256,6 +266,14 @@ export default function AgentChatPage() {
               <div className="flex min-w-0 flex-1 items-center text-sm font-medium">
                 <ThreadTitle threadId={threadId} thread={thread} />
               </div>
+              {!isWelcomeMode && (
+                <ConversationViewToggle
+                  chatLabel={t.trajectory.chat}
+                  trajectoryLabel={t.trajectory.title}
+                  value={conversationView}
+                  onChange={setConversationView}
+                />
+              )}
               <div className="flex shrink-0 items-center sm:mr-4">
                 <Tooltip content={t.agents.newChat}>
                   <Button
@@ -289,30 +307,42 @@ export default function AgentChatPage() {
 
             <main className="flex min-h-0 max-w-full grow flex-col">
               <div className="flex min-h-0 flex-1 justify-center">
-                <MessageList
-                  className={cn("size-full", !isWelcomeMode && "pt-10")}
-                  testId="main-message-list"
-                  threadId={threadId}
-                  thread={thread}
-                  paddingBottom={MESSAGE_LIST_DEFAULT_PADDING_BOTTOM}
-                  hasMoreHistory={hasMoreHistory}
-                  loadMoreHistory={loadMoreHistory}
-                  isHistoryLoading={isHistoryLoading}
-                  tokenUsageInlineMode={tokenUsageInlineMode}
-                  canRegenerate={
-                    !isNewThread &&
-                    !isMock &&
-                    env.NEXT_PUBLIC_STATIC_WEBSITE_ONLY !== "true" &&
-                    !isUploading &&
-                    !thread.isLoading
-                  }
-                  onRegenerateMessage={handleRegenerate}
-                  onSubmitHumanInput={
-                    isMock || env.NEXT_PUBLIC_STATIC_WEBSITE_ONLY === "true"
-                      ? undefined
-                      : handleSubmitHumanInput
-                  }
-                />
+                {conversationView === "chat" ? (
+                  <MessageList
+                    className={cn("size-full", !isWelcomeMode && "pt-10")}
+                    testId="main-message-list"
+                    threadId={threadId}
+                    thread={thread}
+                    paddingBottom={MESSAGE_LIST_DEFAULT_PADDING_BOTTOM}
+                    hasMoreHistory={hasMoreHistory}
+                    loadMoreHistory={loadMoreHistory}
+                    isHistoryLoading={isHistoryLoading}
+                    tokenUsageInlineMode={tokenUsageInlineMode}
+                    canRegenerate={
+                      !isNewThread &&
+                      !isMock &&
+                      env.NEXT_PUBLIC_STATIC_WEBSITE_ONLY !== "true" &&
+                      !isUploading &&
+                      !thread.isLoading
+                    }
+                    onRegenerateMessage={handleRegenerate}
+                    onSubmitHumanInput={
+                      isMock || env.NEXT_PUBLIC_STATIC_WEBSITE_ONLY === "true"
+                        ? undefined
+                        : handleSubmitHumanInput
+                    }
+                  />
+                ) : (
+                  <div className="size-full min-h-0 pt-12">
+                    <TrajectoryView
+                      hasMoreHistory={hasMoreHistory}
+                      isHistoryLoading={isHistoryLoading}
+                      isStreaming={thread.isLoading}
+                      loadMoreHistory={loadMoreHistory}
+                      messages={thread.messages}
+                    />
+                  </div>
+                )}
               </div>
 
               <div

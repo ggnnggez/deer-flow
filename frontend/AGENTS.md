@@ -13,6 +13,7 @@ DeerFlow Frontend is a Next.js 16 web interface for an AI agent system. It commu
 - **LangGraph SDK** (`@langchain/langgraph-sdk` ^1.5.3) — Agent orchestration and streaming
 - **LangChain Core** (`@langchain/core` ^1.1.15) — Fundamental AI building blocks
 - **TanStack Query** (`@tanstack/react-query` ^5.90.17) — Server state management
+- **TanStack Virtual** (`@tanstack/react-virtual` ^3.13.23) — Long Trajectory list virtualization
 - **UI**: Shadcn UI, MagicUI, React Bits, and Vercel AI SDK elements (generated from registries — see Code Style)
 
 ## Commands
@@ -50,10 +51,10 @@ The frontend is a stateful chat application. Users create **threads** (conversat
 - **`components/`** — React components:
   - `ui/` — Shadcn UI primitives (auto-generated, ESLint-ignored)
   - `ai-elements/` — Vercel AI SDK elements (auto-generated, ESLint-ignored)
-  - `workspace/` — Chat page components (messages, artifacts, settings)
+  - `workspace/` — Chat page components (messages, artifacts, settings, trajectory)
   - `landing/` — Landing page sections
   - `docs/` — Docs / MDX rendering components
-- **`core/`** — Business logic, the heart of the app. Domains include `threads/` (creation, streaming, state), `api/` (LangGraph client singleton), `agents/` (custom agents), `ansich/` (typed admin observability API, 5-second TanStack queries, health/error preservation, and pure presentation helpers), `auth/` (authentication), `artifacts/`, `channels/` (IM connections), `i18n/` (en-US, zh-CN), `settings/`, `memory/`, `skills/`, `messages/`, `mcp/`, `models/`, `input-polish/` (pre-send draft rewrite API), `voice-input/` (browser speech-recognition helpers), `suggestions/`, `tasks/`, `todos/`, `tools/`, `workspace-changes/` (run-scoped changed-file summaries and diff fetching), `config/`, `notification/`, `blog/`, plus rendering helpers (`rehype/`, `streamdown/`) and `utils/`.
+- **`core/`** — Business logic, the heart of the app. Domains include `threads/` (creation, streaming, state), `api/` (LangGraph client singleton), `agents/` (custom agents), `ansich/` (typed admin observability API, 5-second TanStack queries, health/error preservation, and pure presentation helpers), `auth/` (authentication), `artifacts/`, `channels/` (IM connections), `i18n/` (en-US, zh-CN), `settings/`, `memory/`, `skills/`, `messages/`, `mcp/`, `models/`, `trajectory/` (pure message-to-turn projection and flattened search/fold rows), `input-polish/` (pre-send draft rewrite API), `voice-input/` (browser speech-recognition helpers), `suggestions/`, `tasks/`, `todos/`, `tools/`, `workspace-changes/` (run-scoped changed-file summaries and diff fetching), `config/`, `notification/`, `blog/`, plus rendering helpers (`rehype/`, `streamdown/`) and `utils/`.
 - **`hooks/`** — Shared React hooks
 - **`lib/`** — Utilities (`cn()` from clsx + tailwind-merge)
 - **`content/`** — MDX content (blog posts, docs) rendered by the app
@@ -66,9 +67,10 @@ The frontend is a stateful chat application. Users create **threads** (conversat
 1. Optional composer helpers such as `core/input-polish` can rewrite the local draft before submission, and `core/voice-input` can transcribe browser microphone input into that same local draft; confirmed user input then flows to thread hooks (`core/threads/hooks.ts`) → LangGraph SDK streaming
 2. Stream events update thread state (messages, artifacts, todos, goal)
 3. `useThreadHistory` loads persisted conversation pages from `GET /api/threads/{id}/messages/page`, preserving the backend's thread-global event `seq`; rendering overlays checkpoint/live copies at their matching canonical identities (a summarized checkpoint may contain a protected early input plus a recent tail), suppresses checkpoint/transient prefixes whose canonical position is still behind an unloaded cursor page instead of collapsing that unknown gap before a recent anchor, then adds optimistic messages without timestamp re-sorting. History invalidation preserves already-loaded pages so their established ordering positions are not discarded.
-4. Stop actions call the LangGraph SDK stream stop path; `core/threads/hooks.ts` invalidates current-thread, thread-history, token-usage, and sidebar/search caches immediately and schedules one follow-up refetch because SDK stop may finish via abort + fire-and-forget cancel before backend title finalization commits
-5. TanStack Query manages server state; localStorage stores user settings
-6. Components subscribe to thread state and render updates
+4. Conversation pages can render the same ordered `thread.messages` as Chat or Trajectory. `core/trajectory/projector.ts` groups visible messages at human-message boundaries, joins tool results by `tool_call_id`, and aggregates only recorded usage and duration metadata; `components/workspace/trajectory/trajectory-view.tsx` owns search, folding, detail inspection, history loading, tail following, and virtualized rows. It must not infer unavailable timing or prompt data.
+5. Stop actions call the LangGraph SDK stream stop path; `core/threads/hooks.ts` invalidates current-thread, thread-history, token-usage, and sidebar/search caches immediately and schedules one follow-up refetch because SDK stop may finish via abort + fire-and-forget cancel before backend title finalization commits
+6. TanStack Query manages server state; localStorage stores user settings
+7. Components subscribe to thread state and render updates
 
 Ansich is deliberately separate from chat state. The sidebar entry is rendered
 only for `system_role="admin"`; this is a convenience boundary, while Gateway

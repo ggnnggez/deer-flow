@@ -5,7 +5,7 @@ Like the original DeerFlow 1.0, we would love to give the community a minimalist
 ## Tech Stack
 
 - **Framework**: [Next.js 16](https://nextjs.org/) with [App Router](https://nextjs.org/docs/app)
-- **UI**: [React 19](https://react.dev/), [Tailwind CSS 4](https://tailwindcss.com/), [Shadcn UI](https://ui.shadcn.com/), [MagicUI](https://magicui.design/) and [React Bits](https://reactbits.dev/)
+- **UI**: [React 19](https://react.dev/), [Tailwind CSS 4](https://tailwindcss.com/), [Shadcn UI](https://ui.shadcn.com/), [MagicUI](https://magicui.design/), [React Bits](https://reactbits.dev/), and [TanStack Virtual](https://tanstack.com/virtual/latest)
 - **AI Integration**: [LangGraph SDK](https://www.npmjs.com/package/@langchain/langgraph-sdk) and [Vercel AI Elements](https://vercel.com/ai-sdk/ai-elements)
 
 ## Quick Start
@@ -75,6 +75,8 @@ pnpm start
 └── /chats/[thread_id]   # A specific chat page
 ```
 
+Conversation pages provide Chat and Trajectory views over the same LangGraph message history. Trajectory groups messages into user turns, joins tool calls with their results, shows available token usage and duration metadata, supports search and turn folding, and virtualizes long histories in the browser. The basic view does not synthesize timing or prompt data that the backend did not record.
+
 ## Configuration
 
 ### Environment Variables
@@ -114,6 +116,7 @@ src/
 │   ├── models/             # Data models & types
 │   ├── settings/           # User settings
 │   ├── skills/             # Skills system
+│   ├── trajectory/         # Message-to-trajectory projection and row model
 │   ├── threads/            # Thread management
 │   ├── todos/              # Todo system
 │   └── utils/              # Utility functions

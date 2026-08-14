@@ -96,6 +96,28 @@ export interface Translations {
     truncatedSummary: string;
   };
 
+  trajectory: {
+    chat: string;
+    title: string;
+    searchPlaceholder: string;
+    collapseAll: string;
+    expandAll: string;
+    loadEarlier: string;
+    loadingEarlier: string;
+    empty: string;
+    noMatches: string;
+    turn: (number: number) => string;
+    records: (count: number) => string;
+    seconds: (seconds: number) => string;
+    inputTokens: string;
+    outputTokens: string;
+    totalTokens: string;
+    details: string;
+    request: string;
+    result: string;
+    running: string;
+  };
+
   // Input Box
   inputBox: {
     placeholder: string;

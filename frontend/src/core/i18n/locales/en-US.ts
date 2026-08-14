@@ -113,6 +113,28 @@ export const enUS: Translations = {
     truncatedSummary: "Some changes were truncated.",
   },
 
+  trajectory: {
+    chat: "Chat",
+    title: "Trajectory",
+    searchPlaceholder: "Search trajectory",
+    collapseAll: "Collapse all turns",
+    expandAll: "Expand all turns",
+    loadEarlier: "Load earlier history",
+    loadingEarlier: "Loading earlier history...",
+    empty: "No trajectory records yet.",
+    noMatches: "No trajectory records match this search.",
+    turn: (number) => `Turn ${number}`,
+    records: (count) => `${count} ${count === 1 ? "record" : "records"}`,
+    seconds: (seconds) => `${seconds.toFixed(seconds < 10 ? 1 : 0)}s`,
+    inputTokens: "Input",
+    outputTokens: "Output",
+    totalTokens: "Total",
+    details: "Record details",
+    request: "Request",
+    result: "Result",
+    running: "Running",
+  },
+
   // Input Box
   inputBox: {
     placeholder: "How can I assist you today?",
@@ -480,16 +502,14 @@ export const enUS: Translations = {
         "Highest serialized byte usage reached by the queue since this Gateway process started. Values near byte capacity indicate past large-payload pressure.",
       watermark:
         "Largest Observation ingest sequence successfully projected by this process. It is a processing position, not a completion percentage, and failed jobs may leave gaps below it.",
-      lag:
-        "Approximate time gap between the newest recorded Observation and the newest successfully projected Observation. Sustained growth indicates projection backlog.",
+      lag: "Approximate time gap between the newest recorded Observation and the newest successfully projected Observation. Sustained growth indicates projection backlog.",
       failedJobs:
         "Projection and assessor jobs currently in the failed state. Select the value to inspect errors and retry by Task.",
       accepted:
         "Observations accepted into the in-process queue since this Gateway process started. Acceptance does not guarantee persistence or successful projection.",
       dropped:
         "Observations rejected by the Collector since this Gateway process started, for example when capacity or storage is unavailable. Any non-zero value means evidence may be missing.",
-      lost:
-        "Total missing Observations calculated from recorded loss ranges. A non-zero value means affected evidence-based conclusions may become unknown.",
+      lost: "Total missing Observations calculated from recorded loss ranges. A non-zero value means affected evidence-based conclusions may become unknown.",
       snapshotRequests:
         "Model-context snapshot capture batches attempted since this Gateway process started. The value in parentheses is accepted/dropped Observations, not successful/failed requests.",
       snapshotItems:

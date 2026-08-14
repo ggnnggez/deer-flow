@@ -32,6 +32,11 @@ import { ThreadScheduledTasksLink } from "@/components/workspace/thread-schedule
 import { ThreadTitle } from "@/components/workspace/thread-title";
 import { TodoList } from "@/components/workspace/todo-list";
 import { TokenUsageIndicator } from "@/components/workspace/token-usage-indicator";
+import {
+  ConversationViewToggle,
+  TrajectoryView,
+  type ConversationView,
+} from "@/components/workspace/trajectory";
 import { useActiveGoal } from "@/components/workspace/use-active-goal";
 import { Welcome } from "@/components/workspace/welcome";
 import { useBrowserControlEnabled } from "@/core/features";
@@ -68,6 +73,8 @@ export default function ChatPage() {
   // the moment the user submits so the UI animates immediately, even though
   // `isNewThread` stays true until the backend actually creates the thread.
   const [isWelcomeMode, setIsWelcomeMode] = useState(isNewThread);
+  const [conversationView, setConversationView] =
+    useState<ConversationView>("chat");
   const [settings, setSettings] = useThreadSettings(threadId);
   const [localSettings, setLocalSettings] = useLocalSettings();
   const { enabled: browserControlEnabled } = useBrowserControlEnabled();
@@ -95,6 +102,9 @@ export default function ChatPage() {
   // is harmless during the submit transition.
   useEffect(() => {
     setIsWelcomeMode(isNewThread);
+    if (isNewThread) {
+      setConversationView("chat");
+    }
   }, [isNewThread]);
 
   const { showNotification } = useNotification();
@@ -278,6 +288,14 @@ export default function ChatPage() {
               <div className="flex min-w-0 flex-1 items-center text-sm font-medium">
                 <ThreadTitle threadId={threadId} thread={thread} />
               </div>
+              {!isWelcomeMode && (
+                <ConversationViewToggle
+                  chatLabel={t.trajectory.chat}
+                  trajectoryLabel={t.trajectory.title}
+                  value={conversationView}
+                  onChange={setConversationView}
+                />
+              )}
               <div className="flex shrink-0 items-center gap-2">
                 {!isNewThread && (
                   <ThreadScheduledTasksLink threadId={threadId} />
@@ -301,39 +319,51 @@ export default function ChatPage() {
             </header>
             <main className="flex min-h-0 max-w-full grow flex-col">
               <div className="flex min-h-0 flex-1 justify-center">
-                <MessageList
-                  className={cn("size-full", !isWelcomeMode && "pt-10")}
-                  testId="main-message-list"
-                  threadId={threadId}
-                  thread={thread}
-                  paddingBottom={MESSAGE_LIST_DEFAULT_PADDING_BOTTOM}
-                  hasMoreHistory={hasMoreHistory}
-                  loadMoreHistory={loadMoreHistory}
-                  isHistoryLoading={isHistoryLoading}
-                  tokenUsageInlineMode={tokenUsageInlineMode}
-                  canRegenerate={
-                    !isNewThread &&
-                    !isMock &&
-                    env.NEXT_PUBLIC_STATIC_WEBSITE_ONLY !== "true" &&
-                    !isUploading &&
-                    !thread.isLoading
-                  }
-                  onRegenerateMessage={handleRegenerate}
-                  onSubmitHumanInput={
-                    isMock || env.NEXT_PUBLIC_STATIC_WEBSITE_ONLY === "true"
-                      ? undefined
-                      : handleSubmitHumanInput
-                  }
-                  canBranch={
-                    !isNewThread &&
-                    !isMock &&
-                    env.NEXT_PUBLIC_STATIC_WEBSITE_ONLY !== "true" &&
-                    !isUploading &&
-                    !thread.isLoading &&
-                    !branchThread.isPending
-                  }
-                  onBranchTurn={handleBranchTurn}
-                />
+                {conversationView === "chat" ? (
+                  <MessageList
+                    className={cn("size-full", !isWelcomeMode && "pt-10")}
+                    testId="main-message-list"
+                    threadId={threadId}
+                    thread={thread}
+                    paddingBottom={MESSAGE_LIST_DEFAULT_PADDING_BOTTOM}
+                    hasMoreHistory={hasMoreHistory}
+                    loadMoreHistory={loadMoreHistory}
+                    isHistoryLoading={isHistoryLoading}
+                    tokenUsageInlineMode={tokenUsageInlineMode}
+                    canRegenerate={
+                      !isNewThread &&
+                      !isMock &&
+                      env.NEXT_PUBLIC_STATIC_WEBSITE_ONLY !== "true" &&
+                      !isUploading &&
+                      !thread.isLoading
+                    }
+                    onRegenerateMessage={handleRegenerate}
+                    onSubmitHumanInput={
+                      isMock || env.NEXT_PUBLIC_STATIC_WEBSITE_ONLY === "true"
+                        ? undefined
+                        : handleSubmitHumanInput
+                    }
+                    canBranch={
+                      !isNewThread &&
+                      !isMock &&
+                      env.NEXT_PUBLIC_STATIC_WEBSITE_ONLY !== "true" &&
+                      !isUploading &&
+                      !thread.isLoading &&
+                      !branchThread.isPending
+                    }
+                    onBranchTurn={handleBranchTurn}
+                  />
+                ) : (
+                  <div className="size-full min-h-0 pt-12">
+                    <TrajectoryView
+                      hasMoreHistory={hasMoreHistory}
+                      isHistoryLoading={isHistoryLoading}
+                      isStreaming={thread.isLoading}
+                      loadMoreHistory={loadMoreHistory}
+                      messages={thread.messages}
+                    />
+                  </div>
+                )}
               </div>
               <div
                 className={cn(

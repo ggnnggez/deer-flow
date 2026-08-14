@@ -112,6 +112,28 @@ export const zhCN: Translations = {
     truncatedSummary: "部分变更已被截断。",
   },
 
+  trajectory: {
+    chat: "对话",
+    title: "轨迹",
+    searchPlaceholder: "搜索轨迹",
+    collapseAll: "折叠全部轮次",
+    expandAll: "展开全部轮次",
+    loadEarlier: "加载更早历史",
+    loadingEarlier: "正在加载更早历史...",
+    empty: "暂无轨迹记录。",
+    noMatches: "没有匹配的轨迹记录。",
+    turn: (number) => `第 ${number} 轮`,
+    records: (count) => `${count} 条记录`,
+    seconds: (seconds) => `${seconds.toFixed(seconds < 10 ? 1 : 0)} 秒`,
+    inputTokens: "输入",
+    outputTokens: "输出",
+    totalTokens: "总计",
+    details: "记录详情",
+    request: "请求",
+    result: "结果",
+    running: "运行中",
+  },
+
   // Input Box
   inputBox: {
     placeholder: "今天我能为你做些什么？",
@@ -439,7 +461,8 @@ export const zhCN: Translations = {
     lag: "延迟",
     failedJobs: "失败 Job",
     failedJobsDialogTitle: "失败 Job",
-    failedJobsDialogDescriptionGlobal: "当前所有 Task 中正在失败的投影与评估 Job。",
+    failedJobsDialogDescriptionGlobal:
+      "当前所有 Task 中正在失败的投影与评估 Job。",
     failedJobsDialogDescriptionTask: "当前这个 Task 正在失败的投影与评估 Job。",
     failedJobsEmpty: "没有失败的 Job。",
     failedJobKindLabel: {
@@ -463,16 +486,14 @@ export const zhCN: Translations = {
         "本次 Gateway 进程启动以来，队列达到过的最大序列化字节数。接近字节容量表示曾有大载荷压力。",
       watermark:
         "本进程已成功完成投影的最大 Observation ingest_seq。它是处理位置，不是完成百分比；更低序列仍可能存在失败 Job。",
-      lag:
-        "最新已记录 Observation 与最新成功投影 Observation 之间的近似时间差。持续增长表示投影正在积压。",
+      lag: "最新已记录 Observation 与最新成功投影 Observation 之间的近似时间差。持续增长表示投影正在积压。",
       failedJobs:
         "当前处于失败状态的投影 Job 和评估 Job。点击数值可查看错误，并按 Task 重试。",
       accepted:
         "本次 Gateway 进程启动以来，被接收入进程内队列的 Observation 数量。接收不等于已持久化或成功投影。",
       dropped:
         "本次 Gateway 进程启动以来，被 Collector 拒绝的 Observation 数量，例如队列超限或存储不可用。非零表示证据可能缺失。",
-      lost:
-        "根据已记录丢失区间计算出的缺失 Observation 总数。非零时，受影响的证据化结论可能降级为 unknown。",
+      lost: "根据已记录丢失区间计算出的缺失 Observation 总数。非零时，受影响的证据化结论可能降级为 unknown。",
       snapshotRequests:
         "本次 Gateway 进程启动以来尝试采集的模型上下文快照批次。括号内是接受/丢弃的 Observation 数，不是成功/失败请求数。",
       snapshotItems:
@@ -541,8 +562,7 @@ export const zhCN: Translations = {
     effectIntent: "副作用意图",
     effectObserved: "已观测副作用",
     coverage: "观测覆盖度",
-    unknownEffectCoverage:
-      "副作用覆盖度未知；没有记录不代表没有发生副作用。",
+    unknownEffectCoverage: "副作用覆盖度未知；没有记录不代表没有发生副作用。",
     agentRelease: "Agent Release",
     noAgentRelease: "此 Task 尚未解析出 Agent Release。",
     releaseHash: "Release 哈希",
