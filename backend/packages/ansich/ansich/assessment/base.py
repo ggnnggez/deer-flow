@@ -16,6 +16,7 @@ AuthorityClass = Literal[
     "human_override",
     "deterministic",
     "configured_rule",
+    "soft_human",
     "automated",
 ]
 FidelityClass = Literal["hard", "rule", "soft"]

@@ -83,6 +83,7 @@ from ansich.assessment.tool_frequency import (
     assess_tool_frequency,
 )
 from ansich.belief.resolver import (
+    DEFAULT_RESOLVER,
     BeliefAssertion,
     resolve_current_belief,
 )
@@ -2085,7 +2086,7 @@ class SqlAnsichBackend:
                     }
                 )
             )
-        resolved = resolve_current_belief(assertions)
+        resolved = resolve_current_belief(assertions, resolver=DEFAULT_RESOLVER)
         current = await session.get(
             AnsichCurrentBeliefRow,
             (subject_id, field_name),

@@ -323,7 +323,7 @@ def test_resolver_uses_authority_then_as_of_and_never_regresses_on_late_commit()
     assert human_resolution.selected.assertion_id == "assertion-human-old"
     assert rule_resolution.selected.assertion_id == "assertion-rule-new"
     assert human_resolution.resolver.name == "ansich-default"
-    assert human_resolution.resolver.version == "1.0.0"
+    assert human_resolution.resolver.version == "2.0.0"
 
 
 def test_resolver_uses_stable_assertion_id_as_the_final_tie_breaker() -> None:
