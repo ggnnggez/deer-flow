@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from datetime import UTC, datetime, timedelta
@@ -146,6 +147,27 @@ def test_the_empty_cohort_sentinel_is_never_comparable() -> None:
     assert comparison.comparison_status == "not_comparable"
     assert comparison.reason == "no_shared_cohort"
     assert comparison.observed_delta is None
+
+
+def test_an_inverted_scale_polarity_is_not_comparable_in_either_direction() -> None:
+    """Identical ranges with opposite polarity are not the same measurement.
+
+    A 0..1 scale where higher is better and one where lower is better produce
+    deltas whose sign means the opposite thing on each side, so §7's "same score
+    scale" must cover polarity, not just the range.
+    """
+
+    higher_is_better = _cell(mean_score=0.5, scale={"min": 0.0, "max": 1.0, "higher_is_better": True})
+    lower_is_better = _cell(mean_score=0.8, scale={"min": 0.0, "max": 1.0, "higher_is_better": False})
+
+    forward = _only(compare_release_quality([higher_is_better], [lower_is_better], min_samples=5, unexplained_loss=False))
+    reverse = _only(compare_release_quality([lower_is_better], [higher_is_better], min_samples=5, unexplained_loss=False))
+
+    assert (forward.comparison_status, reverse.comparison_status) == ("not_comparable", "not_comparable")
+    assert (forward.reason, reverse.reason) == ("scale_mismatch", "scale_mismatch")
+    assert (forward.observed_delta, reverse.observed_delta) == (None, None)
+    # The same polarity on both sides stays comparable.
+    assert _only(compare_release_quality([higher_is_better], [higher_is_better], min_samples=5, unexplained_loss=False)).comparison_status == "comparable"
 
 
 def test_a_different_score_scale_is_not_comparable_in_either_direction() -> None:
@@ -473,6 +495,57 @@ async def test_record_evaluation_receipt_is_failed_without_durable_storage() -> 
     assert receipt.idempotent_replay is False
 
 
+class _StalledStorageBackend:
+    """A storage backend whose write cannot finish inside the terminal window.
+
+    ``persist_and_project`` is the only method the collector needs; every read is
+    duck-typed and safely absent. The gate lets the test release the pending
+    write before shutdown instead of leaving a coroutine parked forever.
+    """
+
+    def __init__(self) -> None:
+        self.released = asyncio.Event()
+        self.persist_calls = 0
+
+    async def persist_and_project(self, observations):
+        self.persist_calls += 1
+        await self.released.wait()
+        return len(observations)
+
+
+@pytest.mark.anyio
+async def test_record_evaluation_receipt_is_failed_when_the_flush_loses_the_observation() -> None:
+    task_id = new_id()
+    backend = _StalledStorageBackend()
+    service = AnsichService(
+        backend,
+        flush_interval_ms=60_000,
+        # The write is still in flight when the terminal window closes, so
+        # flush_task times out BEFORE persisting and records the Observation as
+        # lost. A receipt that then read "pending" would poll a job that will
+        # never exist.
+        terminal_flush_timeout_ms=50,
+    )
+    await service.start()
+    try:
+        receipt = await service.record_evaluation(
+            _benchmark(task_id),
+            source_event_id=None,
+            producer=_producer(),
+        )
+        health = service.get_health()
+    finally:
+        backend.released.set()
+        await service.stop()
+
+    assert backend.persist_calls == 1
+    assert receipt.projection_status == "failed"
+    assert receipt.idempotent_replay is False
+    assert health.loss_detected is True
+    assert health.dropped_count == 1
+    assert [(item.first_sequence, item.last_sequence, item.task_id) for item in health.lost_ranges] == [(1, 1, task_id)]
+
+
 @pytest.mark.anyio
 async def test_record_evaluation_receipt_is_failed_on_a_stopped_service(tmp_path) -> None:
     task_id, run_id = new_id(), "eval-service-stopped"
@@ -753,7 +826,8 @@ async def test_get_release_quality_derives_the_mean_score_and_filters_by_cohort(
     assert (cohort.assessed_count, cohort.pass_count, cohort.fail_count, cohort.partial_count) == (2, 1, 1, 0)
     # mean_score is derived at read time from score_sum/score_count.
     assert cohort.mean_score == pytest.approx(0.5)
-    assert cohort.scale == {"min": 0.0, "max": 1.0}
+    # Polarity travels with the range so the comparability gate can see it.
+    assert cohort.scale == {"min": 0.0, "max": 1.0, "higher_is_better": True}
     assert cohort.as_of == _OCCURRED_AT + timedelta(minutes=5)
     assert matching_cohort is not None
     assert len(matching_cohort.cohorts) == 1

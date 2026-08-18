@@ -405,7 +405,19 @@ class AnsichService:
                 projection_status="failed",
                 idempotent_replay=False,
             )
-        await self.flush_task(record.task_id)
+        if not (await self.flush_task(record.task_id)).persisted:
+            # The same reasoning one branch up, for the write rather than the
+            # intake: a terminal-flush timeout before persistence, or a storage
+            # failure, drops the Observation and records it as a lost range.
+            # There is no job to poll, so reporting "pending" would leave the
+            # caller waiting on a projection that can never arrive. A settle
+            # timeout AFTER a successful write keeps ``persisted=True`` and
+            # correctly falls through to the real job status below.
+            return EvaluationRecordReceipt(
+                observation_id=observation.obs_id,
+                projection_status="failed",
+                idempotent_replay=False,
+            )
         return EvaluationRecordReceipt(
             observation_id=observation.obs_id,
             projection_status=await self._evaluation_projection_status(observation.obs_id),

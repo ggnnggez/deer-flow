@@ -1545,5 +1545,9 @@ class AnsichReleaseQualityStatsRow(Base):
     score_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
     scale_min: Mapped[float | None] = mapped_column(Float)
     scale_max: Mapped[float | None] = mapped_column(Float)
+    # Polarity is part of scale identity, not decoration: two cells sharing a
+    # range but disagreeing on direction are not the same measurement, and a
+    # delta between them would carry opposite meanings on each side.
+    scale_higher_is_better: Mapped[bool | None] = mapped_column(Boolean)
     as_of: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
     projector_version: Mapped[str] = mapped_column(String(32), nullable=False)

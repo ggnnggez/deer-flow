@@ -2938,7 +2938,9 @@ class SqlAnsichBackend:
                     fail_count=row.fail_count,
                     partial_count=row.partial_count,
                     mean_score=(row.score_sum / row.score_count) if row.score_count > 0 and row.score_sum is not None else None,
-                    scale=None if row.scale_min is None and row.scale_max is None else {"min": row.scale_min, "max": row.scale_max},
+                    # Polarity ships with the range so ``compare_release_quality``
+                    # rejects two cells that share a scale but invert its meaning.
+                    scale=None if row.scale_min is None and row.scale_max is None else {"min": row.scale_min, "max": row.scale_max, "higher_is_better": row.scale_higher_is_better},
                     as_of=_as_utc(row.as_of),
                 )
                 for row in rows
@@ -7959,6 +7961,10 @@ class SqlAnsichBackend:
             "score_count": 0 if mixed_scales or not scores else len(scores),
             "scale_min": scales[0][0] if scales else None,
             "scale_max": scales[0][1] if scales else None,
+            # The retained scale is the full triple the mixed-scale check keys
+            # on; storing only the range would let a comparison treat opposite
+            # polarities as one scale.
+            "scale_higher_is_better": scales[0][2] if scales else None,
             "as_of": as_of,
             "projector_version": _EVALUATION_PROJECTOR_VERSION,
         }

@@ -92,6 +92,7 @@ def upgrade() -> None:
         sa.Column("score_count", sa.Integer(), nullable=False),
         sa.Column("scale_min", sa.Float(), nullable=True),
         sa.Column("scale_max", sa.Float(), nullable=True),
+        sa.Column("scale_higher_is_better", sa.Boolean(), nullable=True),
         sa.Column("as_of", sa.DateTime(timezone=True), nullable=False),
         sa.Column("projector_version", sa.String(length=32), nullable=False),
         sa.ForeignKeyConstraint(

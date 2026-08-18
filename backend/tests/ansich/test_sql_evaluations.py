@@ -87,6 +87,9 @@ def test_evaluation_models_compile_with_postgresql_constraints_and_indexes() -> 
     assert "FOREIGN KEY(release_id) REFERENCES ansich_entities (entity_id) ON DELETE CASCADE" in ddl["ansich_release_quality_stats"]
     assert "assessed_count INTEGER NOT NULL" in ddl["ansich_release_quality_stats"]
     assert "score_sum FLOAT" in ddl["ansich_release_quality_stats"]
+    # Scale polarity is part of scale identity: comparing two cells on range
+    # alone would compare a higher-is-better mean against a lower-is-better one.
+    assert "scale_higher_is_better BOOLEAN" in ddl["ansich_release_quality_stats"]
     assert "as_of TIMESTAMP WITH TIME ZONE NOT NULL" in ddl["ansich_release_quality_stats"]
 
     assert {index.name for index in AnsichEvaluationIndexRow.__table__.indexes} == {
@@ -394,6 +397,7 @@ async def _projection_snapshot(
                 row.score_count,
                 row.scale_min,
                 row.scale_max,
+                row.scale_higher_is_better,
                 _utc(row.as_of),
                 row.projector_version,
             )
@@ -1034,7 +1038,7 @@ async def test_release_quality_stats_aggregate_current_beliefs_for_a_cohort(tmp_
     assert (cell.assessed_count, cell.pass_count, cell.fail_count, cell.partial_count) == (2, 1, 1, 0)
     assert cell.score_sum == 1.0
     assert cell.score_count == 2
-    assert (cell.scale_min, cell.scale_max) == (0.0, 1.0)
+    assert (cell.scale_min, cell.scale_max, cell.scale_higher_is_better) == (0.0, 1.0, True)
     assert _utc(cell.as_of) == later
     assert cell.projector_version == "1"
 
@@ -1092,7 +1096,7 @@ async def test_release_quality_stats_refuse_to_average_mixed_scales(tmp_path) ->
     assert cell.score_sum is None
     assert cell.score_count == 0
     # Deterministic tiebreak: the lowest evaluation_obs_id contributes the scale.
-    assert (cell.scale_min, cell.scale_max) == (0.0, 1.0)
+    assert (cell.scale_min, cell.scale_max, cell.scale_higher_is_better) == (0.0, 1.0, True)
 
 
 @pytest.mark.anyio
@@ -1129,7 +1133,7 @@ async def test_release_quality_stats_use_the_empty_cohort_sentinel(tmp_path) -> 
     assert (cell.assessed_count, cell.pass_count, cell.fail_count, cell.partial_count) == (1, 0, 0, 1)
     assert cell.score_sum is None
     assert cell.score_count == 0
-    assert (cell.scale_min, cell.scale_max) == (None, None)
+    assert (cell.scale_min, cell.scale_max, cell.scale_higher_is_better) == (None, None, None)
 
 
 @pytest.mark.anyio
@@ -1233,5 +1237,6 @@ async def test_rebuild_reproduces_index_rows_stats_and_current_beliefs(tmp_path)
     # assessed/pass/fail/partial/score_sum/score_count: the human override wins
     # the first Task's belief and carries no score, so only one score is summed.
     assert before["stats"][0][3:9] == (2, 2, 0, 0, 1.0, 1)
-    assert _utc(before["stats"][0][11]) == later
+    assert before["stats"][0][9:12] == (0.0, 1.0, True)
+    assert _utc(before["stats"][0][12]) == later
     assert before == after
