@@ -5,12 +5,21 @@ import hashlib
 import json
 import logging
 import posixpath
-from datetime import datetime
+from datetime import UTC, datetime
 from typing import Literal
 
 from ansich.alerts import AlertWorkflowConflict
-from ansich.contracts import ControlValue, TaskLifecycleScope
+from ansich.contracts import ControlValue, NamedVersion, Producer, TaskLifecycleScope
 from ansich.credentials import contains_credential_like_material
+from ansich.evaluation import (
+    EvaluationDimension,
+    EvaluationKind,
+    EvaluationRecord,
+    EvaluationSubjectType,
+    EvaluationVerdict,
+    ScoreScale,
+)
+from ansich.quality import compare_release_quality
 from ansich.release import (
     AgentRelease,
     AgentReleaseFingerprint,
@@ -18,12 +27,14 @@ from ansich.release import (
 )
 from ansich.task_tree import TaskTreeDirection
 from fastapi import APIRouter, Header, HTTPException, Query, Request, Response
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field
 
 from app.gateway.deps import (
+    AnsichEvaluationSettings,
     get_current_user_from_request,
     get_run_manager,
     require_admin_user,
+    snapshot_ansich_evaluation_settings,
 )
 from deerflow.runtime.runs.manager import CancelOutcome
 from deerflow.runtime.runs.schemas import RunStatus
@@ -31,6 +42,17 @@ from deerflow.runtime.runs.schemas import RunStatus
 router = APIRouter(prefix="/api/ansich", tags=["ansich"])
 _ADMIN_REQUIRED = "Ansich developer/operator observability requires an admin account."
 logger = logging.getLogger(__name__)
+#: Identity of evaluations submitted over HTTP rather than by a runtime probe.
+_EVALUATION_PRODUCER = Producer(name="ansich-evaluation-api", version="1", instance_id="gateway")
+#: The assessor identity of an operator's explicit Alert-dismissal judgement.
+_DISMISSAL_ASSESSOR = NamedVersion(name="operator-dismissal", version="1.0.0")
+#: Kinds whose replay identity is their suite/case/run tuple, so the contract
+#: derives their ``source_event_id`` instead of taking the caller's key. Mirrors
+#: the contract's own suite-bound set (``ansich.evaluation``), which is private.
+_BENCHMARK_EVALUATION_KINDS: frozenset[str] = frozenset({"benchmark_assertion", "unit_test"})
+#: Used only when a request arrives on an app whose lifespan captured nothing —
+#: router tests and alternative ASGI compositions. Production always snapshots.
+_DEFAULT_EVALUATION_SETTINGS = snapshot_ansich_evaluation_settings(None)
 
 
 def _service_or_503(request: Request):
@@ -42,6 +64,13 @@ def _service_or_503(request: Request):
 
 def _projection_status(service) -> dict:
     return service.get_health().model_dump(mode="json")
+
+
+def _evaluation_settings(request: Request) -> AnsichEvaluationSettings:
+    """Return the startup snapshot of the evaluation knobs (never a live read)."""
+
+    settings = getattr(request.app.state, "ansich_evaluation_settings", None)
+    return settings if settings is not None else _DEFAULT_EVALUATION_SETTINGS
 
 
 def _ensure_queryable(service) -> None:
@@ -133,8 +162,30 @@ class AlertWorkflowRequest(BaseModel):
     workflow_version: int = Field(ge=1)
 
 
+class AlertSemanticOverride(BaseModel):
+    """An operator's explicit quality judgement attached to a dismissal.
+
+    Optional by design: an ordinary acknowledge or dismiss is an operational
+    decision about the Alert, not a semantic claim about the Task, and must
+    leave the quality Beliefs untouched (spec section 5).
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    dimension: Literal[
+        "correctness",
+        "completeness",
+        "relevance",
+        "safety",
+        "efficiency",
+    ]
+    verdict: Literal["pass", "fail", "partial"]
+    rationale: str | None = None
+
+
 class AlertDismissRequest(AlertWorkflowRequest):
     reason: str = Field(min_length=1, max_length=512)
+    semantic_override: AlertSemanticOverride | None = None
 
 
 def _redact_release_prompt(manifest: dict) -> None:
@@ -213,10 +264,12 @@ async def compare_releases(
     request: Request,
     left: str = Query(min_length=1),
     right: str = Query(min_length=1),
+    cohort: str | None = Query(default=None),
 ) -> dict:
     await require_admin_user(request, detail=_ADMIN_REQUIRED)
     service = _service_or_503(request)
     _ensure_queryable(service)
+    settings = _evaluation_settings(request)
     try:
         left_detail = await service.get_agent_release(left)
         right_detail = await service.get_agent_release(right)
@@ -230,12 +283,35 @@ async def compare_releases(
         ) from exc
     if left_detail is None or right_detail is None:
         raise HTTPException(status_code=404, detail="Ansich AgentRelease not found")
+    try:
+        left_quality = await service.get_release_quality(left, cohort_key=cohort)
+        right_quality = await service.get_release_quality(right, cohort_key=cohort)
+    except Exception as exc:
+        raise HTTPException(
+            status_code=503,
+            detail={
+                "message": "Ansich AgentRelease quality comparison query failed",
+                "projection_status": _projection_status(service),
+            },
+        ) from exc
     comparison = compare_agent_releases(
         _release_from_detail(left_detail),
         _release_from_detail(right_detail),
     )
+    # A release nobody evaluated compares as absent quality, never as a missing
+    # release: the structural comparison above stays available either way.
+    comparisons = compare_release_quality(
+        () if left_quality is None else left_quality.cohorts,
+        () if right_quality is None else right_quality.cohorts,
+        min_samples=settings.min_cohort_samples,
+        unexplained_loss=service.get_health().loss_detected,
+    )
     return {
         "comparison": comparison.model_dump(mode="json"),
+        "quality": {
+            "comparisons": [item.model_dump(mode="json") for item in comparisons],
+            "cohort": cohort,
+        },
         "projection_status": _projection_status(service),
     }
 
@@ -298,6 +374,36 @@ async def get_agent_release_manifest(
     return {
         "release_id": release_id,
         "manifest": detail.manifest.model_dump(mode="json"),
+    }
+
+
+@router.get("/agent-releases/{release_id}/quality")
+async def get_agent_release_quality(
+    release_id: str,
+    request: Request,
+    cohort: str | None = Query(default=None),
+) -> dict:
+    """Return one AgentRelease's aggregated semantic quality cells."""
+
+    await require_admin_user(request, detail=_ADMIN_REQUIRED)
+    service = _service_or_503(request)
+    _ensure_queryable(service)
+    try:
+        quality = await service.get_release_quality(release_id, cohort_key=cohort)
+    except Exception as exc:
+        raise HTTPException(
+            status_code=503,
+            detail={
+                "message": "Ansich AgentRelease quality query failed",
+                "projection_status": _projection_status(service),
+            },
+        ) from exc
+    if quality is None:
+        raise HTTPException(status_code=404, detail="Ansich AgentRelease not found")
+    return {
+        "release_id": quality.release_id,
+        "cohorts": [cohort_view.model_dump(mode="json") for cohort_view in quality.cohorts],
+        "projection_status": _projection_status(service),
     }
 
 
@@ -493,6 +599,60 @@ async def get_alert_detail(alert_id: str, request: Request) -> dict:
     }
 
 
+async def _record_dismissal_override(
+    service,
+    *,
+    alert_id: str,
+    alert,
+    override: AlertSemanticOverride,
+) -> dict:
+    """Record the operator's semantic judgement for an already-dismissed Alert.
+
+    Best-effort on purpose: the workflow write has already succeeded, so a
+    failure here degrades the extra assertion instead of retracting a dismissal
+    the operator can no longer repeat (the next attempt hits a version
+    conflict). The Alert's subject is only the owning Task for Task-scoped
+    Alerts — a ToolCall-scoped one (the scope-safety types) carries no Task in
+    its summary, so it degrades rather than attaching a Task-level quality
+    Belief to a ToolCall id.
+    """
+
+    try:
+        subject_type = await service.get_evaluation_subject(alert.subject_id)
+        if subject_type != "task":
+            return {"status": "degraded", "reason": "alert_subject_is_not_a_task", "evaluation": None}
+        receipt = await service.record_evaluation(
+            EvaluationRecord(
+                subject_type="task",
+                subject_id=alert.subject_id,
+                task_id=alert.subject_id,
+                evaluation_kind="developer_annotation",
+                dimension=override.dimension,
+                verdict=override.verdict,
+                rationale=override.rationale,
+                assessor=_DISMISSAL_ASSESSOR,
+                fidelity_class="soft",
+                human_override=True,
+                occurred_at=datetime.now(UTC),
+            ),
+            # The dismissal that produced this workflow version is the replay
+            # identity, matching the workflow Observation's own stable id.
+            source_event_id=f"evaluation:dismiss:{alert_id}:{alert.workflow_version}",
+            producer=_EVALUATION_PRODUCER,
+        )
+    except Exception:
+        logger.exception(
+            "Ansich Alert dismissal semantic override failed",
+            extra={"ansich_alert_id": alert_id},
+        )
+        return {"status": "degraded", "reason": "evaluation_write_failed", "evaluation": None}
+    return {
+        "status": "recorded",
+        "reason": None,
+        "evaluation": receipt.model_dump(mode="json"),
+    }
+
+
 async def _change_alert_workflow(
     *,
     alert_id: str,
@@ -500,6 +660,7 @@ async def _change_alert_workflow(
     workflow_version: int,
     reason: str | None,
     request: Request,
+    semantic_override: AlertSemanticOverride | None = None,
 ) -> dict:
     await require_admin_user(request, detail=_ADMIN_REQUIRED)
     user = getattr(request.state, "user", None)
@@ -541,10 +702,19 @@ async def _change_alert_workflow(
         ) from exc
     if alert is None:
         raise HTTPException(status_code=404, detail="Ansich Alert not found")
-    return {
+    payload = {
         "alert": alert.model_dump(mode="json"),
         "projection_status": _projection_status(service),
     }
+    if semantic_override is not None:
+        # Additive field: consumers of the existing two keys are untouched.
+        payload["semantic_override"] = await _record_dismissal_override(
+            service,
+            alert_id=alert_id,
+            alert=alert,
+            override=semantic_override,
+        )
+    return payload
 
 
 @router.post("/operations/alerts/{alert_id}/acknowledge")
@@ -574,6 +744,7 @@ async def dismiss_alert(
         workflow_version=body.workflow_version,
         reason=body.reason,
         request=request,
+        semantic_override=body.semantic_override,
     )
 
 
@@ -1157,6 +1328,210 @@ async def get_step_context(step_id: str, request: Request) -> dict:
     if context is None:
         raise HTTPException(status_code=404, detail="Ansich effective ContextSnapshot not found")
     return {"context": context.model_dump(mode="json"), "projection_status": _projection_status(service)}
+
+
+class EvaluationRecordRequest(BaseModel):
+    """One submitted evaluation, carrying every EvaluationRecord field.
+
+    ``task_id`` is the only difference from the contract record: a Task subject
+    always evaluates its own Task, so the owning Task is derived from the
+    subject and an explicit, disagreeing value is rejected rather than
+    silently preferred. Every other subject must name its Task. Unknown fields
+    are refused like the contract record refuses them, so a misspelled verdict
+    or rationale is reported instead of silently dropped.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    subject_type: EvaluationSubjectType
+    subject_id: str = Field(min_length=1)
+    task_id: str | None = Field(default=None, min_length=1)
+    evaluation_kind: EvaluationKind
+    dimension: EvaluationDimension
+    verdict: EvaluationVerdict | None = None
+    score: float | None = None
+    scale: ScoreScale | None = None
+    expected: str | None = None
+    actual: str | None = None
+    rationale: str | None = None
+    assessor: NamedVersion
+    fidelity_class: Literal["hard", "rule", "soft"]
+    human_override: bool = False
+    cohort_key: str | None = None
+    suite: str | None = None
+    suite_version: str | None = None
+    case_id: str | None = None
+    run_id: str | None = None
+    occurred_at: datetime
+
+    def to_record(self) -> EvaluationRecord:
+        """Resolve the owning Task and validate through the contract."""
+
+        if self.subject_type == "task":
+            if self.task_id is not None and self.task_id != self.subject_id:
+                raise ValueError("a task-subject evaluation derives task_id from subject_id")
+            task_id = self.subject_id
+        elif self.task_id is None:
+            raise ValueError("an evaluation of a non-task subject requires task_id")
+        else:
+            task_id = self.task_id
+        return EvaluationRecord(
+            subject_type=self.subject_type,
+            subject_id=self.subject_id,
+            task_id=task_id,
+            evaluation_kind=self.evaluation_kind,
+            dimension=self.dimension,
+            verdict=self.verdict,
+            score=self.score,
+            scale=self.scale,
+            expected=self.expected,
+            actual=self.actual,
+            rationale=self.rationale,
+            assessor=self.assessor,
+            fidelity_class=self.fidelity_class,
+            human_override=self.human_override,
+            cohort_key=self.cohort_key,
+            suite=self.suite,
+            suite_version=self.suite_version,
+            case_id=self.case_id,
+            run_id=self.run_id,
+            occurred_at=self.occurred_at,
+        )
+
+
+def _canonical_evaluation_payload_size(record: EvaluationRecord) -> int:
+    """Measure the Observation payload exactly as storage will encode it."""
+
+    payload = {"evaluation": record.model_dump(mode="json")}
+    return len(json.dumps(payload, ensure_ascii=False, separators=(",", ":"), sort_keys=True).encode("utf-8"))
+
+
+@router.post("/evaluations")
+async def record_evaluation(
+    body: EvaluationRecordRequest,
+    request: Request,
+    idempotency_key: str = Header(alias="Idempotency-Key"),
+) -> dict:
+    """Record one evaluation and report where its projection currently stands."""
+
+    await require_admin_user(request, detail=_ADMIN_REQUIRED)
+    if not idempotency_key.strip() or len(idempotency_key) > 128:
+        raise HTTPException(
+            status_code=422,
+            detail="Idempotency-Key must contain 1 to 128 characters",
+        )
+    service = _service_or_503(request)
+    _ensure_queryable(service)
+    settings = _evaluation_settings(request)
+    try:
+        record = body.to_record()
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    payload_bytes = _canonical_evaluation_payload_size(record)
+    if payload_bytes > settings.max_payload_bytes:
+        raise HTTPException(
+            status_code=413,
+            detail={
+                "message": "Ansich evaluation payload is too large",
+                "payload_bytes": payload_bytes,
+                "limit_bytes": settings.max_payload_bytes,
+            },
+        )
+    try:
+        entity_type = await service.get_evaluation_subject(record.subject_id)
+    except Exception as exc:
+        raise HTTPException(
+            status_code=503,
+            detail={
+                "message": "Ansich evaluation subject query failed",
+                "projection_status": _projection_status(service),
+            },
+        ) from exc
+    if entity_type is None:
+        raise HTTPException(status_code=404, detail="Ansich evaluation subject not found")
+    if entity_type != record.subject_type:
+        raise HTTPException(
+            status_code=422,
+            detail=f"Ansich evaluation subject is a {entity_type}, not a {record.subject_type}",
+        )
+    try:
+        receipt = await service.record_evaluation(
+            record,
+            # A suite-bound evaluation replays on its own suite/case/run tuple,
+            # so the contract derives that identity instead of the caller key.
+            source_event_id=(None if record.evaluation_kind in _BENCHMARK_EVALUATION_KINDS else f"evaluation:api:{idempotency_key}"),
+            producer=_EVALUATION_PRODUCER,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    except Exception as exc:
+        raise HTTPException(
+            status_code=503,
+            detail={
+                "message": "Ansich evaluation write failed",
+                "projection_status": _projection_status(service),
+            },
+        ) from exc
+    return receipt.model_dump(mode="json")
+
+
+@router.get("/tasks/{task_id}/evaluations")
+async def list_task_evaluations(task_id: str, request: Request) -> dict:
+    """Return one Task's quality Beliefs plus the evaluations behind them."""
+
+    await require_admin_user(request, detail=_ADMIN_REQUIRED)
+    service = _service_or_503(request)
+    _ensure_queryable(service)
+    try:
+        task = await service.get_task(task_id)
+        if task is None:
+            raise HTTPException(status_code=404, detail="Ansich Task not found")
+        beliefs = await service.get_quality_beliefs(task_id)
+        evaluations = await service.list_evaluations(task_id=task_id)
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise HTTPException(
+            status_code=503,
+            detail={
+                "message": "Ansich evaluation query failed",
+                "projection_status": _projection_status(service),
+            },
+        ) from exc
+    return {
+        "task_id": task_id,
+        "quality_beliefs": [belief.model_dump(mode="json") for belief in beliefs],
+        "evaluations": [item.model_dump(mode="json") for item in evaluations],
+        "projection_status": _projection_status(service),
+    }
+
+
+@router.get("/steps/{step_id}/evaluations")
+async def list_step_evaluations(step_id: str, request: Request) -> dict:
+    """Return the evaluations recorded against one Step."""
+
+    await require_admin_user(request, detail=_ADMIN_REQUIRED)
+    service = _service_or_503(request)
+    _ensure_queryable(service)
+    try:
+        if await service.get_evaluation_subject(step_id) != "step":
+            raise HTTPException(status_code=404, detail="Ansich Step not found")
+        evaluations = await service.list_evaluations(subject_type="step", subject_id=step_id)
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise HTTPException(
+            status_code=503,
+            detail={
+                "message": "Ansich evaluation query failed",
+                "projection_status": _projection_status(service),
+            },
+        ) from exc
+    return {
+        "step_id": step_id,
+        "evaluations": [item.model_dump(mode="json") for item in evaluations],
+        "projection_status": _projection_status(service),
+    }
 
 
 @router.get("/context-snapshots/{snapshot_id}")

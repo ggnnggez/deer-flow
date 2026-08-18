@@ -40,7 +40,11 @@ class EmptyBridge:
 async def test_gateway_runtime_starts_and_stops_enabled_ansich_without_sql(monkeypatch):
     app = FastAPI()
     config = SimpleNamespace(
-        ansich=AnsichConfig(enabled=True),
+        ansich=AnsichConfig(
+            enabled=True,
+            evaluation_min_cohort_samples=7,
+            evaluation_max_payload_bytes=4_096,
+        ),
         database=SimpleNamespace(backend="memory", checkpoint_channel_mode="full"),
         run_events=SimpleNamespace(backend="memory"),
         stream_bridge=SimpleNamespace(recovered_stream_cleanup_delay_seconds=60.0),
@@ -64,5 +68,11 @@ async def test_gateway_runtime_starts_and_stops_enabled_ansich_without_sql(monke
         service = app.state.ansich_service
         assert service is not None
         assert service.get_health().status == "failed"
+        # The evaluation knobs are frozen beside the service: ``ansich`` is a
+        # restart-required section, so the routes must never read them live.
+        assert app.state.ansich_evaluation_settings == gateway_deps.AnsichEvaluationSettings(
+            min_cohort_samples=7,
+            max_payload_bytes=4_096,
+        )
 
     assert service.get_health().status == "stopped"

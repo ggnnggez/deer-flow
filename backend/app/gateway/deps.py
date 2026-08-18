@@ -22,12 +22,14 @@ import logging
 import os
 from collections.abc import AsyncGenerator, Callable
 from contextlib import AsyncExitStack, asynccontextmanager
+from dataclasses import dataclass
 from typing import TYPE_CHECKING, TypeVar, cast
 
 from fastapi import FastAPI, HTTPException, Request
 from langgraph.types import Checkpointer
 
 from deerflow.community.browser_automation.session import browser_multi_worker_error
+from deerflow.config.ansich_config import AnsichConfig
 from deerflow.config.app_config import AppConfig, get_app_config
 from deerflow.persistence.feedback import FeedbackRepository
 from deerflow.runtime import RunContext, RunManager, StreamBridge
@@ -45,6 +47,32 @@ logger = logging.getLogger(__name__)
 # them together if their sum must stay within the server's graceful-shutdown
 # timeout.
 _RUN_DRAIN_TIMEOUT_SECONDS = 5.0
+
+
+@dataclass(frozen=True, slots=True)
+class AnsichEvaluationSettings:
+    """Startup snapshot of the Ansich evaluation knobs the routes need.
+
+    ``ansich`` is a restart-required config section
+    (``STARTUP_ONLY_FIELDS``), and the embedded service is assembled once per
+    process from that same snapshot. Reading these two values live would make
+    them silently hot-reloadable while every other Ansich setting stayed
+    frozen, so the lifespan captures them next to the service and the routes
+    read the capture.
+    """
+
+    min_cohort_samples: int
+    max_payload_bytes: int
+
+
+def snapshot_ansich_evaluation_settings(ansich_config: AnsichConfig | None) -> AnsichEvaluationSettings:
+    """Freeze the evaluation knobs of one ``AnsichConfig`` (defaults when absent)."""
+
+    config = ansich_config if ansich_config is not None else AnsichConfig()
+    return AnsichEvaluationSettings(
+        min_cohort_samples=config.evaluation_min_cohort_samples,
+        max_payload_bytes=config.evaluation_max_payload_bytes,
+    )
 
 
 def _browser_tools_enabled_in_config(config: AppConfig) -> bool:
@@ -303,6 +331,7 @@ async def langgraph_runtime(app: FastAPI, startup_config: AppConfig) -> AsyncGen
         # of aborting Gateway startup or silently switching to volatile data.
         app.state.ansich_service = None
         ansich_config = getattr(config, "ansich", None)
+        app.state.ansich_evaluation_settings = snapshot_ansich_evaluation_settings(ansich_config)
         if ansich_config is not None:
             try:
                 from deerflow.ansich import create_embedded_ansich_service
