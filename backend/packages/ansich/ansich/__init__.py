@@ -25,6 +25,17 @@ from ansich.contracts import (
     TaskLifecycleScope,
     TaskView,
 )
+from ansich.evaluation import (
+    EVALUATION_OBSERVATION_KIND,
+    EvaluationDimension,
+    EvaluationKind,
+    EvaluationRecord,
+    EvaluationSubjectType,
+    EvaluationVerdict,
+    ScoreScale,
+    benchmark_source_event_id,
+    build_evaluation_observation,
+)
 from ansich.ids import new_id
 from ansich.lineage import (
     ContentBlockView,
@@ -103,6 +114,12 @@ __all__ = [
     "ContextStateView",
     "ContextSnapshotItemView",
     "ContextSnapshotView",
+    "EVALUATION_OBSERVATION_KIND",
+    "EvaluationDimension",
+    "EvaluationKind",
+    "EvaluationRecord",
+    "EvaluationSubjectType",
+    "EvaluationVerdict",
     "EvidenceRef",
     "FlushResult",
     "LostRange",
@@ -117,6 +134,7 @@ __all__ = [
     "RecordReceipt",
     "ResolvedBelief",
     "ScopeDescriptor",
+    "ScoreScale",
     "TaskLifecycleScope",
     "TaskScopesView",
     "TaskScopeView",
@@ -138,6 +156,8 @@ __all__ = [
     "ToolEffectsView",
     "ToolResultView",
     "StepView",
+    "benchmark_source_event_id",
+    "build_evaluation_observation",
     "canonical_config_hash",
     "new_id",
     "resolve_current_belief",

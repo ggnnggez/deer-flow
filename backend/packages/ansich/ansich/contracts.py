@@ -54,6 +54,7 @@ EffectObservationKind = Literal[
     "effect.intended",
     "effect.observed",
 ]
+EvaluationObservationKind = Literal["evaluation.recorded"]
 UsageDimension = Literal[
     "input_tokens",
     "output_tokens",
@@ -76,6 +77,7 @@ ObservationKind = (
     | ScopeObservationKind
     | AuthorizationObservationKind
     | EffectObservationKind
+    | EvaluationObservationKind
     | Literal[
         "agent_release.resolved",
         "task.heartbeat",
@@ -268,6 +270,17 @@ class ObservationEnvelope(BaseModel):
                 raise ValueError("effect observation subject must identify payload effect")
             if self.kind != f"effect.{effect.phase}":
                 raise ValueError("effect observation kind does not match effect phase")
+        elif self.kind == "evaluation.recorded":
+            if self.subject_type not in {"task", "step", "tool_call", "content_block", "agent_release"}:
+                raise ValueError("evaluation.recorded requires a task/step/tool_call/content_block/agent_release subject")
+            if self.payload is not None:
+                from ansich.evaluation import EvaluationRecord
+
+                evaluation = EvaluationRecord.model_validate(self.payload.get("evaluation"), strict=False)
+                if evaluation.subject_id != self.subject_id or evaluation.subject_type != self.subject_type:
+                    raise ValueError("evaluation payload subject must match the Observation subject")
+                if evaluation.task_id != self.task_id:
+                    raise ValueError("evaluation payload task must match the Observation task")
         if self.kind == "task.heartbeat":
             payload = self.payload or {}
             elapsed_ms = payload.get("elapsed_ms")
