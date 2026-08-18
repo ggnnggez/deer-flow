@@ -27,6 +27,7 @@ from deerflow.ansich.persistence import sql as sql_module
 from deerflow.ansich.persistence.models import (
     AnsichAssessorErrorRow,
     AnsichAssessorJobRow,
+    AnsichAssessorWatermarkRow,
     AnsichAuthorizationPermissionRow,
     AnsichAuthorizationSnapshotRow,
     AnsichBeliefAssertionRow,
@@ -1454,3 +1455,186 @@ async def test_first_scope_safety_assessment_and_replay_assess_every_tool_call(t
 
     assert cold_start_counts == {first_id: 4, second_id: 4}
     assert replayed_counts == cold_start_counts
+
+
+@pytest.mark.anyio
+async def test_absorbed_low_watermark_window_survives_an_evaluation_rollback(tmp_path) -> None:
+    """P9-M2 fix round 1: the widened window must outlive a rolled-back evaluation.
+
+    Claim-time absorption flips the group's lower jobs to ``completed`` before
+    the evaluation runs, so a rollback leaves them unclaimable. If the widening
+    that pulled their evidence into the window lived only in the evaluation, the
+    retry — which now claims the high sibling alone — would compute a narrower
+    window and skip that evidence permanently. That is the same hole that
+    disqualified "max completed job watermark" as the lower bound, one size
+    smaller.
+
+    Reaching it needs an Observation that committed *after* a higher watermark
+    was already settled, which a single in-process writer cannot produce: it
+    assigns ``ingest_seq`` at insert and commits in that order. The durable mark
+    is therefore seeded directly to the value a concurrent writer's late commit
+    would have left behind; everything after that is the ordinary pipeline.
+    """
+
+    engine, session_factory = _scope_safety_service(tmp_path, "scope-safety-rollback-window.db")
+    async with engine.begin() as connection:
+        await connection.run_sync(Base.metadata.create_all)
+    service = create_sql_ansich_service(
+        session_factory,
+        flush_interval_ms=60_000,
+        # The blocking subject's projection never settles, so every later flush
+        # spends this whole budget waiting. It still has to comfortably exceed
+        # the persist step itself, which shares the same deadline - a budget
+        # tight enough to expire mid-persist drops the taken items outright.
+        terminal_flush_timeout_ms=2_000,
+        projector_poll_interval_ms=5,
+        operations_assessment_interval_ms=60_000,
+    )
+    await service.start()
+    task_id, step_id = new_id(), new_id()
+    settled_id, late_id, blocking_id = new_id(), new_id(), new_id()
+    observed_at = datetime(2026, 8, 19, 13, tzinfo=UTC)
+    producer = Producer(name="scope-safety-rollback", version="1", instance_id="test")
+
+    async def _ingest_seq(session, obs_id: str) -> int:
+        ingest_seq = await session.scalar(select(AnsichObservationRow.ingest_seq).where(AnsichObservationRow.obs_id == obs_id))
+        assert ingest_seq is not None, f"Observation {obs_id} was never persisted"
+        return int(ingest_seq)
+
+    try:
+        await _start_scope_safety_task(
+            service,
+            task_id=task_id,
+            step_id=step_id,
+            observed_at=observed_at,
+            producer=producer,
+            label="rollback",
+        )
+        # Both the settled and the late ToolCall exist up front, so the late
+        # subject's own evidence projects and earns its own assessor jobs -
+        # the ones the claim will absorb.
+        service.record_batch(
+            _scope_safety_tool_call_batch(
+                task_id=task_id,
+                step_id=step_id,
+                tool_call_id=settled_id,
+                call_seq=1,
+                producer=producer,
+                observed_at=observed_at,
+                label="rollback-settled",
+            )
+            + _scope_safety_tool_call_batch(
+                task_id=task_id,
+                step_id=step_id,
+                tool_call_id=late_id,
+                call_seq=2,
+                producer=producer,
+                observed_at=observed_at,
+                label="rollback-late",
+            )
+        )
+        await service.flush_task(task_id)
+        service.record_batch(
+            _scope_safety_evidence_batch(
+                task_id=task_id,
+                step_id=step_id,
+                tool_call_id=settled_id,
+                producer=producer,
+                observed_at=observed_at,
+                label="rollback-settled",
+                with_observed_effect=True,
+            )
+        )
+        await service.flush_task(task_id)
+        await service.assess_operations(now=observed_at)
+
+        late_batch = _scope_safety_evidence_batch(
+            task_id=task_id,
+            step_id=step_id,
+            tool_call_id=late_id,
+            producer=producer,
+            observed_at=observed_at,
+            label="rollback-late",
+            with_observed_effect=True,
+        )
+        service.record_batch(late_batch)
+        await service.flush_task(task_id)
+        # The blocking subject has no ToolCall projection yet, so assessing it
+        # raises _ProjectionDependencyPending and rolls the evaluation back.
+        service.record_batch(
+            _scope_safety_evidence_batch(
+                task_id=task_id,
+                step_id=step_id,
+                tool_call_id=blocking_id,
+                producer=producer,
+                observed_at=observed_at,
+                label="rollback-blocking",
+                with_observed_effect=False,
+            )
+        )
+        await service.flush_task(task_id)
+        await anyio.sleep(0.3)
+        trigger = _scope_safety_observed_effect(
+            task_id=task_id,
+            step_id=step_id,
+            tool_call_id=settled_id,
+            producer=producer,
+            observed_at=observed_at,
+            label="rollback-trigger",
+        )
+        service.record(trigger)
+        await service.flush_task(task_id)
+        await anyio.sleep(0.3)
+
+        async with session_factory() as session:
+            late_last_seq = await _ingest_seq(session, late_batch[-1].obs_id)
+            trigger_seq = await _ingest_seq(session, trigger.obs_id)
+        # Simulate the concurrent writer: the mark already covers the late
+        # subject's evidence, which was invisible when it advanced.
+        async with session_factory() as session, session.begin():
+            mark = await session.get(
+                AnsichAssessorWatermarkRow,
+                (task_id, "scope-safety", "1.0.0"),
+            )
+            assert mark is not None and mark.evidence_watermark < late_last_seq
+            mark.evidence_watermark = late_last_seq
+
+        await service.assess_operations(now=observed_at + timedelta(minutes=1))
+        async with session_factory() as session:
+            rolled_back_conclusions = await session.scalar(select(func.count()).select_from(AnsichScopeConclusionRow).where(AnsichScopeConclusionRow.tool_call_id == late_id))
+
+        # Self-heal: the blocking subject's ToolCall lands, so the retry can
+        # commit.
+        service.record_batch(
+            _scope_safety_tool_call_batch(
+                task_id=task_id,
+                step_id=step_id,
+                tool_call_id=blocking_id,
+                call_seq=3,
+                producer=producer,
+                observed_at=observed_at,
+                label="rollback-blocking",
+            )
+        )
+        await service.flush_task(task_id)
+        await anyio.sleep(0.5)
+        await service.assess_operations(now=observed_at + timedelta(minutes=2))
+
+        async with session_factory() as session:
+            late_conclusions = await session.scalar(select(func.count()).select_from(AnsichScopeConclusionRow).where(AnsichScopeConclusionRow.tool_call_id == late_id))
+            final_mark = await session.get(
+                AnsichAssessorWatermarkRow,
+                (task_id, "scope-safety", "1.0.0"),
+            )
+            final_watermark = None if final_mark is None else final_mark.evidence_watermark
+    finally:
+        await service.stop()
+        await engine.dispose()
+
+    # The first evaluation rolled back, so nothing was written for the late
+    # subject yet - that is the state the retry has to recover from.
+    assert rolled_back_conclusions == 0
+    # The retry claims the high sibling alone; the absorbed low siblings are
+    # already completed, so only a durable widening can still cover them.
+    assert late_conclusions == 4
+    assert final_watermark == trigger_seq

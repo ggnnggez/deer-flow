@@ -624,9 +624,15 @@ bound is `ansich_assessor_watermarks`, written inside the evaluation's own
 transaction and deleted by `rebuild_projections()` with the conclusions it
 describes — an assessor job's `completed` status cannot serve as that bound
 because claiming completes the group's lower jobs before the evaluation runs,
-so a rolled-back evaluation would leave their evidence permanently skipped. The
-bound also drops below the claimed group's lowest watermark, so a Scope
-observation projected after a higher one already settled is still covered.
+so a rolled-back evaluation would leave their evidence permanently skipped.
+Claiming also widens that mark down below the group's lowest watermark, so a
+Scope observation projected after a higher one already settled is still
+covered. That widening is written in the claim's own transaction rather than
+the evaluation's, for the same reason: absorption completes the lower siblings
+before the evaluation runs, so a widening that rolled back with the evaluation
+would leave the retry — which then claims the high sibling alone — unable to
+re-derive them. Lowering a mark is always safe; it can only widen a later
+window.
 Action-repetition and tool-frequency keep their full-history scans: their
 verdicts are sequence properties, not per-subject ones.
 Absolute wall-time assessment takes the maximum of

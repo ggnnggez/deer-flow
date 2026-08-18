@@ -1346,14 +1346,15 @@ class SqlAnsichBackend:
 
     async def _claim_assessor_job(
         self,
-    ) -> tuple[str, str, str, int, int, int] | None:
+    ) -> tuple[str, str, str, int, int] | None:
         """Claim one assessor job, absorbing its currently claimable siblings.
 
-        Returns the claimed job's own (highest) ``evidence_watermark`` plus the
-        *lowest* watermark in the absorbed group. The pair is the exact span of
-        newly projected evidence this evaluation is settling, which lets an
-        incremental assessor widen its window when a lower watermark is claimed
-        after a higher one has already been assessed.
+        Absorption flips the group's lower jobs to ``completed`` here, in the
+        claim's own transaction, before the evaluation runs — so an incremental
+        assessor cannot re-derive their watermarks after a rollback. The claim
+        therefore also widens the durable evidence mark down to just below the
+        group's lowest watermark (see ``_widen_assessor_watermark``), making the
+        widening exactly as durable as the absorption that requires it.
         """
 
         now = datetime.now(UTC)
@@ -1412,12 +1413,18 @@ class SqlAnsichBackend:
             job.attempts += 1
             job.lease_owner = self._lease_owner
             job.lease_expires_at = now + timedelta(seconds=self._projector_lease_seconds)
+            await self._widen_assessor_watermark(
+                session,
+                subject_id=job.subject_id,
+                assessor_name=job.assessor_name,
+                assessor_version=job.assessor_version,
+                window_start_exclusive=min(grouped.evidence_watermark for grouped in grouped_jobs) - 1,
+            )
             return (
                 job.job_id,
                 job.subject_id,
                 job.assessor_name,
                 job.evidence_watermark,
-                min(grouped.evidence_watermark for grouped in grouped_jobs),
                 job.attempts,
             )
 
@@ -1490,14 +1497,7 @@ class SqlAnsichBackend:
             claim = await self._claim_assessor_job()
             if claim is None:
                 break
-            (
-                job_id,
-                task_id,
-                assessor_name,
-                evidence_watermark,
-                group_lowest_watermark,
-                attempt,
-            ) = claim
+            job_id, task_id, assessor_name, evidence_watermark, attempt = claim
             try:
                 async with self._session_factory() as session, session.begin():
                     if assessor_name == ACTION_REPETITION_ASSESSOR.name:
@@ -1591,7 +1591,6 @@ class SqlAnsichBackend:
                         window_start_exclusive = await self._scope_safety_window_start(
                             session,
                             task_id=task_id,
-                            group_lowest_watermark=group_lowest_watermark,
                         )
                         results = await self._assess_scope_safety_at(
                             session,
@@ -1664,28 +1663,55 @@ class SqlAnsichBackend:
         session: AsyncSession,
         *,
         task_id: str,
-        group_lowest_watermark: int,
     ) -> int | None:
         """Exclusive lower bound of the evidence window to re-judge.
 
         ``None`` means cold start (no previous successful assessment for this
         Task), which keeps the original full-Task scan.
 
-        The mark alone would be wrong for a job whose watermark is *below* it —
-        a Scope observation projected after a higher one already settled — so
-        the bound also drops to just under the claimed group's lowest watermark.
-        The window therefore always covers every observation whose own assessor
-        job this evaluation is settling, plus everything since the last
-        successful assessment.
+        The mark is the single source of truth: ``_claim_assessor_job`` has
+        already widened it below the claimed group's lowest watermark, so this
+        read needs no second term to cover a job whose watermark sits under the
+        last settled one. The window therefore always covers every observation
+        whose own assessor job this evaluation is settling, plus everything
+        since the last successful assessment.
         """
 
         mark = await session.get(
             AnsichAssessorWatermarkRow,
             (task_id, SCOPE_SAFETY_ASSESSOR.name, SCOPE_SAFETY_ASSESSOR.version),
         )
-        if mark is None:
-            return None
-        return min(mark.evidence_watermark, group_lowest_watermark - 1)
+        return None if mark is None else mark.evidence_watermark
+
+    @staticmethod
+    async def _widen_assessor_watermark(
+        session: AsyncSession,
+        *,
+        subject_id: str,
+        assessor_name: str,
+        assessor_version: str,
+        window_start_exclusive: int,
+    ) -> None:
+        """Lower an existing mark so it cannot exclude the claimed group.
+
+        Lowering is always safe — it can only widen a future window, never skip
+        evidence — and it must happen in the claim's transaction rather than the
+        evaluation's: absorbed siblings are already ``completed`` by the time
+        the evaluation runs, so a rolled-back evaluation would otherwise leave
+        the retry with no way to re-derive their watermarks.
+
+        No row means cold start, which already re-judges everything, and a group
+        entirely above the mark widens nothing.
+        """
+
+        mark = await session.get(
+            AnsichAssessorWatermarkRow,
+            (subject_id, assessor_name, assessor_version),
+        )
+        if mark is None or mark.evidence_watermark <= window_start_exclusive:
+            return
+        mark.evidence_watermark = window_start_exclusive
+        mark.updated_at = datetime.now(UTC)
 
     @staticmethod
     async def _advance_assessor_watermark(
