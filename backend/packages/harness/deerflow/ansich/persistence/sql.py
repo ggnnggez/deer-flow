@@ -7634,9 +7634,26 @@ class SqlAnsichBackend:
         Belief so retained conflicting assertions never double-count.
         """
 
-        cell = await session.get(
-            AnsichReleaseQualityStatsRow,
-            (release_id, cohort_key, dimension),
+        # Lock the cell BEFORE reading its inputs. Evaluations for different
+        # Tasks of one release are independent projection jobs that separate
+        # leased workers claim concurrently (_claim_projection_job uses
+        # skip_locked), yet they all read-modify-write this single
+        # release-scoped row. Under Postgres READ COMMITTED an unlocked reader
+        # could load the index rows before a peer commits its own and then
+        # overwrite the cell with an aggregate that excludes it — a lost update
+        # that a single-loop replay would not reproduce. Locking first makes the
+        # second worker block until the first commits, and READ COMMITTED then
+        # gives its later statements the committed inputs. Locking after the
+        # read would leave exactly the same window open. FOR UPDATE is a no-op
+        # on SQLite, which has a single writer anyway.
+        cell = await session.scalar(
+            select(AnsichReleaseQualityStatsRow)
+            .where(
+                AnsichReleaseQualityStatsRow.release_id == release_id,
+                AnsichReleaseQualityStatsRow.cohort_key == cohort_key,
+                AnsichReleaseQualityStatsRow.dimension == dimension,
+            )
+            .with_for_update()
         )
         release_task_ids = select(AnsichRelationRow.subject_id).where(
             AnsichRelationRow.predicate == "executed_by",
@@ -7713,6 +7730,14 @@ class SqlAnsichBackend:
             "projector_version": _EVALUATION_PROJECTOR_VERSION,
         }
         if cell is None:
+            # A row that does not exist yet cannot be locked, so two concurrent
+            # first writers can still both reach this insert. The composite
+            # primary key makes one of them lose with an IntegrityError, which
+            # the job machinery treats as an ordinary retryable projection error
+            # (attempts < projector_max_attempts leaves the job pending). The
+            # retry finds the committed row, takes the lock above, and
+            # recomputes over the now-complete inputs, so the race costs one
+            # attempt rather than correctness.
             session.add(
                 AnsichReleaseQualityStatsRow(
                     release_id=release_id,
