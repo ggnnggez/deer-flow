@@ -1547,5 +1547,3 @@ class AnsichReleaseQualityStatsRow(Base):
     scale_max: Mapped[float | None] = mapped_column(Float)
     as_of: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
     projector_version: Mapped[str] = mapped_column(String(32), nullable=False)
-
-    __table_args__ = (Index("ix_ansich_release_quality_cohort", "release_id", "cohort_key", "dimension"),)

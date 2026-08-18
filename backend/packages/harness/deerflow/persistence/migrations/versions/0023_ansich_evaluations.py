@@ -99,20 +99,13 @@ def upgrade() -> None:
             ["ansich_entities.entity_id"],
             ondelete="CASCADE",
         ),
+        # The primary key's unique index already covers
+        # (release_id, cohort_key, dimension), so no extra index is created.
         sa.PrimaryKeyConstraint("release_id", "cohort_key", "dimension"),
-    )
-    _create_index(
-        "ix_ansich_release_quality_cohort",
-        "ansich_release_quality_stats",
-        ["release_id", "cohort_key", "dimension"],
     )
 
 
 def downgrade() -> None:
-    op.drop_index(
-        "ix_ansich_release_quality_cohort",
-        table_name="ansich_release_quality_stats",
-    )
     op.drop_table("ansich_release_quality_stats")
     op.drop_index(
         "ix_ansich_evaluation_task",

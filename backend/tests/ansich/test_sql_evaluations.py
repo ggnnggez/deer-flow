@@ -65,7 +65,10 @@ def test_evaluation_models_compile_with_postgresql_constraints_and_indexes() -> 
         "ix_ansich_evaluation_suite_case",
         "ix_ansich_evaluation_task",
     }
-    assert {index.name for index in AnsichReleaseQualityStatsRow.__table__.indexes} == {"ix_ansich_release_quality_cohort"}
+    # The primary key is exactly (release_id, cohort_key, dimension), so a separate
+    # index over that same tuple would be pure write amplification.
+    assert AnsichReleaseQualityStatsRow.__table__.indexes == set()
+    assert "ix_ansich_release_quality_cohort" not in ddl["ansich_release_quality_stats"]
 
 
 def test_evaluation_migration_upgrades_sqlite(tmp_path) -> None:
@@ -80,7 +83,7 @@ def test_evaluation_migration_upgrades_sqlite(tmp_path) -> None:
     assert columns["ansich_evaluation_index"] == {column.name for column in AnsichEvaluationIndexRow.__table__.columns}
     assert columns["ansich_release_quality_stats"] == {column.name for column in AnsichReleaseQualityStatsRow.__table__.columns}
     assert indexes["ansich_evaluation_index"] == {index.name for index in AnsichEvaluationIndexRow.__table__.indexes}
-    assert indexes["ansich_release_quality_stats"] == {index.name for index in AnsichReleaseQualityStatsRow.__table__.indexes}
+    assert "ix_ansich_release_quality_cohort" not in indexes["ansich_release_quality_stats"]
     assert revision == EVALUATION_REVISION
     assert len(revision) <= 32
 
@@ -105,7 +108,7 @@ def test_evaluation_migration_is_idempotent_on_existing_tables(tmp_path) -> None
 
     assert EVALUATION_TABLES <= table_names
     assert columns["ansich_evaluation_index"] == {column.name for column in AnsichEvaluationIndexRow.__table__.columns}
-    assert indexes["ansich_release_quality_stats"] == {index.name for index in AnsichReleaseQualityStatsRow.__table__.indexes}
+    assert indexes["ansich_evaluation_index"] == {index.name for index in AnsichEvaluationIndexRow.__table__.indexes}
     assert revision == EVALUATION_REVISION
 
 
