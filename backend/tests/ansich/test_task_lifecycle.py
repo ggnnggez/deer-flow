@@ -1,3 +1,4 @@
+import logging
 from concurrent.futures import ThreadPoolExecutor
 from datetime import UTC, datetime, timedelta
 
@@ -217,7 +218,69 @@ async def test_full_queue_is_fail_open_and_visible_as_a_known_lost_range():
 
 
 @pytest.mark.anyio
-async def test_queue_byte_capacity_rejects_an_observation_before_count_capacity():
+async def test_queue_drop_warning_is_structured_and_rate_bounded(caplog) -> None:
+    service = AnsichService.in_memory(queue_capacity=1)
+    await service.start()
+    task_id = new_id()
+    observed_at = datetime(2026, 8, 18, 10, tzinfo=UTC)
+
+    try:
+        service.record(
+            ObservationEnvelope.task_lifecycle(
+                kind="task.created",
+                task_id=task_id,
+                source_kind="deerflow_run",
+                source_id="run-drop-warning",
+                occurred_at=observed_at,
+                source_event_id="run:drop-warning:task:created",
+                producer_seq=1,
+            )
+        )
+        with caplog.at_level(logging.WARNING, logger="ansich.service"):
+            receipts = tuple(
+                service.record(
+                    ObservationEnvelope.task_lifecycle(
+                        kind="task.started",
+                        task_id=task_id,
+                        source_kind="deerflow_run",
+                        source_id="run-drop-warning",
+                        occurred_at=observed_at,
+                        source_event_id=f"run:drop-warning:task:started:{producer_seq}",
+                        producer_seq=producer_seq,
+                    )
+                )
+                for producer_seq in range(2, 6)
+            )
+        health = service.get_health()
+    finally:
+        await service.stop()
+
+    warning_records = [record for record in caplog.records if getattr(record, "event", None) == "ansich.collector.observations_dropped"]
+    assert all(not receipt.accepted and receipt.reason == "queue_full" for receipt in receipts)
+    assert health.dropped_count == 4
+    assert len(warning_records) == 1
+    warning = warning_records[0]
+    assert warning.levelno == logging.WARNING
+    assert warning.reason == "queue_full"
+    assert datetime.fromisoformat(warning.detected_at).tzinfo is not None
+    assert warning.dropped_observation_count == 1
+    assert warning.lost_ranges == (
+        {
+            "first_sequence": 2,
+            "last_sequence": 2,
+            "task_id": task_id,
+            "producer_name": "task-control-probe",
+            "producer_instance_id": "local",
+        },
+    )
+    assert warning.queue_depth == 1
+    assert warning.queue_capacity == 1
+    assert "queue_full" in warning.getMessage()
+    assert task_id in warning.getMessage()
+
+
+@pytest.mark.anyio
+async def test_queue_byte_capacity_rejects_an_observation_before_count_capacity(caplog):
     task_id = new_id()
     observed_at = datetime(2026, 7, 17, 11, 15, tzinfo=UTC)
     first = ObservationEnvelope.task_lifecycle(
@@ -238,17 +301,18 @@ async def test_queue_byte_capacity_rejects_an_observation_before_count_capacity(
 
     try:
         accepted = service.record(first)
-        dropped = service.record(
-            ObservationEnvelope.task_lifecycle(
-                kind="task.started",
-                task_id=task_id,
-                source_kind="deerflow_run",
-                source_id="run-byte-overflow",
-                occurred_at=observed_at + timedelta(seconds=1),
-                source_event_id="run:run-byte-overflow:task:started",
-                producer_seq=2,
+        with caplog.at_level(logging.WARNING, logger="ansich.service"):
+            dropped = service.record(
+                ObservationEnvelope.task_lifecycle(
+                    kind="task.started",
+                    task_id=task_id,
+                    source_kind="deerflow_run",
+                    source_id="run-byte-overflow",
+                    occurred_at=observed_at + timedelta(seconds=1),
+                    source_event_id="run:run-byte-overflow:task:started",
+                    producer_seq=2,
+                )
             )
-        )
         health = service.get_health()
         await service.flush_task(task_id)
         health_after_flush = service.get_health()
@@ -266,6 +330,51 @@ async def test_queue_byte_capacity_rejects_an_observation_before_count_capacity(
     assert health_after_flush.queue_depth == 0
     assert health_after_flush.queue_bytes == 0
     assert health_after_flush.queue_byte_high_watermark == first_size
+    warning = next(record for record in caplog.records if getattr(record, "event", None) == "ansich.collector.observations_dropped")
+    assert warning.reason == "queue_bytes_full"
+    assert warning.lost_ranges[0]["task_id"] == task_id
+
+
+@pytest.mark.anyio
+async def test_queue_drop_warning_failure_remains_fail_open(monkeypatch) -> None:
+    service = AnsichService.in_memory(queue_capacity=1)
+    await service.start()
+    task_id = new_id()
+    observed_at = datetime(2026, 8, 18, 11, tzinfo=UTC)
+
+    def fail_warning(*args, **kwargs):
+        raise OSError("log sink unavailable")
+
+    monkeypatch.setattr("ansich.service.logger.warning", fail_warning)
+    try:
+        accepted = service.record(
+            ObservationEnvelope.task_lifecycle(
+                kind="task.created",
+                task_id=task_id,
+                source_kind="deerflow_run",
+                source_id="run-drop-log-failure",
+                occurred_at=observed_at,
+                source_event_id="run:drop-log-failure:task:created",
+            )
+        )
+        dropped = service.record(
+            ObservationEnvelope.task_lifecycle(
+                kind="task.started",
+                task_id=task_id,
+                source_kind="deerflow_run",
+                source_id="run-drop-log-failure",
+                occurred_at=observed_at,
+                source_event_id="run:drop-log-failure:task:started",
+            )
+        )
+        health = service.get_health()
+    finally:
+        await service.stop()
+
+    assert accepted.accepted is True
+    assert dropped.accepted is False
+    assert dropped.reason == "queue_full"
+    assert health.dropped_count == 1
 
 
 @pytest.mark.anyio

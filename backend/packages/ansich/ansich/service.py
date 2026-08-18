@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import asyncio
+import logging
+import time
 from collections import deque
 from collections.abc import Callable
 from datetime import UTC, datetime
@@ -30,6 +32,9 @@ from ansich.task_tree import (
 )
 from ansich.tool import ToolCallView
 from ansich.usage import AggregationScope, TaskUsageBreakdownView, TaskUsageView
+
+logger = logging.getLogger(__name__)
+_DROP_WARNING_INTERVAL_SECONDS = 60.0
 
 
 def _serialized_observation_size(observation: ObservationEnvelope) -> int:
@@ -92,6 +97,8 @@ class AnsichService:
         self._snapshot_observations_dropped = 0
         self._lost_ranges: list[LostRange] = []
         self._reported_lost_range_count = 0
+        self._last_drop_warning_at: float | None = None
+        self._suppressed_drop_warning_count = 0
         self._loop: asyncio.AbstractEventLoop | None = None
         self._wake_event: asyncio.Event | None = None
         self._projector_wake_event: asyncio.Event | None = None
@@ -174,7 +181,13 @@ class AnsichService:
             elif self._queue_bytes + batch_bytes > self._byte_capacity:
                 reason = "queue_bytes_full"
             if reason is not None:
-                self._record_batch_loss(sequences, batch)
+                batch_lost_ranges = self._record_batch_loss(sequences, batch)
+                if reason in {"queue_full", "queue_bytes_full"}:
+                    self._warn_batch_loss(
+                        reason=reason,
+                        observation_count=len(batch),
+                        lost_ranges=batch_lost_ranges,
+                    )
                 if batch_kind == "context_snapshot":
                     self._snapshot_observations_dropped += len(batch)
                 return tuple(
@@ -915,17 +928,79 @@ class AnsichService:
         self,
         sequences: tuple[int, ...],
         observations: tuple[object, ...],
-    ) -> None:
+    ) -> tuple[LostRange, ...]:
+        batch_ranges: list[LostRange] = []
         for sequence, observation in zip(sequences, observations, strict=True):
             if isinstance(observation, ObservationEnvelope):
+                task_id = observation.task_id
+                producer_name = observation.producer.name
+                producer_instance_id = observation.producer.instance_id
                 self._record_loss(
                     sequence,
-                    observation.task_id,
-                    producer_name=observation.producer.name,
-                    producer_instance_id=observation.producer.instance_id,
+                    task_id,
+                    producer_name=producer_name,
+                    producer_instance_id=producer_instance_id,
                 )
             else:
-                self._record_loss(sequence, None)
+                task_id = None
+                producer_name = None
+                producer_instance_id = None
+                self._record_loss(sequence, task_id)
+            if batch_ranges:
+                previous = batch_ranges[-1]
+                if previous.task_id == task_id and previous.producer_name == producer_name and previous.producer_instance_id == producer_instance_id and previous.last_sequence + 1 == sequence:
+                    batch_ranges[-1] = previous.model_copy(update={"last_sequence": sequence})
+                    continue
+            batch_ranges.append(
+                LostRange(
+                    first_sequence=sequence,
+                    last_sequence=sequence,
+                    task_id=task_id,
+                    producer_name=producer_name,
+                    producer_instance_id=producer_instance_id,
+                )
+            )
+        return tuple(batch_ranges)
+
+    def _warn_batch_loss(
+        self,
+        *,
+        reason: str,
+        observation_count: int,
+        lost_ranges: tuple[LostRange, ...],
+    ) -> None:
+        warning_at = time.monotonic()
+        if self._last_drop_warning_at is not None and warning_at - self._last_drop_warning_at < _DROP_WARNING_INTERVAL_SECONDS:
+            self._suppressed_drop_warning_count += 1
+            return
+        detected_at = datetime.now(UTC).isoformat()
+        serialized_ranges = tuple(item.model_dump(mode="json") for item in lost_ranges)
+        suppressed_warning_count = self._suppressed_drop_warning_count
+        try:
+            logger.warning(
+                "Ansich collector dropped %d observation(s): reason=%s detected_at=%s lost_ranges=%s suppressed_drop_warnings=%d",
+                observation_count,
+                reason,
+                detected_at,
+                serialized_ranges,
+                suppressed_warning_count,
+                extra={
+                    "event": "ansich.collector.observations_dropped",
+                    "reason": reason,
+                    "detected_at": detected_at,
+                    "dropped_observation_count": observation_count,
+                    "lost_ranges": serialized_ranges,
+                    "queue_depth": len(self._queue),
+                    "queue_capacity": self._capacity,
+                    "queue_bytes": self._queue_bytes,
+                    "queue_byte_capacity": self._byte_capacity,
+                    "suppressed_drop_warning_count": suppressed_warning_count,
+                },
+            )
+        except Exception:
+            return
+        self._last_drop_warning_at = warning_at
+        self._suppressed_drop_warning_count = 0
 
     def _record_observation_loss(self, observation: ObservationEnvelope) -> None:
         self._record_loss(
