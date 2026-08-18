@@ -799,14 +799,11 @@ async def _run_operator_action(
             "audit_status": "recorded",
             "idempotent_replay": True,
         }
-    if existing is not None:
-        raise HTTPException(
-            status_code=409,
-            detail={
-                "message": "Operator action is already in progress",
-                "action": existing.model_dump(mode="json"),
-            },
-        )
+    # A `requested` row is deliberately not rejected here. Whether it is still an
+    # in-flight duplicate or an orphan a crash stranded between begin and finish is
+    # one decision, and `begin_operator_action` owns it atomically below so two
+    # concurrent retries cannot both take the same orphan over. The in-progress 409
+    # for a still-fresh attempt comes back from that same conflict election.
     if target.control_value != "running" or record.status not in {RunStatus.pending, RunStatus.running}:
         raise HTTPException(
             status_code=409,

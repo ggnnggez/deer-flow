@@ -8,7 +8,7 @@
 | ---- | ---- | ---- | -------- | ------ |
 | M1 | assessor job 逐观察入队且每个 job 全量重扫历史,长任务评估成本 O(n²) | ✅ 已修复 | 2026-07-19 | `4f5ec989` |
 | L1 | 周期性 heartbeat/dwell 告警对账每秒全量加载该任务全部 episode + evidence | ✅ 已修复 | 2026-07-19 | `4f5ec989` |
-| L2 | operator action 卡在 `requested` 时同 Idempotency-Key 永久 409,无超时回收 | ⬜ 未修复 | — | — |
+| L2 | operator action 卡在 `requested` 时同 Idempotency-Key 永久 409,无超时回收 | ✅ 已修复 | 2026-08-19 | 本次变更(待提交) |
 | L3 | 绝对预算评估中 heartbeat elapsed 无条件覆盖 wall_time 贡献和,终态边界可能低估 | ✅ 已修复 | 2026-07-19 | `b910ba82` |
 | L4 | `observability_degradation` / `projection_failure` 告警类型已声明但无生产者 | ✅ 已决策 | 2026-07-19 | `0a38a96d` |
 
@@ -30,8 +30,14 @@
 
 ## L2. operator action 卡在 `requested` 时同 key 永久 409
 
-- 状态:⬜ 未修复。
-- 位置:`sql.py::begin_operator_action` / `finish_operator_action` + `routers/ansich.py::_run_operator_action`(`existing.status == "requested"` → 409 in-progress)。
+- 状态:✅ 已于 2026-08-19 修复(本次变更,待提交),按裁决 HR3 取「保守过期 + 请求驱动接管」方向,不做启动期扫描。
+  - **过期窗口**:`sql.py` 新增模块级常量 `_STALE_REQUESTED_TAKEOVER_AFTER = timedelta(minutes=5)`,紧邻 `SqlAnsichBackend` 的 projector lease 旋钮(`projector_lease_seconds` 等)并复用其直觉:租约无人续期即可被他人接管。窗口内的 `requested` 仍按「真实在途重复请求」处理并 409,只有超窗口的孤儿才会被接管——**恢复完全由请求驱动**,没有启动期 sweep,一行孤儿只会被真正想执行该操作的 operator 判定。
+  - **时间戳来源(调研结论)**:`ansich_operator_actions.created_at` 早已存在(`DateTime(timezone=True)`、NOT NULL,begin 时写入 `occurred_at`),直接作为计龄锚点;接管时把它重置为本次 `occurred_at`,新尝试因此独享完整窗口。**无需迁移**,head 仍为 `0025_ansich_assessor_watermarks`。
+  - **审计契约(与 HR3 字面表述的偏差,留档)**:被放弃尝试的终态是一条 `operator.action_failed` Observation——与常规失败路径**同一 kind、同一 payload 形状**(未新增审计 kind),`result` 为 `{"outcome": "stale_requested_takeover", "requested_at", "expiry_seconds", "superseded_by_action_id"}`,末项是指向接任尝试的前向指针。审计行本身**不**保留为 `failed`,而是原地重新武装(新 `action_id`、`status=requested`、新 requested Observation)给新尝试:唯一约束是 `(task_id, action_type, idempotency_key)`,因此「陈旧行停在 failed」与「新尝试走完整 requested→terminal 生命周期」在同一把键上互斥——保留前者会让后续同 key 重试重放一条并非真实结果的 `stale_requested_takeover` 失败。取后者(重试重放的必须是**当前存活**尝试的结果),被放弃尝试的终态则留在不可变 Observation 流里——那本就是该审计的持久真相来源(`rebuild_projections()` 会清空 `ansich_operator_actions` 行表)。
+  - **并发形状**:冲突分支的 `SELECT` 加 `with_for_update()`,接管本身是一条以 `(action_id, status='requested')` 为条件的 CAS `UPDATE ... RETURNING`,因此在忽略 `FOR UPDATE` 的方言上同样只选出一个赢家;败者重读到赢家刚武装好的(不再陈旧的)行,退回普通 in-progress 409,不会二次调用 runtime。
+  - **路由**:`_run_operator_action` 里那条重复的「`requested` → 409」前置检查已移除,过期判定只留在 SQL 层一处(原子);仍存活的在途尝试的 409 由 begin 之后的冲突选举路径原样返回,终态重放前置检查不变。
+  - **回归**:`tests/ansich/test_ansich_operations_router.py::test_orphaned_requested_action_is_recovered_after_expiry`(HTTP 全链路:begin 后不 finish → 未过期同 key 仍 409 且未调用 runtime → 把 `created_at` 直接写回 6 分钟前 → 同 key 重试 200 且真正执行、`action_id` 已换新 → 再次重试重放**新**尝试的成功结果 → 两个尝试在审计流里各有 requested+terminal);`tests/ansich/test_sql_alerts.py::test_stale_requested_operator_action_takeover_elects_one_winner`(两个并发同 key 重试打同一行孤儿:恰好一个 `created=True`、恰好一条 `stale_requested_takeover` 终态、行表恒为一行)。
+- 位置:`sql.py::begin_operator_action` / `_take_over_stale_operator_action` / `finish_operator_action` + `routers/ansich.py::_run_operator_action`。
 - 现状:进程在 begin(审计落库)与 finish 之间崩溃时,该 action 永久停留在 `requested`;之后携带同一 Idempotency-Key 的重试永远收到 409 "already in progress",没有 lease/超时把它判定为失败。换一个 key 可以继续操作(控制状态门槛会重新校验),所以不是功能阻断,但与"网络重试不执行两次"的设计意图相比,崩溃路径缺一个收尾:审计记录也永远缺 terminal 观察。
 - 方向:给 `requested` 状态加一个保守的过期窗口(如 5 分钟,复用 projector lease 语义):过期后新请求可将其标记为 `failed`(result 注明 `stale_requested_takeover`)并允许同 key 重新执行;或在服务启动恢复时扫描孤儿 `requested` 行统一收尾。配"begin 后崩溃,重试同 key 最终可执行且审计有终态"的回归测试。
 - 归属:Phase 11(生产韧性)前完成;单实例低频操作下风险有限。
@@ -67,6 +73,6 @@
 ## 计划测试矩阵缺口(随修复补齐)
 
 - M1:✅ `4f5ec989` 已补 job 合并等价性、单次最高 watermark 评估与 Step→Tool batch join 查询护栏。
-- L2:begin 后崩溃的孤儿 `requested` 恢复路径。
+- L2:✅ 本次变更已补 begin 后崩溃的孤儿 `requested` 恢复路径(过期接管 + 未过期仍 409 + 并发单一选举 + 两个尝试各有审计终态)。
 - L3:✅ `b910ba82` 已补最后一个心跳间隔内的 wall_time breach 在 terminal 后保留及双路 evidence 回归。
 - L4:✅ `0a38a96d` 已补“未生产类型不出现在 filter/文案”的后端路由与前端公开常量测试。

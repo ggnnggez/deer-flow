@@ -655,6 +655,20 @@ def _content_blob_key(content_type: str, body: bytes) -> str:
     return digest.hexdigest()
 
 
+#: Conservative expiry for an operator action left stranded in ``requested``,
+#: sharing the lease intuition of ``projector_lease_seconds`` below: work whose
+#: owner stopped renewing eventually becomes claimable by someone else. A process
+#: that dies between ``begin_operator_action`` and ``finish_operator_action``
+#: leaves its audit row ``requested`` forever, so every later retry carrying that
+#: Idempotency-Key would conflict for good and the abandoned attempt would never
+#: reach a terminal. Past this window a retry with the same key terminalizes the
+#: abandoned attempt and executes fresh; inside it, a ``requested`` row is still
+#: treated as a genuine in-flight duplicate. Recovery is deliberately
+#: request-driven — there is no startup sweep, so a stranded row is judged only by
+#: an operator who actually wants that action to happen now.
+_STALE_REQUESTED_TAKEOVER_AFTER = timedelta(minutes=5)
+
+
 class SqlAnsichBackend:
     def __init__(
         self,
@@ -3687,15 +3701,24 @@ class SqlAnsichBackend:
             ).scalar_one_or_none()
             if inserted_action_id is None:
                 existing = await session.scalar(
-                    select(AnsichOperatorActionRow).where(
+                    select(AnsichOperatorActionRow)
+                    .where(
                         AnsichOperatorActionRow.task_id == task_id,
                         AnsichOperatorActionRow.action_type == action_type,
                         AnsichOperatorActionRow.idempotency_key == idempotency_key,
                     )
+                    .with_for_update()
                 )
                 if existing is None:
                     raise RuntimeError("operator action idempotency conflict did not expose the winning row")
-                return self._operator_action_view(existing), False
+                return await self._take_over_stale_operator_action(
+                    session,
+                    existing=existing,
+                    action_id=action_id,
+                    idempotency_key=idempotency_key,
+                    operator_id=operator_id,
+                    occurred_at=occurred_at,
+                )
             observation = self._operator_action_observation(
                 task_id=task_id,
                 action_id=inserted_action_id,
@@ -3724,6 +3747,130 @@ class SqlAnsichBackend:
                 ),
                 True,
             )
+
+    async def _take_over_stale_operator_action(
+        self,
+        session: AsyncSession,
+        *,
+        existing: AnsichOperatorActionRow,
+        action_id: str,
+        idempotency_key: str,
+        operator_id: str,
+        occurred_at: datetime,
+    ) -> tuple[OperatorActionView, bool]:
+        """Recover an operator action stranded in ``requested`` (phase-6 L2 / HR3).
+
+        Declines — reporting the ordinary idempotency conflict — for a terminal
+        row, and for a ``requested`` row still inside
+        ``_STALE_REQUESTED_TAKEOVER_AFTER``, which is a genuine in-flight
+        duplicate rather than an orphan.
+
+        Past that window the abandoned attempt is terminalized by an
+        ``operator.action_failed`` Observation carrying
+        ``stale_requested_takeover`` plus a forward pointer to the attempt that
+        supersedes it — the same Observation kind and payload shape the ordinary
+        failure path writes, so no new audit kind is introduced. The audit row is
+        the ledger entry for one Idempotency-Key rather than a per-attempt record:
+        it holds the unique key, so a later retry has to find the *live* attempt's
+        outcome there, not the abandoned one's. It is therefore re-armed in place
+        for the fresh attempt (new ``action_id``, fresh ``created_at`` so the new
+        attempt owns a full window of its own), and the abandoned attempt's
+        terminal lives on in the immutable Observation stream, which is where this
+        audit is durable anyway — ``rebuild_projections`` clears the row table.
+        """
+
+        if existing.status != "requested":
+            return self._operator_action_view(existing), False
+        requested_at = _as_utc(existing.created_at)
+        if _as_utc(occurred_at) - requested_at < _STALE_REQUESTED_TAKEOVER_AFTER:
+            return self._operator_action_view(existing), False
+        task_id = existing.task_id
+        action_type = cast(Literal["interrupt", "rollback"], existing.action_type)
+        abandoned_action_id = existing.action_id
+        abandoned = self._operator_action_observation(
+            task_id=task_id,
+            action_id=abandoned_action_id,
+            action_type=action_type,
+            status="failed",
+            idempotency_key=idempotency_key,
+            operator_id=operator_id,
+            occurred_at=occurred_at,
+            result={
+                "outcome": "stale_requested_takeover",
+                "requested_at": requested_at.isoformat(),
+                "expiry_seconds": int(_STALE_REQUESTED_TAKEOVER_AFTER.total_seconds()),
+                "superseded_by_action_id": action_id,
+            },
+        )
+        # Compare-and-set against the row identity this transaction just read, so
+        # the election survives a dialect that ignores ``FOR UPDATE``: concurrent
+        # retries against one orphan produce exactly one winner, and the loser
+        # re-reads the winner's re-armed (no longer stale) row as the ordinary
+        # in-progress conflict. ``synchronize_session`` is off because this
+        # statement rewrites the primary key.
+        elected = (
+            await session.execute(
+                update(AnsichOperatorActionRow)
+                .where(
+                    AnsichOperatorActionRow.action_id == abandoned_action_id,
+                    AnsichOperatorActionRow.status == "requested",
+                )
+                .values(
+                    action_id=action_id,
+                    status="requested",
+                    requested_obs_id=None,
+                    terminal_obs_id=None,
+                    result_json=None,
+                    created_at=occurred_at,
+                    updated_at=occurred_at,
+                )
+                .returning(AnsichOperatorActionRow.action_id)
+                .execution_options(synchronize_session=False),
+            )
+        ).scalar_one_or_none()
+        if elected is None:
+            current = await session.scalar(
+                select(AnsichOperatorActionRow).where(
+                    AnsichOperatorActionRow.task_id == task_id,
+                    AnsichOperatorActionRow.action_type == action_type,
+                    AnsichOperatorActionRow.idempotency_key == idempotency_key,
+                )
+            )
+            if current is None:
+                raise RuntimeError("operator action takeover conflict did not expose the winning row")
+            return self._operator_action_view(current), False
+        # The identity map still holds `existing` under the primary key this
+        # statement just rewrote; drop it so nothing can write that ghost back.
+        session.expunge(existing)
+        requested = self._operator_action_observation(
+            task_id=task_id,
+            action_id=action_id,
+            action_type=action_type,
+            status="requested",
+            idempotency_key=idempotency_key,
+            operator_id=operator_id,
+            occurred_at=occurred_at,
+            result=None,
+        )
+        self._add_observation_row(session, abandoned)
+        self._add_observation_row(session, requested)
+        await session.execute(update(AnsichOperatorActionRow).where(AnsichOperatorActionRow.action_id == action_id).values(requested_obs_id=requested.obs_id))
+        await session.flush()
+        return (
+            OperatorActionView(
+                action_id=action_id,
+                task_id=task_id,
+                action_type=action_type,
+                idempotency_key=idempotency_key,
+                status="requested",
+                requested_obs_id=requested.obs_id,
+                terminal_obs_id=None,
+                result=None,
+                created_at=occurred_at,
+                updated_at=occurred_at,
+            ),
+            True,
+        )
 
     async def finish_operator_action(
         self,

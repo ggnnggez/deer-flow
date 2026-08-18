@@ -26,6 +26,7 @@ from deerflow.ansich.persistence.models import (
     AnsichOperatorActionRow,
 )
 from deerflow.ansich.persistence.sql import (
+    _STALE_REQUESTED_TAKEOVER_AFTER,
     SqlAnsichBackend,
     _action_repetition_rows_statement,
     _reconciliation_alert_rows_statement,
@@ -1088,6 +1089,91 @@ async def test_operator_action_idempotency_is_atomic_under_concurrency(
     assert results[0][0].action_id == results[1][0].action_id
     assert len(actions) == 1
     assert len(requested) == 1
+
+
+@pytest.mark.anyio
+async def test_stale_requested_operator_action_takeover_elects_one_winner(
+    tmp_path,
+) -> None:
+    """Two concurrent retries against one orphaned row must elect one takeover.
+
+    The takeover reuses the same conflict-election transaction as ordinary
+    idempotency: the loser observes the winner's re-armed row and reports an
+    in-progress conflict instead of executing the runtime action twice.
+    """
+
+    engine = create_async_engine(f"sqlite+aiosqlite:///{tmp_path / 'ansich-action-takeover.db'}")
+    session_factory = async_sessionmaker(engine, expire_on_commit=False)
+    async with engine.begin() as connection:
+        await connection.run_sync(Base.metadata.create_all)
+    service = create_sql_ansich_service(
+        session_factory,
+        operations_assessment_interval_ms=60_000,
+    )
+    await service.start()
+    task_id = new_id()
+    now = datetime.now(UTC)
+    service.record_batch(
+        (
+            ObservationEnvelope.task_lifecycle(
+                kind="task.created",
+                task_id=task_id,
+                source_kind="deerflow_run",
+                source_id="run-action-takeover",
+                occurred_at=now,
+                source_event_id="run:action-takeover:created",
+            ),
+            ObservationEnvelope.task_lifecycle(
+                kind="task.started",
+                task_id=task_id,
+                source_kind="deerflow_run",
+                source_id="run-action-takeover",
+                occurred_at=now,
+                source_event_id="run:action-takeover:started",
+            ),
+        )
+    )
+    await service.flush_task(task_id)
+    try:
+        orphan, _ = await service.begin_operator_action(
+            task_id=task_id,
+            action_type="interrupt",
+            idempotency_key="crashed-before-finish",
+            operator_id="operator-that-crashed",
+            occurred_at=now - _STALE_REQUESTED_TAKEOVER_AFTER - timedelta(seconds=1),
+        )
+        results = await asyncio.gather(
+            *(
+                service.begin_operator_action(
+                    task_id=task_id,
+                    action_type="interrupt",
+                    idempotency_key="crashed-before-finish",
+                    operator_id=f"admin-{index}",
+                    occurred_at=now,
+                )
+                for index in range(2)
+            )
+        )
+        async with session_factory() as session:
+            actions = list((await session.execute(select(AnsichOperatorActionRow))).scalars())
+            requested = list((await session.execute(select(AnsichObservationRow).where(AnsichObservationRow.kind == "operator.action_requested"))).scalars())
+            failed = list((await session.execute(select(AnsichObservationRow).where(AnsichObservationRow.kind == "operator.action_failed"))).scalars())
+    finally:
+        await service.stop()
+        await engine.dispose()
+
+    assert sorted(started for _, started in results) == [False, True]
+    assert results[0][0].action_id == results[1][0].action_id
+    assert results[0][0].action_id != orphan.action_id
+    # One ledger row per Idempotency-Key, now armed for the winning attempt.
+    assert len(actions) == 1
+    assert actions[0].status == "requested"
+    assert actions[0].action_id == results[0][0].action_id
+    # Exactly one takeover: the orphan is terminalized once, one new attempt opened.
+    assert len(failed) == 1
+    assert failed[0].payload_json["action_id"] == orphan.action_id
+    assert failed[0].payload_json["result"]["outcome"] == "stale_requested_takeover"
+    assert sorted(row.payload_json["action_id"] for row in requested) == sorted((orphan.action_id, actions[0].action_id))
 
 
 def test_phase6_alert_models_compile_with_postgresql_semantics() -> None:

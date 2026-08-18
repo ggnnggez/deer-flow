@@ -682,11 +682,24 @@ acknowledge/dismiss require the current `workflow_version`. Task interrupt and
 rollback routes resolve the Run/thread solely from the server-side Ansich Task
 mapping, validate it against `RunManager`, and require `Idempotency-Key`.
 Database conflict handling atomically elects one concurrent request to call the
-runtime. The action audit records requested/succeeded/failed Observations, but
-a requested-audit write failure remains fail-open for the existing DeerFlow
-action and is returned as `audit_status=degraded`. Interrupt means stop while
-retaining the current checkpoint, never pause; rollback uses the existing
-pre-Run checkpoint behavior.
+runtime. That same election owns the expiry decision for an action a crash
+stranded in `requested` between `begin_operator_action` and
+`finish_operator_action`: inside `_STALE_REQUESTED_TAKEOVER_AFTER` (5 minutes,
+declared next to the projector-lease knobs) such a row is still a genuine
+in-flight duplicate and conflicts, while past it a retry carrying the same
+`Idempotency-Key` terminalizes the abandoned attempt with an
+`operator.action_failed` Observation whose result is `stale_requested_takeover`
+and re-arms the ledger row for a fresh attempt — recovery is request-driven,
+there is no startup sweep. The audit row holds the unique key, so it always
+follows the *live* attempt and a later retry replays that attempt's real outcome;
+the abandoned attempt's terminal stays in the immutable Observation stream. The
+takeover is a compare-and-set on `(action_id, status)`, so concurrent retries
+against one orphan still elect exactly one winner and the loser reports the
+ordinary in-progress conflict. The action audit records requested/succeeded/failed
+Observations, but a requested-audit write failure remains fail-open for the
+existing DeerFlow action and is returned as `audit_status=degraded`. Interrupt
+means stop while retaining the current checkpoint, never pause; rollback uses the
+existing pre-Run checkpoint behavior.
 
 Phase 7 resolves the actual lead/subagent assembly into an
 `AgentRuntimeDescriptor` only after model, prompt, Tool catalog, middleware, and
