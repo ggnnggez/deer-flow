@@ -67,7 +67,7 @@ from ansich.assessment.action_repetition import (
     assess_action_repetition,
     build_step_action,
 )
-from ansich.assessment.base import Assessment, EvidenceRef, canonical_config_hash
+from ansich.assessment.base import Assessment, AuthorityClass, EvidenceRef, canonical_config_hash
 from ansich.assessment.configuration_drift import (
     CONFIGURATION_DRIFT_ASSESSOR,
     assess_configuration_drift,
@@ -104,6 +104,10 @@ from ansich.contracts import (
     control_values_for_lifecycle_scope,
 )
 from ansich.control import should_select_control_candidate
+from ansich.evaluation import (
+    EVALUATION_OBSERVATION_KIND,
+    EvaluationRecord,
+)
 from ansich.heartbeat import TaskHeartbeatView
 from ansich.jobs import FailedJobDetailView, FailedJobErrorView, FailedJobKind, FailedJobSummaryView
 from ansich.lineage import LineageDirection
@@ -276,6 +280,9 @@ _PROJECTORS = (
     ("task-budget", "1"),
     ("task-heartbeat", "1"),
     ("task-safety", "1"),
+    # Registered last on purpose: evaluations point at subjects (Task, Step,
+    # ToolCall, ContentBlock, AgentRelease) that the projectors above create.
+    ("evaluation-projector", "1"),
 )
 _PROJECTOR_KINDS = {
     "task-structural": frozenset((*_CONTROL_BY_KIND, "agent_release.resolved")),
@@ -285,6 +292,7 @@ _PROJECTOR_KINDS = {
     "task-budget": frozenset({"budget.configured"}),
     "task-heartbeat": frozenset({"task.heartbeat"}),
     "task-safety": _SAFETY_PROJECTION_KINDS,
+    "evaluation-projector": frozenset({EVALUATION_OBSERVATION_KIND}),
 }
 _ASSESSOR_VERSIONS = {
     ACTION_REPETITION_ASSESSOR.name: ACTION_REPETITION_ASSESSOR.version,
@@ -305,6 +313,27 @@ _USAGE_DIMENSION_ORDER = {
     "child_tasks_spawned": 8,
 }
 _CONTENT_CANONICALIZATION_VERSION = "1"
+_EVALUATION_PROJECTOR_VERSION = "1"
+_EVALUATION_PROJECTOR_CONFIG_HASH = canonical_config_hash(
+    {
+        "projector": "evaluation-projector",
+        "version": _EVALUATION_PROJECTOR_VERSION,
+    }
+)
+#: Dimensions that carry a named semantic claim, so an evaluation of one of them
+#: becomes a ``quality.<dimension>`` Belief assertion and feeds release stats.
+#: ``custom`` deliberately stays index-only, and ``earliest_erroneous_step``
+#: asserts a Step pointer rather than a quality verdict.
+_EVALUATION_QUALITY_DIMENSIONS = frozenset(
+    {
+        "correctness",
+        "completeness",
+        "relevance",
+        "safety",
+        "efficiency",
+    }
+)
+_EVALUATION_SUITE_BOUND_KINDS = frozenset({"benchmark_assertion", "unit_test"})
 _TOOL_TERMINAL_PRECEDENCE = {
     "unknown_terminal": 0,
     "denied": 1,
@@ -356,6 +385,25 @@ def _assessors_after_projection(
 def _projector_priority_expression():
     priority_by_name = {name: index for index, (name, _) in enumerate(_PROJECTORS)}
     return case(priority_by_name, value=AnsichProjectionJobRow.projector_name, else_=len(priority_by_name))
+
+
+def _evaluation_authority_class(record: EvaluationRecord) -> AuthorityClass:
+    """Map one evaluation onto the Belief resolver's authority ladder (R2).
+
+    Suite-bound evaluations are deterministic only when they carry ``hard``
+    fidelity; the same runner emitting a rule/soft judgement is a configured
+    rule. A developer annotation is authoritative only when it explicitly
+    claims the human override, otherwise it joins ordinary user feedback in the
+    resolver-v2 ``soft_human`` class. An LLM judge is never human evidence.
+    """
+
+    if record.evaluation_kind in _EVALUATION_SUITE_BOUND_KINDS:
+        return "deterministic" if record.fidelity_class == "hard" else "configured_rule"
+    if record.evaluation_kind == "developer_annotation":
+        return "human_override" if record.human_override else "soft_human"
+    if record.evaluation_kind == "user_feedback":
+        return "soft_human"
+    return "automated"
 
 
 def _action_repetition_rows_statement(
@@ -842,6 +890,8 @@ class SqlAnsichBackend:
                         )
                     elif projector_name == "task-safety":
                         await self._project_safety(session, observation)
+                    elif projector_name == "evaluation-projector":
+                        await self._project_evaluation(session, observation)
                     else:
                         raise ValueError(f"unknown Ansich projector: {projector_name}")
                     for assessor_name, assessor_version in _assessors_after_projection(
@@ -7423,3 +7473,255 @@ class SqlAnsichBackend:
             row.result_metadata_json,
         ) != effect_value:
             raise ValueError("ToolEffect conflicts with existing immutable row")
+
+    async def _project_evaluation(
+        self,
+        session: AsyncSession,
+        observation: ObservationEnvelope,
+    ) -> None:
+        # _claim_projection_job already hydrates an externalized payload from
+        # ansich_payloads before handing the envelope over, so this projector
+        # always sees the decoded record. It re-validates the subject/task
+        # cross-checks because that hydration uses model_copy, which does not
+        # re-run the envelope validators.
+        if observation.payload is None:
+            raise ValueError("evaluation.recorded requires an inline decoded payload")
+        record = EvaluationRecord.model_validate(observation.payload.get("evaluation"), strict=False)
+        if record.subject_type != observation.subject_type or record.subject_id != observation.subject_id:
+            raise ValueError("evaluation payload subject must match the Observation subject")
+        if record.task_id != observation.task_id:
+            raise ValueError("evaluation payload task must match the Observation task")
+        if await session.get(AnsichEntityRow, record.subject_id) is None:
+            raise _ProjectionDependencyPending(f"Evaluation {observation.obs_id} is waiting for subject Entity {record.subject_id}")
+
+        step_row: AnsichStepRow | None = None
+        if record.dimension == "earliest_erroneous_step":
+            # The record validator already guarantees a Task subject plus a
+            # non-empty Step id in ``actual``; ownership is a projection-time
+            # fact (R10).
+            step_row = await session.get(AnsichStepRow, record.actual)
+            if step_row is None:
+                raise _ProjectionDependencyPending(f"Evaluation {observation.obs_id} is waiting for Step {record.actual}")
+            if step_row.task_id != record.task_id:
+                raise ValueError("earliest erroneous step must belong to the evaluated Task")
+
+        authority_class = _evaluation_authority_class(record)
+        await self._upsert_evaluation_index(
+            session,
+            observation,
+            record,
+            authority_class=authority_class,
+        )
+
+        if record.dimension in _EVALUATION_QUALITY_DIMENSIONS:
+            value: dict[str, object] = {
+                "verdict": record.verdict,
+                "score": record.score,
+                "scale": None if record.scale is None else record.scale.model_dump(mode="json"),
+                "evaluation_kind": record.evaluation_kind,
+                "cohort_key": record.cohort_key,
+                "suite": record.suite,
+            }
+        elif step_row is not None:
+            value = {
+                "step_id": step_row.entity_id,
+                "step_seq": step_row.step_seq,
+                "verdict": record.verdict,
+            }
+        else:
+            # ``custom`` carries no named semantics, so it stays an indexed
+            # observation instead of becoming a Belief claim.
+            return
+
+        await self._persist_assessment(
+            session,
+            Assessment(
+                subject_id=record.subject_id,
+                field_name=f"quality.{record.dimension}",
+                value=value,
+                as_of=record.occurred_at,
+                asserted_at=datetime.now(UTC),
+                assessor=record.assessor,
+                config_hash=_EVALUATION_PROJECTOR_CONFIG_HASH,
+                authority_class=authority_class,
+                fidelity_class=record.fidelity_class,
+                evidence=(EvidenceRef(obs_id=observation.obs_id),),
+            ),
+        )
+
+        if record.subject_type != "task" or record.dimension not in _EVALUATION_QUALITY_DIMENSIONS:
+            return
+        release_id = await session.scalar(
+            select(AnsichRelationRow.object_id).where(
+                AnsichRelationRow.subject_id == record.task_id,
+                AnsichRelationRow.predicate == "executed_by",
+            )
+        )
+        if release_id is None:
+            # A Task without a starting AgentRelease binding still gets its
+            # index row and Belief; only the release rollup is skipped (R9).
+            return
+        # The rollup reads the current Belief this projection just resolved, so
+        # make that write visible instead of relying on autoflush ordering.
+        await session.flush()
+        await self._recompute_release_quality_stats(
+            session,
+            release_id=release_id,
+            cohort_key=record.cohort_key or "",
+            dimension=record.dimension,
+        )
+
+    @staticmethod
+    async def _upsert_evaluation_index(
+        session: AsyncSession,
+        observation: ObservationEnvelope,
+        record: EvaluationRecord,
+        *,
+        authority_class: AuthorityClass,
+    ) -> None:
+        values: dict[str, object] = {
+            "subject_type": record.subject_type,
+            "subject_id": record.subject_id,
+            "task_id": record.task_id,
+            "evaluation_kind": record.evaluation_kind,
+            "dimension": record.dimension,
+            "verdict": record.verdict,
+            "score": record.score,
+            "scale_min": None if record.scale is None else record.scale.min,
+            "scale_max": None if record.scale is None else record.scale.max,
+            "scale_higher_is_better": None if record.scale is None else record.scale.higher_is_better,
+            "assessor_name": record.assessor.name,
+            "assessor_version": record.assessor.version,
+            "authority_class": authority_class,
+            # The Observation column is Literal["hard"]; the evaluation's real
+            # fidelity only exists inside the payload.
+            "fidelity_class": record.fidelity_class,
+            "cohort_key": record.cohort_key,
+            "suite_id": record.suite,
+            "suite_version": record.suite_version,
+            "case_id": record.case_id,
+            "occurred_at": record.occurred_at,
+            "projector_version": _EVALUATION_PROJECTOR_VERSION,
+        }
+        row = await session.get(AnsichEvaluationIndexRow, observation.obs_id)
+        if row is None:
+            session.add(
+                AnsichEvaluationIndexRow(
+                    evaluation_obs_id=observation.obs_id,
+                    **values,
+                )
+            )
+            await session.flush()
+            return
+        stored = {name: getattr(row, name) for name in values}
+        stored["occurred_at"] = _as_utc(row.occurred_at)
+        if stored != {**values, "occurred_at": _as_utc(record.occurred_at)}:
+            raise ValueError("Evaluation index row conflicts with an existing projection")
+
+    async def _recompute_release_quality_stats(
+        self,
+        session: AsyncSession,
+        *,
+        release_id: str,
+        cohort_key: str,
+        dimension: str,
+    ) -> None:
+        """Rebuild one ``(release, cohort, dimension)`` cell from scratch.
+
+        The cell's population is every Task bound to the release that carries
+        an index row in this cohort and dimension; each such Task contributes
+        exactly one sample, taken from its CURRENT ``quality.<dimension>``
+        Belief so retained conflicting assertions never double-count.
+        """
+
+        cell = await session.get(
+            AnsichReleaseQualityStatsRow,
+            (release_id, cohort_key, dimension),
+        )
+        release_task_ids = select(AnsichRelationRow.subject_id).where(
+            AnsichRelationRow.predicate == "executed_by",
+            AnsichRelationRow.object_id == release_id,
+        )
+        index_rows = list(
+            (
+                await session.execute(
+                    select(
+                        AnsichEvaluationIndexRow.subject_id,
+                        AnsichEvaluationIndexRow.occurred_at,
+                    )
+                    .where(
+                        AnsichEvaluationIndexRow.subject_type == "task",
+                        AnsichEvaluationIndexRow.subject_id.in_(release_task_ids),
+                        AnsichEvaluationIndexRow.dimension == dimension,
+                        func.coalesce(AnsichEvaluationIndexRow.cohort_key, "") == cohort_key,
+                    )
+                    # Deterministic tiebreak for the retained scale below.
+                    .order_by(AnsichEvaluationIndexRow.evaluation_obs_id)
+                )
+            ).all()
+        )
+
+        field_name = f"quality.{dimension}"
+        as_of: datetime | None = None
+        seen_task_ids: set[str] = set()
+        verdicts: list[str | None] = []
+        scores: list[float] = []
+        scales: list[tuple[float | None, float | None, bool | None]] = []
+        for task_id, occurred_at in index_rows:
+            occurred = _as_utc(occurred_at)
+            as_of = occurred if as_of is None else max(as_of, occurred)
+            if task_id in seen_task_ids:
+                continue
+            seen_task_ids.add(task_id)
+            current = await session.get(AnsichCurrentBeliefRow, (task_id, field_name))
+            if current is None:
+                continue
+            assertion = await session.get(AnsichBeliefAssertionRow, current.assertion_id)
+            if assertion is None:
+                continue
+            selected = assertion.value_json or {}
+            verdict = selected.get("verdict")
+            verdicts.append(verdict if isinstance(verdict, str) else None)
+            score = selected.get("score")
+            scale = selected.get("scale")
+            if isinstance(score, int | float) and not isinstance(score, bool) and isinstance(scale, dict):
+                scores.append(float(score))
+                key = (scale.get("min"), scale.get("max"), scale.get("higher_is_better"))
+                if key not in scales:
+                    scales.append(key)
+
+        if not verdicts or as_of is None:
+            # Nothing left to aggregate: the cell must not survive as a stale
+            # read model.
+            if cell is not None:
+                await session.delete(cell)
+            return
+
+        # Scores on different scales are not commensurable; keep the counts and
+        # the first observed scale, but refuse to publish a mixed-scale sum.
+        mixed_scales = len(scales) > 1
+        cell_values: dict[str, object] = {
+            "assessed_count": len(verdicts),
+            "pass_count": sum(1 for verdict in verdicts if verdict == "pass"),
+            "fail_count": sum(1 for verdict in verdicts if verdict == "fail"),
+            "partial_count": sum(1 for verdict in verdicts if verdict == "partial"),
+            "score_sum": None if mixed_scales or not scores else float(sum(scores)),
+            "score_count": 0 if mixed_scales or not scores else len(scores),
+            "scale_min": scales[0][0] if scales else None,
+            "scale_max": scales[0][1] if scales else None,
+            "as_of": as_of,
+            "projector_version": _EVALUATION_PROJECTOR_VERSION,
+        }
+        if cell is None:
+            session.add(
+                AnsichReleaseQualityStatsRow(
+                    release_id=release_id,
+                    cohort_key=cohort_key,
+                    dimension=dimension,
+                    **cell_values,
+                )
+            )
+            await session.flush()
+            return
+        for column_name, column_value in cell_values.items():
+            setattr(cell, column_name, column_value)
