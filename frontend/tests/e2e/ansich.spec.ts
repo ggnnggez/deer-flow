@@ -1804,4 +1804,14 @@ test("release compare separates observed quality from the structural diff", asyn
     0,
   );
   await expect(page.getByText("provider/model-v2")).toBeVisible();
+
+  // The argument order IS the delta's meaning: the backend delta is
+  // `right - left`, and the copy above promises left is this Task's bound
+  // release. Swapping the panel's two arguments inverts every sign while the
+  // whole suite stays green, so every compare request is pinned here.
+  expect(compareSearches.length).toBeGreaterThan(0);
+  for (const search of compareSearches) {
+    expect(search).toContain(`left=${RELEASE_ID}`);
+    expect(search).toContain(`right=${OTHER_RELEASE_ID}`);
+  }
 });

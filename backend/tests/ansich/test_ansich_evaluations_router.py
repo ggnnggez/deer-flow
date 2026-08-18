@@ -11,16 +11,18 @@ from uuid import uuid4
 
 import pytest
 from _router_auth_helpers import make_authed_test_app
-from ansich import AnsichService, ObservationEnvelope, Producer, new_id
+from ansich import AnsichService, ObservationEnvelope, Producer, ToolEffect, new_id
+from ansich.evaluation import EVALUATION_OBSERVATION_KIND
 from ansich.release import AgentRuntimeDescriptor, build_agent_release
 from httpx import ASGITransport, AsyncClient
-from sqlalchemy import event
+from sqlalchemy import event, func, select
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
 from app.gateway.auth.models import User
 from app.gateway.deps import snapshot_ansich_evaluation_settings
 from app.gateway.routers import ansich as ansich_router
 from deerflow.ansich import create_embedded_ansich_service, create_sql_ansich_service
+from deerflow.ansich.persistence.models import AnsichBeliefAssertionRow, AnsichObservationRow
 from deerflow.config.ansich_config import AnsichConfig
 from deerflow.persistence.base import Base
 
@@ -53,13 +55,26 @@ def _regular_user() -> User:
 class _EvaluationHarness:
     """The pieces one router test needs: a real service, its app, and a client."""
 
-    def __init__(self, service: AnsichService, app, client: AsyncClient) -> None:
+    def __init__(self, service: AnsichService, app, client: AsyncClient, session_factory=None) -> None:
         self.service = service
         self.app = app
         self.client = client
+        self.session_factory = session_factory
 
     def set_evaluation_settings(self, config: AnsichConfig) -> None:
         self.app.state.ansich_evaluation_settings = snapshot_ansich_evaluation_settings(config)
+
+    async def count_recorded_evaluations(self) -> int:
+        """Count persisted evaluation Observations, whatever their subject."""
+
+        async with self.session_factory() as session:
+            return int(await session.scalar(select(func.count()).select_from(AnsichObservationRow).where(AnsichObservationRow.kind == EVALUATION_OBSERVATION_KIND)))
+
+    async def count_quality_assertions(self) -> int:
+        """Count persisted ``quality.<dimension>`` assertions, whatever their subject."""
+
+        async with self.session_factory() as session:
+            return int(await session.scalar(select(func.count()).select_from(AnsichBeliefAssertionRow).where(AnsichBeliefAssertionRow.field_name.like("quality.%"))))
 
 
 @asynccontextmanager
@@ -103,7 +118,7 @@ async def _evaluation_harness(
             transport=ASGITransport(app=app),
             base_url="http://test",
         ) as client:
-            yield _EvaluationHarness(service, app, client)
+            yield _EvaluationHarness(service, app, client, session_factory)
     finally:
         await service.stop()
         await engine.dispose()
@@ -229,6 +244,72 @@ async def _open_tool_frequency_alert(service: AnsichService, *, task_id: str, ru
     )
     await service.flush_task(task_id)
     await service.assess_operations(now=_OCCURRED_AT + timedelta(seconds=1))
+
+
+async def _open_unverified_effect_alert(service: AnsichService, *, task_id: str, run_id: str) -> str:
+    """Produce one scope-safety Alert whose subject is a ToolCall, not the Task.
+
+    ``assess_scope_safety`` asserts on the ``tool_call_id`` (scope_safety.py:120),
+    so every scope-safety Alert type carries a ToolCall subject. An intended
+    effect with no observed counterpart and no authorization snapshot is the
+    cheapest of them: ``unverified_effect`` is ``present``.
+    """
+
+    step_id = new_id()
+    tool_call_id = new_id()
+    effect_obs_id = new_id()
+    producer = Producer(name="ansich-evaluations-router-test", version="1", instance_id="test")
+    effect = ToolEffect(
+        effect_id=new_id(),
+        tool_call_id=tool_call_id,
+        effect_class="filesystem_write",
+        phase="intended",
+        target_preview="workspace/report.md",
+        fidelity_class="declared",
+        source_obs_id=effect_obs_id,
+    )
+    service.record_batch(
+        (
+            _task_created(task_id, run_id),
+            _task_started(task_id, run_id),
+            _step_started(task_id, step_id),
+            ObservationEnvelope(
+                kind="tool.issued",
+                occurred_at=_OCCURRED_AT,
+                task_id=task_id,
+                step_id=step_id,
+                subject_type="tool_call",
+                subject_id=tool_call_id,
+                producer=producer,
+                source_event_id=f"run:{run_id}:tool:issued",
+                correlation_id=task_id,
+                payload={
+                    "call_seq": 1,
+                    "provider_call_id": f"provider-{run_id}",
+                    "tool_name": "write_file",
+                    "args_hash": "b" * 64,
+                    "args_preview": {"path": "workspace/report.md"},
+                    "tool_schema_block_id": None,
+                },
+            ),
+            ObservationEnvelope(
+                obs_id=effect_obs_id,
+                kind="effect.intended",
+                occurred_at=_OCCURRED_AT,
+                task_id=task_id,
+                step_id=step_id,
+                subject_type="effect",
+                subject_id=effect.effect_id,
+                producer=producer,
+                source_event_id=f"run:{run_id}:effect:intended",
+                correlation_id=task_id,
+                payload={"effect": effect.model_dump(mode="json")},
+            ),
+        )
+    )
+    await service.flush_task(task_id)
+    await service.assess_operations(now=_OCCURRED_AT + timedelta(seconds=1))
+    return tool_call_id
 
 
 # ---------------------------------------------------------------------------
@@ -911,3 +992,63 @@ async def test_a_failing_semantic_override_never_fails_the_dismissal(tmp_path, m
     assert dismissed.json()["semantic_override"]["status"] == "degraded"
     assert dismissed.json()["semantic_override"]["evaluation"] is None
     assert evaluations.json()["evaluations"] == []
+
+
+@pytest.mark.anyio
+async def test_a_tool_call_subject_alert_degrades_its_semantic_override(tmp_path) -> None:
+    """A scope-safety Alert cannot be overridden into a Task-level quality Belief.
+
+    Overriding hard safety evidence is deliberately out of v1 scope: the Alert's
+    subject is a ToolCall, so the override degrades with a marker instead of
+    attaching ``quality.<dimension>`` to a ToolCall id. Without this guard the
+    dismissal would still return 200 and every other test would stay green.
+    """
+
+    task_id, run_id = new_id(), "eval-router-tool-call-subject"
+
+    async with _evaluation_harness(
+        tmp_path,
+        "ansich-evaluations-tool-call-subject.db",
+    ) as harness:
+        tool_call_id = await _open_unverified_effect_alert(
+            harness.service,
+            task_id=task_id,
+            run_id=run_id,
+        )
+        # The `task` filter matches the Alert's subject, and this Alert's
+        # subject is exactly what makes it interesting: a ToolCall.
+        listed = await harness.client.get(
+            "/api/ansich/operations/alerts",
+            params={"type": "unverified_effect"},
+        )
+        alert = listed.json()["items"][0]
+        evaluations_before = await harness.count_recorded_evaluations()
+        assertions_before = await harness.count_quality_assertions()
+        dismissed = await harness.client.post(
+            f"/api/ansich/operations/alerts/{alert['alert_id']}/dismiss",
+            json={
+                "workflow_version": alert["workflow_version"],
+                "reason": "the write was reviewed by hand",
+                "semantic_override": {
+                    "dimension": "safety",
+                    "verdict": "pass",
+                    "rationale": "operator confirmed the intended write stayed in scope",
+                },
+            },
+        )
+        evaluations_after = await harness.count_recorded_evaluations()
+        assertions_after = await harness.count_quality_assertions()
+        task_evaluations = await harness.client.get(f"/api/ansich/tasks/{task_id}/evaluations")
+
+    assert alert["subject_id"] == tool_call_id
+    assert dismissed.status_code == 200
+    assert dismissed.json()["alert"]["workflow_state"] == "dismissed"
+    assert dismissed.json()["semantic_override"] == {
+        "status": "degraded",
+        "reason": "alert_subject_is_not_a_task",
+        "evaluation": None,
+    }
+    assert (evaluations_after, assertions_after) == (evaluations_before, assertions_before)
+    assert (evaluations_after, assertions_after) == (0, 0)
+    assert task_evaluations.json()["evaluations"] == []
+    assert all(belief["unassessed"] is True for belief in task_evaluations.json()["quality_beliefs"])
