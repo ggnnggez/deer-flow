@@ -253,6 +253,7 @@ async def test_evaluation_endpoints_are_admin_only() -> None:
             )
             task_evaluations = await client.get(f"/api/ansich/tasks/{new_id()}/evaluations")
             step_evaluations = await client.get(f"/api/ansich/steps/{new_id()}/evaluations")
+            evaluation_payload = await client.get(f"/api/ansich/evaluations/{new_id()}/payload")
             release_quality = await client.get(f"/api/ansich/agent-releases/{new_id()}/quality")
     finally:
         await service.stop()
@@ -260,6 +261,7 @@ async def test_evaluation_endpoints_are_admin_only() -> None:
     assert posted.status_code == 403
     assert task_evaluations.status_code == 403
     assert step_evaluations.status_code == 403
+    assert evaluation_payload.status_code == 403
     assert release_quality.status_code == 403
 
 
@@ -277,9 +279,10 @@ async def test_evaluation_endpoints_are_503_without_an_ansich_service() -> None:
         )
         task_evaluations = await client.get(f"/api/ansich/tasks/{new_id()}/evaluations")
         step_evaluations = await client.get(f"/api/ansich/steps/{new_id()}/evaluations")
+        evaluation_payload = await client.get(f"/api/ansich/evaluations/{new_id()}/payload")
         release_quality = await client.get(f"/api/ansich/agent-releases/{new_id()}/quality")
 
-    for response in (posted, task_evaluations, step_evaluations, release_quality):
+    for response in (posted, task_evaluations, step_evaluations, evaluation_payload, release_quality):
         assert response.status_code == 503
         assert response.json()["detail"] == "Ansich is disabled or unavailable"
 
@@ -302,11 +305,12 @@ async def test_evaluation_endpoints_are_503_when_storage_is_unavailable() -> Non
             )
             task_evaluations = await client.get(f"/api/ansich/tasks/{new_id()}/evaluations")
             step_evaluations = await client.get(f"/api/ansich/steps/{new_id()}/evaluations")
+            evaluation_payload = await client.get(f"/api/ansich/evaluations/{new_id()}/payload")
             release_quality = await client.get(f"/api/ansich/agent-releases/{new_id()}/quality")
     finally:
         await service.stop()
 
-    for response in (posted, task_evaluations, step_evaluations, release_quality):
+    for response in (posted, task_evaluations, step_evaluations, evaluation_payload, release_quality):
         assert response.status_code == 503
         assert response.json()["detail"]["projection_status"]["status"] == "failed"
 
@@ -562,6 +566,58 @@ async def test_task_evaluations_report_unassessed_then_resolved_quality_beliefs(
     assert beliefs["correctness"]["authority_class"] == "soft_human"
     assert beliefs["correctness"]["conflicting_assertion_count"] == 1
     assert beliefs["safety"]["unassessed"] is True
+
+
+# ---------------------------------------------------------------------------
+# GET /api/ansich/evaluations/{obs_id}/payload
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.anyio
+async def test_evaluation_payload_serves_expected_actual_lazily_and_no_store(tmp_path) -> None:
+    """The bodies the index deliberately omits are readable only through this route."""
+
+    task_id, run_id = new_id(), "eval-router-payload"
+    created = _task_created(task_id, run_id)
+
+    async with _evaluation_harness(tmp_path, "ansich-evaluations-payload.db") as harness:
+        harness.service.record(created)
+        await harness.service.flush_task(task_id)
+
+        recorded = await harness.client.post(
+            "/api/ansich/evaluations",
+            headers={"Idempotency-Key": "eval-router-payload-1"},
+            json=_annotation_body(
+                task_id,
+                verdict="fail",
+                expected="a cited answer",
+                actual="an uncited answer",
+                rationale="no source was named",
+            ),
+        )
+        obs_id = recorded.json()["observation_id"]
+
+        payload = await harness.client.get(f"/api/ansich/evaluations/{obs_id}/payload")
+        unknown = await harness.client.get(f"/api/ansich/evaluations/{new_id()}/payload")
+        not_an_evaluation = await harness.client.get(f"/api/ansich/evaluations/{created.obs_id}/payload")
+        listed = await harness.client.get(f"/api/ansich/tasks/{task_id}/evaluations")
+
+    assert recorded.status_code == 200
+    assert payload.status_code == 200
+    assert payload.headers["cache-control"] == "no-store"
+    body = payload.json()
+    assert body["evaluation_obs_id"] == obs_id
+    evaluation = body["payload"]["evaluation"]
+    assert evaluation["expected"] == "a cited answer"
+    assert evaluation["actual"] == "an uncited answer"
+    assert evaluation["rationale"] == "no source was named"
+    # The polled index carries none of those bodies.
+    assert listed.status_code == 200
+    assert set(listed.json()["evaluations"][0]) & {"expected", "actual", "rationale"} == set()
+    assert unknown.status_code == 404
+    assert unknown.json()["detail"] == "Ansich evaluation payload not found"
+    assert not_an_evaluation.status_code == 404
+    assert not_an_evaluation.json()["detail"] == "Ansich evaluation payload not found"
 
 
 # ---------------------------------------------------------------------------

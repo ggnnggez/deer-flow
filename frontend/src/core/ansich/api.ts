@@ -15,6 +15,7 @@ import type {
   AnsichContextCompressionResponse,
   AnsichContextCompressionListResponse,
   AnsichContextResponse,
+  AnsichEvaluationPayloadResponse,
   AnsichFailedJobDetailResponse,
   AnsichFailedJobKind,
   AnsichFailedJobsResponse,
@@ -495,6 +496,27 @@ export async function fetchAnsichTaskEvaluations(
     await throwAnsichApiError(
       response,
       `Failed to load Ansich Task evaluations: ${response.statusText}`,
+    );
+  }
+  return response.json();
+}
+
+/**
+ * Read one evaluation's `expected`/`actual`/`rationale` bodies. Same rule as
+ * the raw Tool payloads: fetched only after an explicit admin action, never
+ * placed in a polling response or prefetched into a query cache.
+ */
+export async function fetchAnsichEvaluationPayload(
+  obsId: string,
+): Promise<AnsichEvaluationPayloadResponse> {
+  const response = await fetch(
+    ansichUrl(`/evaluations/${encodeURIComponent(obsId)}/payload`),
+    { cache: "no-store" },
+  );
+  if (!response.ok) {
+    await throwAnsichApiError(
+      response,
+      `Failed to load Ansich evaluation payload: ${response.statusText}`,
     );
   }
   return response.json();

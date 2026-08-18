@@ -13,6 +13,7 @@ import {
   AnsichContextPanel,
   AnsichAgentReleasePanel,
   AnsichBudgetPanel,
+  AnsichEvaluationsPanel,
   AnsichEvidenceSection,
   AnsichObservationTimeline,
   AnsichProjectionHealth,
@@ -47,8 +48,19 @@ import type {
 import { useAuth } from "@/core/auth/AuthProvider";
 import { useI18n } from "@/core/i18n/hooks";
 
-type TaskView = "summary" | "decision" | "resources" | "evidence";
-const TASK_VIEWS: TaskView[] = ["summary", "decision", "resources", "evidence"];
+type TaskView =
+  | "summary"
+  | "decision"
+  | "resources"
+  | "evidence"
+  | "evaluations";
+const TASK_VIEWS: TaskView[] = [
+  "summary",
+  "decision",
+  "resources",
+  "evidence",
+  "evaluations",
+];
 
 function usageValue(
   values: AnsichTaskUsageValue[],
@@ -238,6 +250,9 @@ export default function AnsichTaskDetailPage() {
                   <TabsTrigger value="evidence">
                     {t.ansich.viewEvidence}
                   </TabsTrigger>
+                  <TabsTrigger value="evaluations">
+                    {t.ansich.viewEvaluations}
+                  </TabsTrigger>
                 </TabsList>
 
                 <TabsContent value="summary" className="space-y-4">
@@ -306,6 +321,13 @@ export default function AnsichTaskDetailPage() {
                   <AnsichEvidenceSection title={t.ansich.currentBehavior}>
                     <BeliefEvidenceCard behavior={behavior ?? null} />
                   </AnsichEvidenceSection>
+                </TabsContent>
+
+                <TabsContent value="evaluations">
+                  <AnsichEvaluationsPanel
+                    taskId={taskId}
+                    polling={taskIsRunning}
+                  />
                 </TabsContent>
               </Tabs>
             </>

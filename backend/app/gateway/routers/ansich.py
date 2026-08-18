@@ -1534,6 +1534,42 @@ async def list_step_evaluations(step_id: str, request: Request) -> dict:
     }
 
 
+@router.get("/evaluations/{obs_id}/payload")
+async def get_evaluation_payload(obs_id: str, request: Request, response: Response) -> dict:
+    """Return one evaluation Observation's full payload after an explicit read.
+
+    The list endpoints project metadata only; ``expected``/``actual``/
+    ``rationale`` are bodies and follow the same rule as raw Tool and
+    ContentBlock payloads — never polled, never cached, always logged.
+    """
+
+    await require_admin_user(request, detail=_ADMIN_REQUIRED)
+    service = _service_or_503(request)
+    _ensure_queryable(service)
+    try:
+        payload = await service.get_evaluation_observation_payload(obs_id)
+    except Exception as exc:
+        raise HTTPException(
+            status_code=503,
+            detail={
+                "message": "Ansich evaluation payload query failed",
+                "projection_status": _projection_status(service),
+            },
+        ) from exc
+    if payload is None:
+        raise HTTPException(status_code=404, detail="Ansich evaluation payload not found")
+    user = getattr(request.state, "user", None)
+    logger.info(
+        "Ansich evaluation payload accessed",
+        extra={
+            "ansich_evaluation_obs_id": obs_id,
+            "ansich_actor_id": str(getattr(user, "id", "unknown")),
+        },
+    )
+    response.headers["Cache-Control"] = "no-store"
+    return {"evaluation_obs_id": obs_id, "payload": payload}
+
+
 @router.get("/context-snapshots/{snapshot_id}")
 async def get_context_snapshot(snapshot_id: str, request: Request) -> dict:
     await require_admin_user(request, detail=_ADMIN_REQUIRED)

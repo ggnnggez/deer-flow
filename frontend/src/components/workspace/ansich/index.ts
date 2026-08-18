@@ -3,6 +3,7 @@ export { AnsichAlertPanel } from "./alert-panel";
 export { AnsichActiveTaskRow } from "./active-task-row";
 export { AnsichAgentReleasePanel } from "./agent-release-panel";
 export { AnsichBudgetPanel } from "./budget-panel";
+export { AnsichEvaluationsPanel } from "./evaluations-panel";
 export { AnsichTaskTreePanel } from "./task-tree-panel";
 export { AnsichScopeEffectsPanel } from "./scope-effects-panel";
 export { AnsichProjectionHealth } from "./projection-health";

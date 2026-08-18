@@ -2766,6 +2766,29 @@ class SqlAnsichBackend:
             entity = await session.get(AnsichEntityRow, subject_id)
         return None if entity is None else entity.entity_type
 
+    async def get_evaluation_observation_payload(self, obs_id: str) -> dict | None:
+        """Return one evaluation Observation's full payload, or ``None``.
+
+        This is the only read that returns evaluation bodies — ``expected``,
+        ``actual``, ``rationale`` — which the query index deliberately omits.
+        An Observation of any other kind is reported as absent rather than
+        served, so this route cannot become a general payload reader.
+        """
+
+        async with self._session_factory() as session:
+            observation = await session.scalar(select(AnsichObservationRow).where(AnsichObservationRow.obs_id == obs_id))
+            if observation is None or observation.kind != EVALUATION_OBSERVATION_KIND:
+                return None
+            if observation.payload_json is not None:
+                return observation.payload_json
+            if observation.payload_ref_id is None:
+                return None
+            payload = await session.get(AnsichPayloadRow, observation.payload_ref_id)
+            if payload is None:
+                return None
+            decoded = json.loads(payload.body.decode(payload.encoding))
+        return decoded if isinstance(decoded, dict) else None
+
     async def list_evaluations(
         self,
         *,

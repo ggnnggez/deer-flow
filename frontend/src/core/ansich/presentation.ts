@@ -204,6 +204,36 @@ export function formatEvaluationVerdict(
   return `${score} / ${scaleMax}`;
 }
 
+/** The i18n key naming one evaluation dimension. */
+export type AnsichDimensionLabelKey =
+  | "dimensionCorrectness"
+  | "dimensionCompleteness"
+  | "dimensionRelevance"
+  | "dimensionSafety"
+  | "dimensionEfficiency"
+  | "dimensionEarliestErroneousStep"
+  | "dimensionCustom";
+
+const DIMENSION_LABEL_KEYS: Record<string, AnsichDimensionLabelKey> = {
+  correctness: "dimensionCorrectness",
+  completeness: "dimensionCompleteness",
+  relevance: "dimensionRelevance",
+  safety: "dimensionSafety",
+  efficiency: "dimensionEfficiency",
+  earliest_erroneous_step: "dimensionEarliestErroneousStep",
+};
+
+/**
+ * Name one evaluation dimension for display. The contract's dimension set is
+ * open, so an unrecognized dimension is labeled as custom and rendered beside
+ * its raw key rather than being hidden or silently mapped onto a known one.
+ */
+export function evaluationDimensionLabelKey(
+  dimension: string,
+): AnsichDimensionLabelKey {
+  return DIMENSION_LABEL_KEYS[dimension] ?? "dimensionCustom";
+}
+
 export type AnsichQualityBeliefTone =
   | "pass"
   | "fail"

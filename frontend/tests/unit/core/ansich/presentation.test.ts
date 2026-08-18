@@ -4,6 +4,7 @@ import {
   getAlertPresentationCategory,
   countMissingContextItems,
   countLostObservations,
+  evaluationDimensionLabelKey,
   formatEvaluationVerdict,
   getBudgetPresentation,
   formatAnsichTimestamp,
@@ -282,6 +283,32 @@ describe("qualityBeliefTone", () => {
     expect(qualityBeliefTone(belief({ value: { status: "unassessed" } }))).toBe(
       "unknown",
     );
+  });
+});
+
+describe("evaluationDimensionLabelKey", () => {
+  it("names each contract dimension", () => {
+    expect(evaluationDimensionLabelKey("correctness")).toBe(
+      "dimensionCorrectness",
+    );
+    expect(evaluationDimensionLabelKey("completeness")).toBe(
+      "dimensionCompleteness",
+    );
+    expect(evaluationDimensionLabelKey("relevance")).toBe("dimensionRelevance");
+    expect(evaluationDimensionLabelKey("safety")).toBe("dimensionSafety");
+    expect(evaluationDimensionLabelKey("efficiency")).toBe(
+      "dimensionEfficiency",
+    );
+    expect(evaluationDimensionLabelKey("earliest_erroneous_step")).toBe(
+      "dimensionEarliestErroneousStep",
+    );
+  });
+
+  it("falls back to the custom label for an unknown dimension", () => {
+    expect(evaluationDimensionLabelKey("tone_of_voice")).toBe(
+      "dimensionCustom",
+    );
+    expect(evaluationDimensionLabelKey("")).toBe("dimensionCustom");
   });
 });
 

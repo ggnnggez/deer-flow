@@ -1112,6 +1112,20 @@ export interface AnsichStepEvaluationsResponse {
 }
 
 /**
+ * One evaluation Observation's full payload, read lazily through the audited
+ * `no-store` route. The `evaluation` block carries the bodies the index omits —
+ * `expected`, `actual`, `rationale` — and is typed as an open record because
+ * the payload is the raw contract envelope, not a projection.
+ */
+export interface AnsichEvaluationPayloadResponse {
+  evaluation_obs_id: string;
+  payload: {
+    evaluation?: Record<string, unknown>;
+    [key: string]: unknown;
+  };
+}
+
+/**
  * One `(cohort, dimension)` quality cell of one AgentRelease.
  *
  * `cohort_key` is the aggregation sentinel, where `""` means the evaluations

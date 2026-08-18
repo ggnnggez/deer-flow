@@ -465,6 +465,20 @@ class AnsichService:
             )
         )
 
+    async def get_evaluation_observation_payload(self, obs_id: str) -> dict | None:
+        """Return one evaluation Observation's full payload, or ``None``.
+
+        The evaluation index is metadata only; ``expected``/``actual``/
+        ``rationale`` live in the Observation payload and are read here, one
+        Observation at a time, after an explicit request. A backend without
+        this capability reports absence rather than an error.
+        """
+
+        get_payload = getattr(self._backend, "get_evaluation_observation_payload", None)
+        if not callable(get_payload):
+            return None
+        return await get_payload(obs_id)
+
     async def get_quality_beliefs(self, subject_id: str) -> list[QualityBeliefView]:
         """Return the subject's quality Beliefs, unassessed dimensions included.
 

@@ -627,6 +627,25 @@ export interface Translations {
     viewDecisionTrace: string;
     viewResourcesSafety: string;
     viewEvidence: string;
+    viewEvaluations: string;
+    evaluationsTitle: string;
+    evaluationsUnassessed: string;
+    evaluationsConflicts: string;
+    evaluationsEvidence: string;
+    evaluationsExpectedActual: string;
+    evaluationsExpected: string;
+    evaluationsActual: string;
+    evaluationsRationale: string;
+    evaluationsAssessor: string;
+    evaluationsRecorded: string;
+    evaluationsNoRecords: string;
+    dimensionCorrectness: string;
+    dimensionCompleteness: string;
+    dimensionRelevance: string;
+    dimensionSafety: string;
+    dimensionEfficiency: string;
+    dimensionEarliestErroneousStep: string;
+    dimensionCustom: string;
     signal: {
       behavior: string;
       budgetExceeded: string;

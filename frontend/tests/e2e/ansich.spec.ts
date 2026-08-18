@@ -18,6 +18,7 @@ const COMPRESSION_ID = "ac695124-12f7-48fd-bc4e-54058924d85a";
 const OLDER_COMPRESSION_ID = "9c695124-12f7-48fd-bc4e-54058924d85a";
 const SUMMARY_BLOCK_ID = "cc695124-12f7-48fd-bc4e-54058924d85a";
 const ALERT_ID = "ec695124-12f7-48fd-bc4e-54058924d85a";
+const EVALUATION_OBS_ID = "1e695124-12f7-48fd-bc4e-54058924d85a";
 const RELEASE_ID = "fc695124-12f7-48fd-bc4e-54058924d85a";
 const OTHER_RELEASE_ID = "0d695124-12f7-48fd-bc4e-54058924d85a";
 const RELEASE_HASH = "a".repeat(64);
@@ -1276,6 +1277,221 @@ test("context tab distinguishes failed projection from no observed context", asy
   await expect(
     page.getByText("No effective model context is available yet."),
   ).toHaveCount(0);
+});
+
+test("evaluations view separates one resolved verdict from four unassessed dimensions", async ({
+  page,
+}) => {
+  mockLangGraphAPI(page, { threads: [] });
+  let payloadRequests = 0;
+  const unassessedBelief = (dimension: string) => ({
+    dimension,
+    value: { status: "unassessed" },
+    source: { name: "none", version: "1" },
+    authority_class: "unknown",
+    fidelity_class: "unknown",
+    as_of: null,
+    resolver: null,
+    conflicting_assertion_count: 0,
+    evidence_obs_ids: [],
+    unassessed: true,
+  });
+  await page.route(`**/api/ansich/tasks/${TASK_ID}`, (route) =>
+    route.fulfill({
+      status: 200,
+      contentType: "application/json",
+      body: JSON.stringify({ task: TASK, projection_status: HEALTH }),
+    }),
+  );
+  // Task detail keeps its page-level queries running on every view.
+  await page.route(`**/api/ansich/tasks/${TASK_ID}/timeline`, (route) =>
+    route.fulfill({
+      status: 200,
+      contentType: "application/json",
+      body: JSON.stringify({
+        items: [],
+        next_cursor: null,
+        projection_status: HEALTH,
+      }),
+    }),
+  );
+  await page.route(`**/api/ansich/tasks/${TASK_ID}/steps`, (route) =>
+    route.fulfill({
+      status: 200,
+      contentType: "application/json",
+      body: JSON.stringify({
+        items: [],
+        system_operations: [],
+        projection_status: HEALTH,
+      }),
+    }),
+  );
+  await page.route(`**/api/ansich/tasks/${TASK_ID}/usage?*`, (route) =>
+    route.fulfill({
+      status: 200,
+      contentType: "application/json",
+      body: JSON.stringify({
+        usage: {
+          task_id: TASK_ID,
+          local: [],
+          inclusive: [],
+          inclusive_status: "available",
+        },
+        scope: "local",
+        values: [],
+        sources: [],
+        projection_status: HEALTH,
+      }),
+    }),
+  );
+  await page.route(`**/api/ansich/tasks/${TASK_ID}/budgets`, (route) =>
+    route.fulfill({
+      status: 200,
+      contentType: "application/json",
+      body: JSON.stringify({
+        budgets: { task_id: TASK_ID, budgets: [] },
+        health: [],
+        projection_status: HEALTH,
+      }),
+    }),
+  );
+  await page.route(
+    `**/api/ansich/tasks/${TASK_ID}/context-compressions?*`,
+    (route) =>
+      route.fulfill({
+        status: 200,
+        contentType: "application/json",
+        body: JSON.stringify({
+          items: [],
+          next_cursor: null,
+          projection_status: HEALTH,
+        }),
+      }),
+  );
+  await page.route(`**/api/ansich/tasks/${TASK_ID}/evaluations`, (route) =>
+    route.fulfill({
+      status: 200,
+      contentType: "application/json",
+      body: JSON.stringify({
+        task_id: TASK_ID,
+        quality_beliefs: [
+          {
+            dimension: "correctness",
+            value: { verdict: "fail" },
+            source: { name: "ansich-llm-judge", version: "1.0.0" },
+            authority_class: "soft_human",
+            fidelity_class: "soft",
+            as_of: "2026-07-17T12:00:05Z",
+            resolver: { name: "ansich-default", version: "2" },
+            conflicting_assertion_count: 2,
+            evidence_obs_ids: [EVALUATION_OBS_ID],
+            unassessed: false,
+          },
+          unassessedBelief("completeness"),
+          unassessedBelief("relevance"),
+          unassessedBelief("safety"),
+          unassessedBelief("efficiency"),
+        ],
+        evaluations: [
+          {
+            evaluation_obs_id: EVALUATION_OBS_ID,
+            subject_type: "task",
+            subject_id: TASK_ID,
+            task_id: TASK_ID,
+            evaluation_kind: "llm_judge",
+            dimension: "correctness",
+            verdict: "fail",
+            score: null,
+            scale_min: null,
+            scale_max: null,
+            scale_higher_is_better: null,
+            assessor_name: "ansich-llm-judge",
+            assessor_version: "1.0.0",
+            authority_class: "soft_human",
+            fidelity_class: "soft",
+            cohort_key: "ansich-regression@2026.08.1",
+            suite_id: "ansich-regression",
+            suite_version: "2026.08.1",
+            case_id: "case-1",
+            occurred_at: "2026-07-17T12:00:05Z",
+          },
+        ],
+        projection_status: HEALTH,
+      }),
+    }),
+  );
+  await page.route(
+    `**/api/ansich/evaluations/${EVALUATION_OBS_ID}/payload`,
+    (route) => {
+      payloadRequests += 1;
+      return route.fulfill({
+        status: 200,
+        contentType: "application/json",
+        body: JSON.stringify({
+          evaluation_obs_id: EVALUATION_OBS_ID,
+          payload: {
+            evaluation: {
+              expected: "a cited answer",
+              actual: "an uncited answer",
+              rationale: "no source was named",
+            },
+          },
+        }),
+      });
+    },
+  );
+
+  await page.goto(`/workspace/ansich/tasks/${TASK_ID}?view=evaluations`);
+
+  // The five R6 dimensions are always present, assessed or not.
+  const beliefs = page.getByRole("list", { name: "Quality evaluations" });
+  for (const dimension of [
+    "Correctness",
+    "Completeness",
+    "Relevance",
+    "Safety",
+    "Efficiency",
+  ]) {
+    await expect(beliefs.getByText(dimension, { exact: true })).toBeVisible();
+  }
+  // One resolved fail, rendered in the destructive tone.
+  const correctness = beliefs.getByRole("listitem", { name: "Correctness" });
+  await expect(correctness.getByText("fail", { exact: true })).toHaveClass(
+    /text-destructive/,
+  );
+  await expect(
+    correctness.getByText("soft_human", { exact: true }),
+  ).toBeVisible();
+  await expect(
+    correctness.getByText("ansich-llm-judge@1.0.0", { exact: true }),
+  ).toBeVisible();
+  await expect(
+    correctness.getByText("ansich-default@2", { exact: true }),
+  ).toBeVisible();
+  await expect(
+    correctness.getByText("Conflicting assertions: 2", { exact: true }),
+  ).toBeVisible();
+  // The four unassessed dimensions stay neutral — never green, never red.
+  const safety = beliefs.getByRole("listitem", { name: "Safety" });
+  await expect(safety.getByText("Unassessed", { exact: true })).toHaveClass(
+    /text-muted-foreground/,
+  );
+
+  // Recorded evaluations list its index rows with cohort/suite metadata.
+  const recorded = page.getByRole("list", { name: "Recorded evaluations" });
+  await expect(recorded.getByText("llm_judge", { exact: true })).toBeVisible();
+  // Both the cohort chip and the suite@version chip carry this identity.
+  await expect(
+    recorded.getByText("ansich-regression@2026.08.1", { exact: true }),
+  ).toHaveCount(2);
+
+  // Bodies are never fetched with the list: only an explicit expand loads them.
+  expect(payloadRequests).toBe(0);
+  await page.getByRole("button", { name: "Expected vs actual" }).click();
+  await expect(page.getByText("a cited answer")).toBeVisible();
+  await expect(page.getByText("an uncited answer")).toBeVisible();
+  await expect(page.getByText("no source was named")).toBeVisible();
+  expect(payloadRequests).toBe(1);
 });
 
 test("operations page preserves storage-unavailable detail from a 503", async ({

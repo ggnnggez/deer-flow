@@ -7,6 +7,7 @@ rs.mock("@/core/api/fetcher", () => ({
 import {
   AnsichApiError,
   compareAnsichAgentReleases,
+  fetchAnsichEvaluationPayload,
   fetchAnsichReleaseQuality,
   fetchAnsichStepEvaluations,
   fetchAnsichTaskEvaluations,
@@ -98,6 +99,41 @@ describe("Ansich evaluation API", () => {
     );
     expect(mockedFetch.mock.calls[0]?.[1]).toBeUndefined();
     expect(result).toEqual(body);
+  });
+
+  it("reads one evaluation's bodies from the audited no-store payload route", async () => {
+    const body = {
+      evaluation_obs_id: "obs/one",
+      payload: {
+        evaluation: {
+          expected: "a cited answer",
+          actual: "an uncited answer",
+          rationale: "no source was named",
+        },
+      },
+    };
+    mockedFetch.mockResolvedValue(jsonResponse(body));
+
+    const result = await fetchAnsichEvaluationPayload("obs/one");
+
+    expect(mockedFetch).toHaveBeenCalledWith(
+      expect.stringContaining("/api/ansich/evaluations/obs%2Fone/payload"),
+      { cache: "no-store" },
+    );
+    expect(result).toEqual(body);
+  });
+
+  it("surfaces a rejected evaluation payload read", async () => {
+    mockedFetch.mockResolvedValue({
+      ok: false,
+      status: 404,
+      statusText: "Not Found",
+      json: async () => ({ detail: "Ansich evaluation payload not found" }),
+    } as Response);
+
+    await expect(fetchAnsichEvaluationPayload("obs/one")).rejects.toThrow(
+      "Ansich evaluation payload not found",
+    );
   });
 
   it("omits the cohort filter from release quality when none is selected", async () => {
