@@ -782,3 +782,144 @@ async def test_sql_projects_scopes_authorization_and_effects_as_typed_rows(
     assert rebuilt_scopes == task_scopes
     assert rebuilt_authorization == authorization
     assert rebuilt_effects == effects
+
+
+@pytest.mark.anyio
+async def test_externalized_scope_authorization_and_effect_payloads_read_back(tmp_path) -> None:
+    engine = create_async_engine(f"sqlite+aiosqlite:///{tmp_path / 'safety-externalized-payloads.db'}")
+
+    @event.listens_for(engine.sync_engine, "connect")
+    def _enable_foreign_keys(dbapi_connection, _connection_record):
+        cursor = dbapi_connection.cursor()
+        cursor.execute("PRAGMA foreign_keys=ON")
+        cursor.close()
+
+    session_factory = async_sessionmaker(engine, expire_on_commit=False)
+    async with engine.begin() as connection:
+        await connection.run_sync(Base.metadata.create_all)
+    service = create_sql_ansich_service(
+        session_factory,
+        flush_interval_ms=60_000,
+        terminal_flush_timeout_ms=100,
+        projector_poll_interval_ms=5,
+        operations_assessment_interval_ms=60_000,
+        # An Observation is only ever read back with payload=None when its
+        # payload was externalized into ansich_payloads, so drive every payload
+        # in this test over the inline threshold instead of padding a field.
+        inline_payload_max_bytes=16,
+    )
+    await service.start()
+    task_id, step_id, tool_call_id = new_id(), new_id(), new_id()
+    observed_at = datetime(2026, 8, 18, 11, tzinfo=UTC)
+    producer = Producer(name="externalized-payload-test", version="1", instance_id="test")
+    scope_obs_id, authorization_obs_id, effect_obs_id = new_id(), new_id(), new_id()
+    scope = ScopeDescriptor(
+        scope_id=new_id(),
+        scope_kind="workspace",
+        external_ref_hash="a" * 64,
+        display_label="workspace",
+        created_obs_id=scope_obs_id,
+    )
+    snapshot = AuthorizationSnapshot(
+        snapshot_id=new_id(),
+        tool_call_id=tool_call_id,
+        policy_id="externalized-payload-policy",
+        policy_version="1",
+        policy_hash="b" * 64,
+        decision="allowed",
+        details_available=False,
+        evaluated_at=observed_at,
+        evidence_obs_ids=(authorization_obs_id,),
+    )
+    effect = ToolEffect(
+        effect_id=new_id(),
+        tool_call_id=tool_call_id,
+        effect_class="filesystem_write",
+        phase="observed",
+        scope_id=scope.scope_id,
+        target_hash="c" * 64,
+        target_preview="workspace/report.md",
+        fidelity_class="hard",
+        source_obs_id=effect_obs_id,
+        result_metadata={"status": "written"},
+    )
+    externalized_obs_ids = (scope_obs_id, authorization_obs_id, effect_obs_id)
+
+    try:
+        service.record(
+            ObservationEnvelope.task_lifecycle(
+                kind="task.created",
+                task_id=task_id,
+                source_kind="deerflow_run",
+                source_id="externalized-payload-run",
+                occurred_at=observed_at,
+                source_event_id="externalized-payload:task:created",
+            )
+        )
+        await service.flush_task(task_id)
+        service.record_batch(
+            (
+                ObservationEnvelope(
+                    obs_id=scope_obs_id,
+                    kind="scope.snapshotted",
+                    occurred_at=observed_at,
+                    task_id=task_id,
+                    subject_type="scope",
+                    subject_id=scope.scope_id,
+                    producer=producer,
+                    source_event_id="externalized-payload:scope:snapshotted",
+                    correlation_id="externalized-payload-run",
+                    payload={"scope": scope.model_dump(mode="json")},
+                ),
+                ObservationEnvelope(
+                    obs_id=authorization_obs_id,
+                    kind="authorization.allowed",
+                    occurred_at=observed_at,
+                    task_id=task_id,
+                    step_id=step_id,
+                    subject_type="authorization_snapshot",
+                    subject_id=snapshot.snapshot_id,
+                    producer=producer,
+                    source_event_id="externalized-payload:authorization:allowed",
+                    correlation_id="externalized-payload-run",
+                    payload={"snapshot": snapshot.model_dump(mode="json")},
+                ),
+                ObservationEnvelope(
+                    obs_id=effect_obs_id,
+                    kind="effect.observed",
+                    occurred_at=observed_at,
+                    task_id=task_id,
+                    step_id=step_id,
+                    subject_type="effect",
+                    subject_id=effect.effect_id,
+                    producer=producer,
+                    source_event_id="externalized-payload:effect:observed",
+                    correlation_id="externalized-payload-run",
+                    payload={"effect": effect.model_dump(mode="json")},
+                ),
+            )
+        )
+        await service.flush_task(task_id)
+
+        async with session_factory() as session:
+            stored_rows = list((await session.execute(select(AnsichObservationRow).where(AnsichObservationRow.obs_id.in_(externalized_obs_ids)))).scalars())
+        stored_payload_state = {row.obs_id: (row.payload_json, row.payload_ref_id is not None) for row in stored_rows}
+
+        timeline = await service.list_timeline(task_id, limit=50)
+        observations = await service.list_observations(task_id)
+    finally:
+        await service.stop()
+        await engine.dispose()
+
+    assert stored_payload_state == {obs_id: (None, True) for obs_id in externalized_obs_ids}
+    for read_back in (dict((observation.obs_id, observation) for _, observation in timeline), {observation.obs_id: observation for observation in observations}):
+        assert set(externalized_obs_ids) <= set(read_back)
+        assert read_back[scope_obs_id].kind == "scope.snapshotted"
+        assert read_back[scope_obs_id].subject_id == scope.scope_id
+        assert read_back[authorization_obs_id].kind == "authorization.allowed"
+        assert read_back[authorization_obs_id].subject_id == snapshot.snapshot_id
+        assert read_back[effect_obs_id].kind == "effect.observed"
+        assert read_back[effect_obs_id].subject_id == effect.effect_id
+        for obs_id in externalized_obs_ids:
+            assert read_back[obs_id].payload is None
+            assert read_back[obs_id].payload_ref_id is not None

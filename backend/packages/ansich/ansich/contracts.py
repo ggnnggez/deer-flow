@@ -241,35 +241,38 @@ class ObservationEnvelope(BaseModel):
         elif self.kind.startswith("operator.action_") and (self.subject_type != "task" or self.subject_id != self.task_id):
             raise ValueError("Operator action observation subject must identify task_id")
         elif self.kind == "scope.snapshotted":
-            from ansich.safety import ScopeDescriptor
-
             if self.subject_type != "scope":
                 raise ValueError("scope observation subject_type must be scope")
-            scope = ScopeDescriptor.model_validate((self.payload or {}).get("scope"), strict=False)
-            if scope.scope_id != self.subject_id:
-                raise ValueError("scope observation subject must identify payload scope")
-        elif self.kind.startswith("authorization."):
-            from ansich.safety import AuthorizationSnapshot
+            if self.payload is not None:
+                from ansich.safety import ScopeDescriptor
 
+                scope = ScopeDescriptor.model_validate(self.payload.get("scope"), strict=False)
+                if scope.scope_id != self.subject_id:
+                    raise ValueError("scope observation subject must identify payload scope")
+        elif self.kind.startswith("authorization."):
             if self.subject_type != "authorization_snapshot":
                 raise ValueError("authorization observation subject_type must be authorization_snapshot")
-            snapshot = AuthorizationSnapshot.model_validate((self.payload or {}).get("snapshot"), strict=False)
-            if snapshot.snapshot_id != self.subject_id:
-                raise ValueError("authorization observation subject must identify payload snapshot")
-            if self.kind != "authorization.evaluated":
-                expected_kind = f"authorization.{snapshot.decision}"
-                if self.kind != expected_kind:
-                    raise ValueError("authorization observation kind does not match snapshot decision")
-        elif self.kind.startswith("effect."):
-            from ansich.safety import ToolEffect
+            if self.payload is not None:
+                from ansich.safety import AuthorizationSnapshot
 
+                snapshot = AuthorizationSnapshot.model_validate(self.payload.get("snapshot"), strict=False)
+                if snapshot.snapshot_id != self.subject_id:
+                    raise ValueError("authorization observation subject must identify payload snapshot")
+                if self.kind != "authorization.evaluated":
+                    expected_kind = f"authorization.{snapshot.decision}"
+                    if self.kind != expected_kind:
+                        raise ValueError("authorization observation kind does not match snapshot decision")
+        elif self.kind.startswith("effect."):
             if self.subject_type != "effect":
                 raise ValueError("effect observation subject_type must be effect")
-            effect = ToolEffect.model_validate((self.payload or {}).get("effect"), strict=False)
-            if effect.effect_id != self.subject_id:
-                raise ValueError("effect observation subject must identify payload effect")
-            if self.kind != f"effect.{effect.phase}":
-                raise ValueError("effect observation kind does not match effect phase")
+            if self.payload is not None:
+                from ansich.safety import ToolEffect
+
+                effect = ToolEffect.model_validate(self.payload.get("effect"), strict=False)
+                if effect.effect_id != self.subject_id:
+                    raise ValueError("effect observation subject must identify payload effect")
+                if self.kind != f"effect.{effect.phase}":
+                    raise ValueError("effect observation kind does not match effect phase")
         elif self.kind == "evaluation.recorded":
             if self.subject_type not in {"task", "step", "tool_call", "content_block", "agent_release"}:
                 raise ValueError("evaluation.recorded requires a task/step/tool_call/content_block/agent_release subject")

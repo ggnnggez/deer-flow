@@ -15,7 +15,7 @@
 | F10-5 | score delta 的真实分母 `score_count` 在视图边界被丢弃,门禁与展示都用 `assessed_count` | ⬜ 未修复 | — | — |
 | F10-6 | 兄弟 rollup(`_refresh_behavior_belief`、usage/budget 读模型)仍是未串行化的 read-modify-write | ⬜ 未修复 | — | — |
 | F10-7 | 缺 per-observation 持久化信号,存在「observation 丢失但回执永远 pending」的窗口 | ⬜ 未修复 | — | — |
-| F10-8 | `contracts.py` 的 scope/authorization/effect 三个 `_validate_subject` 分支缺 payload-None 守卫(既存缺陷) | ⬜ 未修复 | — | — |
+| F10-8 | `contracts.py` 的 scope/authorization/effect 三个 `_validate_subject` 分支缺 payload-None 守卫(既存缺陷) | ✅ 已修复 | 2026-08-18 | 本次变更待提交 |
 | F10-9 | 同一组常量六处复制(suite-bound kinds ×3、五维度集合 ×3) | ⬜ 未修复 | — | — |
 | F10-10 | settle 时序 flaky 未隔离:在负载下轮换命中无关测试 | ⬜ 未修复 | — | — |
 | F10-11 | pass-rate 兜底未标注量表极性 | ⬜ 未修复 | — | — |
@@ -88,7 +88,8 @@
 
 ## F10-8. 三个 `_validate_subject` 分支缺 payload-None 守卫
 
-- 状态:⬜ 未修复(既存缺陷,非本阶段引入)。
+- 状态:✅ 已修复(2026-08-18,本次变更待提交)。把 `evaluation.recorded` 分支的守卫模式原样复制到 `scope.snapshotted`/`authorization.*`/`effect.*` 三个分支:subject_type 检查保持无条件,只有 payload 交叉校验挪进 `if self.payload is not None:`,payload 在手时的校验强度一字未改(`test_safety_contracts.py` 里 kind/decision、kind/phase 两条冲突拒绝用例未改动仍绿)。回归钉子:`backend/tests/ansich/test_sql_safety.py::test_externalized_scope_authorization_and_effect_payloads_read_back`——服务按 `inline_payload_max_bytes=16` 构造,让每条 payload 都走 externalize,记录 scope/authorization/effect 三条 observation 并 flush,先断言这三行在库里确实是 `payload_json IS NULL AND payload_ref_id IS NOT NULL`,再经 `service.list_timeline()` 与 `service.list_observations()` 两个公共读读回。RED 证据:读路径不是降级成空/degraded,而是直接抛 `ValidationError: Input should be a valid dictionary or instance of ScopeDescriptor [input_value=None]`(`sql.py:5574` 的 `_observation_from_row`);逐个分支补守卫时报错依次换成 `AuthorizationSnapshot`、`ToolEffect`,三个分支各自都被这一条用例钉住。附带确认:`_claim_projection_job` 同样先 `_observation_from_row` 再 hydrate payload,所以修复前这三种 kind 的 externalized observation 连投影都认领不了,job 永远 pending、`flush_task` 只能等到 `projection_settle_timeout`——"能写进去、再也读不出来"比诊断记录的还要广一层。
+- 原始诊断(留档):
 - 位置:`backend/packages/ansich/ansich/contracts.py` 的 `scope.snapshotted`/`authorization.*`/`effect.*` 分支(contracts.py:243-271);`evaluation.recorded` 分支(:273-283)是正确的参考写法。
 - 现状:这三个分支无条件 `model_validate((self.payload or {}).get(...))`,payload 为 `None` 时直接抛错。externalize 的 observation 在 `_observation_from_row` 里重新校验时 payload 不在手上,于是这些 kind 一旦走 externalize 路径就是"能写进去、再也读不出来"。`evaluation.recorded` 分支用 `if self.payload is not None:` 把交叉校验包起来,是本仓库里唯一正确的样板。
 - 方向:把 evaluation 分支的守卫模式复制到这三个分支,不改变 payload 在手时的校验强度;补一条 externalized payload 往返的回归。
