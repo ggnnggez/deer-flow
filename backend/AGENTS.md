@@ -469,7 +469,15 @@ payloads externalize through `ansich_payloads`) and load only through the logged
 count/byte capacity plus both high-watermarks, and snapshot
 accepted/dropped/item/byte/incomplete/missing counts. Queue byte accounting uses
 the canonical serialized Observation envelope size, so large tool artifacts and
-base64 payloads cannot bypass the in-process memory bound.
+base64 payloads cannot bypass the in-process memory bound. Queue count/byte
+overflow remains fail-open, but emits an immediate structured WARNING carrying
+the UTC detection time, reason, task/producer/sequence ranges, and queue
+watermarks; warnings are rate-limited to one per service per 60 seconds and log
+handler failures are swallowed. A later successful Observation write also
+persists unreported task-scoped ranges as `observability.degraded`; periodic
+operations assessment copies current in-memory ranges into the active-task read
+model, but that read-model field is refreshed from empty memory after restart
+and is not the durable source of record for historical loss.
 The polled Operations Task list uses one portable CTE + outer-join query over
 TaskSummary/current assertion/ordered evidence; pagination happens before
 evidence fan-out, and an isolated missing assertion yields a degraded row rather
@@ -598,6 +606,13 @@ the same subject/assessor/version into one evaluation at their highest evidence
 watermark; absorbed lower jobs complete without an attempt, while retry backoff
 and version boundaries remain intact. Action-repetition loads ordered
 Step/Tool inputs with one batch outer join instead of one Tool query per Step.
+Assessment persistence first requires its subject Entity; a missing dependency
+keeps the assessor job pending without consuming an attempt or writing a hard
+assessor-error row, so scope-safety self-heals when its ToolCall projection
+lands. The wait carries its own durable `dependency_pending_since` anchor and
+shares `projector_dependency_timeout_seconds`, so a subject that never arrives
+crosses the deadline into the same durable failed-job and operator retry path
+as projector dependency waits instead of polling forever.
 Evaluations read only evidence at or below their watermark, and no-evidence
 results use the watermark event time as `as_of`, not the later processing time.
 Absolute wall-time assessment takes the maximum of
@@ -1053,6 +1068,7 @@ This invokes `alembic revision --autogenerate` against the live ORM models. Revi
 - `migrations/versions/0019_ansich_task_tree_usage.py` — Phase 8 typed parent/child Task spawns and ancestry closure, source-aware usage contributions, and local/inclusive usage summaries
 - `migrations/versions/0020_ansich_scope_safety.py` — Phase 9 typed Scope, authorization, ToolEffect, and scope-safety conclusion storage
 - `migrations/versions/0021_ansich_summary_assertion_fk.py` — nullable Task-summary assertion pointer with `ON DELETE SET NULL` for degraded missing-assertion reads
+- `migrations/versions/0022_ansich_assessor_deadline.py` — durable first-seen time for dependency-pending assessor jobs and their bounded failure deadline
 - `persistence/bootstrap.py` — `bootstrap_schema(engine, backend=...)`, the three-branch decision + locking
 - Tests: `tests/test_persistence_bootstrap.py` (branches), `tests/test_persistence_bootstrap_concurrency.py` (concurrency), `tests/test_persistence_bootstrap_regression.py` (issue #3682), `tests/test_persistence_migrations_env.py` (filter), `tests/blocking_io/test_persistence_bootstrap.py` (asyncio.to_thread anchor)
 
