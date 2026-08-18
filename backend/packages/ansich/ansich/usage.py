@@ -22,6 +22,19 @@ _STRUCTURAL_DIMENSION_BY_KIND: dict[str, UsageDimension] = {
 
 _BUDGET_CONSUMED_USAGE_DIMENSIONS: frozenset[UsageDimension] = frozenset({"wall_time_ms", "child_tasks_spawned"})
 
+#: Dimensions whose contributions carry a *cumulative* measurement rather than
+#: an increment: ``delta`` is the total observed so far for that source Task, so
+#: aggregation takes the maximum per source Task and only then sums across
+#: sources. Every other dimension is a sum-type delta.
+MAX_TYPE_USAGE_DIMENSIONS: frozenset[UsageDimension] = frozenset({"wall_time_ms"})
+
+#: Observation kinds that re-report a max-type dimension on every tick of one
+#: Task. Their contributions must be stored as a single high-water mark per
+#: ``(aggregate Task, source Task)`` — appending one durable row per tick makes
+#: both the write volume and the summary refresh grow with the tick count
+#: (phase-8 review followup M2, direction ①).
+HIGH_WATER_USAGE_KINDS: frozenset[str] = frozenset({"task.heartbeat"})
+
 
 class UsageContribution(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True, strict=True)

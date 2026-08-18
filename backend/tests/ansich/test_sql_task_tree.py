@@ -125,7 +125,7 @@ def test_phase8_task_tree_migration_upgrades_sqlite(tmp_path) -> None:
     finally:
         engine.dispose()
 
-    assert revision == "0023_ansich_evaluations"
+    assert revision == "0024_ansich_wall_time_watermarks"
     assert {"ansich_task_spawns", "ansich_task_ancestry"} <= table_names
     assert "aggregate_task_id" in contribution_columns
     assert "task_id" not in contribution_columns

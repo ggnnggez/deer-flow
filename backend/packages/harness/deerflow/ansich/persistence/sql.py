@@ -139,6 +139,8 @@ from ansich.safety import AuthorizationPermission, AuthorizationSnapshot, ScopeD
 from ansich.task_tree import TaskSpawnView, TaskTreeDirection
 from ansich.tool import ContentDerivationSourceRole, ToolTransformKind
 from ansich.usage import (
+    HIGH_WATER_USAGE_KINDS,
+    MAX_TYPE_USAGE_DIMENSIONS,
     AggregationScope,
     TaskUsageBreakdownView,
     TaskUsageSourceView,
@@ -1962,6 +1964,11 @@ class SqlAnsichBackend:
                         AnsichTaskHeartbeatRow.elapsed_ms.desc(),
                         AnsichObservationRow.ingest_seq.desc(),
                     )
+                    # Only the highest-elapsed row is read; without the LIMIT
+                    # this assessment materialized every historical tick, which
+                    # is the same read amplification P8-M2 removes on the
+                    # contribution side.
+                    .limit(1)
                 )
             ).all()
         )
@@ -5731,17 +5738,22 @@ class SqlAnsichBackend:
         local_rows = list(
             (
                 await session.execute(
-                    select(AnsichUsageContributionRow).where(
+                    select(AnsichUsageContributionRow, AnsichObservationRow.kind)
+                    .join(
+                        AnsichObservationRow,
+                        AnsichObservationRow.obs_id == AnsichUsageContributionRow.source_obs_id,
+                    )
+                    .where(
                         AnsichUsageContributionRow.aggregate_task_id == AnsichUsageContributionRow.source_task_id,
                         AnsichUsageContributionRow.source_task_id.in_(descendant_task_ids),
                     )
                 )
-            ).scalars()
+            ).all()
         )
         changed: set[tuple[str, str]] = set()
         for ancestor_task_id in ancestor_task_ids:
-            for row in local_rows:
-                inserted = await self._insert_usage_contribution(
+            for row, source_kind in local_rows:
+                inserted = await self._store_usage_contribution(
                     session,
                     aggregate_task_id=ancestor_task_id,
                     source_task_id=row.source_task_id,
@@ -5749,6 +5761,10 @@ class SqlAnsichBackend:
                     source_obs_id=row.source_obs_id,
                     delta=row.delta,
                     as_of=_as_utc(row.as_of),
+                    # The descendant's own high-water mark stays a high-water
+                    # mark on the new ancestor, so a late spawn edge cannot
+                    # reintroduce a second wall_time row for that source.
+                    high_water=(source_kind in HIGH_WATER_USAGE_KINDS and row.dimension in MAX_TYPE_USAGE_DIMENSIONS),
                 )
                 if inserted:
                     changed.add((ancestor_task_id, row.dimension))
@@ -6169,10 +6185,11 @@ class SqlAnsichBackend:
                 )
                 if existing_tool_contribution is not None:
                     continue
+            high_water = observation.kind in HIGH_WATER_USAGE_KINDS and contribution.dimension in MAX_TYPE_USAGE_DIMENSIONS
             ancestor_ids = tuple((await session.execute(select(AnsichTaskAncestryRow.ancestor_task_id).where(AnsichTaskAncestryRow.descendant_task_id == contribution.source_task_id))).scalars())
             targets = (contribution.source_task_id, *ancestor_ids)
             for aggregate_task_id in targets:
-                inserted = await self._insert_usage_contribution(
+                inserted = await self._store_usage_contribution(
                     session,
                     aggregate_task_id=aggregate_task_id,
                     source_task_id=contribution.source_task_id,
@@ -6180,6 +6197,7 @@ class SqlAnsichBackend:
                     source_obs_id=contribution.source_obs_id,
                     delta=contribution.delta,
                     as_of=contribution.as_of,
+                    high_water=high_water,
                 )
                 if not inserted:
                     continue
@@ -6198,6 +6216,109 @@ class SqlAnsichBackend:
                     aggregation_scope="inclusive",
                     updated_at=observation.recorded_at,
                 )
+
+    @classmethod
+    async def _store_usage_contribution(
+        cls,
+        session: AsyncSession,
+        *,
+        aggregate_task_id: str,
+        source_task_id: str,
+        dimension: str,
+        source_obs_id: str,
+        delta: int,
+        as_of: datetime,
+        high_water: bool,
+    ) -> bool:
+        """Persist one contribution, returning whether the aggregate changed.
+
+        Sum-type dimensions append an immutable row keyed by
+        ``(aggregate, source, dimension, source_obs_id)``. Max-type dimensions
+        fed by a repeating tick (``HIGH_WATER_USAGE_KINDS``) instead keep ONE
+        row per ``(aggregate, source)``, replaced only when the new observation
+        raises the high-water mark — see ``_upsert_high_water_contribution``.
+        """
+
+        if not high_water:
+            return await cls._insert_usage_contribution(
+                session,
+                aggregate_task_id=aggregate_task_id,
+                source_task_id=source_task_id,
+                dimension=dimension,
+                source_obs_id=source_obs_id,
+                delta=delta,
+                as_of=as_of,
+            )
+        return await cls._upsert_high_water_contribution(
+            session,
+            aggregate_task_id=aggregate_task_id,
+            source_task_id=source_task_id,
+            dimension=dimension,
+            source_obs_id=source_obs_id,
+            delta=delta,
+            as_of=as_of,
+        )
+
+    @staticmethod
+    async def _upsert_high_water_contribution(
+        session: AsyncSession,
+        *,
+        aggregate_task_id: str,
+        source_task_id: str,
+        dimension: str,
+        source_obs_id: str,
+        delta: int,
+        as_of: datetime,
+    ) -> bool:
+        """Keep one high-water contribution row per ``(aggregate, source)``.
+
+        The stored row is the lexicographic maximum of
+        ``(delta, as_of, source_obs_id)`` over every tick observed so far, which
+        makes the update commutative and idempotent: replaying an already-seen
+        or an out-of-order tick converges on the same row, so
+        ``rebuild_projections()`` reproduces the projection exactly.
+
+        Only rows produced by a ``HIGH_WATER_USAGE_KINDS`` observation take part.
+        A terminal ``budget.consumed`` wall_time contribution arrives once per
+        Task, keeps its own immutable row, and therefore keeps its own evidence
+        alongside the heartbeat mark.
+        """
+
+        existing = list(
+            (
+                await session.execute(
+                    select(AnsichUsageContributionRow)
+                    .join(
+                        AnsichObservationRow,
+                        AnsichObservationRow.obs_id == AnsichUsageContributionRow.source_obs_id,
+                    )
+                    .where(
+                        AnsichUsageContributionRow.aggregate_task_id == aggregate_task_id,
+                        AnsichUsageContributionRow.source_task_id == source_task_id,
+                        AnsichUsageContributionRow.dimension == dimension,
+                        AnsichObservationRow.kind.in_(HIGH_WATER_USAGE_KINDS),
+                    )
+                )
+            ).scalars()
+        )
+        candidate = (delta, as_of, source_obs_id)
+        if existing and max((row.delta, _as_utc(row.as_of), row.source_obs_id) for row in existing) >= candidate:
+            return False
+        for row in existing:
+            await session.delete(row)
+        await session.flush()
+        session.add(
+            AnsichUsageContributionRow(
+                aggregate_task_id=aggregate_task_id,
+                source_task_id=source_task_id,
+                dimension=dimension,
+                source_obs_id=source_obs_id,
+                delta=delta,
+                as_of=as_of,
+            )
+        )
+        await session.flush()
+        return True
 
     @staticmethod
     async def _insert_usage_contribution(

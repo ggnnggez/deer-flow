@@ -7,7 +7,7 @@
 | 编号 | 摘要 | 状态 | 修复时间 | Commit |
 | ---- | ---- | ---- | -------- | ------ |
 | M1 | `wall_time_ms/local` 由 `_project_heartbeat` 与 `_project_usage` 双写者共同拥有,职责重叠 | ✅ 已修复(2026-08-19,本次变更待提交) | 2026-08-19 | 本次变更待提交 |
-| M2 | heartbeat 每 tick 落一条持久 wall_time contribution,叠加 recompute-per-insert 的 summary 刷新,长任务写/读放大随 tick 平方增长 | ⬜ 未修复 | — | — |
+| M2 | heartbeat 每 tick 落一条持久 wall_time contribution,叠加 recompute-per-insert 的 summary 刷新,长任务写/读放大随 tick 平方增长 | ✅ 已修复(方向 ①,2026-08-19,本次变更待提交) | 2026-08-19 | 本次变更待提交 |
 | L1 | `_aexecute` 吞掉 `asyncio.CancelledError` 且不 re-raise | ⬜ 未修复 | — | — |
 | L2 | `get_task_tree` 每节点 5 查询各自开 session,大树 N+1 | ⬜ 未修复 | — | — |
 
@@ -21,10 +21,17 @@
 
 ## M2. heartbeat wall_time 的写/读放大
 
-- 状态:⬜ 未修复。
+- 状态:✅ 已修复(方向 ① / 裁决 HR1,2026-08-19,本次变更待提交)。wall_time 现按 max 型高水位通道存储:heartbeat 来源的 `wall_time_ms` contribution 对每个 `(aggregate_task_id, source_task_id)` 只保留一行,新 tick 仅在抬高水位时替换该行,不再每 tick 追加。方向 ②(sum 维度的通用增量刷新)按 HR1 留待 Phase 11。
+  - **存储形态决策(HR1 只固定语义、不固定存储)**:复用 `ansich_usage_contributions`,不新建水位表。理由是消费端零改动即可保持语义——`_refresh_usage_summary`、`_assess_absolute_limits_at`、`get_task_usage_breakdown`、`_assess_budget_rows`、rebuild 删除清单全部已经按"每 source 取 max 再跨 source 求和"读该表,把 N 行压成 1 行不改变任何一处的结果;新建表则要同时改这五处并做并集读,风险更大而收益为零。写入侧新增 `_store_usage_contribution`(按 `high_water` 分派)与 `_upsert_high_water_contribution`(读取该 pair 的 heartbeat 来源行,按 `(delta, as_of, source_obs_id)` 字典序比较,仅在严格增大时 delete+insert)。max 可交换、幂等,因此乱序 tick 与 `rebuild_projections()` 收敛到同一行。
+  - **对 RFC 幂等键的偏离(需留档)**:RFC 的 `(source_obs_id, dimension)` 幂等键论证针对 sum 型维度——每条观察贡献一个独立增量,行不可变才不会重复计数。wall_time 是 max 型(每 tick 重报累计值),重复计数本就不成立,幂等由 max 保证而非由行不可变保证;因此该表对 `task.heartbeat` 来源的 wall_time 行不再是 append-only。主键 `(aggregate, source, dimension, source_obs_id)` 不变,被支配的历史行由迁移 `0024` 删除。语义声明集中在 `ansich/usage.py::MAX_TYPE_USAGE_DIMENSIONS` 与 `::HIGH_WATER_USAGE_KINDS`(框架无关层),而不是散落在 SQL 层的字符串比较里。
+  - **终态 wall_time 不受影响**:`budget.consumed` 的终态 wall_time 每个 Task 只有一条(来自 Task 单调时钟),仍走原有的不可变 contribution 行,因此 `_assess_absolute_limits_at` 的"终态贡献与最新 heartbeat elapsed 取 max、并保留两条证据路径"语义逐字保留(`test_sql_alerts.py::test_sql_terminal_wall_time_breach_keeps_final_interval_after_last_heartbeat` 与新增的 `test_sql_heartbeat.py::test_terminal_wall_time_keeps_its_own_row_beside_the_heartbeat_high_water_mark` 双向锁定);`test_sql_budget.py` 未做任何修改且保持绿色。顺带把 `_assess_absolute_limits_at` 中"取全部 heartbeat 行再取第一条"的查询加上 `.limit(1)`(行为等价,消除同一路径上另一处 O(N) 读放大)。
+  - **as_of 不变量**:summary 的 `as_of` 仍等于喂给它的最新 wall_time 证据时间(heartbeat 水位行的 as_of 与终态 contribution 的 as_of 取 max)。被支配但更晚的终态贡献保留独立行,正是为了不丢这个 provenance(见 M1 的 `test_wall_time_summary_is_written_only_from_usage_contributions`,该用例只把行数断言 3 改为 2,值/as_of/watermark 断言原样保留)。
+  - **已知取舍(方向 ① 的固有代价,留档)**:不再保留 per-tick 历史,因此"某个旧 evidence watermark 时刻的 elapsed 是多少"不再可答。local 作用域无影响——`_assess_absolute_limits_at` 另有 `ansich_task_heartbeats` 全量 tick 证据路径,按 watermark 取 max 精确复原;仅 inclusive 作用域在"祖先的 assessor job watermark 低于后代水位行所属观察"的少见时序下会漏计该后代(读到 0),表现为**偏低**而非误报,且下一次更高 watermark 的 assessor job 与周期性 `_assess_budget_rows`(读 summary,精确)都会立即纠正。要做到精确需按 watermark 扫整棵子树的 heartbeat 行,那恰好会把本项要消除的读放大搬到另一张表上。
+  - **退化态(承接 M1 的单一写者取舍,留档)**:usage projector 持久失败而 heartbeat projector 成功时,wall_time summary 不存在(unknown)——本次改动不改变这一点。M1 之后 `_refresh_usage_summary` 是 wall_time summary 的唯一写者,因此不再有"heartbeat 写者兜底"的第二条路径;这是"单一事实源"换来的可观测性代价,由 projection health / failed-job 面板暴露。
 - 位置:`backend/packages/ansich/ansich/usage.py::usage_contributions_for_observation`(`task.heartbeat` 现返回一条 `wall_time_ms` contribution,`source_obs_id=heartbeat.obs_id` 每 tick 唯一)+ `sql.py::_project_usage`(对 `(source, *ancestors)` 每个 aggregate 各 insert 一行)+ `::_refresh_usage_summary`(每次 insert 后全量重扫该 aggregate/dimension 的所有 contribution)。
 - 现状:Phase 5 的 heartbeat 只对单行 `AnsichTaskUsageRow` 做 O(1) 的 max 更新;Phase 8 改为每个 heartbeat tick 落一条持久 `ansich_usage_contributions` 行,并按 ancestry fan-out 到每个祖先。一个等待子任务的长活 parent(默认 10 秒心跳)每小时 360 tick,×(1+祖先数)条 wall_time 行;`_refresh_usage_summary` 又在每次 insert 时全量重算该 aggregate 的 wall_time(max-per-source-then-sum),于是 parent inclusive wall_time 的刷新是 O(H²)。同样的 recompute-per-insert 模式作用于 token/step/tool 维度的 fan-out:parent inclusive 每收到一条子贡献就全量重扫所有子贡献,总代价 O(N²)(N=贡献总数)。对 v1(短任务、单层树、admin-only、lazy 读)可接受,但心跳频繁、parent 可长期挂起等待子任务,这是明确的扩展性悬崖。
-- 方向(择一或组合):① wall_time 不进 per-tick contribution 行——heartbeat 仍走单行 high-water-mark(把 wall_time 视为 max-型维度而非 sum-型 delta,inclusive 侧单独按 source 汇总各自的 water-mark),避免每 tick 落行;② `_refresh_usage_summary` 从"全量重算"改为增量(对 sum 维度做 `+= delta`,对 wall_time 维度维护 per-source 的当前 max 并只在超过时调整总和),消除 recompute-per-insert;两者都需配"贡献数增长时刷新工作量不呈平方"的性能护栏测试(参考 P5-M1 的 SQL 监听回归写法)。
+- 方向(择一或组合):① wall_time 不进 per-tick contribution 行——heartbeat 仍走单行 high-water-mark(把 wall_time 视为 max-型维度而非 sum-型 delta,inclusive 侧单独按 source 汇总各自的 water-mark),避免每 tick 落行;② `_refresh_usage_summary` 从"全量重算"改为增量(对 sum 维度做 `+= delta`,对 wall_time 维度维护 per-source 的当前 max 并只在超过时调整总和),消除 recompute-per-insert;两者都需配"贡献数增长时刷新工作量不呈平方"的性能护栏测试(参考 P5-M1 的 SQL 监听回归写法)。**已按 HR1 落地 ①;② 留待 Phase 11。**
+- 迁移:`0024_ansich_wall_time_watermarks`(chains from `0023_ansich_evaluations`)。纯数据迁移、无 schema 变更:按与投影器同一套 `(delta, as_of, source_obs_id)` 全序,删除被严格支配的 heartbeat 来源 wall_time 行,每个 `(aggregate, source)` 只留水位行;终态 `budget.consumed` 行与所有 sum 型维度不动。因所有消费端都以 max 归约同一 `(aggregate, source)`,删除非最大行不改变任何读出值,故 `ansich_task_usage` summary 刻意不重写。upgrade 以 inspector 守卫建表缺失并可重复执行(0016/0023 先例);downgrade 结构上为 no-op——被删的是可重建的投影产物而非源事实,heartbeat 观察原样保留,`rebuild_projections()` 会按当时运行的代码版本重新生成(与 0019 downgrade 先删派生行的处理同源)。
 - 归属:Phase 11 前完成(与 M1 同批治理 wall_time 通道);load test 前若发现 parent 挂起时间长可提前。
 
 ## L1. `_aexecute` 吞 `CancelledError` 不 re-raise
@@ -59,6 +66,6 @@
 ## 计划测试矩阵缺口(随修复补齐)
 
 - M1:✅ 已补齐(2026-08-19)——`test_sql_heartbeat.py::test_heartbeat_projector_alone_does_not_maintain_wall_time_summary`(usage projector 关闭后 heartbeat 不单独维护 wall_time summary)与 `::test_wall_time_summary_is_written_only_from_usage_contributions`(summary 等于 contribution 模型的权威值)。
-- M2:贡献数增长时 summary 刷新工作量不呈平方(SQL 监听护栏)。
+- M2:✅ 已补齐(2026-08-19)——`test_sql_heartbeat.py::test_wall_time_refresh_work_per_tick_does_not_grow_with_tick_count`(SQL 监听护栏:每 tick 触及 `ansich_usage_contributions` 的语句数恒定,且刷新扫描集恒为 1 行,累计工作量线性而非平方)、`::test_heartbeat_ticks_keep_one_wall_time_high_water_row_per_source`(N tick 后每个 `(aggregate, source)` 恰好 1 行,含 ancestry fan-out,local/inclusive 值不变)、`::test_out_of_order_heartbeats_converge_on_the_wall_time_high_water_mark`(乱序 + `rebuild_projections()` 重放同一行)、`::test_terminal_wall_time_keeps_its_own_row_beside_the_heartbeat_high_water_mark`(终态与 heartbeat 两条证据路径均保留)、`::test_wall_time_watermark_migration_collapses_historical_per_tick_rows`(历史行折叠、终态/sum 维度不动、可重复执行)。
 - L1:取消后终态 first-writer 且资源清理完成。
 - L2:tree 查询次数按节点批量而非线性增长。

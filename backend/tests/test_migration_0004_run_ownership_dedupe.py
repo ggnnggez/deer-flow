@@ -158,7 +158,7 @@ async def test_migration_dedupes_duplicate_active_rows_before_unique_index(tmp_p
             version_row = raw.execute("SELECT version_num FROM alembic_version").fetchone()
         # init_engine upgrades to the repository head after applying the 0004
         # dedupe, so later revisions must also be reflected here.
-        assert version_row[0] == "0023_ansich_evaluations"
+        assert version_row[0] == "0024_ansich_wall_time_watermarks"
 
         # Sanity: the invariant the index enforces is now true — at most one
         # active row per thread.

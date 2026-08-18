@@ -40,7 +40,9 @@ from deerflow.ansich.persistence.models import (
 )
 from deerflow.persistence.base import Base
 
-EVALUATION_REVISION = "0023_ansich_evaluations"
+# The two migration tests below upgrade to ``head``, so this pin tracks the
+# current head revision rather than the evaluation revision itself.
+HEAD_REVISION = "0024_ansich_wall_time_watermarks"
 PREVIOUS_REVISION = "0022_ansich_assessor_deadline"
 EVALUATION_TABLES = {"ansich_evaluation_index", "ansich_release_quality_stats"}
 
@@ -116,7 +118,7 @@ def test_evaluation_migration_upgrades_sqlite(tmp_path) -> None:
     assert columns["ansich_release_quality_stats"] == {column.name for column in AnsichReleaseQualityStatsRow.__table__.columns}
     assert indexes["ansich_evaluation_index"] == {index.name for index in AnsichEvaluationIndexRow.__table__.indexes}
     assert "ix_ansich_release_quality_cohort" not in indexes["ansich_release_quality_stats"]
-    assert revision == EVALUATION_REVISION
+    assert revision == HEAD_REVISION
     assert len(revision) <= 32
 
 
@@ -141,7 +143,7 @@ def test_evaluation_migration_is_idempotent_on_existing_tables(tmp_path) -> None
     assert EVALUATION_TABLES <= table_names
     assert columns["ansich_evaluation_index"] == {column.name for column in AnsichEvaluationIndexRow.__table__.columns}
     assert indexes["ansich_evaluation_index"] == {index.name for index in AnsichEvaluationIndexRow.__table__.indexes}
-    assert revision == EVALUATION_REVISION
+    assert revision == HEAD_REVISION
 
 
 def test_evaluation_migration_downgrade_drops_tables(tmp_path) -> None:
