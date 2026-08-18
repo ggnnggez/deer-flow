@@ -335,6 +335,11 @@ export function useAnsichAgentReleaseComparison(
  * One Task's quality Beliefs plus the evaluation rows behind them. Polls while
  * the Task runs, because a late assessor can attach an evaluation after the
  * Steps themselves stop changing.
+ *
+ * The key stays under the shared `["ansich", "tasks", taskId]` namespace so the
+ * operator invalidations reach it: retrying a failed assessor job is precisely
+ * what repairs a missing evaluation, and once a Task is terminal nothing else
+ * would ever refresh this cache.
  */
 export function useAnsichTaskEvaluations(
   taskId: string,
@@ -342,7 +347,7 @@ export function useAnsichTaskEvaluations(
   polling = true,
 ) {
   return useQuery({
-    queryKey: ["ansich", "task", taskId, "evaluations"],
+    queryKey: ["ansich", "tasks", taskId, "evaluations"],
     queryFn: () => fetchAnsichTaskEvaluations(taskId),
     enabled: enabled && Boolean(taskId),
     retry: false,
@@ -358,7 +363,7 @@ export function useAnsichStepEvaluations(
   enabled = true,
 ) {
   return useQuery({
-    queryKey: ["ansich", "step", stepId, "evaluations"],
+    queryKey: ["ansich", "steps", stepId, "evaluations"],
     queryFn: () => fetchAnsichStepEvaluations(stepId ?? ""),
     enabled: enabled && Boolean(stepId),
     retry: false,
@@ -376,7 +381,7 @@ export function useAnsichReleaseQuality(
   enabled = true,
 ) {
   return useQuery({
-    queryKey: ["ansich", "release", releaseId, "quality", cohort],
+    queryKey: ["ansich", "agent-releases", releaseId, "quality", cohort],
     queryFn: () =>
       fetchAnsichReleaseQuality(releaseId ?? "", cohort ?? undefined),
     enabled: enabled && Boolean(releaseId),

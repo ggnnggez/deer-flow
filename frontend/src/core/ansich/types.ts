@@ -1102,13 +1102,13 @@ export interface AnsichTaskEvaluationsResponse {
   task_id: string;
   quality_beliefs: AnsichQualityBelief[];
   evaluations: AnsichEvaluation[];
-  projection_status: Partial<AnsichHealth>;
+  projection_status: AnsichHealth;
 }
 
 export interface AnsichStepEvaluationsResponse {
   step_id: string;
   evaluations: AnsichEvaluation[];
-  projection_status: Partial<AnsichHealth>;
+  projection_status: AnsichHealth;
 }
 
 /**
@@ -1134,5 +1134,5 @@ export interface AnsichReleaseQualityCohort {
 export interface AnsichReleaseQualityResponse {
   release_id: string;
   cohorts: AnsichReleaseQualityCohort[];
-  projection_status: Partial<AnsichHealth>;
+  projection_status: AnsichHealth;
 }
