@@ -140,9 +140,11 @@ from ansich.task_tree import TaskSpawnView, TaskTreeDirection
 from ansich.tool import ContentDerivationSourceRole, ToolTransformKind
 from ansich.usage import (
     HIGH_WATER_USAGE_KINDS,
+    LLM_TOKEN_USAGE_DIMENSIONS,
     MAX_TYPE_USAGE_DIMENSIONS,
     AggregationScope,
     TaskUsageBreakdownView,
+    TaskUsageByModelView,
     TaskUsageSourceView,
     TaskUsageValue,
     TaskUsageView,
@@ -4143,6 +4145,58 @@ class SqlAnsichBackend:
                 for source_task_id, values in sorted(values_by_source.items())
             ),
         )
+
+    async def get_task_usage_by_model(self, task_id: str) -> list[TaskUsageByModelView]:
+        """Group the Task's own LLM attempts by the provider model they reported.
+
+        LOCAL scope only: an attempt row belongs to the Task that made it, so
+        this never fans out through Task ancestry the way inclusive usage does.
+        Attempts without a provider identity (requested but never answered,
+        failed, or answered without one) are retained in the explicit ``None``
+        bucket. Token sums add only recorded values — an unreported dimension
+        contributes nothing rather than a zero, and a dimension no attempt in
+        the bucket reported stays ``None`` instead of being fabricated as 0.
+        """
+
+        async with self._session_factory() as session:
+            rows = list(
+                (
+                    await session.execute(
+                        select(
+                            AnsichLlmAttemptRow.provider_model,
+                            AnsichLlmAttemptRow.usage_json,
+                        ).where(AnsichLlmAttemptRow.task_id == task_id)
+                    )
+                ).all()
+            )
+        attempt_counts: dict[str | None, int] = {}
+        usage_counts: dict[str | None, int] = {}
+        sums: dict[tuple[str | None, str], int] = {}
+        for provider_model, usage_json in rows:
+            attempt_counts[provider_model] = attempt_counts.get(provider_model, 0) + 1
+            usage_counts.setdefault(provider_model, 0)
+            recorded = False
+            if isinstance(usage_json, dict):
+                for dimension in LLM_TOKEN_USAGE_DIMENSIONS:
+                    value = usage_json.get(dimension)
+                    if not isinstance(value, int) or isinstance(value, bool) or value < 0:
+                        continue
+                    sums[(provider_model, dimension)] = sums.get((provider_model, dimension), 0) + value
+                    recorded = True
+            if recorded:
+                usage_counts[provider_model] += 1
+        return [
+            TaskUsageByModelView(
+                provider_model=provider_model,
+                attempt_count=attempt_counts[provider_model],
+                attempts_with_usage=usage_counts[provider_model],
+                input_tokens=sums.get((provider_model, "input_tokens")),
+                output_tokens=sums.get((provider_model, "output_tokens")),
+                total_tokens=sums.get((provider_model, "total_tokens")),
+            )
+            # Named models in stable order, the unknown bucket last.
+            for provider_model in sorted(attempt_counts, key=lambda name: (name is None, name or ""))
+        ]
 
     async def get_task_budgets(self, task_id: str) -> TaskBudgetsView:
         async with self._session_factory() as session:

@@ -94,6 +94,7 @@ from ansich.task_tree import (
 from ansich.tool import ContentDerivationView, ToolBelief, ToolCallView, ToolResultView
 from ansich.usage import (
     TaskUsageBreakdownView,
+    TaskUsageByModelView,
     TaskUsageSourceView,
     TaskUsageValue,
     TaskUsageView,
@@ -172,6 +173,7 @@ __all__ = [
     "TaskTreeView",
     "TaskView",
     "TaskUsageBreakdownView",
+    "TaskUsageByModelView",
     "TaskUsageSourceView",
     "TaskUsageValue",
     "TaskUsageView",

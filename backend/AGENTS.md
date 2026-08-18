@@ -578,6 +578,17 @@ assessor synchronously; they return the latest projection while the background
 assessment loop owns writes. `GET /tasks/{task_id}/usage?scope=local|inclusive`
 returns scoped dimensions and their source-Task breakdown;
 `GET /tasks/{task_id}/budgets` returns configured policy plus health Beliefs.
+Adding `?by=model` to the usage read appends an additive `by_model` block that
+groups the Task's own LLM attempts by the `provider_model` each reported —
+LOCAL scope only, because an attempt belongs to the Task that made it, so
+`by=model` combined with `scope=inclusive` is a 422 rather than a fan-out.
+Attempts without a provider identity (requested but never answered, failed, or
+answered without one) stay in an explicit `provider_model: null` bucket instead
+of being dropped, and token sums add only recorded values: an unreported
+dimension contributes nothing rather than a zero, a dimension no attempt in the
+bucket reported stays `null`, and `attempts_with_usage` says how many of the
+bucket's attempts contributed at all so a partially-reported bucket cannot read
+as a complete total. Without the parameter the response is unchanged.
 
 Phase 8 promotes each accepted `task` Tool delegation to a child Ansich Task.
 `task_tool.py` creates a deterministic `deerflow_subagent` identity and passes an

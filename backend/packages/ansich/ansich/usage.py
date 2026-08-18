@@ -22,6 +22,11 @@ _STRUCTURAL_DIMENSION_BY_KIND: dict[str, UsageDimension] = {
 
 _BUDGET_CONSUMED_USAGE_DIMENSIONS: frozenset[UsageDimension] = frozenset({"wall_time_ms", "child_tasks_spawned"})
 
+#: Token dimensions an ``llm.responded`` usage payload may report. Both the
+#: local usage contributions and the by-model breakdown read exactly these, so
+#: the two cannot drift apart.
+LLM_TOKEN_USAGE_DIMENSIONS: tuple[UsageDimension, ...] = ("input_tokens", "output_tokens", "total_tokens")
+
 #: Dimensions whose contributions carry a *cumulative* measurement rather than
 #: an increment: ``delta`` is the total observed so far for that source Task, so
 #: aggregation takes the maximum per source Task and only then sums across
@@ -72,6 +77,36 @@ class TaskUsageView(BaseModel):
     inclusive_status: Literal["available"] = "available"
 
 
+class TaskUsageByModelView(BaseModel):
+    """One provider-model bucket of a Task's own LLM attempt token usage.
+
+    ``provider_model`` is the identity the provider reported on
+    ``llm.responded``. Attempts that never produced one — requested but never
+    answered, failed, or answered without a model identity — are kept together
+    in the explicit ``None`` bucket instead of being dropped; the bucket is
+    part of the answer, not a gap in it. Aggregation is LOCAL only: an attempt
+    belongs to the Task that made it, so nothing fans out through Task
+    ancestry.
+
+    ``attempt_count`` counts every attempt in the bucket. The token sums count
+    only what was actually recorded — an attempt that reported no value for a
+    dimension contributes nothing to it rather than a zero, and a dimension no
+    attempt in the bucket recorded stays ``None``, because absent usage is
+    unknown and not zero. ``attempts_with_usage`` reports how many attempts
+    contributed at least one recorded dimension, so a bucket whose usage is
+    only partially reported cannot be read as a complete total.
+    """
+
+    model_config = ConfigDict(extra="forbid", frozen=True, strict=True)
+
+    provider_model: str | None
+    attempt_count: int = Field(ge=0)
+    attempts_with_usage: int = Field(ge=0)
+    input_tokens: int | None = Field(default=None, ge=0)
+    output_tokens: int | None = Field(default=None, ge=0)
+    total_tokens: int | None = Field(default=None, ge=0)
+
+
 class TaskUsageSourceView(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True, strict=True)
 
@@ -109,7 +144,7 @@ def usage_contributions_for_observation(
     if not isinstance(usage, dict):
         return ()
     contributions: list[UsageContribution] = []
-    for dimension in ("input_tokens", "output_tokens", "total_tokens"):
+    for dimension in LLM_TOKEN_USAGE_DIMENSIONS:
         value = usage.get(dimension)
         if not isinstance(value, int) or isinstance(value, bool) or value < 0:
             continue

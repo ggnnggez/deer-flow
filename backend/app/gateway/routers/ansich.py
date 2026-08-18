@@ -1052,10 +1052,15 @@ async def get_task_usage(
     task_id: str,
     request: Request,
     scope: Literal["local", "inclusive"] = Query(default="local"),
+    by: Literal["model"] | None = Query(default=None),
 ) -> dict:
     await require_admin_user(request, detail=_ADMIN_REQUIRED)
     service = _service_or_503(request)
     _ensure_queryable(service)
+    # The by-model breakdown is computed from the Task's own LLM attempts, so
+    # it has no inclusive form: a descendant's attempts belong to that Task.
+    if by == "model" and scope == "inclusive":
+        raise HTTPException(status_code=422, detail="by=model supports local scope only")
     try:
         task = await service.get_task(task_id)
         if task is None:
@@ -1064,6 +1069,7 @@ async def get_task_usage(
             service.get_task_usage(task_id),
             service.get_task_usage_breakdown(task_id, scope=scope),
         )
+        by_model = await service.get_task_usage_by_model(task_id) if by == "model" else []
     except HTTPException:
         raise
     except Exception as exc:
@@ -1074,13 +1080,17 @@ async def get_task_usage(
                 "projection_status": _projection_status(service),
             },
         ) from exc
-    return {
+    payload = {
         "usage": usage.model_dump(mode="json"),
         "scope": scope,
         "values": [item.model_dump(mode="json") for item in (usage.local if scope == "local" else usage.inclusive)],
         "sources": [item.model_dump(mode="json") for item in breakdown.sources],
         "projection_status": _projection_status(service),
     }
+    # Additive: without ?by=model the response is unchanged, key order included.
+    if by == "model":
+        payload["by_model"] = [item.model_dump(mode="json") for item in by_model]
+    return payload
 
 
 @router.get("/tasks/{task_id}/budgets")

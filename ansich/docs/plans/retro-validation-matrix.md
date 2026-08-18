@@ -963,7 +963,7 @@ git commit -m "docs(ansich): record retro validation matrix results and conclusi
 | C | #4176 | 部分失败（预期内） | **诚实性强通过 / 能力边界确认** | `get_tool_effects` 返回非 None，`coverage == "unknown"`，`effects == ()`——没有证据时既不谎称 complete，也不凭空产出 effect，文档写的限制**确实按文档行为**。但要分清两件事：Ansich 能诚实地说"我不知道 bash 干了什么"，**不代表**它能回答 #4176 的根问题（`outputs/*.json` 是否生成）。后者按设计就在范围外，需要 bash 侧 instrumentation 才可能。 |
 | D | #3875 | 强通过 | **强通过** ✅ 命中 | 父 Task `local.total_tokens == 0`、`inclusive.total_tokens == 4_404_500`，`get_task_usage_breakdown(scope="inclusive").sources` 直接点名子 Task。#3875 的"lead 只发了 1 次 dispatch，99.7% token 在子 agent"这个结论可直接读出，无需人工算比例。 |
 | E | #3113 | 强通过 | **强通过** ✅ 命中 | 子 Task `control.value == "completed"` 与父侧 `ToolCallView.execution.value == "failed"` 同时可读，且 `execution.evidence_obs_ids` 非空。两个相反终态两存——这正是单一可变 status 字段在结构上做不到的事。 |
-| F | #3645 | 弱通过 | **弱通过** ✅ 命中 | 证据层成立：`LlmAttemptView.provider_model` 逐 attempt 记录，两个 Task 的模型身份互不相交（`lead-provider-model` / `sub-provider-model`），不存在 #3645 那种"一个 run 级 `model_name` 列"。但 39 个端点里 `grep by_model` 无命中——**缺的是聚合查询，不是证据**。补一个 by-model 汇总即可，属于 API 层工作。 |
+| F | #3645 | 弱通过 | **弱通过** ✅ 命中 | 证据层成立：`LlmAttemptView.provider_model` 逐 attempt 记录，两个 Task 的模型身份互不相交（`lead-provider-model` / `sub-provider-model`），不存在 #3645 那种"一个 run 级 `model_name` 列"。但 39 个端点里 `grep by_model` 无命中——**缺的是聚合查询，不是证据**。补一个 by-model 汇总即可，属于 API 层工作。**已补**（commit `feat(ansich): expose per-model usage breakdown on task usage`）：`GET /tasks/{task_id}/usage?by=model` 按 attempt 的 `provider_model` 做 LOCAL 聚合，无身份的 attempt 保留为显式 `None` 桶，未上报的维度为 `null` 而非 0；弱通过的这笔账已结清。 |
 
 ## 结论
 
@@ -971,7 +971,7 @@ git commit -m "docs(ansich): record retro validation matrix results and conclusi
 
 **2. 失败项：零。** 没有任何一条落到"证据不足"这一档，因此本轮不需要改采集设计。唯一被确认的能力边界在 C：bash 缺 instrumentation，`coverage="unknown"` 是设计使然而非缺陷，要回答 #4176 的根问题（产物是否生成）必须先给 bash 加副作用采集，归属 Phase 9 之后的独立议题，不属于本矩阵范围。
 
-**3. 弱通过的账：一笔，在 F。** 证据齐全（`provider_model` 逐 attempt 记录）但缺 by-model 聚合查询，39 个端点无一命中 `by_model`。这是纯 API 层工作，不涉及采集或投影，建议随下一次 Ansich API 改动顺带补上。B 另有一个**副产品**值得记账：`同 source_identity + 不同 content_hash` 是 #3684 那类"消息被就地覆盖"的精确检出条件，目前没有 assessor 使用它——如果要把 B 从"证据可查"升级成"自动告警"，这是现成的规则。
+**3. 弱通过的账：一笔，在 F。** 证据齐全（`provider_model` 逐 attempt 记录）但缺 by-model 聚合查询，39 个端点无一命中 `by_model`。这是纯 API 层工作，不涉及采集或投影，建议随下一次 Ansich API 改动顺带补上。**已按此结清**：`GET /tasks/{task_id}/usage?by=model`（commit `feat(ansich): expose per-model usage breakdown on task usage`），LOCAL 作用域、`by=model` 与 `scope=inclusive` 组合返回 422。B 另有一个**副产品**值得记账：`同 source_identity + 不同 content_hash` 是 #3684 那类"消息被就地覆盖"的精确检出条件，目前没有 assessor 使用它——如果要把 B 从"证据可查"升级成"自动告警"，这是现成的规则。
 
 **4. 对"Ansich 有没有价值"这个问题的回答。** 六条用例证明了三件此前只是主张的事：终态判断可被独立证据推翻（A）、相反终态可以两存（E）、token 归属可按来源 Task 拆分（D）。这三件在单一可变 status 字段 + 单一 run 级 model 列的模型下**在结构上做不到**，不是实现优劣问题。同时也确认了边界：Ansich 不产出新裁决，只产出矛盾证据；能力止于采集粒度，bash 之类无 instrumentation 的路径它只会说 unknown。
 

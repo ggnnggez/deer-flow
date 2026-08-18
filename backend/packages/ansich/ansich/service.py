@@ -42,7 +42,7 @@ from ansich.task_tree import (
     TaskTreeView,
 )
 from ansich.tool import ToolCallView
-from ansich.usage import AggregationScope, TaskUsageBreakdownView, TaskUsageView
+from ansich.usage import AggregationScope, TaskUsageBreakdownView, TaskUsageByModelView, TaskUsageView
 
 logger = logging.getLogger(__name__)
 _DROP_WARNING_INTERVAL_SECONDS = 60.0
@@ -784,6 +784,18 @@ class AnsichService:
         scope: AggregationScope,
     ) -> TaskUsageBreakdownView:
         return await self._backend.get_task_usage_breakdown(task_id, scope=scope)
+
+    async def get_task_usage_by_model(self, task_id: str) -> list[TaskUsageByModelView]:
+        """Group the Task's own LLM attempt usage by reported provider model.
+
+        Optional backend capability: a backend that does not retain physical
+        attempts answers with an empty breakdown rather than failing the read.
+        """
+
+        by_model = getattr(self._backend, "get_task_usage_by_model", None)
+        if not callable(by_model):
+            return []
+        return list(await by_model(task_id))
 
     async def get_task_budgets(self, task_id: str) -> TaskBudgetsView:
         return await self._backend.get_task_budgets(task_id)

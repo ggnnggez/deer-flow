@@ -89,6 +89,229 @@ async def test_sql_usage_is_idempotent_and_preserves_unknown_token_dimensions(tm
     ]
 
 
+def _attempt_observations(
+    *,
+    task_id: str,
+    attempt_id: str,
+    occurred_at: datetime,
+    terminal: str,
+    provider_model: str | None = None,
+    usage: dict[str, object] | None = None,
+) -> tuple[ObservationEnvelope, ...]:
+    """Build one physical LLM attempt: always requested, optionally terminal."""
+
+    producer = Producer(name="sql-usage-by-model-test", version="1", instance_id="test")
+
+    def envelope(kind: str, payload: dict[str, object]) -> ObservationEnvelope:
+        return ObservationEnvelope(
+            kind=kind,
+            occurred_at=occurred_at,
+            task_id=task_id,
+            subject_type="llm_attempt",
+            subject_id=attempt_id,
+            producer=producer,
+            source_event_id=f"attempt:{attempt_id}:{kind}",
+            correlation_id=task_id,
+            payload=payload,
+        )
+
+    request = envelope(
+        "llm.requested",
+        {
+            "attempt_no": 1,
+            "actor_kind": "system_operation",
+            "operation_id": new_id(),
+            "operation_kind": "other",
+        },
+    )
+    if terminal == "requested":
+        return (request,)
+    if terminal == "failed":
+        return (request, envelope("llm.failed", {"attempt_no": 1, "latency_ms": 12}))
+    responded: dict[str, object] = {
+        "attempt_no": 1,
+        "latency_ms": 20,
+        "usage": dict(usage or {}),
+    }
+    if provider_model is not None:
+        responded["provider_model"] = provider_model
+    return (request, envelope("llm.responded", responded))
+
+
+@pytest.mark.anyio
+async def test_sql_usage_by_model_groups_attempts_and_keeps_the_unknown_provider_bucket(tmp_path):
+    engine = create_async_engine(f"sqlite+aiosqlite:///{tmp_path / 'ansich-usage-by-model.db'}")
+    session_factory = async_sessionmaker(engine, expire_on_commit=False)
+    async with engine.begin() as connection:
+        await connection.run_sync(Base.metadata.create_all)
+    service = create_sql_ansich_service(session_factory)
+    await service.start()
+    task_id = new_id()
+    empty_task_id = new_id()
+    observed_at = datetime(2026, 8, 18, 10, 0, tzinfo=UTC)
+
+    try:
+        service.record_batch(
+            (
+                ObservationEnvelope.task_lifecycle(
+                    kind="task.created",
+                    task_id=task_id,
+                    source_kind="deerflow_run",
+                    source_id="run-usage-by-model",
+                    occurred_at=observed_at,
+                    source_event_id="run:run-usage-by-model:task:created",
+                ),
+                ObservationEnvelope.task_lifecycle(
+                    kind="task.created",
+                    task_id=empty_task_id,
+                    source_kind="deerflow_run",
+                    source_id="run-usage-by-model-empty",
+                    occurred_at=observed_at,
+                    source_event_id="run:run-usage-by-model-empty:task:created",
+                ),
+            )
+        )
+        await service.flush_task(task_id)
+        await service.flush_task(empty_task_id)
+        service.record_batch(
+            (
+                *_attempt_observations(
+                    task_id=task_id,
+                    attempt_id=new_id(),
+                    occurred_at=observed_at,
+                    terminal="responded",
+                    provider_model="model-a",
+                    usage={"input_tokens": 10, "output_tokens": 5, "total_tokens": 15},
+                ),
+                *_attempt_observations(
+                    task_id=task_id,
+                    attempt_id=new_id(),
+                    occurred_at=observed_at,
+                    terminal="responded",
+                    provider_model="model-a",
+                    usage={"input_tokens": 20, "output_tokens": 7, "total_tokens": 27},
+                ),
+                *_attempt_observations(
+                    task_id=task_id,
+                    attempt_id=new_id(),
+                    occurred_at=observed_at,
+                    terminal="responded",
+                    provider_model="model-b",
+                    usage={"input_tokens": 3, "output_tokens": 1, "total_tokens": 4},
+                ),
+                *_attempt_observations(
+                    task_id=task_id,
+                    attempt_id=new_id(),
+                    occurred_at=observed_at,
+                    terminal="requested",
+                ),
+                *_attempt_observations(
+                    task_id=task_id,
+                    attempt_id=new_id(),
+                    occurred_at=observed_at,
+                    terminal="failed",
+                ),
+            )
+        )
+        await service.flush_task(task_id)
+
+        by_model = await service.get_task_usage_by_model(task_id)
+        empty = await service.get_task_usage_by_model(empty_task_id)
+    finally:
+        await service.stop()
+        await engine.dispose()
+
+    assert [item.model_dump(mode="json") for item in by_model] == [
+        {
+            "provider_model": "model-a",
+            "attempt_count": 2,
+            "attempts_with_usage": 2,
+            "input_tokens": 30,
+            "output_tokens": 12,
+            "total_tokens": 42,
+        },
+        {
+            "provider_model": "model-b",
+            "attempt_count": 1,
+            "attempts_with_usage": 1,
+            "input_tokens": 3,
+            "output_tokens": 1,
+            "total_tokens": 4,
+        },
+        {
+            "provider_model": None,
+            "attempt_count": 2,
+            "attempts_with_usage": 0,
+            "input_tokens": None,
+            "output_tokens": None,
+            "total_tokens": None,
+        },
+    ]
+    assert empty == []
+
+
+@pytest.mark.anyio
+async def test_sql_usage_by_model_reports_unrecorded_token_dimensions_as_unknown(tmp_path):
+    engine = create_async_engine(f"sqlite+aiosqlite:///{tmp_path / 'ansich-usage-by-model-null.db'}")
+    session_factory = async_sessionmaker(engine, expire_on_commit=False)
+    async with engine.begin() as connection:
+        await connection.run_sync(Base.metadata.create_all)
+    service = create_sql_ansich_service(session_factory)
+    await service.start()
+    task_id = new_id()
+    observed_at = datetime(2026, 8, 18, 10, 5, tzinfo=UTC)
+
+    try:
+        service.record(
+            ObservationEnvelope.task_lifecycle(
+                kind="task.created",
+                task_id=task_id,
+                source_kind="deerflow_run",
+                source_id="run-usage-by-model-null",
+                occurred_at=observed_at,
+                source_event_id="run:run-usage-by-model-null:task:created",
+            )
+        )
+        await service.flush_task(task_id)
+        service.record_batch(
+            (
+                *_attempt_observations(
+                    task_id=task_id,
+                    attempt_id=new_id(),
+                    occurred_at=observed_at,
+                    terminal="responded",
+                    provider_model="model-c",
+                    usage={"total_tokens": 9},
+                ),
+                *_attempt_observations(
+                    task_id=task_id,
+                    attempt_id=new_id(),
+                    occurred_at=observed_at,
+                    terminal="responded",
+                    provider_model="model-c",
+                    usage={},
+                ),
+            )
+        )
+        await service.flush_task(task_id)
+
+        by_model = await service.get_task_usage_by_model(task_id)
+    finally:
+        await service.stop()
+        await engine.dispose()
+
+    assert [item.model_dump(mode="json") for item in by_model] == [
+        {
+            "provider_model": "model-c",
+            "attempt_count": 2,
+            "attempts_with_usage": 1,
+            "input_tokens": None,
+            "output_tokens": None,
+            "total_tokens": 9,
+        }
+    ]
+
+
 @pytest.mark.anyio
 async def test_sql_usage_counts_one_tool_execution_across_started_and_terminal_evidence(tmp_path):
     engine = create_async_engine(f"sqlite+aiosqlite:///{tmp_path / 'ansich-tool-usage.db'}")

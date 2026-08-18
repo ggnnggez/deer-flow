@@ -1140,6 +1140,217 @@ async def test_failed_jobs_list_detail_and_retry_over_http(tmp_path):
         await engine.dispose()
 
 
+def _router_attempt_observations(
+    *,
+    task_id: str,
+    occurred_at: datetime,
+    provider_model: str | None,
+    usage: dict[str, object] | None,
+) -> tuple[ObservationEnvelope, ...]:
+    attempt_id = new_id()
+    producer = Producer(name="router-usage-by-model-test", version="1", instance_id="test")
+
+    def envelope(kind: str, payload: dict[str, object]) -> ObservationEnvelope:
+        return ObservationEnvelope(
+            kind=kind,
+            occurred_at=occurred_at,
+            task_id=task_id,
+            subject_type="llm_attempt",
+            subject_id=attempt_id,
+            producer=producer,
+            source_event_id=f"attempt:{attempt_id}:{kind}",
+            correlation_id=task_id,
+            payload=payload,
+        )
+
+    request = envelope(
+        "llm.requested",
+        {
+            "attempt_no": 1,
+            "actor_kind": "system_operation",
+            "operation_id": new_id(),
+            "operation_kind": "other",
+        },
+    )
+    if usage is None and provider_model is None:
+        return (request,)
+    responded: dict[str, object] = {
+        "attempt_no": 1,
+        "latency_ms": 20,
+        "usage": dict(usage or {}),
+    }
+    if provider_model is not None:
+        responded["provider_model"] = provider_model
+    return (request, envelope("llm.responded", responded))
+
+
+@pytest.mark.anyio
+async def test_task_usage_by_model_is_additive_local_only_and_keeps_the_unknown_bucket(tmp_path):
+    engine = create_async_engine(f"sqlite+aiosqlite:///{tmp_path / 'ansich-router-usage-by-model.db'}")
+    session_factory = async_sessionmaker(engine, expire_on_commit=False)
+    async with engine.begin() as connection:
+        await connection.run_sync(Base.metadata.create_all)
+    backend = SqlAnsichBackend(session_factory)
+    service = AnsichService(backend, flush_interval_ms=60_000)
+    await service.start()
+    task_id = new_id()
+    empty_task_id = new_id()
+    observed_at = datetime(2026, 8, 18, 11, 0, tzinfo=UTC)
+    app = make_authed_test_app(user_factory=admin_user)
+    app.state.ansich_service = service
+    app.include_router(ansich_router.router)
+
+    try:
+        service.record_batch(
+            (
+                ObservationEnvelope.task_lifecycle(
+                    kind="task.created",
+                    task_id=task_id,
+                    source_kind="deerflow_run",
+                    source_id="run-router-usage-by-model",
+                    occurred_at=observed_at,
+                    source_event_id="run:run-router-usage-by-model:task:created",
+                ),
+                ObservationEnvelope.task_lifecycle(
+                    kind="task.created",
+                    task_id=empty_task_id,
+                    source_kind="deerflow_run",
+                    source_id="run-router-usage-by-model-empty",
+                    occurred_at=observed_at,
+                    source_event_id="run:run-router-usage-by-model-empty:task:created",
+                ),
+            )
+        )
+        await service.flush_task(task_id)
+        await service.flush_task(empty_task_id)
+        service.record_batch(
+            (
+                *_router_attempt_observations(
+                    task_id=task_id,
+                    occurred_at=observed_at,
+                    provider_model="model-a",
+                    usage={"input_tokens": 10, "output_tokens": 5, "total_tokens": 15},
+                ),
+                *_router_attempt_observations(
+                    task_id=task_id,
+                    occurred_at=observed_at,
+                    provider_model="model-a",
+                    usage={"input_tokens": 20, "output_tokens": 7, "total_tokens": 27},
+                ),
+                *_router_attempt_observations(
+                    task_id=task_id,
+                    occurred_at=observed_at,
+                    provider_model="model-b",
+                    usage={"input_tokens": 3, "output_tokens": 1, "total_tokens": 4},
+                ),
+                *_router_attempt_observations(
+                    task_id=task_id,
+                    occurred_at=observed_at,
+                    provider_model=None,
+                    usage=None,
+                ),
+            )
+        )
+        await service.flush_task(task_id)
+
+        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+            baseline_response = await client.get(f"/api/ansich/tasks/{task_id}/usage")
+            by_model_response = await client.get(
+                f"/api/ansich/tasks/{task_id}/usage",
+                params={"by": "model"},
+            )
+            inclusive_response = await client.get(
+                f"/api/ansich/tasks/{task_id}/usage",
+                params={"by": "model", "scope": "inclusive"},
+            )
+            empty_response = await client.get(
+                f"/api/ansich/tasks/{empty_task_id}/usage",
+                params={"by": "model"},
+            )
+    finally:
+        await service.stop()
+        await engine.dispose()
+
+    assert baseline_response.status_code == 200
+    baseline = baseline_response.json()
+    # Pins today's response shape: no new key, no reordering, nothing dropped.
+    assert list(baseline) == ["usage", "scope", "values", "sources", "projection_status"]
+
+    assert by_model_response.status_code == 200
+    with_by_model = by_model_response.json()
+    # Equal dicts in equal key order serialize to equal bytes, so the
+    # pre-existing part of the response is byte-identical and `by_model` is
+    # strictly appended.
+    assert list(with_by_model) == [*baseline, "by_model"]
+    assert {key: value for key, value in with_by_model.items() if key != "by_model"} == baseline
+    assert with_by_model["by_model"] == [
+        {
+            "provider_model": "model-a",
+            "attempt_count": 2,
+            "attempts_with_usage": 2,
+            "input_tokens": 30,
+            "output_tokens": 12,
+            "total_tokens": 42,
+        },
+        {
+            "provider_model": "model-b",
+            "attempt_count": 1,
+            "attempts_with_usage": 1,
+            "input_tokens": 3,
+            "output_tokens": 1,
+            "total_tokens": 4,
+        },
+        {
+            "provider_model": None,
+            "attempt_count": 1,
+            "attempts_with_usage": 0,
+            "input_tokens": None,
+            "output_tokens": None,
+            "total_tokens": None,
+        },
+    ]
+
+    assert inclusive_response.status_code == 422
+    assert inclusive_response.json()["detail"] == "by=model supports local scope only"
+
+    assert empty_response.status_code == 200
+    assert empty_response.json()["by_model"] == []
+
+
+@pytest.mark.anyio
+async def test_task_usage_by_model_is_empty_when_the_backend_cannot_answer():
+    service = AnsichService.in_memory()
+    await service.start()
+    task_id = new_id()
+    observed_at = datetime(2026, 8, 18, 11, 30, tzinfo=UTC)
+    app = make_authed_test_app(user_factory=admin_user)
+    app.state.ansich_service = service
+    app.include_router(ansich_router.router)
+
+    try:
+        service.record(
+            ObservationEnvelope.task_lifecycle(
+                kind="task.created",
+                task_id=task_id,
+                source_kind="deerflow_run",
+                source_id="run-router-usage-by-model-memory",
+                occurred_at=observed_at,
+                source_event_id="run:run-router-usage-by-model-memory:task:created",
+            )
+        )
+        await service.flush_task(task_id)
+        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+            response = await client.get(
+                f"/api/ansich/tasks/{task_id}/usage",
+                params={"by": "model"},
+            )
+    finally:
+        await service.stop()
+
+    assert response.status_code == 200
+    assert response.json()["by_model"] == []
+
+
 @pytest.mark.anyio
 async def test_failed_jobs_endpoints_503_when_storage_unavailable():
     service = create_embedded_ansich_service(AnsichConfig(enabled=True), None)
