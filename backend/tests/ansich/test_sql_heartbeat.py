@@ -20,6 +20,9 @@ from deerflow.persistence.base import Base
 
 WALL_TIME_WATERMARK_REVISION = "0024_ansich_wall_time_watermarks"
 PREVIOUS_REVISION = "0023_ansich_evaluations"
+#: Upgrading to ``head`` lands past 0024 once later revisions exist, so the
+#: chain-head assertions track this rather than the revision under test.
+HEAD_REVISION = "0025_ansich_assessor_watermarks"
 
 
 def _alembic_config(database_path: Path) -> AlembicConfig:
@@ -1072,7 +1075,7 @@ def test_wall_time_watermark_migration_upgrades_sqlite(tmp_path) -> None:
     alembic_command.upgrade(config, "head")
 
     revision = _alembic_revision(database_path)
-    assert revision == WALL_TIME_WATERMARK_REVISION
+    assert revision == HEAD_REVISION
     assert len(revision) <= 32
 
 
@@ -1113,7 +1116,7 @@ def test_wall_time_watermark_migration_collapses_historical_per_tick_rows(tmp_pa
         ]
     )
     assert twice == after
-    assert _alembic_revision(database_path) == WALL_TIME_WATERMARK_REVISION
+    assert _alembic_revision(database_path) == HEAD_REVISION
 
 
 def test_wall_time_watermark_migration_downgrade_returns_to_previous_revision(tmp_path) -> None:
@@ -1485,4 +1488,4 @@ def test_wall_time_watermark_migration_matches_a_replayed_projection(tmp_path) -
     # summaries alike.
     assert migrated_contributions == replayed_contributions
     assert migrated_usage == replayed_usage
-    assert _alembic_revision(database_path) == WALL_TIME_WATERMARK_REVISION
+    assert _alembic_revision(database_path) == HEAD_REVISION

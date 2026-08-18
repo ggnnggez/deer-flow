@@ -615,6 +615,20 @@ crosses the deadline into the same durable failed-job and operator retry path
 as projector dependency waits instead of polling forever.
 Evaluations read only evidence at or below their watermark, and no-evidence
 results use the watermark event time as `as_of`, not the later processing time.
+Scope-safety is assessed incrementally: each conclusion depends only on one
+`tool_call_id`'s own snapshots and effects, so a trigger re-judges just the
+ToolCalls named by evidence in the new watermark window and leaves converged
+conclusions unwritten (they are stamped with the assessment time, so a rewrite
+would append an assertion every trigger rather than dedupe). The window's lower
+bound is `ansich_assessor_watermarks`, written inside the evaluation's own
+transaction and deleted by `rebuild_projections()` with the conclusions it
+describes — an assessor job's `completed` status cannot serve as that bound
+because claiming completes the group's lower jobs before the evaluation runs,
+so a rolled-back evaluation would leave their evidence permanently skipped. The
+bound also drops below the claimed group's lowest watermark, so a Scope
+observation projected after a higher one already settled is still covered.
+Action-repetition and tool-frequency keep their full-history scans: their
+verdicts are sequence properties, not per-subject ones.
 Absolute wall-time assessment takes the maximum of
 the accumulated terminal contribution and the latest heartbeat elapsed value,
 and retains both evidence paths, so the final interval after heartbeats stop
@@ -1150,6 +1164,8 @@ This invokes `alembic revision --autogenerate` against the live ORM models. Revi
 - `migrations/versions/0021_ansich_summary_assertion_fk.py` — nullable Task-summary assertion pointer with `ON DELETE SET NULL` for degraded missing-assertion reads
 - `migrations/versions/0022_ansich_assessor_deadline.py` — durable first-seen time for dependency-pending assessor jobs and their bounded failure deadline
 - `migrations/versions/0023_ansich_evaluations.py` — Phase 10 rebuildable evaluation query index and `(release, cohort, dimension)` release quality statistics
+- `migrations/versions/0024_ansich_wall_time_watermarks.py` — data-only collapse of historical per-tick `wall_time_ms` usage contributions into one high-water row per `(aggregate, source)`
+- `migrations/versions/0025_ansich_assessor_watermarks.py` — durable per-`(subject, assessor, version)` mark of the highest evidence watermark an assessor has successfully settled, so scope-safety can re-judge only the ToolCalls a new watermark window names
 - `persistence/bootstrap.py` — `bootstrap_schema(engine, backend=...)`, the three-branch decision + locking
 - Tests: `tests/test_persistence_bootstrap.py` (branches), `tests/test_persistence_bootstrap_concurrency.py` (concurrency), `tests/test_persistence_bootstrap_regression.py` (issue #3682), `tests/test_persistence_migrations_env.py` (filter), `tests/blocking_io/test_persistence_bootstrap.py` (asyncio.to_thread anchor)
 

@@ -67,7 +67,7 @@ from ansich.assessment.action_repetition import (
     assess_action_repetition,
     build_step_action,
 )
-from ansich.assessment.base import Assessment, AuthorityClass, EvidenceRef, canonical_config_hash
+from ansich.assessment.base import Assessment, AssessorDescriptor, AuthorityClass, EvidenceRef, canonical_config_hash
 from ansich.assessment.configuration_drift import (
     CONFIGURATION_DRIFT_ASSESSOR,
     assess_configuration_drift,
@@ -165,6 +165,7 @@ from deerflow.ansich.persistence.models import (
     AnsichAlertWorkflowEventRow,
     AnsichAssessorErrorRow,
     AnsichAssessorJobRow,
+    AnsichAssessorWatermarkRow,
     AnsichAuthorizationPermissionRow,
     AnsichAuthorizationScopeRow,
     AnsichAuthorizationSnapshotRow,
@@ -999,6 +1000,10 @@ class SqlAnsichBackend:
                 AnsichOperatorActionRow,
                 AnsichAssessorErrorRow,
                 AnsichAssessorJobRow,
+                # Deleted with the conclusions it describes: a surviving mark
+                # would make the post-rebuild assessment skip the very
+                # ToolCalls whose conclusions were just dropped.
+                AnsichAssessorWatermarkRow,
                 AnsichScopeConclusionRow,
                 AnsichTaskHeartbeatRow,
                 AnsichActiveTaskReadModelRow,
@@ -1341,7 +1346,16 @@ class SqlAnsichBackend:
 
     async def _claim_assessor_job(
         self,
-    ) -> tuple[str, str, str, int, int] | None:
+    ) -> tuple[str, str, str, int, int, int] | None:
+        """Claim one assessor job, absorbing its currently claimable siblings.
+
+        Returns the claimed job's own (highest) ``evidence_watermark`` plus the
+        *lowest* watermark in the absorbed group. The pair is the exact span of
+        newly projected evidence this evaluation is settling, which lets an
+        incremental assessor widen its window when a lower watermark is claimed
+        after a higher one has already been assessed.
+        """
+
         now = datetime.now(UTC)
         async with self._session_factory() as session, session.begin():
             claimable = or_(
@@ -1403,6 +1417,7 @@ class SqlAnsichBackend:
                 job.subject_id,
                 job.assessor_name,
                 job.evidence_watermark,
+                min(grouped.evidence_watermark for grouped in grouped_jobs),
                 job.attempts,
             )
 
@@ -1475,7 +1490,14 @@ class SqlAnsichBackend:
             claim = await self._claim_assessor_job()
             if claim is None:
                 break
-            job_id, task_id, assessor_name, evidence_watermark, attempt = claim
+            (
+                job_id,
+                task_id,
+                assessor_name,
+                evidence_watermark,
+                group_lowest_watermark,
+                attempt,
+            ) = claim
             try:
                 async with self._session_factory() as session, session.begin():
                     if assessor_name == ACTION_REPETITION_ASSESSOR.name:
@@ -1566,10 +1588,16 @@ class SqlAnsichBackend:
                                 now=now,
                             )
                     elif assessor_name == SCOPE_SAFETY_ASSESSOR.name:
+                        window_start_exclusive = await self._scope_safety_window_start(
+                            session,
+                            task_id=task_id,
+                            group_lowest_watermark=group_lowest_watermark,
+                        )
                         results = await self._assess_scope_safety_at(
                             session,
                             task_id=task_id,
                             evidence_watermark=evidence_watermark,
+                            window_start_exclusive=window_start_exclusive,
                             now=now,
                         )
                         for result in results:
@@ -1597,6 +1625,15 @@ class SqlAnsichBackend:
                                     source_assertion_id=assertion.assertion_id,
                                     now=now,
                                 )
+                        # Same transaction as the conclusions above, so the mark
+                        # is durable exactly when they are: a failure rolls both
+                        # back and the retry re-opens the same window.
+                        await self._advance_assessor_watermark(
+                            session,
+                            task_id=task_id,
+                            assessor=SCOPE_SAFETY_ASSESSOR,
+                            evidence_watermark=evidence_watermark,
+                        )
                     else:
                         raise ValueError(f"unknown Ansich assessor: {assessor_name}")
                     summary = await session.get(AnsichTaskSummaryRow, task_id)
@@ -1622,14 +1659,159 @@ class SqlAnsichBackend:
                 await self._record_assessor_error(job_id, attempt, exc)
         return changed
 
+    async def _scope_safety_window_start(
+        self,
+        session: AsyncSession,
+        *,
+        task_id: str,
+        group_lowest_watermark: int,
+    ) -> int | None:
+        """Exclusive lower bound of the evidence window to re-judge.
+
+        ``None`` means cold start (no previous successful assessment for this
+        Task), which keeps the original full-Task scan.
+
+        The mark alone would be wrong for a job whose watermark is *below* it —
+        a Scope observation projected after a higher one already settled — so
+        the bound also drops to just under the claimed group's lowest watermark.
+        The window therefore always covers every observation whose own assessor
+        job this evaluation is settling, plus everything since the last
+        successful assessment.
+        """
+
+        mark = await session.get(
+            AnsichAssessorWatermarkRow,
+            (task_id, SCOPE_SAFETY_ASSESSOR.name, SCOPE_SAFETY_ASSESSOR.version),
+        )
+        if mark is None:
+            return None
+        return min(mark.evidence_watermark, group_lowest_watermark - 1)
+
+    @staticmethod
+    async def _advance_assessor_watermark(
+        session: AsyncSession,
+        *,
+        task_id: str,
+        assessor: AssessorDescriptor,
+        evidence_watermark: int,
+    ) -> None:
+        mark = await session.get(
+            AnsichAssessorWatermarkRow,
+            (task_id, assessor.name, assessor.version),
+        )
+        if mark is None:
+            session.add(
+                AnsichAssessorWatermarkRow(
+                    subject_id=task_id,
+                    assessor_name=assessor.name,
+                    assessor_version=assessor.version,
+                    evidence_watermark=evidence_watermark,
+                    updated_at=datetime.now(UTC),
+                )
+            )
+            return
+        # Never lower: a job claimed out of watermark order settles evidence
+        # the higher assessment already covered.
+        if evidence_watermark > mark.evidence_watermark:
+            mark.evidence_watermark = evidence_watermark
+            mark.updated_at = datetime.now(UTC)
+
+    @staticmethod
+    def _scope_safety_evidence_subject(row: AnsichObservationRow) -> str | None:
+        """``tool_call_id`` an observation carries, read without validating it.
+
+        Returns ``None`` when the subject cannot be read cheaply (an
+        externalized payload, or a kind that carries no ToolCall at all, such as
+        ``scope.snapshotted``); callers must not treat that as "belongs to no
+        ToolCall".
+        """
+
+        payload = row.payload_json
+        if not isinstance(payload, dict):
+            return None
+        if row.kind.startswith("authorization."):
+            carrier = payload.get("snapshot")
+        elif row.kind.startswith("effect."):
+            carrier = payload.get("effect")
+        else:
+            return None
+        if not isinstance(carrier, dict):
+            return None
+        tool_call_id = carrier.get("tool_call_id")
+        return tool_call_id if isinstance(tool_call_id, str) else None
+
+    async def _scope_safety_tool_calls_in_window(
+        self,
+        session: AsyncSession,
+        *,
+        task_id: str,
+        window_start_exclusive: int,
+        evidence_watermark: int,
+    ) -> frozenset[str] | None:
+        """ToolCalls named by evidence new since the previous assessment.
+
+        ``None`` asks the caller to fall back to the full scan, which is what an
+        observation whose subject cannot be read cheaply must produce: skipping
+        it would silently drop a conclusion instead of degrading to the previous
+        behaviour.
+        """
+
+        rows = list(
+            (
+                await session.execute(
+                    select(AnsichObservationRow)
+                    .where(
+                        AnsichObservationRow.task_id == task_id,
+                        AnsichObservationRow.ingest_seq > window_start_exclusive,
+                        AnsichObservationRow.ingest_seq <= evidence_watermark,
+                        AnsichObservationRow.kind.in_(_SAFETY_PROJECTION_KINDS),
+                    )
+                    .order_by(AnsichObservationRow.ingest_seq)
+                )
+            ).scalars()
+        )
+        affected: set[str] = set()
+        for row in rows:
+            if row.kind == "scope.snapshotted":
+                # Scope evidence is Task-scoped and names no ToolCall; it feeds
+                # the Scope projection, never a per-ToolCall conclusion.
+                continue
+            tool_call_id = self._scope_safety_evidence_subject(row)
+            if tool_call_id is None:
+                return None
+            affected.add(tool_call_id)
+        return frozenset(affected)
+
     async def _assess_scope_safety_at(
         self,
         session: AsyncSession,
         *,
         task_id: str,
         evidence_watermark: int,
+        window_start_exclusive: int | None,
         now: datetime,
     ) -> tuple[ScopeSafetyAssessmentResult, ...]:
+        """Re-judge the ToolCalls this trigger actually carries evidence for.
+
+        Each conclusion is a pure function of one ``tool_call_id``'s own
+        snapshots and effects, so a ToolCall with no new evidence would be
+        re-judged to the identical verdict. Its stored conclusion is therefore
+        left untouched rather than rewritten — ``as_of`` is stamped with the
+        assessment time, so a rewrite would append a fresh assertion and a fresh
+        conclusion row every trigger rather than being absorbed by
+        ``_persist_assessment``'s dedupe.
+        """
+
+        affected: frozenset[str] | None = None
+        if window_start_exclusive is not None:
+            affected = await self._scope_safety_tool_calls_in_window(
+                session,
+                task_id=task_id,
+                window_start_exclusive=window_start_exclusive,
+                evidence_watermark=evidence_watermark,
+            )
+            if affected is not None and not affected:
+                return ()
         rows = list(
             (
                 await session.execute(
@@ -1647,6 +1829,11 @@ class SqlAnsichBackend:
         effects_by_tool: dict[str, dict[str, ToolEffect]] = {}
         for row in rows:
             payload = row.payload_json or {}
+            # A re-judged ToolCall still needs its complete evidence, so only
+            # rows that positively belong to an unaffected ToolCall are skipped;
+            # anything unreadable keeps the original validation behaviour.
+            if affected is not None and (subject := self._scope_safety_evidence_subject(row)) is not None and subject not in affected:
+                continue
             if row.kind.startswith("authorization."):
                 snapshot = AuthorizationSnapshot.model_validate(payload.get("snapshot"), strict=False)
                 snapshots_by_tool.setdefault(snapshot.tool_call_id, {})[snapshot.snapshot_id] = snapshot

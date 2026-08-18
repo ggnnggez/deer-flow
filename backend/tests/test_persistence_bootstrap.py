@@ -51,7 +51,7 @@ from deerflow.persistence.migrations._helpers import _normalize_default
 asyncio_test = pytest.mark.asyncio
 
 
-HEAD = "0024_ansich_wall_time_watermarks"
+HEAD = "0025_ansich_assessor_watermarks"
 BASELINE = "0001_baseline"
 
 

@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import anyio
@@ -23,11 +23,13 @@ from sqlalchemy.pool import Pool
 from sqlalchemy.schema import CreateTable
 
 from deerflow.ansich import create_sql_ansich_service
+from deerflow.ansich.persistence import sql as sql_module
 from deerflow.ansich.persistence.models import (
     AnsichAssessorErrorRow,
     AnsichAssessorJobRow,
     AnsichAuthorizationPermissionRow,
     AnsichAuthorizationSnapshotRow,
+    AnsichBeliefAssertionRow,
     AnsichCurrentBeliefRow,
     AnsichEntityRow,
     AnsichObservationRow,
@@ -202,7 +204,7 @@ def test_phase9_safety_migration_upgrades_sqlite(tmp_path) -> None:
     finally:
         engine.dispose()
 
-    assert revision == "0024_ansich_wall_time_watermarks"
+    assert revision == "0025_ansich_assessor_watermarks"
     assert {
         "ansich_authorization_snapshots",
         "ansich_authorization_scopes",
@@ -923,3 +925,532 @@ async def test_externalized_scope_authorization_and_effect_payloads_read_back(tm
         for obs_id in externalized_obs_ids:
             assert read_back[obs_id].payload is None
             assert read_back[obs_id].payload_ref_id is not None
+
+
+def _scope_safety_tool_call_batch(
+    *,
+    task_id: str,
+    step_id: str,
+    tool_call_id: str,
+    call_seq: int,
+    producer: Producer,
+    observed_at: datetime,
+    label: str,
+) -> tuple[ObservationEnvelope, ...]:
+    """The ToolCall projection a scope-safety conclusion needs as its subject."""
+
+    return (
+        ObservationEnvelope(
+            kind="tool.issued",
+            occurred_at=observed_at,
+            task_id=task_id,
+            step_id=step_id,
+            subject_type="tool_call",
+            subject_id=tool_call_id,
+            producer=producer,
+            source_event_id=f"{label}:tool:issued",
+            correlation_id=label,
+            payload={
+                "call_seq": call_seq,
+                "provider_call_id": f"provider-{label}",
+                "tool_name": "write_file",
+                "args_hash": f"{call_seq:064d}",
+                "args_preview": {"path": f"workspace/{label}.md"},
+                "tool_schema_block_id": None,
+            },
+        ),
+    )
+
+
+def _scope_safety_evidence_batch(
+    *,
+    task_id: str,
+    step_id: str,
+    tool_call_id: str,
+    producer: Producer,
+    observed_at: datetime,
+    label: str,
+    with_observed_effect: bool,
+) -> tuple[ObservationEnvelope, ...]:
+    """Authorization plus effect evidence for one ToolCall.
+
+    ``with_observed_effect=False`` leaves the call with a declared intent and no
+    concrete observed effect, which is exactly the ``unverified_effect``
+    ``present`` state that a later ``effect.observed`` clears.
+    """
+
+    snapshot_id = new_id()
+    evaluated_obs_id = new_id()
+    decision_obs_id = new_id()
+    snapshot = AuthorizationSnapshot(
+        snapshot_id=snapshot_id,
+        tool_call_id=tool_call_id,
+        policy_id="incremental-policy",
+        policy_version="1",
+        policy_hash="d" * 64,
+        decision="allowed",
+        details_available=True,
+        reason_codes=("allowed",),
+        evaluated_at=observed_at,
+        evidence_obs_ids=(evaluated_obs_id, decision_obs_id),
+    )
+    intended_obs_id = new_id()
+    intended = ToolEffect(
+        effect_id=new_id(),
+        tool_call_id=tool_call_id,
+        effect_class="filesystem_write",
+        phase="intended",
+        scope_id=None,
+        target_hash="e" * 64,
+        target_preview=f"workspace/{label}.md",
+        fidelity_class="inferred",
+        source_obs_id=intended_obs_id,
+    )
+    observations = [
+        ObservationEnvelope(
+            obs_id=evaluated_obs_id,
+            kind="authorization.evaluated",
+            occurred_at=observed_at,
+            task_id=task_id,
+            step_id=step_id,
+            subject_type="authorization_snapshot",
+            subject_id=snapshot_id,
+            producer=producer,
+            source_event_id=f"{label}:authorization:evaluated",
+            correlation_id=label,
+            payload={"snapshot": snapshot.model_dump(mode="json")},
+        ),
+        ObservationEnvelope(
+            obs_id=decision_obs_id,
+            kind="authorization.allowed",
+            occurred_at=observed_at,
+            task_id=task_id,
+            step_id=step_id,
+            subject_type="authorization_snapshot",
+            subject_id=snapshot_id,
+            producer=producer,
+            source_event_id=f"{label}:authorization:allowed",
+            correlation_id=label,
+            payload={"snapshot": snapshot.model_dump(mode="json")},
+        ),
+        ObservationEnvelope(
+            obs_id=intended_obs_id,
+            kind="effect.intended",
+            occurred_at=observed_at,
+            task_id=task_id,
+            step_id=step_id,
+            subject_type="effect",
+            subject_id=intended.effect_id,
+            producer=producer,
+            source_event_id=f"{label}:effect:intended",
+            correlation_id=label,
+            payload={"effect": intended.model_dump(mode="json")},
+        ),
+    ]
+    if with_observed_effect:
+        observations.append(
+            _scope_safety_observed_effect(
+                task_id=task_id,
+                step_id=step_id,
+                tool_call_id=tool_call_id,
+                producer=producer,
+                observed_at=observed_at,
+                label=label,
+            )
+        )
+    return tuple(observations)
+
+
+def _scope_safety_observed_effect(
+    *,
+    task_id: str,
+    step_id: str,
+    tool_call_id: str,
+    producer: Producer,
+    observed_at: datetime,
+    label: str,
+) -> ObservationEnvelope:
+    observed_obs_id = new_id()
+    observed = ToolEffect(
+        effect_id=new_id(),
+        tool_call_id=tool_call_id,
+        effect_class="filesystem_write",
+        phase="observed",
+        scope_id=None,
+        target_hash="f" * 64,
+        target_preview=f"workspace/{label}.md",
+        fidelity_class="hard",
+        source_obs_id=observed_obs_id,
+        result_metadata={"status": "written"},
+    )
+    return ObservationEnvelope(
+        obs_id=observed_obs_id,
+        kind="effect.observed",
+        occurred_at=observed_at,
+        task_id=task_id,
+        step_id=step_id,
+        subject_type="effect",
+        subject_id=observed.effect_id,
+        producer=producer,
+        source_event_id=f"{label}:effect:observed",
+        correlation_id=label,
+        payload={"effect": observed.model_dump(mode="json")},
+    )
+
+
+def _scope_safety_service(tmp_path, name: str):
+    engine = create_async_engine(f"sqlite+aiosqlite:///{tmp_path / name}")
+
+    @event.listens_for(engine.sync_engine, "connect")
+    def _enable_foreign_keys(dbapi_connection, _connection_record):
+        cursor = dbapi_connection.cursor()
+        cursor.execute("PRAGMA foreign_keys=ON")
+        cursor.close()
+
+    session_factory = async_sessionmaker(engine, expire_on_commit=False)
+    return engine, session_factory
+
+
+async def _start_scope_safety_task(service, *, task_id: str, step_id: str, observed_at: datetime, producer: Producer, label: str) -> None:
+    service.record_batch(
+        (
+            ObservationEnvelope.task_lifecycle(
+                kind="task.created",
+                task_id=task_id,
+                source_kind="deerflow_run",
+                source_id=label,
+                occurred_at=observed_at,
+                source_event_id=f"{label}:task:created",
+            ),
+            ObservationEnvelope(
+                kind="step.started",
+                occurred_at=observed_at,
+                task_id=task_id,
+                step_id=step_id,
+                subject_type="step",
+                subject_id=step_id,
+                producer=producer,
+                source_event_id=f"{label}:step:started",
+                correlation_id=label,
+                payload={"step_seq": 1, "actor_kind": "lead_agent"},
+            ),
+        )
+    )
+    await service.flush_task(task_id)
+
+
+@pytest.mark.anyio
+async def test_scope_safety_reassessment_work_does_not_grow_with_tool_call_count(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    """P9-M2: one new ToolCall's evidence must not re-judge the whole Task.
+
+    Each scope-safety conclusion is decided from one ``tool_call_id``'s own
+    snapshots and effects, so a trigger carrying evidence for exactly one
+    ToolCall has exactly one converged conclusion to move. The domain-call
+    counter pins the re-judged subject count at 1, and the
+    ``ansich_scope_conclusions`` statement counter pins that no per-subject
+    write fan-out replaced it — together they keep the cumulative cost linear
+    in the ToolCall count instead of quadratic.
+    """
+
+    tool_calls = 5
+    engine, session_factory = _scope_safety_service(tmp_path, "scope-safety-incremental-cost.db")
+    async with engine.begin() as connection:
+        await connection.run_sync(Base.metadata.create_all)
+    service = create_sql_ansich_service(
+        session_factory,
+        flush_interval_ms=60_000,
+        projector_poll_interval_ms=60_000,
+        operations_assessment_interval_ms=60_000,
+    )
+    await service.start()
+    task_id, step_id = new_id(), new_id()
+    observed_at = datetime(2026, 8, 19, 10, tzinfo=UTC)
+    producer = Producer(name="scope-safety-cost", version="1", instance_id="test")
+
+    assessed_subjects: list[str] = []
+    real_assess_scope_safety = sql_module.assess_scope_safety
+
+    def counting_assess_scope_safety(**kwargs):
+        assessed_subjects.append(kwargs["tool_call_id"])
+        return real_assess_scope_safety(**kwargs)
+
+    monkeypatch.setattr(sql_module, "assess_scope_safety", counting_assess_scope_safety)
+
+    conclusion_statements = {"count": 0}
+
+    def capture_conclusion_sql(
+        _connection,
+        _cursor,
+        statement,
+        _parameters,
+        _context,
+        _executemany,
+    ) -> None:
+        if "ansich_scope_conclusions" in " ".join(statement.lower().split()):
+            conclusion_statements["count"] += 1
+
+    subjects_per_round: list[int] = []
+    statements_per_round: list[int] = []
+    try:
+        await _start_scope_safety_task(
+            service,
+            task_id=task_id,
+            step_id=step_id,
+            observed_at=observed_at,
+            producer=producer,
+            label="cost",
+        )
+        event.listen(engine.sync_engine, "before_cursor_execute", capture_conclusion_sql)
+        try:
+            for index in range(tool_calls):
+                label = f"cost-{index}"
+                tool_call_id = new_id()
+                service.record_batch(
+                    _scope_safety_tool_call_batch(
+                        task_id=task_id,
+                        step_id=step_id,
+                        tool_call_id=tool_call_id,
+                        call_seq=index + 1,
+                        producer=producer,
+                        observed_at=observed_at,
+                        label=label,
+                    )
+                )
+                await service.flush_task(task_id)
+                service.record_batch(
+                    _scope_safety_evidence_batch(
+                        task_id=task_id,
+                        step_id=step_id,
+                        tool_call_id=tool_call_id,
+                        producer=producer,
+                        observed_at=observed_at,
+                        label=label,
+                        with_observed_effect=True,
+                    )
+                )
+                await service.flush_task(task_id)
+                assessed_subjects.clear()
+                conclusion_statements["count"] = 0
+                await service.assess_operations(now=observed_at + timedelta(minutes=index + 1))
+                subjects_per_round.append(len(assessed_subjects))
+                statements_per_round.append(conclusion_statements["count"])
+        finally:
+            event.remove(engine.sync_engine, "before_cursor_execute", capture_conclusion_sql)
+    finally:
+        await service.stop()
+        await engine.dispose()
+
+    # Every trigger carries evidence for exactly one ToolCall, so exactly one
+    # scope-safety conclusion set is recomputed no matter how long the Task is.
+    assert subjects_per_round == [1] * tool_calls
+    # And the conclusion write path did not grow to replace the wide re-judge.
+    assert max(statements_per_round) == min(statements_per_round)
+
+
+@pytest.mark.anyio
+async def test_late_scope_evidence_reassesses_only_its_own_tool_call(tmp_path) -> None:
+    """P9-M2: a converged ToolCall keeps its conclusions with no rewrite.
+
+    ``scope-safety`` stamps ``as_of``/``asserted_at`` with the assessment time,
+    so a re-judged conclusion is never absorbed by ``_persist_assessment``'s
+    dedupe even when nothing changed: it appends a fresh assertion and a fresh
+    ``ansich_scope_conclusions`` row every trigger. Counting those rows is
+    therefore a direct read of whether the untouched subject was re-judged.
+    """
+
+    engine, session_factory = _scope_safety_service(tmp_path, "scope-safety-incremental-window.db")
+    async with engine.begin() as connection:
+        await connection.run_sync(Base.metadata.create_all)
+    service = create_sql_ansich_service(
+        session_factory,
+        flush_interval_ms=60_000,
+        projector_poll_interval_ms=60_000,
+        operations_assessment_interval_ms=60_000,
+    )
+    await service.start()
+    task_id, step_id = new_id(), new_id()
+    converged_id, late_id = new_id(), new_id()
+    observed_at = datetime(2026, 8, 19, 11, tzinfo=UTC)
+    producer = Producer(name="scope-safety-window", version="1", instance_id="test")
+
+    async def _scope_safety_state(session, tool_call_id: str) -> tuple[int, int, tuple[str, ...]]:
+        assertions = await session.scalar(
+            select(func.count())
+            .select_from(AnsichBeliefAssertionRow)
+            .where(
+                AnsichBeliefAssertionRow.subject_id == tool_call_id,
+                AnsichBeliefAssertionRow.field_name.like("scope_safety:%"),
+            )
+        )
+        conclusions = await session.scalar(select(func.count()).select_from(AnsichScopeConclusionRow).where(AnsichScopeConclusionRow.tool_call_id == tool_call_id))
+        current = tuple(
+            (
+                await session.execute(
+                    select(AnsichCurrentBeliefRow.assertion_id)
+                    .where(
+                        AnsichCurrentBeliefRow.subject_id == tool_call_id,
+                        AnsichCurrentBeliefRow.field_name.like("scope_safety:%"),
+                    )
+                    .order_by(AnsichCurrentBeliefRow.field_name)
+                )
+            ).scalars()
+        )
+        return int(assertions or 0), int(conclusions or 0), current
+
+    try:
+        await _start_scope_safety_task(
+            service,
+            task_id=task_id,
+            step_id=step_id,
+            observed_at=observed_at,
+            producer=producer,
+            label="window",
+        )
+        for index, (tool_call_id, label) in enumerate(((converged_id, "window-converged"), (late_id, "window-late"))):
+            service.record_batch(
+                _scope_safety_tool_call_batch(
+                    task_id=task_id,
+                    step_id=step_id,
+                    tool_call_id=tool_call_id,
+                    call_seq=index + 1,
+                    producer=producer,
+                    observed_at=observed_at,
+                    label=label,
+                )
+            )
+            await service.flush_task(task_id)
+            service.record_batch(
+                _scope_safety_evidence_batch(
+                    task_id=task_id,
+                    step_id=step_id,
+                    tool_call_id=tool_call_id,
+                    producer=producer,
+                    observed_at=observed_at,
+                    label=label,
+                    # The late subject stays unverified until its observed
+                    # effect lands in a later watermark window.
+                    with_observed_effect=tool_call_id == converged_id,
+                )
+            )
+            await service.flush_task(task_id)
+        await service.assess_operations(now=observed_at)
+
+        async with session_factory() as session:
+            converged_before = await _scope_safety_state(session, converged_id)
+            late_before = await _scope_safety_state(session, late_id)
+        unverified_before = await service.get_current_belief(late_id, "scope_safety:unverified_effect")
+
+        service.record(
+            _scope_safety_observed_effect(
+                task_id=task_id,
+                step_id=step_id,
+                tool_call_id=late_id,
+                producer=producer,
+                observed_at=observed_at,
+                label="window-late",
+            )
+        )
+        await service.flush_task(task_id)
+        await service.assess_operations(now=observed_at + timedelta(minutes=5))
+
+        async with session_factory() as session:
+            converged_after = await _scope_safety_state(session, converged_id)
+            late_after = await _scope_safety_state(session, late_id)
+        unverified_after = await service.get_current_belief(late_id, "scope_safety:unverified_effect")
+    finally:
+        await service.stop()
+        await engine.dispose()
+
+    # The converged subject received no new evidence: same assertion count,
+    # same conclusion rows, same selected assertions.
+    assert converged_before == (4, 4, converged_before[2])
+    assert converged_after == converged_before
+    # The subject the new evidence belongs to is re-judged and its conclusion
+    # actually moves.
+    assert late_before[0] == 4
+    assert late_after[0] > late_before[0]
+    assert late_after[2] != late_before[2]
+    assert unverified_before is not None and unverified_before.value["value"] == "present"
+    assert unverified_after is not None and unverified_after.value["value"] == "cleared"
+
+
+@pytest.mark.anyio
+async def test_first_scope_safety_assessment_and_replay_assess_every_tool_call(tmp_path) -> None:
+    """P9-M2: the incremental window must reset with the conclusions it guards.
+
+    A Task whose first assessment happens after several ToolCalls already
+    carry evidence has no previous window, so the cold-start path judges all of
+    them. ``rebuild_projections()`` deletes the conclusions, so whatever records
+    the previous window has to be deleted with them or the replay would rebuild
+    an empty projection.
+    """
+
+    engine, session_factory = _scope_safety_service(tmp_path, "scope-safety-cold-start.db")
+    async with engine.begin() as connection:
+        await connection.run_sync(Base.metadata.create_all)
+    service = create_sql_ansich_service(
+        session_factory,
+        flush_interval_ms=60_000,
+        projector_poll_interval_ms=60_000,
+        operations_assessment_interval_ms=60_000,
+    )
+    await service.start()
+    task_id, step_id = new_id(), new_id()
+    first_id, second_id = new_id(), new_id()
+    observed_at = datetime(2026, 8, 19, 12, tzinfo=UTC)
+    producer = Producer(name="scope-safety-cold", version="1", instance_id="test")
+
+    async def _conclusion_counts(session) -> dict[str, int]:
+        return {tool_call_id: int(await session.scalar(select(func.count()).select_from(AnsichScopeConclusionRow).where(AnsichScopeConclusionRow.tool_call_id == tool_call_id)) or 0) for tool_call_id in (first_id, second_id)}
+
+    try:
+        await _start_scope_safety_task(
+            service,
+            task_id=task_id,
+            step_id=step_id,
+            observed_at=observed_at,
+            producer=producer,
+            label="cold",
+        )
+        for index, (tool_call_id, label) in enumerate(((first_id, "cold-first"), (second_id, "cold-second"))):
+            service.record_batch(
+                _scope_safety_tool_call_batch(
+                    task_id=task_id,
+                    step_id=step_id,
+                    tool_call_id=tool_call_id,
+                    call_seq=index + 1,
+                    producer=producer,
+                    observed_at=observed_at,
+                    label=label,
+                )
+            )
+            await service.flush_task(task_id)
+            service.record_batch(
+                _scope_safety_evidence_batch(
+                    task_id=task_id,
+                    step_id=step_id,
+                    tool_call_id=tool_call_id,
+                    producer=producer,
+                    observed_at=observed_at,
+                    label=label,
+                    with_observed_effect=True,
+                )
+            )
+            await service.flush_task(task_id)
+        # Nothing has been assessed yet: this is the cold-start path.
+        await service.assess_operations(now=observed_at)
+        async with session_factory() as session:
+            cold_start_counts = await _conclusion_counts(session)
+
+        await service.rebuild_projections()
+        async with session_factory() as session:
+            replayed_counts = await _conclusion_counts(session)
+    finally:
+        await service.stop()
+        await engine.dispose()
+
+    assert cold_start_counts == {first_id: 4, second_id: 4}
+    assert replayed_counts == cold_start_counts

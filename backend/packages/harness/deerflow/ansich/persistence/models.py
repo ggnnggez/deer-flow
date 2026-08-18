@@ -182,6 +182,34 @@ class AnsichAssessorErrorRow(Base):
     )
 
 
+class AnsichAssessorWatermarkRow(Base):
+    """Highest evidence watermark one assessor has *successfully* settled.
+
+    An assessor job's own ``status`` cannot answer this: claiming coalesces the
+    group's lower jobs to ``completed`` before the evaluation runs, so a failed
+    or crashed evaluation leaves them completed with nothing assessed. This row
+    is written inside the evaluation's own transaction, so it advances only when
+    the conclusions it describes are durable, and it is deleted together with
+    those conclusions by ``rebuild_projections()``.
+    """
+
+    __tablename__ = "ansich_assessor_watermarks"
+
+    subject_id: Mapped[str] = mapped_column(
+        String(36),
+        ForeignKey("ansich_tasks.entity_id", ondelete="CASCADE"),
+        primary_key=True,
+    )
+    assessor_name: Mapped[str] = mapped_column(String(64), primary_key=True)
+    assessor_version: Mapped[str] = mapped_column(String(32), primary_key=True)
+    evidence_watermark: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        nullable=False,
+        default=_utc_now,
+    )
+
+
 class AnsichEntityRow(Base):
     __tablename__ = "ansich_entities"
 

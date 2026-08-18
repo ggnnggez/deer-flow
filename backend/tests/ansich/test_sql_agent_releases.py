@@ -97,7 +97,7 @@ def test_phase7_release_migration_upgrades_sqlite(tmp_path) -> None:
     finally:
         engine.dispose()
 
-    assert revision == "0024_ansich_wall_time_watermarks"
+    assert revision == "0025_ansich_assessor_watermarks"
     assert {
         "ansich_agent_releases",
         "ansich_agent_release_components",
