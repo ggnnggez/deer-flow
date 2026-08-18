@@ -9,6 +9,7 @@ from sqlalchemy import create_engine, event, inspect, text
 from sqlalchemy.dialects import postgresql
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 from sqlalchemy.schema import CreateTable
+from support.ansich_settle import only_test_driven_assessments
 
 from deerflow.ansich import create_sql_ansich_service
 from deerflow.ansich.persistence.models import (
@@ -33,6 +34,7 @@ async def test_unchanged_active_task_refresh_does_not_write_read_model_row(
         session_factory,
         operations_assessment_interval_ms=60_000,
     )
+    only_test_driven_assessments(service)
     await service.start()
     task_id = new_id()
     observed_at = datetime(2026, 7, 18, 9, tzinfo=UTC)
@@ -102,6 +104,7 @@ async def test_active_task_read_model_materializes_current_action_and_operations
     async with engine.begin() as connection:
         await connection.run_sync(Base.metadata.create_all)
     service = create_sql_ansich_service(session_factory, long_dwell_seconds=120)
+    only_test_driven_assessments(service)
     await service.start()
     task_id = new_id()
     step_id = new_id()
@@ -266,6 +269,7 @@ async def test_active_task_filters_and_cursor_use_stable_evidence_order(tmp_path
     async with engine.begin() as connection:
         await connection.run_sync(Base.metadata.create_all)
     service = create_sql_ansich_service(session_factory)
+    only_test_driven_assessments(service)
     await service.start()
     started_at = datetime(2026, 7, 18, 15, tzinfo=UTC)
     task_ids = (new_id(), new_id())

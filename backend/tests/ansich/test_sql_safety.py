@@ -21,6 +21,7 @@ from sqlalchemy.dialects import postgresql
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 from sqlalchemy.pool import Pool
 from sqlalchemy.schema import CreateTable
+from support.ansich_settle import only_test_driven_assessments
 
 from deerflow.ansich import create_sql_ansich_service
 from deerflow.ansich.persistence import sql as sql_module
@@ -272,6 +273,7 @@ async def test_scope_safety_waits_for_subject_entity_then_self_heals(tmp_path) -
         projector_poll_interval_ms=5,
         operations_assessment_interval_ms=60_000,
     )
+    only_test_driven_assessments(service)
     await service.start()
     task_id, step_id, tool_call_id = new_id(), new_id(), new_id()
     observed_at = datetime(2026, 8, 18, 9, tzinfo=UTC)
@@ -433,6 +435,7 @@ async def test_scope_safety_dependency_wait_crosses_deadline_into_failed_job_and
         operations_assessment_interval_ms=60_000,
         projector_dependency_timeout_seconds=0,
     )
+    only_test_driven_assessments(service)
     await service.start()
     task_id, step_id, tool_call_id = new_id(), new_id(), new_id()
     observed_at = datetime(2026, 8, 18, 9, tzinfo=UTC)
@@ -586,6 +589,7 @@ async def test_sql_projects_scopes_authorization_and_effects_as_typed_rows(
     async with engine.begin() as connection:
         await connection.run_sync(Base.metadata.create_all)
     service = create_sql_ansich_service(session_factory)
+    only_test_driven_assessments(service)
     await service.start()
     task_id, step_id, tool_call_id = new_id(), new_id(), new_id()
     observed_at = datetime.now(UTC)
@@ -803,6 +807,7 @@ async def test_sql_projects_delete_and_permission_effects_as_typed_rows(tmp_path
     async with engine.begin() as connection:
         await connection.run_sync(Base.metadata.create_all)
     service = create_sql_ansich_service(session_factory)
+    only_test_driven_assessments(service)
     await service.start()
     task_id, step_id = new_id(), new_id()
     observed_at = datetime.now(UTC)
@@ -1427,6 +1432,7 @@ async def test_scope_safety_reassessment_work_does_not_grow_with_tool_call_count
         projector_poll_interval_ms=60_000,
         operations_assessment_interval_ms=60_000,
     )
+    only_test_driven_assessments(service)
     await service.start()
     task_id, step_id = new_id(), new_id()
     observed_at = datetime(2026, 8, 19, 10, tzinfo=UTC)
@@ -1532,6 +1538,7 @@ async def test_late_scope_evidence_reassesses_only_its_own_tool_call(tmp_path) -
         projector_poll_interval_ms=60_000,
         operations_assessment_interval_ms=60_000,
     )
+    only_test_driven_assessments(service)
     await service.start()
     task_id, step_id = new_id(), new_id()
     converged_id, late_id = new_id(), new_id()
@@ -1659,6 +1666,7 @@ async def test_first_scope_safety_assessment_and_replay_assess_every_tool_call(t
         projector_poll_interval_ms=60_000,
         operations_assessment_interval_ms=60_000,
     )
+    only_test_driven_assessments(service)
     await service.start()
     task_id, step_id = new_id(), new_id()
     first_id, second_id = new_id(), new_id()
@@ -1751,6 +1759,13 @@ async def test_absorbed_low_watermark_window_survives_an_evaluation_rollback(tmp
         projector_poll_interval_ms=5,
         operations_assessment_interval_ms=60_000,
     )
+    # This test choreographs exactly which evidence window each scope-safety
+    # evaluation sees: it seeds the durable mark by hand and asserts on the
+    # conclusions and the mark afterwards. The projector loop's first-iteration
+    # assessment ignores the 60s cadence, so under suite load it can claim the
+    # assessor jobs mid-choreography and evaluate a window the test never
+    # arranged. Every assessment here is the test's own.
+    only_test_driven_assessments(service)
     await service.start()
     task_id, step_id = new_id(), new_id()
     settled_id, late_id, blocking_id = new_id(), new_id(), new_id()

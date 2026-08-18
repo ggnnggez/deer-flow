@@ -5,6 +5,7 @@ import pytest
 from ansich import AnsichService, ObservationEnvelope, Producer, new_id
 from sqlalchemy.dialects import postgresql, sqlite
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
+from support.ansich_settle import only_test_driven_assessments
 
 from deerflow.ansich import create_sql_ansich_service
 from deerflow.ansich.persistence.sql import _periodic_budget_rows_statement
@@ -89,6 +90,16 @@ async def test_sql_budget_health_retains_terminal_overshoot_and_evidence(tmp_pat
     async with engine.begin() as connection:
         await connection.run_sync(Base.metadata.create_all)
     service = create_sql_ansich_service(session_factory)
+    # Which assertion this Task's budget_health Belief resolves to is exactly
+    # what the reads below compare, and two assessors write it: the terminal
+    # control projection (budget-health@1) and the absolute-limit assessor job
+    # that `assess_operations` drains. The projector loop assesses on its own
+    # cadence with a wall-clock `now`, which outranks the simulated `now` this
+    # test asserts with - so a background assessment landing between the two
+    # reads flips the selected source from budget-health@1 to
+    # absolute-limit@1.0.0 and fails the comparison. The test drives every
+    # assessment itself instead.
+    only_test_driven_assessments(service)
     await service.start()
     task_id = new_id()
     observed_at = datetime(2026, 7, 18, 13, tzinfo=UTC)
@@ -163,6 +174,11 @@ async def test_sql_budget_health_retains_terminal_overshoot_and_evidence(tmp_pat
     assert len(terminal_health) == 1
     assert len(health_after_periodic_assessment) == 1
     assert len(rebuilt_terminal_health) == 1
+    # Pinned, not incidental: the terminal control projection's own assertion is
+    # the one both reads must see, so a future writer that overtakes it fails
+    # here with a source name instead of flaking on the comparison below.
+    assert terminal_health[0].source.name == "budget-health"
+    assert health_after_periodic_assessment[0].source.name == "budget-health"
     assert health_after_periodic_assessment[0].model_dump(exclude={"selected_by"}) == terminal_health[0].model_dump(exclude={"selected_by"})
     assert health_after_periodic_assessment[0].selected_by.name == "ansich-default"
     belief = terminal_health[0]
@@ -187,6 +203,7 @@ async def test_task_scoped_collector_loss_makes_budget_health_unknown(tmp_path):
     async with engine.begin() as connection:
         await connection.run_sync(Base.metadata.create_all)
     service = create_sql_ansich_service(session_factory, queue_capacity=1)
+    only_test_driven_assessments(service)
     await service.start()
     task_id = new_id()
     step_id = new_id()

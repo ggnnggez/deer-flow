@@ -17,7 +17,7 @@
 | F10-7 | 缺 per-observation 持久化信号,存在「observation 丢失但回执永远 pending」的窗口 | ⬜ 未修复 | — | — |
 | F10-8 | `contracts.py` 的 scope/authorization/effect 三个 `_validate_subject` 分支缺 payload-None 守卫(既存缺陷) | ✅ 已修复 | 2026-08-18 | 本次变更待提交 |
 | F10-9 | 同一组常量六处复制(suite-bound kinds ×3、五维度集合 ×3) | ⬜ 未修复 | — | — |
-| F10-10 | settle 时序 flaky 未隔离:在负载下轮换命中无关测试 | ⬜ 未修复 | — | — |
+| F10-10 | settle 时序 flaky 未隔离:在负载下轮换命中无关测试 | ✅ 已修复 | 2026-08-19 | 本次变更待提交 |
 | F10-11 | pass-rate 兜底未标注量表极性 | ⬜ 未修复 | — | — |
 | F10-12 | feedback 桥接在请求路径上 await 一次无上界的 DB 读 | ⬜ 未修复 | — | — |
 | F10-13 | `/acknowledge` 静默忽略 `semantic_override` | ⬜ 未修复 | — | — |
@@ -105,7 +105,20 @@
 
 ## F10-10. settle 时序 flaky 未隔离
 
-- 状态:⬜ 未修复。
+- 状态:✅ 已修复(2026-08-19,本次变更待提交)。四条证据指向同一个后台写者:`AnsichService._projector_loop` 在**第一轮迭代就无条件**跑一次 `assess_operations()`(`next_assessment = loop.time()`),之后每 `operations_assessment_interval_ms` 再跑一次;它用的是**墙钟** `now`,而这些测试自己驱动的评估传的是**模拟** `now`。凡是断言「哪一次评估跑过、跑在哪个 watermark 上」的测试,在套件负载下就是在跟这次后台调用赛跑——把 `operations_assessment_interval_ms` 调到 60s(`e91d9f1c` 的做法)只压掉周期那一半,第一轮那次压不掉;调大超时更是治不了,因为等的是另一个写者而不是一个慢操作。修复因此不是等更久,而是让这些测试**拥有评估调度**:新增 `backend/tests/support/ansich_settle.py::only_test_driven_assessments(service)`,按发起 task 区分,把 projector loop 自己发起的 `assess_operations()` 变成 no-op(投影照跑,测试的显式调用照跑,`rebuild_projections()` 内部的 `_assess_operations_unlocked` 不受影响)。另加 `backend/tests/ansich/conftest.py`,把本目录所有 SQLite 引擎对齐生产的并发 pragma。
+- RED 证据(可复现,不是只靠推理):24 个 CPU 忙循环压着重复跑那四条测试,`test_sql_budget_health_retains_terminal_overshoot_and_evidence` **8/8 失败**,失败点与本会话记录一致——`{'source': {'name': 'absolute-limit', 'version': '1.0.0'}} != {'source': {'name': 'budget-health', 'version': '1'}}`(两次读的 `model_dump` 比对);修复后同一负载 **8/8 通过**。另用一段独立脚本把「后台评估落在两次读之间」显式重放,复现同一条不等式,并验证修复后两次读拿到同一条 assertion。
+- 逐条诊断:
+  1. `test_sql_budget.py::test_sql_budget_health_retains_terminal_overshoot_and_evidence`(最老的一条,`phase-9-review-followups.md` 里就记过「无关的预存 flaky」):`budget_health:total_tokens:local` 这个 field 有两个写者——终态 control 投影里的 `_assess_budget_rows`(source `budget-health@1`,`asserted_at = observation.recorded_at`,墙钟)与 `absolute-limit@1.0.0` assessor job(`asserted_at` = 评估传入的 `now`)。`ansich-default@2.0.0` 在 authority 相同时按 `(as_of, asserted_at, assertion_id)` 取最大,而测试自己的评估用的是 2026-07-18 的模拟时间,永远排在 `recorded_at` 之前,所以 budget-health 稳定胜出;projector loop 用墙钟评估写出的 absolute-limit assertion 则更晚,一旦落在两次读之间就翻转 selected source。修复:gate,并把两次读的 `source.name` 显式钉成 `budget-health`——让「等的是哪个 assessor 的断言」变成写死的期望,而不是碰巧。
+  2. `test_sql_alerts.py::test_sql_assessor_jobs_coalesce_to_highest_pending_watermark`(`e91d9f1c` 修过一轮的同一条):它断言 `pending_count > 1`、`evaluated_watermarks == [highest_watermark]`、`sum(attempts) == 1`,三条都在描述「只有我这一次评估跑过」。第一轮迭代那次后台评估一旦滑到三条 action step 投影之后,就会先把 job drain 掉,三条断言一起塌。修复:gate。
+  3. `test_sql_safety.py::test_absorbed_low_watermark_window_survives_an_evaluation_rollback`(本批 Task 4 新增):它手工把 `ansich_assessor_watermarks` 改成 late 证据的 ingest_seq(前置断言 `mark.evidence_watermark < late_last_seq`)再驱动三次评估;后台评估会用墙钟认领 scope-safety job 并推进这个 mark,精心安排的窗口直接不成立。同一条还观察到过一次 SQLite `database is locked`,那是另一类问题:测试引擎是裸 `create_async_engine`,`journal_mode=delete` + 驱动默认 5s `busy_timeout`,而生产 `deerflow/persistence/engine.py` 给每条 SQLite 连接设 WAL + 30s `busy_timeout`;回滚日志模式下「读事务要升级为写事务、而另一条连接持 RESERVED」会**立即**返回 SQLITE_BUSY(SQLite 故意不走 busy handler,因为重试必然死锁),于是测试直接报错而不是等待。修复:gate + conftest 的 pragma 对齐。三处 `anyio.sleep(0.3/0.5)` 保留:它们等的是 dependency-pending 的 250ms 退避,是下界等待(负载下只会睡更久),不是竞态源。
+  4. `test_sql_task_lifecycle.py::test_step_attempt_and_context_are_queryable_after_projection`:**推定诊断——没拿到原始失败文本,人工负载下也没能复现**。可以排除 outcome-racing:它自己不调 `assess_operations`,断言的 `StepView`/`ContextSnapshotView` 里没有任何 assessment 派生字段,中间件是同步记录(只有 heartbeat probe 用 `create_task`,本测试不启动它),writer loop 与 `flush_task` 共用 `_persist_lock`。剩下的负载敏感面只有两处:SQLite 锁竞争(已由 conftest 消除)与 `flush_task` 的 10s 投影 settle 预算(`4e5eb0fd` 的耐心默认值,本次未动)。
+- 同型清扫:按「测试自己驱动评估 ⇒ 测试拥有评估调度」这条统一规则,把 gate 补到 `tests/ansich/` 里全部 26 条「启动了 service 又自己调 `assess_operations`」的测试(含上面三条),分布为 `test_sql_alerts`(8)、`test_sql_safety`(7)、`test_ansich_operations_router`(3)、`test_sql_active_tasks`(3)、`test_sql_budget`(2)、`test_sql_heartbeat`(2)、`test_sql_task_tree`(2)、`test_sql_agent_releases`(1)。
+- 只登记不修(形状不同,不适用同一把锁):
+  - 151 条「启动了 service 但不自己驱动评估」的测试:后台评估对它们是环境噪声而不是结果竞态,是否该静默要逐条判断,没有证据就不动。
+  - `tests/ansich/test_task_lifecycle.py::test_background_writer_makes_running_task_queryable_without_explicit_flush`(`anyio.fail_after(0.5)`)与 `tests/ansich/test_sql_heartbeat.py::test_background_assessor_materializes_running_task_heartbeat_belief`(`asyncio.timeout(1)`):等的是确定性条件(轮询到 Task / heartbeat Belief 出现),但**期限本身**对负载敏感。它们真轮换红的话,唯一正确的改法是放宽那个期限——完成信号已经是确定性的,不需要再加 sleep。
+  - `tests/ansich/test_task_lifecycle.py::test_rebuild_is_mutually_exclusive_with_background_projection` 里的 `anyio.sleep(0.05)`:那是给 projector loop「有机会」抢 job 的否定式断言窗口(`project_pending_during_rebuild == 0`),负载下只会让机会更少,方向是安全的,但它是一个时间窗而不是信号。
+- 验收:`uv run pytest tests/ansich -q` 背靠背连跑三次全绿——`483 passed` / 200.87s、`483 passed` / 210.40s、`483 passed` / 287.95s(483 含本次新增的两条机制钉子;改动前为 481)。另加两条钉子:`tests/ansich/test_settle_isolation.py` 断言 gate 确实只放行测试自己的调用、且本目录的裸引擎报 `wal` / `30000`——这两个机制坏掉时都是静默的(空闲机器上照样全绿),所以必须钉住。
+- 原始诊断(留档):
 - 位置:`backend/tests/ansich/` 的 SQLite 集成测试族(负载下轮换命中,每条单跑必过)。
 - 现状:Task 9 期间观察到一条与被测行为无关的失败,在不同测试之间轮换出现;同族现象在 Phase 7 已经确诊为投影 settle 时序对套件级负载敏感,而不是被测代码的缺陷。它现在的代价是每次全量跑都要人工判断"这条红是不是真的"。
 - 方向:沿用 Phase 7 M2 的先例(`e91d9f1c`/`4e5eb0fd`)——隔离 SQL 集成测试的 settle 时序,让等待条件不再依赖套件整体负载,而不是靠调大超时。

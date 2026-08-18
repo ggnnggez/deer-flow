@@ -7,6 +7,7 @@ from ansich import ObservationEnvelope, Producer, new_id
 from httpx import ASGITransport, AsyncClient
 from sqlalchemy import select, update
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
+from support.ansich_settle import only_test_driven_assessments
 
 from app.gateway.auth.models import User
 from app.gateway.routers import ansich as ansich_router
@@ -41,6 +42,7 @@ async def test_filtered_empty_active_read_does_not_refresh_ready_read_model(
         session_factory,
         operations_assessment_interval_ms=60_000,
     )
+    only_test_driven_assessments(service)
     await service.start()
     task_id = new_id()
     observed_at = datetime.now(UTC) - timedelta(seconds=10)
@@ -166,6 +168,7 @@ async def test_operator_endpoints_return_active_usage_budgets_and_etag(
     async with engine.begin() as connection:
         await connection.run_sync(Base.metadata.create_all)
     service = create_sql_ansich_service(session_factory)
+    only_test_driven_assessments(service)
     await service.start()
     task_id = new_id()
     step_id = new_id()
@@ -287,6 +290,7 @@ async def test_alert_endpoints_list_detail_and_enforce_workflow_version(
         tool_frequency_threshold=1,
         operations_assessment_interval_ms=60_000,
     )
+    only_test_driven_assessments(service)
     await service.start()
     task_id = new_id()
     step_id = new_id()

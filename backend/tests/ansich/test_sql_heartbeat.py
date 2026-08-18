@@ -9,6 +9,7 @@ from alembic.config import Config as AlembicConfig
 from ansich import ObservationEnvelope, Producer, new_id
 from sqlalchemy import create_engine, event, func, select, text
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
+from support.ansich_settle import only_test_driven_assessments
 
 from deerflow.ansich import create_sql_ansich_service
 from deerflow.ansich.persistence.models import (
@@ -392,6 +393,7 @@ async def test_heartbeat_assessor_persists_stale_and_recovery_without_changing_c
         heartbeat_stale_after_seconds=30,
         operations_assessment_interval_ms=60_000,
     )
+    only_test_driven_assessments(service)
     await service.start()
     task_id = new_id()
     started_at = datetime(2026, 7, 18, 11, tzinfo=UTC)
@@ -831,6 +833,7 @@ async def test_terminal_wall_time_keeps_its_own_row_beside_the_heartbeat_high_wa
         session_factory,
         operations_assessment_interval_ms=60_000,
     )
+    only_test_driven_assessments(service)
     await service.start()
     task_id = new_id()
     observed_at = datetime(2026, 8, 19, 10, 30, tzinfo=UTC)

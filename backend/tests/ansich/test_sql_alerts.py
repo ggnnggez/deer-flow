@@ -11,6 +11,7 @@ from sqlalchemy import create_engine, event, func, inspect, select, text
 from sqlalchemy.dialects import postgresql, sqlite
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 from sqlalchemy.schema import CreateTable
+from support.ansich_settle import only_test_driven_assessments
 
 from deerflow.ansich import create_sql_ansich_service
 from deerflow.ansich.persistence.models import (
@@ -126,6 +127,7 @@ async def test_sql_assessor_job_projects_exact_repetition_belief_and_alert(
         exact_repetition_window=3,
         operations_assessment_interval_ms=60_000,
     )
+    only_test_driven_assessments(service)
     await service.start()
     task_id = new_id()
     started_at = datetime(2026, 7, 18, 16, 30, tzinfo=UTC)
@@ -305,6 +307,11 @@ async def test_sql_assessor_jobs_coalesce_to_highest_pending_watermark(
         "before_cursor_execute",
         capture_assessment_sql,
     )
+    # The 60s cadence above only spaces out the projector loop's *periodic*
+    # assessments; its first iteration assesses unconditionally, and under
+    # suite load that one call can slip past the Observations below and drain
+    # the very assessor jobs whose coalescing this test counts.
+    only_test_driven_assessments(service)
     await service.start()
     try:
         service.record_batch(
@@ -412,6 +419,7 @@ async def test_sql_tool_frequency_alert_does_not_mark_behavior_runaway(
         tool_frequency_threshold=3,
         operations_assessment_interval_ms=60_000,
     )
+    only_test_driven_assessments(service)
     await service.start()
     task_id = new_id()
     started_at = datetime(2026, 7, 18, 16, 45, tzinfo=UTC)
@@ -481,6 +489,7 @@ async def test_sql_absolute_budget_breach_marks_runaway_and_opens_alert(
         session_factory,
         operations_assessment_interval_ms=60_000,
     )
+    only_test_driven_assessments(service)
     await service.start()
     task_id = new_id()
     started_at = datetime(2026, 7, 18, 17, tzinfo=UTC)
@@ -600,6 +609,7 @@ async def test_sql_terminal_wall_time_breach_keeps_final_interval_after_last_hea
         session_factory,
         operations_assessment_interval_ms=60_000,
     )
+    only_test_driven_assessments(service)
     await service.start()
     task_id = new_id()
     started_at = datetime(2026, 7, 18, 17, 30, tzinfo=UTC)
@@ -706,6 +716,7 @@ async def test_sql_wall_clock_assessment_opens_and_resolves_liveness_alerts(
         long_dwell_seconds=5,
         operations_assessment_interval_ms=60_000,
     )
+    only_test_driven_assessments(service)
     await service.start()
     task_id = new_id()
     step_id = new_id()
@@ -824,6 +835,7 @@ async def test_periodic_alert_reconciliation_skips_historical_episode_evidence(
         heartbeat_stale_after_seconds=2,
         operations_assessment_interval_ms=60_000,
     )
+    only_test_driven_assessments(service)
     await service.start()
     task_id = new_id()
     started_at = datetime(2026, 7, 18, 17, 45, tzinfo=UTC)
@@ -949,6 +961,7 @@ async def test_failed_assessor_jobs_degrade_health_and_can_be_retried(
         flush_interval_ms=60_000,
         operations_assessment_interval_ms=60_000,
     )
+    only_test_driven_assessments(service)
     await service.start()
     task_id = new_id()
     started_at = datetime(2026, 7, 18, 18, tzinfo=UTC)

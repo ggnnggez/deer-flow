@@ -12,6 +12,7 @@ from sqlalchemy import create_engine, event, func, inspect, select, text
 from sqlalchemy.dialects import postgresql
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 from sqlalchemy.schema import CreateTable
+from support.ansich_settle import only_test_driven_assessments
 
 from deerflow.ansich import create_sql_ansich_service
 from deerflow.ansich.persistence.models import (
@@ -216,6 +217,7 @@ async def test_provider_reported_model_mismatch_creates_drift_belief_without_mut
     async with engine.begin() as connection:
         await connection.run_sync(Base.metadata.create_all)
     service = create_sql_ansich_service(session_factory)
+    only_test_driven_assessments(service)
     await service.start()
     task_id, step_id, attempt_id = new_id(), new_id(), new_id()
     run_id = "release-drift-run"

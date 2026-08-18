@@ -11,6 +11,7 @@ from sqlalchemy import create_engine, inspect, select, text
 from sqlalchemy.dialects import postgresql
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 from sqlalchemy.schema import CreateTable
+from support.ansich_settle import only_test_driven_assessments
 
 from deerflow.ansich import create_sql_ansich_service
 from deerflow.ansich.persistence.models import (
@@ -351,6 +352,7 @@ async def test_usage_rolls_up_two_levels_and_backfills_a_late_spawn_without_doub
     async with engine.begin() as connection:
         await connection.run_sync(Base.metadata.create_all)
     service = create_sql_ansich_service(session_factory)
+    only_test_driven_assessments(service)
     await service.start()
     root_id, child_id, grandchild_id = new_id(), new_id(), new_id()
     root_step, child_step, grandchild_step = new_id(), new_id(), new_id()
@@ -652,6 +654,7 @@ async def test_inclusive_wall_time_uses_each_running_descendants_latest_heartbea
         session_factory,
         operations_assessment_interval_ms=60_000,
     )
+    only_test_driven_assessments(service)
     await service.start()
     root_id, child_id = new_id(), new_id()
     root_step, root_tool = new_id(), new_id()

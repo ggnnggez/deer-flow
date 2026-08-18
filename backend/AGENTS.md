@@ -745,6 +745,20 @@ suite load with incomplete projections. Production embedded assembly always
 passes `AnsichConfig.terminal_flush_timeout_ms` explicitly (2 seconds by
 default), preserving the runtime's bounded fail-open terminal flush.
 
+Two test-side rules keep that suite deterministic under load, both introduced
+by F10-10 and neither of them a timeout. (1) `_projector_loop` assesses on its
+first iteration unconditionally and then on its own cadence, always with a
+wall-clock `now`; a test that drives `assess_operations(now=...)` itself and
+then asserts on which assessment ran is racing that call, so every such test
+calls `tests/support/ansich_settle.py::only_test_driven_assessments(service)`
+before `start()` — the projector keeps projecting, only its own assessments
+fall silent. (2) `tests/ansich/conftest.py` puts every SQLite engine in that
+directory into `journal_mode=WAL` with a 30s `busy_timeout`, matching
+`deerflow/persistence/engine.py`; a bare `create_async_engine` otherwise leaves
+the file in rollback-journal mode, where a read transaction upgrading to a
+write one against a held RESERVED lock fails with "database is locked"
+immediately instead of waiting.
+
 Phase 10 accepts external evaluations as `evaluation.recorded` v1 Observations
 over `task`, `step`, `tool_call`, `content_block`, and `agent_release` subjects;
 one evaluation stays an Observation and never becomes an Entity. The core
