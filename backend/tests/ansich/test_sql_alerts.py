@@ -1185,5 +1185,5 @@ def test_phase6_alert_migration_upgrades_sqlite_and_backfills_assertions(
         "authority_class",
         "confidence",
     } <= assertion_columns
-    assert revision == "0022_ansich_assessor_deadline"
+    assert revision == "0023_ansich_evaluations"
     assert len(revision) <= 32

@@ -1497,3 +1497,55 @@ class AnsichActiveTaskReadModelRow(Base):
             "budget_status",
         ),
     )
+
+
+class AnsichEvaluationIndexRow(Base):
+    __tablename__ = "ansich_evaluation_index"
+
+    evaluation_obs_id: Mapped[str] = mapped_column(String(36), ForeignKey("ansich_observations.obs_id", ondelete="CASCADE"), primary_key=True)
+    subject_type: Mapped[str] = mapped_column(String(32), nullable=False)
+    subject_id: Mapped[str] = mapped_column(String(36), nullable=False)
+    task_id: Mapped[str] = mapped_column(String(36), nullable=False)
+    evaluation_kind: Mapped[str] = mapped_column(String(32), nullable=False)
+    dimension: Mapped[str] = mapped_column(String(32), nullable=False)
+    verdict: Mapped[str | None] = mapped_column(String(16))
+    score: Mapped[float | None] = mapped_column(Float)
+    scale_min: Mapped[float | None] = mapped_column(Float)
+    scale_max: Mapped[float | None] = mapped_column(Float)
+    scale_higher_is_better: Mapped[bool | None] = mapped_column(Boolean)
+    assessor_name: Mapped[str] = mapped_column(String(64), nullable=False)
+    assessor_version: Mapped[str | None] = mapped_column(String(32))
+    authority_class: Mapped[str] = mapped_column(String(32), nullable=False)
+    fidelity_class: Mapped[str] = mapped_column(String(16), nullable=False)
+    cohort_key: Mapped[str | None] = mapped_column(String(128))
+    suite_id: Mapped[str | None] = mapped_column(String(128))
+    suite_version: Mapped[str | None] = mapped_column(String(64))
+    case_id: Mapped[str | None] = mapped_column(String(128))
+    occurred_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    projector_version: Mapped[str] = mapped_column(String(32), nullable=False)
+
+    __table_args__ = (
+        Index("ix_ansich_evaluation_subject_dimension", "subject_type", "subject_id", "dimension", "occurred_at"),
+        Index("ix_ansich_evaluation_suite_case", "suite_id", "suite_version", "case_id"),
+        Index("ix_ansich_evaluation_task", "task_id", "occurred_at"),
+    )
+
+
+class AnsichReleaseQualityStatsRow(Base):
+    __tablename__ = "ansich_release_quality_stats"
+
+    release_id: Mapped[str] = mapped_column(String(36), ForeignKey("ansich_entities.entity_id", ondelete="CASCADE"), primary_key=True)
+    cohort_key: Mapped[str] = mapped_column(String(128), primary_key=True)
+    dimension: Mapped[str] = mapped_column(String(32), primary_key=True)
+    assessed_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    pass_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    fail_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    partial_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    score_sum: Mapped[float | None] = mapped_column(Float)
+    score_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    scale_min: Mapped[float | None] = mapped_column(Float)
+    scale_max: Mapped[float | None] = mapped_column(Float)
+    as_of: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    projector_version: Mapped[str] = mapped_column(String(32), nullable=False)
+
+    __table_args__ = (Index("ix_ansich_release_quality_cohort", "release_id", "cohort_key", "dimension"),)
