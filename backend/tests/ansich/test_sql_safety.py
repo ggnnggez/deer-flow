@@ -3,6 +3,7 @@ from __future__ import annotations
 from datetime import UTC, datetime
 from pathlib import Path
 
+import anyio
 import pytest
 from alembic import command as alembic_command
 from alembic.config import Config as AlembicConfig
@@ -11,6 +12,7 @@ from ansich import (
     AuthorizationSnapshot,
     ObservationEnvelope,
     Producer,
+    ScopeDescriptor,
     ToolEffect,
     new_id,
 )
@@ -22,6 +24,8 @@ from sqlalchemy.schema import CreateTable
 
 from deerflow.ansich import create_sql_ansich_service
 from deerflow.ansich.persistence.models import (
+    AnsichAssessorErrorRow,
+    AnsichAssessorJobRow,
     AnsichAuthorizationPermissionRow,
     AnsichAuthorizationSnapshotRow,
     AnsichCurrentBeliefRow,
@@ -198,7 +202,7 @@ def test_phase9_safety_migration_upgrades_sqlite(tmp_path) -> None:
     finally:
         engine.dispose()
 
-    assert revision == "0021_ansich_summary_assertion_fk"
+    assert revision == "0022_ansich_assessor_deadline"
     assert {
         "ansich_authorization_snapshots",
         "ansich_authorization_scopes",
@@ -243,6 +247,324 @@ def test_phase9_safety_migration_upgrades_sqlite(tmp_path) -> None:
     assert downgraded_revision == "0019_ansich_task_tree_usage"
     assert "external_ref_hash" not in downgraded_scope_columns
     assert downgraded_values == ("a" * 64, "b" * 64)
+
+
+@pytest.mark.anyio
+async def test_scope_safety_waits_for_subject_entity_then_self_heals(tmp_path) -> None:
+    engine = create_async_engine(f"sqlite+aiosqlite:///{tmp_path / 'scope-safety-subject-dependency.db'}")
+
+    @event.listens_for(engine.sync_engine, "connect")
+    def _enable_foreign_keys(dbapi_connection, _connection_record):
+        cursor = dbapi_connection.cursor()
+        cursor.execute("PRAGMA foreign_keys=ON")
+        cursor.close()
+
+    session_factory = async_sessionmaker(engine, expire_on_commit=False)
+    async with engine.begin() as connection:
+        await connection.run_sync(Base.metadata.create_all)
+    service = create_sql_ansich_service(
+        session_factory,
+        flush_interval_ms=60_000,
+        terminal_flush_timeout_ms=100,
+        projector_poll_interval_ms=5,
+        operations_assessment_interval_ms=60_000,
+    )
+    await service.start()
+    task_id, step_id, tool_call_id = new_id(), new_id(), new_id()
+    observed_at = datetime(2026, 8, 18, 9, tzinfo=UTC)
+    producer = Producer(name="scope-dependency-test", version="1", instance_id="test")
+    authorization_obs_id = new_id()
+    snapshot = AuthorizationSnapshot(
+        snapshot_id=new_id(),
+        tool_call_id=tool_call_id,
+        policy_id="scope-dependency-policy",
+        policy_version="1",
+        policy_hash="a" * 64,
+        decision="allowed",
+        details_available=False,
+        evaluated_at=observed_at,
+        evidence_obs_ids=(authorization_obs_id,),
+    )
+    scope_obs_id = new_id()
+    scope = ScopeDescriptor(
+        scope_id=new_id(),
+        scope_kind="workspace",
+        external_ref_hash="b" * 64,
+        display_label="workspace",
+        created_obs_id=scope_obs_id,
+    )
+
+    try:
+        service.record(
+            ObservationEnvelope.task_lifecycle(
+                kind="task.created",
+                task_id=task_id,
+                source_kind="deerflow_run",
+                source_id="scope-dependency-run",
+                occurred_at=observed_at,
+                source_event_id="scope-dependency:task:created",
+            )
+        )
+        await service.flush_task(task_id)
+        service.record_batch(
+            (
+                ObservationEnvelope(
+                    obs_id=authorization_obs_id,
+                    kind="authorization.evaluated",
+                    occurred_at=observed_at,
+                    task_id=task_id,
+                    step_id=step_id,
+                    subject_type="authorization_snapshot",
+                    subject_id=snapshot.snapshot_id,
+                    producer=producer,
+                    source_event_id="scope-dependency:authorization:evaluated",
+                    correlation_id="scope-dependency-run",
+                    payload={"snapshot": snapshot.model_dump(mode="json")},
+                ),
+                ObservationEnvelope(
+                    obs_id=scope_obs_id,
+                    kind="scope.snapshotted",
+                    occurred_at=observed_at,
+                    task_id=task_id,
+                    subject_type="scope",
+                    subject_id=scope.scope_id,
+                    producer=producer,
+                    source_event_id="scope-dependency:scope:snapshotted",
+                    correlation_id="scope-dependency-run",
+                    payload={"scope": scope.model_dump(mode="json")},
+                ),
+            )
+        )
+        await service.flush_task(task_id)
+        await service.assess_operations(now=observed_at)
+
+        async with session_factory() as session:
+            waiting_job = await session.scalar(select(AnsichAssessorJobRow).where(AnsichAssessorJobRow.assessor_name == "scope-safety"))
+            error_count = await session.scalar(select(func.count()).select_from(AnsichAssessorErrorRow))
+            missing_subject = await session.get(AnsichEntityRow, tool_call_id)
+
+        assert waiting_job is not None
+        assert waiting_job.status == "pending"
+        assert waiting_job.attempts == 0
+        assert "waiting for subject Entity" in (waiting_job.last_error or "")
+        assert error_count == 0
+        assert missing_subject is None
+
+        await anyio.sleep(0.3)
+        service.record_batch(
+            (
+                ObservationEnvelope(
+                    kind="step.started",
+                    occurred_at=observed_at,
+                    task_id=task_id,
+                    step_id=step_id,
+                    subject_type="step",
+                    subject_id=step_id,
+                    producer=producer,
+                    source_event_id="scope-dependency:step:started",
+                    correlation_id="scope-dependency-run",
+                    payload={"step_seq": 1, "actor_kind": "lead_agent"},
+                ),
+                ObservationEnvelope(
+                    kind="tool.issued",
+                    occurred_at=observed_at,
+                    task_id=task_id,
+                    step_id=step_id,
+                    subject_type="tool_call",
+                    subject_id=tool_call_id,
+                    producer=producer,
+                    source_event_id="scope-dependency:tool:issued",
+                    correlation_id="scope-dependency-run",
+                    payload={
+                        "call_seq": 1,
+                        "provider_call_id": "provider-scope-dependency",
+                        "tool_name": "write_file",
+                        "args_hash": "c" * 64,
+                        "args_preview": {"path": "workspace/result.md"},
+                        "tool_schema_block_id": None,
+                    },
+                ),
+            )
+        )
+        await service.flush_task(task_id)
+        await anyio.sleep(0.3)
+        await service.assess_operations(now=observed_at)
+
+        async with session_factory() as session:
+            recovered_subject = await session.get(AnsichEntityRow, tool_call_id)
+            recovered_statuses = tuple((await session.execute(select(AnsichAssessorJobRow.status).where(AnsichAssessorJobRow.assessor_name == "scope-safety"))).scalars())
+            error_count_after_recovery = await session.scalar(select(func.count()).select_from(AnsichAssessorErrorRow))
+        belief = await service.get_current_belief(
+            tool_call_id,
+            "scope_safety:policy_denial",
+        )
+    finally:
+        await service.stop()
+        await engine.dispose()
+
+    assert recovered_subject is not None
+    assert recovered_statuses
+    assert set(recovered_statuses) == {"completed"}
+    assert error_count_after_recovery == 0
+    assert belief is not None
+
+
+@pytest.mark.anyio
+async def test_scope_safety_dependency_wait_crosses_deadline_into_failed_job_and_retry(tmp_path) -> None:
+    engine = create_async_engine(f"sqlite+aiosqlite:///{tmp_path / 'scope-safety-dependency-deadline.db'}")
+
+    @event.listens_for(engine.sync_engine, "connect")
+    def _enable_foreign_keys(dbapi_connection, _connection_record):
+        cursor = dbapi_connection.cursor()
+        cursor.execute("PRAGMA foreign_keys=ON")
+        cursor.close()
+
+    session_factory = async_sessionmaker(engine, expire_on_commit=False)
+    async with engine.begin() as connection:
+        await connection.run_sync(Base.metadata.create_all)
+    service = create_sql_ansich_service(
+        session_factory,
+        flush_interval_ms=60_000,
+        terminal_flush_timeout_ms=100,
+        projector_poll_interval_ms=5,
+        operations_assessment_interval_ms=60_000,
+        projector_dependency_timeout_seconds=0,
+    )
+    await service.start()
+    task_id, step_id, tool_call_id = new_id(), new_id(), new_id()
+    observed_at = datetime(2026, 8, 18, 9, tzinfo=UTC)
+    producer = Producer(name="scope-dependency-deadline-test", version="1", instance_id="test")
+    authorization_obs_id = new_id()
+    snapshot = AuthorizationSnapshot(
+        snapshot_id=new_id(),
+        tool_call_id=tool_call_id,
+        policy_id="scope-dependency-deadline-policy",
+        policy_version="1",
+        policy_hash="a" * 64,
+        decision="allowed",
+        details_available=False,
+        evaluated_at=observed_at,
+        evidence_obs_ids=(authorization_obs_id,),
+    )
+    scope_obs_id = new_id()
+    scope = ScopeDescriptor(
+        scope_id=new_id(),
+        scope_kind="workspace",
+        external_ref_hash="b" * 64,
+        display_label="workspace",
+        created_obs_id=scope_obs_id,
+    )
+
+    try:
+        service.record(
+            ObservationEnvelope.task_lifecycle(
+                kind="task.created",
+                task_id=task_id,
+                source_kind="deerflow_run",
+                source_id="scope-dependency-deadline-run",
+                occurred_at=observed_at,
+                source_event_id="scope-dependency-deadline:task:created",
+            )
+        )
+        await service.flush_task(task_id)
+        service.record_batch(
+            (
+                ObservationEnvelope(
+                    obs_id=authorization_obs_id,
+                    kind="authorization.evaluated",
+                    occurred_at=observed_at,
+                    task_id=task_id,
+                    step_id=step_id,
+                    subject_type="authorization_snapshot",
+                    subject_id=snapshot.snapshot_id,
+                    producer=producer,
+                    source_event_id="scope-dependency-deadline:authorization:evaluated",
+                    correlation_id="scope-dependency-deadline-run",
+                    payload={"snapshot": snapshot.model_dump(mode="json")},
+                ),
+                ObservationEnvelope(
+                    obs_id=scope_obs_id,
+                    kind="scope.snapshotted",
+                    occurred_at=observed_at,
+                    task_id=task_id,
+                    subject_type="scope",
+                    subject_id=scope.scope_id,
+                    producer=producer,
+                    source_event_id="scope-dependency-deadline:scope:snapshotted",
+                    correlation_id="scope-dependency-deadline-run",
+                    payload={"scope": scope.model_dump(mode="json")},
+                ),
+            )
+        )
+        await service.flush_task(task_id)
+        await service.assess_operations(now=observed_at)
+
+        async with session_factory() as session:
+            timed_out_job = await session.scalar(select(AnsichAssessorJobRow).where(AnsichAssessorJobRow.assessor_name == "scope-safety"))
+            timed_out_error_count = await session.scalar(select(func.count()).select_from(AnsichAssessorErrorRow).where(AnsichAssessorErrorRow.job_id == timed_out_job.job_id))
+        health_after_timeout = service.get_health()
+
+        assert timed_out_job.status == "failed"
+        assert timed_out_job.dependency_pending_since is not None
+        assert "waiting for subject Entity" in (timed_out_job.last_error or "")
+        assert timed_out_error_count == 1
+        assert health_after_timeout.failed_jobs >= 1
+
+        service.record_batch(
+            (
+                ObservationEnvelope(
+                    kind="step.started",
+                    occurred_at=observed_at,
+                    task_id=task_id,
+                    step_id=step_id,
+                    subject_type="step",
+                    subject_id=step_id,
+                    producer=producer,
+                    source_event_id="scope-dependency-deadline:step:started",
+                    correlation_id="scope-dependency-deadline-run",
+                    payload={"step_seq": 1, "actor_kind": "lead_agent"},
+                ),
+                ObservationEnvelope(
+                    kind="tool.issued",
+                    occurred_at=observed_at,
+                    task_id=task_id,
+                    step_id=step_id,
+                    subject_type="tool_call",
+                    subject_id=tool_call_id,
+                    producer=producer,
+                    source_event_id="scope-dependency-deadline:tool:issued",
+                    correlation_id="scope-dependency-deadline-run",
+                    payload={
+                        "call_seq": 1,
+                        "provider_call_id": "provider-scope-dependency-deadline",
+                        "tool_name": "write_file",
+                        "args_hash": "c" * 64,
+                        "args_preview": {"path": "workspace/result.md"},
+                        "tool_schema_block_id": None,
+                    },
+                ),
+            )
+        )
+        await service.flush_task(task_id)
+        retried = await service.retry_failed_projections(task_id=task_id)
+        await service.assess_operations(now=observed_at)
+
+        async with session_factory() as session:
+            recovered_statuses = tuple((await session.execute(select(AnsichAssessorJobRow.status).where(AnsichAssessorJobRow.assessor_name == "scope-safety"))).scalars())
+        belief = await service.get_current_belief(
+            tool_call_id,
+            "scope_safety:policy_denial",
+        )
+        health_after_retry = service.get_health()
+    finally:
+        await service.stop()
+        await engine.dispose()
+
+    assert retried >= 1
+    assert recovered_statuses
+    assert set(recovered_statuses) == {"completed"}
+    assert belief is not None
+    assert health_after_retry.failed_jobs == 0
 
 
 @pytest.mark.anyio

@@ -1052,6 +1052,7 @@ class SqlAnsichBackend:
                         status="pending",
                         attempts=0,
                         available_at=datetime.now(UTC),
+                        dependency_pending_since=None,
                         lease_owner=None,
                         lease_expires_at=None,
                         last_error=None,
@@ -1359,20 +1360,43 @@ class SqlAnsichBackend:
             if job is None:
                 return
             message = str(exc)[:4_000]
-            job.status = "failed" if attempt >= self._projector_max_attempts else "pending"
-            job.available_at = datetime.now(UTC) + timedelta(milliseconds=250)
-            job.lease_owner = None
-            job.lease_expires_at = None
-            job.last_error = message
-            session.add(
-                AnsichAssessorErrorRow(
-                    error_id=new_id(),
-                    job_id=job_id,
-                    attempt=attempt,
-                    error_type=type(exc).__name__,
-                    message=message,
+            if isinstance(exc, _ProjectionDependencyPending):
+                now = datetime.now(UTC)
+                pending_since = now if job.dependency_pending_since is None else _as_utc(job.dependency_pending_since)
+                job.dependency_pending_since = pending_since
+                job.status = "failed" if now - pending_since >= self._projector_dependency_timeout else "pending"
+                job.attempts = max(0, job.attempts - 1)
+                job.available_at = now + timedelta(milliseconds=250)
+                job.lease_owner = None
+                job.lease_expires_at = None
+                job.last_error = message
+                if job.status != "failed":
+                    return
+                session.add(
+                    AnsichAssessorErrorRow(
+                        error_id=new_id(),
+                        job_id=job_id,
+                        attempt=attempt,
+                        error_type=type(exc).__name__,
+                        message=message,
+                    )
                 )
-            )
+            else:
+                job.dependency_pending_since = None
+                job.status = "failed" if attempt >= self._projector_max_attempts else "pending"
+                job.available_at = datetime.now(UTC) + timedelta(milliseconds=250)
+                job.lease_owner = None
+                job.lease_expires_at = None
+                job.last_error = message
+                session.add(
+                    AnsichAssessorErrorRow(
+                        error_id=new_id(),
+                        job_id=job_id,
+                        attempt=attempt,
+                        error_type=type(exc).__name__,
+                        message=message,
+                    )
+                )
         await self._refresh_failed_job_count()
 
     async def _refresh_failed_job_count(self) -> None:
@@ -1533,6 +1557,7 @@ class SqlAnsichBackend:
                     if job is None:
                         raise RuntimeError("claimed Ansich assessor job disappeared")
                     job.status = "completed"
+                    job.dependency_pending_since = None
                     job.lease_owner = None
                     job.lease_expires_at = None
                     job.last_error = None
@@ -1934,6 +1959,8 @@ class SqlAnsichBackend:
         session: AsyncSession,
         assessment: Assessment,
     ) -> tuple[AnsichBeliefAssertionRow, bool]:
+        if await session.get(AnsichEntityRow, assessment.subject_id) is None:
+            raise _ProjectionDependencyPending(f"Assessment {assessment.field_name} is waiting for subject Entity {assessment.subject_id}")
         existing_rows = list(
             (
                 await session.execute(

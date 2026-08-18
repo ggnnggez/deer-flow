@@ -144,6 +144,7 @@ class AnsichAssessorJobRow(Base):
     lease_owner: Mapped[str | None] = mapped_column(String(128))
     lease_expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     last_error: Mapped[str | None] = mapped_column(Text)
+    dependency_pending_since: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
 
     __table_args__ = (
         UniqueConstraint(

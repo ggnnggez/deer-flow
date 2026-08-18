@@ -22,6 +22,7 @@ from deerflow.ansich import create_sql_ansich_service
 from deerflow.ansich.execution import ANSICH_EXECUTION_CONTEXT_KEY, AnsichExecutionContext
 from deerflow.ansich.middleware import AnsichAttemptMiddleware, AnsichDecisionMiddleware
 from deerflow.ansich.persistence.models import (
+    AnsichAssessorJobRow,
     AnsichBeliefAssertionRow,
     AnsichContentOccurrenceRow,
     AnsichContextSnapshotItemRow,
@@ -906,10 +907,12 @@ async def test_projection_failure_health_survives_service_restart(tmp_path, monk
 
 
 def test_dependency_pending_deadline_uses_timezone_aware_sql_on_supported_dialects() -> None:
-    column_type = AnsichProjectionJobRow.__table__.c.dependency_pending_since.type
-
-    assert column_type.compile(dialect=sqlite.dialect()) == "DATETIME"
-    assert column_type.compile(dialect=postgresql.dialect()) == "TIMESTAMP WITH TIME ZONE"
+    for column_type in (
+        AnsichProjectionJobRow.__table__.c.dependency_pending_since.type,
+        AnsichAssessorJobRow.__table__.c.dependency_pending_since.type,
+    ):
+        assert column_type.compile(dialect=sqlite.dialect()) == "DATETIME"
+        assert column_type.compile(dialect=postgresql.dialect()) == "TIMESTAMP WITH TIME ZONE"
 
 
 def test_projection_dependency_deadline_migration_upgrades_sqlite(tmp_path) -> None:
@@ -932,7 +935,31 @@ def test_projection_dependency_deadline_migration_upgrades_sqlite(tmp_path) -> N
         engine.dispose()
 
     assert "dependency_pending_since" in column_names
-    assert revision == "0021_ansich_summary_assertion_fk"
+    assert revision == "0022_ansich_assessor_deadline"
+    assert len(revision) <= 32
+
+
+def test_assessor_dependency_deadline_migration_upgrades_sqlite(tmp_path) -> None:
+    backend_root = Path(__file__).resolve().parents[2]
+    config = AlembicConfig(str(backend_root / "packages" / "harness" / "deerflow" / "persistence" / "migrations" / "alembic.ini"))
+    database_path = tmp_path / "ansich-assessor-deadline-migration.db"
+    config.set_main_option("sqlalchemy.url", f"sqlite+aiosqlite:///{database_path}")
+    # The Alembic env only applies process-wide logging.fileConfig when this
+    # remains set; the integration test must not disable loggers used later.
+    config.config_file_name = None
+
+    alembic_command.upgrade(config, "head")
+
+    engine = create_engine(f"sqlite:///{database_path}")
+    try:
+        column_names = {column["name"] for column in inspect(engine).get_columns("ansich_assessor_jobs")}
+        with engine.connect() as connection:
+            revision = connection.scalar(text("SELECT version_num FROM alembic_version"))
+    finally:
+        engine.dispose()
+
+    assert "dependency_pending_since" in column_names
+    assert revision == "0022_ansich_assessor_deadline"
     assert len(revision) <= 32
 
 
