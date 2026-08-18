@@ -759,6 +759,28 @@ export const enUS: Translations = {
     dimensionEfficiency: "Efficiency",
     dimensionEarliestErroneousStep: "Earliest erroneous Step",
     dimensionCustom: "Custom dimension",
+    qualityTitle: "Release quality",
+    qualityDescription:
+      "Observed differences between the two releases' recorded evaluations.",
+    qualityNoComparisons: "No quality evidence for these two releases.",
+    qualityNotComparable: "Not comparable",
+    qualityObservedDelta: "Observed delta",
+    qualityUnassessed: "Unassessed",
+    qualitySamples: "Samples",
+    qualityCohortPlaceholder: "Cohort key (blank: all cohorts)",
+    qualityNoCohort: "No declared cohort",
+    qualityScaleHigherIsBetter: "Scale: higher is better",
+    qualityScaleLowerIsBetter: "Scale: lower is better",
+    qualityReasonNoSharedCohort:
+      "No shared cohort — the two sample sets are not one population.",
+    qualityReasonScaleMismatch:
+      "Different score scales — the two sides measure different things.",
+    qualityReasonInsufficientSamples:
+      "Too few assessed samples on at least one side.",
+    qualityReasonObservabilityLoss:
+      "Unexplained observability loss — evidence may be missing.",
+    qualityReasonUnknown:
+      "Declined for a reason this view does not recognize yet.",
     signal: {
       behavior: "Runaway behavior",
       budgetExceeded: "Budget exceeded",

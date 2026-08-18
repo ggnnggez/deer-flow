@@ -12,6 +12,7 @@ rs.mock("@tanstack/react-query", () => ({
 }));
 
 import {
+  useAnsichAgentReleaseComparison,
   useAnsichReleaseQuality,
   useAnsichStepEvaluations,
   useAnsichTaskEvaluations,
@@ -70,6 +71,30 @@ describe("Ansich evaluation query keys", () => {
       "agent-releases",
       "release/one",
       "quality",
+      null,
+    ]);
+  });
+
+  it("keys the release comparison per requested cohort so a cohort change refetches", () => {
+    useAnsichAgentReleaseComparison("left/one", "right/one", true, "suite@1.0");
+    useAnsichAgentReleaseComparison("left/one", "right/one");
+
+    expect(capturedQueryKey(0)).toEqual([
+      "ansich",
+      "agent-releases",
+      "compare",
+      "left/one",
+      "right/one",
+      "suite@1.0",
+    ]);
+    // The cohort argument is appended, so the pre-existing three-argument
+    // call shape keeps working and asks for every cohort.
+    expect(capturedQueryKey(1)).toEqual([
+      "ansich",
+      "agent-releases",
+      "compare",
+      "left/one",
+      "right/one",
       null,
     ]);
   });

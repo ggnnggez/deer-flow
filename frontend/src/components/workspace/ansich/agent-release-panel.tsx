@@ -10,6 +10,7 @@ import {
   CardHeader,
   CardTitle,
 } from "@/components/ui/card";
+import { Input } from "@/components/ui/input";
 import {
   Select,
   SelectContent,
@@ -31,6 +32,8 @@ import type {
 } from "@/core/ansich/types";
 import { useI18n } from "@/core/i18n/hooks";
 
+import { AnsichReleaseQualitySection } from "./release-quality-section";
+
 export function AnsichAgentReleasePanel({
   taskId,
   polling,
@@ -40,6 +43,11 @@ export function AnsichAgentReleasePanel({
 }) {
   const { t } = useI18n();
   const [rightReleaseId, setRightReleaseId] = useState<string | null>(null);
+  // The committed cohort is separate from what is being typed: every change
+  // is a different comparison request, so it is committed on Enter or blur
+  // rather than on each keystroke.
+  const [cohortDraft, setCohortDraft] = useState("");
+  const [cohort, setCohort] = useState<string | null>(null);
   const taskReleaseQuery = useAnsichTaskAgentRelease(taskId, true, polling);
   const binding = taskReleaseQuery.data?.binding ?? null;
   const currentReleaseId = binding?.release.summary.release_id ?? null;
@@ -47,7 +55,17 @@ export function AnsichAgentReleasePanel({
   const comparisonQuery = useAnsichAgentReleaseComparison(
     currentReleaseId,
     rightReleaseId,
+    true,
+    cohort,
   );
+
+  // A blank box asks for every cohort. The backend's empty-string cohort is a
+  // distinct declared-no-cohort bucket, which a text field cannot express
+  // apart from "unset", so it stays reachable only through the per-row label.
+  function commitCohort() {
+    const next = cohortDraft.trim();
+    setCohort(next.length > 0 ? next : null);
+  }
 
   if (taskReleaseQuery.isPending) {
     return <Skeleton className="h-72 w-full" />;
@@ -179,24 +197,43 @@ export function AnsichAgentReleasePanel({
               {releasesQuery.error.message}
             </div>
           ) : (
-            <Select
-              value={rightReleaseId ?? undefined}
-              onValueChange={setRightReleaseId}
-            >
-              <SelectTrigger className="w-full max-w-xl">
-                <SelectValue placeholder={t.ansich.selectRelease} />
-              </SelectTrigger>
-              <SelectContent>
-                {(releasesQuery.data?.items ?? [])
-                  .filter((item) => item.release_id !== currentReleaseId)
-                  .map((item) => (
-                    <SelectItem key={item.release_id} value={item.release_id}>
-                      {item.agent_name} · {shortHash(item.release_hash)} ·{" "}
-                      {item.created_at}
-                    </SelectItem>
-                  ))}
-              </SelectContent>
-            </Select>
+            <div className="flex flex-wrap gap-3">
+              <Select
+                value={rightReleaseId ?? undefined}
+                onValueChange={setRightReleaseId}
+              >
+                <SelectTrigger
+                  aria-label={t.ansich.selectRelease}
+                  className="w-full max-w-xl"
+                >
+                  <SelectValue placeholder={t.ansich.selectRelease} />
+                </SelectTrigger>
+                <SelectContent>
+                  {(releasesQuery.data?.items ?? [])
+                    .filter((item) => item.release_id !== currentReleaseId)
+                    .map((item) => (
+                      <SelectItem key={item.release_id} value={item.release_id}>
+                        {item.agent_name} · {shortHash(item.release_hash)} ·{" "}
+                        {item.created_at}
+                      </SelectItem>
+                    ))}
+                </SelectContent>
+              </Select>
+              <Input
+                aria-label={t.ansich.qualityCohortPlaceholder}
+                placeholder={t.ansich.qualityCohortPlaceholder}
+                className="w-full max-w-xs"
+                value={cohortDraft}
+                onChange={(event) => setCohortDraft(event.currentTarget.value)}
+                onBlur={commitCohort}
+                onKeyDown={(event) => {
+                  if (event.key === "Enter") {
+                    event.preventDefault();
+                    commitCohort();
+                  }
+                }}
+              />
+            </div>
           )}
           {comparisonQuery.isFetching ? (
             <Skeleton className="h-40 w-full" />
@@ -209,6 +246,12 @@ export function AnsichAgentReleasePanel({
           ) : null}
         </CardContent>
       </Card>
+
+      {/* Semantic quality lives in its own card region, never mixed into the
+          structural diff above (spec §7). */}
+      {comparisonQuery.isFetching ? null : (
+        <AnsichReleaseQualitySection quality={comparisonQuery.data?.quality} />
+      )}
     </div>
   );
 }
@@ -343,11 +386,10 @@ function ReleaseComparison({
       </div>
     );
   }
+  // No quality label here: the structural diff states structural facts only,
+  // and the quality section below reports what the evaluations actually say.
   return (
     <div className="space-y-3">
-      <Badge variant="outline">
-        {t.ansich.quality}: {t.ansich.unassessed}
-      </Badge>
       {groups.map((group) => (
         <section key={group.component} className="rounded-lg border p-3">
           <h3 className="mb-2 font-medium">{group.component}</h3>

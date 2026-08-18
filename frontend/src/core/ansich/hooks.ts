@@ -307,10 +307,21 @@ export function useAnsichAgentReleases(limit = 100, enabled = true) {
   });
 }
 
+/**
+ * Compare two AgentReleases, optionally within one evaluation cohort.
+ *
+ * `cohort` is appended after `enabled` rather than inserted before it because
+ * the third positional argument is already `enabled` for existing callers. It
+ * is part of the query key, so changing the requested cohort is a different
+ * comparison and refetches instead of serving the previous cohort's answer.
+ * `null` means "every cohort"; the empty string is the backend's explicit
+ * declared-no-cohort bucket and is threaded through as a real filter.
+ */
 export function useAnsichAgentReleaseComparison(
   leftReleaseId: string | null,
   rightReleaseId: string | null,
   enabled = true,
+  cohort: string | null = null,
 ) {
   return useQuery({
     queryKey: [
@@ -319,9 +330,14 @@ export function useAnsichAgentReleaseComparison(
       "compare",
       leftReleaseId,
       rightReleaseId,
+      cohort,
     ],
     queryFn: () =>
-      compareAnsichAgentReleases(leftReleaseId ?? "", rightReleaseId ?? ""),
+      compareAnsichAgentReleases(
+        leftReleaseId ?? "",
+        rightReleaseId ?? "",
+        cohort ?? undefined,
+      ),
     enabled:
       enabled &&
       Boolean(leftReleaseId) &&

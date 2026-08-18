@@ -1,4 +1,4 @@
-import { expect, test } from "@playwright/test";
+import { expect, test, type Route } from "@playwright/test";
 
 import { mockLangGraphAPI } from "./utils/mock-api";
 
@@ -881,9 +881,7 @@ test("admin navigates from Ansich operations to evidence-backed Task detail", as
   await page.getByRole("button", { name: "Trace sources" }).click();
   await expect(page.getByText("provenance", { exact: true })).toBeVisible();
   await expect(
-    page
-      .getByRole("link", { name: `subagent_task:${CHILD_TASK_ID}` })
-      .first(),
+    page.getByRole("link", { name: `subagent_task:${CHILD_TASK_ID}` }).first(),
   ).toHaveAttribute("href", `/workspace/ansich/tasks/${CHILD_TASK_ID}`);
   expect(lineageRequests).toBe(1);
   await expect(
@@ -1514,4 +1512,286 @@ test("operations page preserves storage-unavailable detail from a 503", async ({
   await page.goto("/workspace/ansich/operations");
 
   await expect(page.getByText("Ansich storage is unavailable")).toBeVisible();
+});
+
+test("release compare separates observed quality from the structural diff", async ({
+  page,
+}) => {
+  mockLangGraphAPI(page, { threads: [] });
+  const emptyPage = { items: [], next_cursor: null, projection_status: HEALTH };
+  const jsonRoute = (body: unknown) => (route: Route) =>
+    route.fulfill({
+      status: 200,
+      contentType: "application/json",
+      body: JSON.stringify(body),
+    });
+
+  // Task detail always issues these page-level queries, whatever the view.
+  await page.route(
+    `**/api/ansich/tasks/${TASK_ID}`,
+    jsonRoute({ task: TASK, projection_status: HEALTH }),
+  );
+  await page.route(
+    `**/api/ansich/tasks/${TASK_ID}/timeline`,
+    jsonRoute(emptyPage),
+  );
+  await page.route(
+    `**/api/ansich/tasks/${TASK_ID}/steps`,
+    jsonRoute({ items: [], system_operations: [], projection_status: HEALTH }),
+  );
+  await page.route(
+    `**/api/ansich/tasks/${TASK_ID}/usage?*`,
+    jsonRoute({
+      usage: {
+        task_id: TASK_ID,
+        local: [],
+        inclusive: [],
+        inclusive_status: "available",
+      },
+      scope: "local",
+      values: [],
+      sources: [],
+      projection_status: HEALTH,
+    }),
+  );
+  await page.route(
+    `**/api/ansich/tasks/${TASK_ID}/budgets`,
+    jsonRoute({
+      budgets: { task_id: TASK_ID, budgets: [] },
+      health: [],
+      projection_status: HEALTH,
+    }),
+  );
+  await page.route(
+    `**/api/ansich/tasks/${TASK_ID}/context-compressions?*`,
+    jsonRoute(emptyPage),
+  );
+
+  const summary = {
+    release_id: RELEASE_ID,
+    namespace: "deerflow",
+    agent_name: "lead-agent",
+    release_hash: RELEASE_HASH,
+    schema_version: 1,
+    model_hash: "1".repeat(64),
+    prompt_hash: "2".repeat(64),
+    tool_catalog_hash: "3".repeat(64),
+    policy_hash: "4".repeat(64),
+    runtime_build_id: "5".repeat(64),
+    created_at: "2026-07-17T12:00:00Z",
+    task_count: 2,
+    quality_status: "unassessed",
+  };
+  await page.route(
+    `**/api/ansich/tasks/${TASK_ID}/agent-release`,
+    jsonRoute({
+      binding: {
+        task_id: TASK_ID,
+        relation_role: "executed_by",
+        established_obs_id: "release-observation-e2e",
+        release: {
+          summary,
+          manifest: {
+            schema_version: 1,
+            namespace: "deerflow",
+            agent_name: "lead-agent",
+            model: {
+              requested: "fast",
+              effective: "provider/model-v1",
+              provider: "provider",
+              behavior_parameters: { temperature: 0 },
+            },
+            prompt: {
+              template_id: "lead-v1",
+              template_hash: "6".repeat(64),
+              rendered_base_prompt_hash: "7".repeat(64),
+              rendered_base_prompt_preview: "Controlled system prompt preview",
+              soul_hash: null,
+              available_skill_catalog_hash: null,
+            },
+            tools: [],
+            policy: { middleware_chain: [], values: {} },
+            runtime_build: {
+              package_version: "2.1.0",
+              image_digest: "unknown",
+              git_commit: "e2e",
+            },
+          },
+        },
+      },
+      provider_drift: null,
+      projection_status: HEALTH,
+    }),
+  );
+  await page.route(
+    "**/api/ansich/agent-releases?*",
+    jsonRoute({
+      items: [
+        summary,
+        {
+          ...summary,
+          release_id: OTHER_RELEASE_ID,
+          release_hash: OTHER_RELEASE_HASH,
+          model_hash: "0".repeat(64),
+        },
+      ],
+      operational_distributions: { availability: "unavailable" },
+      projection_status: HEALTH,
+    }),
+  );
+
+  const COHORT = "ansich-regression@2026.08.1";
+  const structuralComparison = {
+    left_release_hash: RELEASE_HASH,
+    right_release_hash: OTHER_RELEASE_HASH,
+    changed_components: ["model"],
+    model: [
+      {
+        path: "effective",
+        left: "provider/model-v1",
+        right: "provider/model-v2",
+      },
+    ],
+    prompt: [],
+    tools: {
+      added: [],
+      removed: [],
+      schema_changed: [],
+      description_changed: [],
+      source_changed: [],
+    },
+    policy: [],
+    build: [],
+    quality_status: "unassessed",
+  };
+  const comparableRow = {
+    dimension: "correctness",
+    cohort_key: COHORT,
+    comparison_status: "comparable",
+    reason: null,
+    observed_delta: 0.125,
+    left_sample_count: 12,
+    right_sample_count: 15,
+    coverage: {
+      min_samples: 5,
+      unexplained_loss: false,
+      left: {
+        present: true,
+        assessed_count: 12,
+        scale: { min: 0, max: 1, higher_is_better: true },
+      },
+      right: {
+        present: true,
+        assessed_count: 15,
+        scale: { min: 0, max: 1, higher_is_better: true },
+      },
+    },
+    resolver: { name: "ansich-default", version: "2" },
+  };
+  const refusedRow = {
+    dimension: "safety",
+    // The empty key is the declared-no-cohort bucket, not a shared population.
+    cohort_key: "",
+    comparison_status: "not_comparable",
+    reason: "insufficient_samples",
+    observed_delta: null,
+    left_sample_count: 2,
+    right_sample_count: 1,
+    coverage: {
+      min_samples: 5,
+      unexplained_loss: false,
+      left: { present: true, assessed_count: 2, scale: null },
+      right: { present: true, assessed_count: 1, scale: null },
+    },
+    resolver: { name: "ansich-default", version: "2" },
+  };
+  const compareSearches: string[] = [];
+  await page.route("**/api/ansich/agent-releases/compare?*", (route) => {
+    const url = new URL(route.request().url());
+    compareSearches.push(url.search);
+    const cohort = url.searchParams.get("cohort");
+    // An old backend, or one without evaluation storage, omits the block.
+    const quality =
+      cohort === "legacy-backend"
+        ? undefined
+        : {
+            comparisons:
+              cohort === null ? [comparableRow, refusedRow] : [comparableRow],
+            cohort,
+          };
+    return route.fulfill({
+      status: 200,
+      contentType: "application/json",
+      body: JSON.stringify({
+        comparison: structuralComparison,
+        ...(quality ? { quality } : {}),
+        projection_status: HEALTH,
+      }),
+    });
+  });
+
+  await page.goto(`/workspace/ansich/tasks/${TASK_ID}?view=evidence`);
+  await page.getByRole("button", { name: "Agent release" }).click();
+  await page.getByRole("combobox", { name: "Select another release" }).click();
+  await page.getByRole("option").first().click();
+
+  // The structural diff stays a structural statement.
+  await expect(page.getByText("provider/model-v2")).toBeVisible();
+
+  // Quality is its own card region, never mixed into that diff.
+  const quality = page.getByRole("list", { name: "Release quality" });
+  const correctness = quality.getByRole("listitem", { name: "Correctness" });
+  await expect(
+    correctness.getByText("Observed delta", { exact: true }),
+  ).toBeVisible();
+  await expect(correctness.getByText("+0.125", { exact: true })).toBeVisible();
+  await expect(correctness.getByText("12 → 15", { exact: true })).toBeVisible();
+  await expect(correctness.getByText(COHORT, { exact: true })).toBeVisible();
+  // Polarity is reported from the payload's scale, not from the delta's sign.
+  await expect(
+    correctness.getByText("Scale: higher is better", { exact: true }),
+  ).toBeVisible();
+
+  // A refused comparison is muted and explained — never the error colour.
+  const safety = quality.getByRole("listitem", { name: "Safety" });
+  await expect(safety.getByText("Not comparable", { exact: true })).toHaveClass(
+    /text-muted-foreground/,
+  );
+  const refusal = safety.getByText(
+    "Too few assessed samples on at least one side.",
+    { exact: true },
+  );
+  await expect(refusal).toHaveClass(/text-muted-foreground/);
+  await expect(refusal).not.toHaveClass(/text-destructive/);
+  await expect(
+    safety.getByText("No declared cohort", { exact: true }),
+  ).toBeVisible();
+  // v1 reports an observed difference only.
+  await expect(page.getByText(/significan/i)).toHaveCount(0);
+
+  // A committed cohort refetches, and the section reflects that cohort.
+  const cohortInput = page.getByRole("textbox", {
+    name: "Cohort key (blank: all cohorts)",
+  });
+  await cohortInput.fill(COHORT);
+  await cohortInput.press("Enter");
+  await expect(quality.getByRole("listitem", { name: "Safety" })).toHaveCount(
+    0,
+  );
+  await expect(
+    quality.getByRole("listitem", { name: "Correctness" }),
+  ).toBeVisible();
+  expect(
+    compareSearches.some((search) =>
+      search.includes("cohort=ansich-regression%402026.08.1"),
+    ),
+  ).toBe(true);
+
+  // A response without the quality block hides the section and nothing else.
+  await cohortInput.fill("legacy-backend");
+  await cohortInput.press("Enter");
+  await expect(page.getByText("Release quality", { exact: true })).toHaveCount(
+    0,
+  );
+  await expect(page.getByText("provider/model-v2")).toBeVisible();
 });

@@ -646,6 +646,22 @@ export interface Translations {
     dimensionEfficiency: string;
     dimensionEarliestErroneousStep: string;
     dimensionCustom: string;
+    qualityTitle: string;
+    qualityDescription: string;
+    qualityNoComparisons: string;
+    qualityNotComparable: string;
+    qualityObservedDelta: string;
+    qualityUnassessed: string;
+    qualitySamples: string;
+    qualityCohortPlaceholder: string;
+    qualityNoCohort: string;
+    qualityScaleHigherIsBetter: string;
+    qualityScaleLowerIsBetter: string;
+    qualityReasonNoSharedCohort: string;
+    qualityReasonScaleMismatch: string;
+    qualityReasonInsufficientSamples: string;
+    qualityReasonObservabilityLoss: string;
+    qualityReasonUnknown: string;
     signal: {
       behavior: string;
       budgetExceeded: string;
