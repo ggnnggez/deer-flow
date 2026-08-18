@@ -52,6 +52,16 @@ class AnsichConfig(BaseModel):
         ge=1,
         description="Dwell threshold used by the operator-facing Task assessor.",
     )
+    evaluation_min_cohort_samples: int = Field(
+        default=5,
+        ge=1,
+        description="Assessed samples required on both sides before a release quality cohort is comparable.",
+    )
+    evaluation_max_payload_bytes: int = Field(
+        default=262_144,
+        ge=1,
+        description="Largest accepted evaluation record payload; larger submissions are rejected rather than truncated.",
+    )
     assessors: AnsichAssessorConfig = Field(
         default_factory=AnsichAssessorConfig,
         description="Versioned runaway and frequency assessor thresholds.",

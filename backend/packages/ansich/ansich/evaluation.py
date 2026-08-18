@@ -3,7 +3,7 @@ from __future__ import annotations
 from datetime import datetime
 from typing import Literal, Self
 
-from pydantic import BaseModel, ConfigDict, field_validator, model_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from ansich.contracts import NamedVersion, ObservationEnvelope, Producer
 from ansich.ids import new_id
@@ -34,6 +34,26 @@ EvaluationSubjectType = Literal[
     "content_block",
     "agent_release",
 ]
+EvaluationProjectionStatus = Literal["pending", "applied", "failed"]
+
+#: The named semantic dimensions every evaluated subject is reported against.
+#: They are always present in a quality Belief read: a dimension nothing has
+#: assessed is reported as ``unassessed`` rather than omitted, because a
+#: completed Task never implies pass.
+QUALITY_DIMENSIONS: tuple[EvaluationDimension, ...] = (
+    "correctness",
+    "completeness",
+    "relevance",
+    "safety",
+    "efficiency",
+)
+#: The source of an unassessed dimension: nothing asserted it, so there is no
+#: assessor identity to report.
+UNASSESSED_SOURCE = NamedVersion(name="none", version="1")
+#: Neither authority nor fidelity is knowable for a dimension nobody assessed;
+#: they are deliberately outside the resolver's authority ladder so an
+#: unassessed Belief can never be ranked against, or mistaken for, a real one.
+UNASSESSED_CLASS = "unknown"
 
 _SUITE_BOUND_KINDS = frozenset({"benchmark_assertion", "unit_test"})
 
@@ -119,6 +139,87 @@ class EvaluationRecord(BaseModel):
             if not self.actual:
                 raise ValueError("earliest_erroneous_step evaluations must name the Step id in actual")
         return self
+
+
+class EvaluationView(BaseModel):
+    """One row of the rebuildable evaluation query index.
+
+    This is a metadata projection: expected/actual/rationale bodies stay in the
+    Observation payload and are read through the audited raw-payload route.
+    """
+
+    model_config = ConfigDict(extra="forbid", frozen=True, strict=True)
+
+    evaluation_obs_id: str
+    subject_type: str
+    subject_id: str
+    task_id: str
+    evaluation_kind: str
+    dimension: str
+    verdict: str | None = None
+    score: float | None = None
+    scale_min: float | None = None
+    scale_max: float | None = None
+    scale_higher_is_better: bool | None = None
+    assessor_name: str
+    assessor_version: str | None = None
+    authority_class: str
+    fidelity_class: str
+    cohort_key: str | None = None
+    suite_id: str | None = None
+    suite_version: str | None = None
+    case_id: str | None = None
+    occurred_at: datetime
+
+
+class EvaluationRecordReceipt(BaseModel):
+    """Where one recorded evaluation stands, without waiting for projection."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True, strict=True)
+
+    observation_id: str
+    projection_status: EvaluationProjectionStatus
+    idempotent_replay: bool = False
+
+
+class QualityBeliefView(BaseModel):
+    """The current semantic Belief for one dimension of one subject.
+
+    ``unassessed`` is a first-class state: it carries the complete Belief
+    structure with an explicit ``{"status": "unassessed"}`` value, the ``none``
+    source, and no evidence, so absence of evaluation is never rendered as a
+    verdict.
+    """
+
+    model_config = ConfigDict(extra="forbid", frozen=True, strict=True)
+
+    dimension: str
+    value: dict[str, object]
+    source: NamedVersion
+    authority_class: str
+    fidelity_class: str
+    as_of: datetime | None = None
+    resolver: NamedVersion | None = None
+    conflicting_assertion_count: int = Field(default=0, ge=0)
+    evidence_obs_ids: tuple[str, ...] = ()
+    unassessed: bool = False
+
+
+def unassessed_quality_belief(dimension: str) -> QualityBeliefView:
+    """Return the complete Belief structure for a dimension nothing assessed."""
+
+    return QualityBeliefView(
+        dimension=dimension,
+        value={"status": "unassessed"},
+        source=UNASSESSED_SOURCE,
+        authority_class=UNASSESSED_CLASS,
+        fidelity_class=UNASSESSED_CLASS,
+        as_of=None,
+        resolver=None,
+        conflicting_assertion_count=0,
+        evidence_obs_ids=(),
+        unassessed=True,
+    )
 
 
 def benchmark_source_event_id(

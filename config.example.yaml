@@ -15,7 +15,7 @@
 # ============================================================================
 # Bump this number when the config schema changes.
 # Run `make config-upgrade` to merge new fields into your local config.yaml.
-config_version: 31
+config_version: 32
 
 # ============================================================================
 # Logging
@@ -1831,6 +1831,13 @@ ansich:
   heartbeat_interval_seconds: 10
   heartbeat_stale_after_seconds: 30
   long_dwell_seconds: 120
+  # Release quality is compared only inside one cohort, and only once both
+  # sides carry at least this many assessed samples; otherwise the comparison
+  # is declined with a reason instead of averaging unrelated Tasks.
+  evaluation_min_cohort_samples: 5
+  # Evaluation submissions larger than this are rejected rather than truncated,
+  # so an expected/actual body cannot silently lose its evidence.
+  evaluation_max_payload_bytes: 262144
   # Assessor thresholds are hashed into every Belief Assertion. Changing one
   # changes the rule config identity without rewriting earlier assertions.
   assessors:

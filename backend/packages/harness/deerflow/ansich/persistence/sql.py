@@ -106,7 +106,10 @@ from ansich.contracts import (
 from ansich.control import should_select_control_candidate
 from ansich.evaluation import (
     EVALUATION_OBSERVATION_KIND,
+    EvaluationProjectionStatus,
     EvaluationRecord,
+    EvaluationView,
+    QualityBeliefView,
 )
 from ansich.heartbeat import TaskHeartbeatView
 from ansich.jobs import FailedJobDetailView, FailedJobErrorView, FailedJobKind, FailedJobSummaryView
@@ -121,6 +124,7 @@ from ansich.operations import (
     assess_heartbeat,
 )
 from ansich.operator import OperatorActionView, TaskActionTarget
+from ansich.quality import ReleaseQualityDimensionView, ReleaseQualityView
 from ansich.release import (
     AgentRelease,
     AgentReleaseDetailView,
@@ -2711,6 +2715,235 @@ class SqlAnsichBackend:
             if assertion is None:
                 return None
             return await self._belief_assertion_view(session, assertion)
+
+    async def find_evaluation_observation(self, source_event_id: str) -> str | None:
+        """Return the Observation id an evaluation intake identity already has."""
+
+        async with self._session_factory() as session:
+            return await session.scalar(
+                select(AnsichObservationRow.obs_id)
+                .where(
+                    AnsichObservationRow.kind == EVALUATION_OBSERVATION_KIND,
+                    AnsichObservationRow.source_event_id == source_event_id,
+                )
+                # The uniqueness constraint also spans the producer identity, so
+                # pin the replay to the first intake rather than an arbitrary one.
+                .order_by(AnsichObservationRow.ingest_seq)
+                .limit(1)
+            )
+
+    async def get_observation_projection_status(
+        self,
+        obs_id: str,
+    ) -> EvaluationProjectionStatus | None:
+        """Summarize one Observation's projection jobs, or ``None`` if it has none.
+
+        A failed job dominates: it is durable evidence that the read model will
+        not converge without operator retry. Anything still claimable — pending,
+        leased, or dependency-waiting — reads as ``pending``.
+        """
+
+        async with self._session_factory() as session:
+            statuses = tuple(
+                (
+                    await session.execute(
+                        select(AnsichProjectionJobRow.status).where(
+                            AnsichProjectionJobRow.obs_id == obs_id,
+                        )
+                    )
+                ).scalars()
+            )
+        if not statuses:
+            return None
+        if any(status == "failed" for status in statuses):
+            return "failed"
+        if all(status == "completed" for status in statuses):
+            return "applied"
+        return "pending"
+
+    async def get_evaluation_subject(self, subject_id: str) -> str | None:
+        async with self._session_factory() as session:
+            entity = await session.get(AnsichEntityRow, subject_id)
+        return None if entity is None else entity.entity_type
+
+    async def list_evaluations(
+        self,
+        *,
+        subject_type: str | None = None,
+        subject_id: str | None = None,
+        task_id: str | None = None,
+        limit: int = 100,
+    ) -> list[EvaluationView]:
+        statement = select(AnsichEvaluationIndexRow)
+        if subject_type is not None:
+            statement = statement.where(AnsichEvaluationIndexRow.subject_type == subject_type)
+        if subject_id is not None:
+            statement = statement.where(AnsichEvaluationIndexRow.subject_id == subject_id)
+        if task_id is not None:
+            statement = statement.where(AnsichEvaluationIndexRow.task_id == task_id)
+        statement = statement.order_by(
+            AnsichEvaluationIndexRow.occurred_at.desc(),
+            AnsichEvaluationIndexRow.evaluation_obs_id.desc(),
+        ).limit(limit)
+        async with self._session_factory() as session:
+            rows = tuple((await session.execute(statement)).scalars())
+        return [
+            EvaluationView(
+                evaluation_obs_id=row.evaluation_obs_id,
+                subject_type=row.subject_type,
+                subject_id=row.subject_id,
+                task_id=row.task_id,
+                evaluation_kind=row.evaluation_kind,
+                dimension=row.dimension,
+                verdict=row.verdict,
+                score=row.score,
+                scale_min=row.scale_min,
+                scale_max=row.scale_max,
+                scale_higher_is_better=row.scale_higher_is_better,
+                assessor_name=row.assessor_name,
+                assessor_version=row.assessor_version,
+                authority_class=row.authority_class,
+                fidelity_class=row.fidelity_class,
+                cohort_key=row.cohort_key,
+                suite_id=row.suite_id,
+                suite_version=row.suite_version,
+                case_id=row.case_id,
+                occurred_at=_as_utc(row.occurred_at),
+            )
+            for row in rows
+        ]
+
+    async def list_quality_beliefs(self, subject_id: str) -> list[QualityBeliefView]:
+        """Return the persisted ``quality.*`` current Beliefs of one subject.
+
+        Unassessed dimensions are not synthesized here: this read reports only
+        what was actually asserted, and the service completes the picture.
+        """
+
+        async with self._session_factory() as session:
+            rows = (
+                await session.execute(
+                    select(AnsichCurrentBeliefRow, AnsichBeliefAssertionRow)
+                    .join(
+                        AnsichBeliefAssertionRow,
+                        AnsichBeliefAssertionRow.assertion_id == AnsichCurrentBeliefRow.assertion_id,
+                    )
+                    .where(
+                        AnsichCurrentBeliefRow.subject_id == subject_id,
+                        AnsichCurrentBeliefRow.field_name.like("quality.%"),
+                    )
+                    .order_by(AnsichCurrentBeliefRow.field_name)
+                )
+            ).all()
+            if not rows:
+                return []
+            # ResolvedBelief carries conflicting_assertion_count only for a fresh
+            # resolution; the persisted current-belief row does not store it, so
+            # the retained losing assertions are counted here.
+            conflict_counts = {
+                field_name: int(count)
+                for field_name, count in (
+                    await session.execute(
+                        select(AnsichBeliefAssertionRow.field_name, func.count())
+                        .where(
+                            AnsichBeliefAssertionRow.subject_id == subject_id,
+                            AnsichBeliefAssertionRow.field_name.like("quality.%"),
+                        )
+                        .group_by(AnsichBeliefAssertionRow.field_name)
+                    )
+                ).all()
+            }
+            evidence: dict[str, list[str]] = {}
+            for assertion_id, obs_id in (
+                await session.execute(
+                    select(
+                        AnsichBeliefEvidenceRow.assertion_id,
+                        AnsichBeliefEvidenceRow.obs_id,
+                    )
+                    .where(AnsichBeliefEvidenceRow.assertion_id.in_([assertion.assertion_id for _, assertion in rows]))
+                    .order_by(
+                        AnsichBeliefEvidenceRow.assertion_id,
+                        AnsichBeliefEvidenceRow.ordinal,
+                    )
+                )
+            ).all():
+                evidence.setdefault(assertion_id, []).append(obs_id)
+        return [
+            QualityBeliefView(
+                dimension=current.field_name.removeprefix("quality."),
+                value=assertion.value_json,
+                source=NamedVersion(
+                    name=assertion.assessor_name,
+                    version=assertion.assessor_version,
+                ),
+                authority_class=assertion.authority_class,
+                fidelity_class=assertion.fidelity_class,
+                as_of=_as_utc(assertion.as_of),
+                resolver=NamedVersion(
+                    name=current.resolver_name,
+                    version=current.resolver_version,
+                ),
+                conflicting_assertion_count=max(0, conflict_counts.get(current.field_name, 1) - 1),
+                evidence_obs_ids=tuple(evidence.get(assertion.assertion_id, ())),
+                unassessed=False,
+            )
+            for current, assertion in rows
+        ]
+
+    async def get_release_quality(
+        self,
+        release_id: str,
+        *,
+        cohort_key: str | None = None,
+    ) -> ReleaseQualityView | None:
+        """Read one AgentRelease's ``(cohort, dimension)`` quality cells.
+
+        ``mean_score`` is derived here rather than stored, so a cell whose
+        samples span incompatible scales (``score_count == 0``) reports counts
+        without an incomparable average.
+
+        Two freshness caveats belong to the projected cells, not this read: a
+        cell's ``as_of`` advances with the newest evaluation in it even when
+        that evaluation changed no selected Belief, and a Task whose release
+        binding lands after the cell's last evaluation only joins the cell when
+        the next evaluation for it recomputes the cell.
+        """
+
+        async with self._session_factory() as session:
+            if await session.get(AnsichAgentReleaseRow, release_id) is None:
+                return None
+            statement = select(AnsichReleaseQualityStatsRow).where(
+                AnsichReleaseQualityStatsRow.release_id == release_id,
+            )
+            if cohort_key is not None:
+                statement = statement.where(AnsichReleaseQualityStatsRow.cohort_key == cohort_key)
+            rows = tuple(
+                (
+                    await session.execute(
+                        statement.order_by(
+                            AnsichReleaseQualityStatsRow.dimension,
+                            AnsichReleaseQualityStatsRow.cohort_key,
+                        )
+                    )
+                ).scalars()
+            )
+        return ReleaseQualityView(
+            release_id=release_id,
+            cohorts=tuple(
+                ReleaseQualityDimensionView(
+                    dimension=row.dimension,
+                    cohort_key=row.cohort_key,
+                    assessed_count=row.assessed_count,
+                    pass_count=row.pass_count,
+                    fail_count=row.fail_count,
+                    partial_count=row.partial_count,
+                    mean_score=(row.score_sum / row.score_count) if row.score_count > 0 and row.score_sum is not None else None,
+                    scale=None if row.scale_min is None and row.scale_max is None else {"min": row.scale_min, "max": row.scale_max},
+                    as_of=_as_utc(row.as_of),
+                )
+                for row in rows
+            ),
+        )
 
     async def get_task_by_source(self, source_kind: str, source_id: str) -> TaskView | None:
         async with self._session_factory() as session:

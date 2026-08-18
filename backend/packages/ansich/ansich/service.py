@@ -15,12 +15,23 @@ from ansich.budget import BudgetHealthBelief, TaskBudgetsView
 from ansich.compression import ContextCompressionSummaryView, ContextCompressionView
 from ansich.context_state import ContextStateView
 from ansich.contracts import AnsichHealth, ControlValue, FlushResult, LostRange, ObservationEnvelope, Producer, RecordReceipt, TaskLifecycleScope, TaskView
+from ansich.evaluation import (
+    QUALITY_DIMENSIONS,
+    EvaluationProjectionStatus,
+    EvaluationRecord,
+    EvaluationRecordReceipt,
+    EvaluationView,
+    QualityBeliefView,
+    build_evaluation_observation,
+    unassessed_quality_belief,
+)
 from ansich.heartbeat import TaskHeartbeatView
 from ansich.jobs import FailedJobDetailView, FailedJobKind, FailedJobSummaryView
 from ansich.lineage import ContentLineageView, LineageDirection, PossibleExposureView, find_possible_exposures, traverse_content_lineage
 from ansich.memory import InMemoryAnsichBackend
 from ansich.operations import ActiveStepView, ActiveTaskView, HeartbeatBelief
 from ansich.operator import OperatorActionView, TaskActionTarget
+from ansich.quality import ReleaseQualityView
 from ansich.release import AgentReleaseDetailView, AgentReleaseSummaryView, TaskAgentReleaseView
 from ansich.safety import TaskScopesView, ToolAuthorizationView, ToolEffectsView
 from ansich.step import ContentBlockPayloadView, ContentOccurrenceView, ContextSnapshotView, LlmAttemptView, StepView
@@ -352,6 +363,130 @@ class AnsichService:
         if not callable(get_current_belief):
             return None
         return await get_current_belief(subject_id, field_name)
+
+    async def record_evaluation(
+        self,
+        record: EvaluationRecord,
+        *,
+        source_event_id: str | None,
+        producer: Producer,
+    ) -> EvaluationRecordReceipt:
+        """Record one evaluation and report where its projection currently is.
+
+        Intake is synchronous and projection is not: the receipt reports the
+        state after one bounded settle attempt rather than blocking until every
+        projector finishes. A replayed intake never records a second
+        Observation — it reports the stored one and the status it has now.
+        """
+
+        # The envelope resolves the replay identity: a benchmark evaluation
+        # derives its stable source_event_id from its suite/case/run tuple, so
+        # the lookup key only exists once the envelope has been built. A replay
+        # discards this envelope without recording it.
+        observation = build_evaluation_observation(
+            record,
+            producer=producer,
+            source_event_id=source_event_id,
+        )
+        find_observation = getattr(self._backend, "find_evaluation_observation", None)
+        existing_obs_id = await find_observation(observation.source_event_id) if callable(find_observation) else None
+        if existing_obs_id is not None:
+            return EvaluationRecordReceipt(
+                observation_id=existing_obs_id,
+                projection_status=await self._evaluation_projection_status(existing_obs_id),
+                idempotent_replay=True,
+            )
+        if not self.record(observation).accepted:
+            # A rejected intake (storage unavailable, stopped service, queue
+            # overflow) was never made durable, so its projection can never
+            # land; the loss is already accounted as a lost range.
+            return EvaluationRecordReceipt(
+                observation_id=observation.obs_id,
+                projection_status="failed",
+                idempotent_replay=False,
+            )
+        await self.flush_task(record.task_id)
+        return EvaluationRecordReceipt(
+            observation_id=observation.obs_id,
+            projection_status=await self._evaluation_projection_status(observation.obs_id),
+            idempotent_replay=False,
+        )
+
+    async def _evaluation_projection_status(self, obs_id: str) -> EvaluationProjectionStatus:
+        if not self.get_health().storage_available:
+            return "failed"
+        read_status = getattr(self._backend, "get_observation_projection_status", None)
+        if not callable(read_status):
+            return "pending"
+        status = await read_status(obs_id)
+        return "pending" if status is None else status
+
+    async def get_evaluation_subject(self, subject_id: str) -> str | None:
+        """Return the Entity type an evaluation subject id resolves to."""
+
+        get_subject = getattr(self._backend, "get_evaluation_subject", None)
+        if not callable(get_subject):
+            return None
+        return await get_subject(subject_id)
+
+    async def list_evaluations(
+        self,
+        *,
+        subject_type: str | None = None,
+        subject_id: str | None = None,
+        task_id: str | None = None,
+        limit: int = 100,
+    ) -> list[EvaluationView]:
+        """List recorded evaluations newest first, metadata only."""
+
+        if limit < 1:
+            raise ValueError("limit must be positive")
+        list_evaluations = getattr(self._backend, "list_evaluations", None)
+        if not callable(list_evaluations):
+            return []
+        return list(
+            await list_evaluations(
+                subject_type=subject_type,
+                subject_id=subject_id,
+                task_id=task_id,
+                limit=limit,
+            )
+        )
+
+    async def get_quality_beliefs(self, subject_id: str) -> list[QualityBeliefView]:
+        """Return the subject's quality Beliefs, unassessed dimensions included.
+
+        Every named dimension is always reported. A dimension nothing asserted
+        is synthesized as ``unassessed`` with no evidence, because a completed
+        Task is not proof of a pass. Dimensions outside that set — currently
+        ``earliest_erroneous_step`` — appear only when a Belief exists for them.
+        """
+
+        list_quality_beliefs = getattr(self._backend, "list_quality_beliefs", None)
+        persisted: dict[str, QualityBeliefView] = {}
+        if callable(list_quality_beliefs):
+            for belief in await list_quality_beliefs(subject_id):
+                persisted[belief.dimension] = belief
+        beliefs = [persisted[dimension] if dimension in persisted else unassessed_quality_belief(dimension) for dimension in QUALITY_DIMENSIONS]
+        beliefs.extend(persisted[dimension] for dimension in sorted(set(persisted) - set(QUALITY_DIMENSIONS)))
+        return beliefs
+
+    async def get_release_quality(
+        self,
+        release_id: str,
+        *,
+        cohort_key: str | None = None,
+    ) -> ReleaseQualityView | None:
+        """Return one AgentRelease's quality cells, or ``None`` if it is unknown.
+
+        A known release with no evaluated Task returns an empty cohort tuple —
+        no evaluation is not the same fact as no release.
+        """
+
+        get_release_quality = getattr(self._backend, "get_release_quality", None)
+        if not callable(get_release_quality):
+            return None
+        return await get_release_quality(release_id, cohort_key=cohort_key)
 
     async def get_task_by_source(self, source_kind: str, source_id: str) -> TaskView | None:
         return await self._backend.get_task_by_source(source_kind, source_id)

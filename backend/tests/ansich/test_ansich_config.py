@@ -26,9 +26,27 @@ def test_ansich_is_disabled_by_default_with_bounded_runtime_settings():
     assert config.heartbeat_interval_seconds == 10
     assert config.heartbeat_stale_after_seconds == 30
     assert config.long_dwell_seconds == 120
+    assert config.evaluation_min_cohort_samples == 5
+    assert config.evaluation_max_payload_bytes == 262_144
     assert config.assessors.exact_repetition_window == 5
     assert config.assessors.tool_frequency_window_seconds == 300
     assert config.assessors.tool_frequency_threshold == 30
+
+
+def test_evaluation_thresholds_are_overridable_and_bounded():
+    config = AnsichConfig.model_validate(
+        {
+            "evaluation_min_cohort_samples": 20,
+            "evaluation_max_payload_bytes": 1024,
+        }
+    )
+
+    assert config.evaluation_min_cohort_samples == 20
+    assert config.evaluation_max_payload_bytes == 1024
+    with pytest.raises(ValidationError):
+        AnsichConfig.model_validate({"evaluation_min_cohort_samples": 0})
+    with pytest.raises(ValidationError):
+        AnsichConfig.model_validate({"evaluation_max_payload_bytes": 0})
 
 
 def test_ansich_assessor_thresholds_are_nested_and_validated():
