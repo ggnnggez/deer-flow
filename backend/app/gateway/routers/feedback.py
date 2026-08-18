@@ -14,6 +14,7 @@ from pydantic import BaseModel, Field
 
 from app.gateway.authz import require_permission
 from app.gateway.deps import get_current_user, get_feedback_repo, get_run_store
+from app.gateway.feedback_evaluation import record_feedback_evaluation
 
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/api/threads", tags=["feedback"])
@@ -80,13 +81,25 @@ async def upsert_feedback(
         raise HTTPException(status_code=404, detail=f"Run {run_id} not found in thread {thread_id}")
 
     feedback_repo = get_feedback_repo(request)
-    return await feedback_repo.upsert(
+    record = await feedback_repo.upsert(
         run_id=run_id,
         thread_id=thread_id,
         rating=body.rating,
         user_id=user_id,
         comment=body.comment,
     )
+    # Best-effort and after the write: it never raises, never alters this
+    # response, and a failed write above skips it entirely so Ansich cannot
+    # mask a feedback failure.
+    await record_feedback_evaluation(
+        request.app.state,
+        thread_id=thread_id,
+        run_id=run_id,
+        user_id=user_id,
+        rating=body.rating,
+        comment=body.comment,
+    )
+    return record
 
 
 @router.delete("/{thread_id}/runs/{run_id}/feedback")
@@ -132,7 +145,7 @@ async def create_feedback(
         raise HTTPException(status_code=404, detail=f"Run {run_id} not found in thread {thread_id}")
 
     feedback_repo = get_feedback_repo(request)
-    return await feedback_repo.create(
+    record = await feedback_repo.create(
         run_id=run_id,
         thread_id=thread_id,
         rating=body.rating,
@@ -140,6 +153,17 @@ async def create_feedback(
         message_id=body.message_id,
         comment=body.comment,
     )
+    # Same contract as the upsert path: after the write, fail-open, response
+    # untouched.
+    await record_feedback_evaluation(
+        request.app.state,
+        thread_id=thread_id,
+        run_id=run_id,
+        user_id=user_id,
+        rating=body.rating,
+        comment=body.comment,
+    )
+    return record
 
 
 @router.get("/{thread_id}/runs/{run_id}/feedback", response_model=list[FeedbackResponse])
