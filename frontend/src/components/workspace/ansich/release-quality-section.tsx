@@ -42,7 +42,17 @@ export function AnsichReleaseQualitySection({
     <Card>
       <CardHeader>
         <CardTitle>{t.ansich.qualityTitle}</CardTitle>
-        <CardDescription>{t.ansich.qualityDescription}</CardDescription>
+        <CardDescription className="space-y-1">
+          <span className="block">{t.ansich.qualityDescription}</span>
+          {/* The subtraction orientation is stated, never left to be guessed:
+              the panel passes the Task's bound release as `left` and the
+              operator's selection as `right`, and the backend's delta is
+              `right - left` (ansich/quality.py::_observed_delta), which the
+              sample-count arrow follows in the same order. */}
+          <span className="text-foreground/80 block font-medium">
+            {t.ansich.qualityDeltaOrientation}
+          </span>
+        </CardDescription>
       </CardHeader>
       <CardContent>
         {quality.comparisons.length === 0 ? (

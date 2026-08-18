@@ -1739,6 +1739,16 @@ test("release compare separates observed quality from the structural diff", asyn
   await expect(page.getByText("provider/model-v2")).toBeVisible();
 
   // Quality is its own card region, never mixed into that diff.
+  // The signed delta is meaningless without its subtraction orientation, so
+  // the card states it: the panel compares this Task's bound release (left)
+  // against the operator's selection (right), and the backend delta is
+  // `right - left`.
+  await expect(
+    page.getByText(
+      "Every row reads this Task's release → the selected release, so the observed delta is the selected release minus this Task's release.",
+      { exact: true },
+    ),
+  ).toBeVisible();
   const quality = page.getByRole("list", { name: "Release quality" });
   const correctness = quality.getByRole("listitem", { name: "Correctness" });
   await expect(

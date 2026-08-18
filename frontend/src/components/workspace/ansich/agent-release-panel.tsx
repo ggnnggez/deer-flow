@@ -105,6 +105,10 @@ export function AnsichAgentReleasePanel({
               </CardDescription>
             </div>
             <div className="flex gap-2">
+              {/* Hardcoded, not read from `summary.quality_status`: the backend
+                  still pins that field to the literal `"unassessed"`
+                  (ansich/release/manifest.py). Requalify this badge — and drop
+                  the literal — when real aggregate release quality lands. */}
               <Badge variant="outline">
                 {t.ansich.quality}: {t.ansich.unassessed}
               </Badge>

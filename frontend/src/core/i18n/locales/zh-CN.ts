@@ -741,6 +741,8 @@ export const zhCN: Translations = {
     dimensionCustom: "自定义维度",
     qualityTitle: "Release 质量",
     qualityDescription: "两个 Release 已记录评估之间的观测差异。",
+    qualityDeltaOrientation:
+      "每一行都按“本 Task 的 Release → 所选 Release”的顺序读取，因此观测差值为所选 Release 减去本 Task 的 Release。",
     qualityNoComparisons: "这两个 Release 之间没有质量证据。",
     qualityNotComparable: "不可比较",
     qualityObservedDelta: "观测差值",

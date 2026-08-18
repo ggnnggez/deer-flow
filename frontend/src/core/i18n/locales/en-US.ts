@@ -762,6 +762,8 @@ export const enUS: Translations = {
     qualityTitle: "Release quality",
     qualityDescription:
       "Observed differences between the two releases' recorded evaluations.",
+    qualityDeltaOrientation:
+      "Every row reads this Task's release → the selected release, so the observed delta is the selected release minus this Task's release.",
     qualityNoComparisons: "No quality evidence for these two releases.",
     qualityNotComparable: "Not comparable",
     qualityObservedDelta: "Observed delta",

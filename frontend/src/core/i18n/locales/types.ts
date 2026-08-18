@@ -648,6 +648,7 @@ export interface Translations {
     dimensionCustom: string;
     qualityTitle: string;
     qualityDescription: string;
+    qualityDeltaOrientation: string;
     qualityNoComparisons: string;
     qualityNotComparable: string;
     qualityObservedDelta: string;
