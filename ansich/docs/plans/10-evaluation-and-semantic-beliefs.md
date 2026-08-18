@@ -26,11 +26,13 @@
 5. 相对 §8 列出的四条端点，额外增加了 `GET /evaluations/{obs_id}/payload`。`expected`/`actual`/`rationale` 是正文，只有让它们走独立的 `no-store` 审计路由，§8 要求的“lazy payload”才是真的按需，而不是把正文塞进列表响应。
 6. `ansich_evaluation_index` 的列比 §6 列出的多：`task_id`、`scale_higher_is_better`、`authority_class`、`fidelity_class`、`cohort_key`、`projector_version`，并多一条 `(task_id, occurred_at)` 索引。前四项分别支撑 Task 维度的列表读取、量表极性、R2 authority 阶梯与 payload 来源的 fidelity；索引服务于 `GET /tasks/{id}/evaluations`。
 7. §5 提到“Current Belief 按 dimension + cohort key 分开”，实现的 Current Belief 仍只按 `quality.<dimension>` 一个 field 存放：cohort 保存在 assertion value 与 release 聚合格里，跨 suite 的分歧作为被保留的冲突 assertion 参与 resolver 选择并计入 `conflicting_assertion_count`，而不是拆成并行的 Current Belief。真正需要按 cohort 并列展示当前判断时，需要一次显式的 field 命名扩展与迁移。
+8. release 聚合格的**成员**按 cohort 过滤，但**取值**取的是 Task 的全局 current Belief——这是偏离 7（R3 的 belief 键不含 cohort）的直接后果。`_recompute_release_quality_stats` 只把在 `(cohort, dimension)` 上有 index 行的 Task 纳入这个格，取样时却读 `session.get(AnsichCurrentBeliefRow, (task_id, field_name))`（`sql.py:7951`），即与 cohort 无关的那一条：同一个 Task 先被 suite A 判 fail、又被 suite B 以更晚的 `as_of` 判 pass 时，A 的格聚合到的是 B 选出的 pass——一个 suite A 从未断言过的判断。§6 说统计聚合的是“Task 在一个明确 cohort 中的 selected/current evaluation”，v1 实现为“population 按 cohort 过滤 + 取值取全局 selected”。per-cohort 取值（按 assertion value 里的 `cohort_key` 过滤选中的 assertion，或改为 per-cohort belief）登记为 [phase-10-review-followups.md](phase-10-review-followups.md) 的 F10-4，归属 Phase 11。
 
 ### 已知限制
 
 - release 聚合格只在“evaluation 落在该 Task 的 `executed_by` 绑定之后”时把这个 Task 计入。绑定晚到会让格暂时保持旧值，直到同一 cohort/dimension 的下一条 evaluation 触发重算；该行为对重放是一致的。
 - 聚合格的 `as_of` 会随格内最新一条 evaluation 前移，即使这条 evaluation 没有改变任何被选中的 Belief。
+- 聚合格是“按 cohort 圈定成员、按全局 selected Belief 取值”（见偏离 8）：一个 Task 被多个 suite 分歧评估时，每个 cohort 的格拿到的都是同一个全局选中的判断，而不是该 cohort 自己的判断。因此 v1 的 cohort 只保证“比较的是同一批 Task”，不保证“比较的是这批 Task 在该 cohort 下的判断”。
 - 前端 Recorded evaluations 列表只显示最新 100 条（服务层默认 `limit=100`）且没有截断提示，登记为 UI-2 跟进项。
 - Task 详情 Agent release 头部的质量徽标仍是硬编码的 `unassessed`：后端 `AgentReleaseSummaryView.quality_status` 目前是 `Literal["unassessed"]`，真正的 release 级聚合出现前不改动该徽标。
 
