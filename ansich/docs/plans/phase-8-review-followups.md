@@ -6,14 +6,14 @@
 
 | 编号 | 摘要 | 状态 | 修复时间 | Commit |
 | ---- | ---- | ---- | -------- | ------ |
-| M1 | `wall_time_ms/local` 由 `_project_heartbeat` 与 `_project_usage` 双写者共同拥有,职责重叠 | ⬜ 未修复 | — | — |
+| M1 | `wall_time_ms/local` 由 `_project_heartbeat` 与 `_project_usage` 双写者共同拥有,职责重叠 | ✅ 已修复(2026-08-19,本次变更待提交) | 2026-08-19 | 本次变更待提交 |
 | M2 | heartbeat 每 tick 落一条持久 wall_time contribution,叠加 recompute-per-insert 的 summary 刷新,长任务写/读放大随 tick 平方增长 | ⬜ 未修复 | — | — |
 | L1 | `_aexecute` 吞掉 `asyncio.CancelledError` 且不 re-raise | ⬜ 未修复 | — | — |
 | L2 | `get_task_tree` 每节点 5 查询各自开 session,大树 N+1 | ⬜ 未修复 | — | — |
 
 ## M1. `wall_time_ms/local` 有两个投影写者
 
-- 状态:⬜ 未修复。
+- 状态:✅ 已修复(2026-08-19,本次变更待提交)。删除 `_project_heartbeat` 中更新 `AnsichTaskUsageRow(wall_time_ms, local)` 的分支(连同其不再需要的 `ingest_seq` 入参),该 projector 现在只写 `ansich_task_heartbeats` 行;`_refresh_usage_summary` 成为 wall_time summary 的唯一写者。等价性依据:`ObservationEnvelope` 对 `task.heartbeat` 的校验(`contracts.py:289-291`)与 `usage_contributions_for_observation`(`usage.py:81-84`)使用同一谓词(非 bool 的 `int` 且 `>= 0`),因此每条合法 heartbeat 必然产出一条 `wall_time_ms` contribution,被删分支的 `max` 结果恒不超过 contribution 模型的 max-per-source-then-sum,值不变。回归测试(`backend/tests/ansich/test_sql_heartbeat.py`):① `test_heartbeat_projector_alone_does_not_maintain_wall_time_summary` 用 monkeypatch 把 `task.heartbeat` 从 `_PROJECTOR_KINDS["task-usage"]` 摘除(即"关闭 usage projector"),断言 heartbeat 证据行照常写入而 summary 行不存在;② `test_wall_time_summary_is_written_only_from_usage_contributions` 让完整管线跑一条 occurred_at 晚于末次 heartbeat 的终态 `budget.consumed` wall_time,断言 summary 的 value/as_of/watermark 等于直接从 `ansich_usage_contributions` 算出的 contribution 模型结果(修复前 heartbeat 写者会把 `as_of` 回退到自己的 occurred_at)。
 - 位置:`backend/packages/harness/deerflow/ansich/persistence/sql.py::_project_heartbeat`(task-heartbeat projector,conditional `usage.value = max(existing, elapsed)`)+ `::_refresh_usage_summary`(task-usage projector,`usage.value = <recompute>` 无条件赋值)。`task.heartbeat` 现同时属于 `_USAGE_PROJECTION_KINDS` 与 `task-heartbeat` 两个 projector kind 集(sql.py:220/242),因此每条 heartbeat 观察生成两个投影 job,分别写同一 `AnsichTaskUsageRow(task_id, "wall_time_ms", "local")` 行。
 - 现状:Phase 8 把 wall_time 纳入 contribution/summary 模型后,`_project_heartbeat` 里那段直接更新 `AnsichTaskUsageRow` 的代码已经冗余——local wall_time 的权威来源应当只有 `_refresh_usage_summary`(它按"每 source 取 max 再跨 source 求和"计算)。当前两条路径都写这一行:单 worker 下 task-usage 优先级(索引 3)高于 task-heartbeat(索引 5),usage job 先按 ingest_seq 消化、contribution 单调累积,`_refresh_usage_summary` 看到的集合单调增长,值单调不降;`_project_heartbeat` 随后的 max 也不下降,因此**当前单 worker 收敛一致、无 active bug**。风险在于:① 两个 projector 同时"拥有"同一投影行违背本阶段"contribution 单一事实源"的设计;② `_refresh_usage_summary` 是无条件赋值而非 max,一旦多 worker(Phase 11)交错或将来有人改动其语义/顺序,两写者可能静默分歧;③ 它是易被误读的死代码。
 - 方向:删除 `_project_heartbeat` 中更新 `AnsichTaskUsageRow(wall_time_ms, local)` 的分支,让 wall_time 的所有 summary 只由 `_refresh_usage_summary` 拥有;`_project_heartbeat` 只保留写 `ansich_task_heartbeats` 行。配"关闭 usage projector 后 heartbeat 不再单独维护 wall_time summary""两条路径产出同一权威值"的回归测试。
@@ -58,7 +58,7 @@
 
 ## 计划测试矩阵缺口(随修复补齐)
 
-- M1:usage projector 关闭后 heartbeat 不单独维护 wall_time summary;两写者产出同一权威值。
+- M1:✅ 已补齐(2026-08-19)——`test_sql_heartbeat.py::test_heartbeat_projector_alone_does_not_maintain_wall_time_summary`(usage projector 关闭后 heartbeat 不单独维护 wall_time summary)与 `::test_wall_time_summary_is_written_only_from_usage_contributions`(summary 等于 contribution 模型的权威值)。
 - M2:贡献数增长时 summary 刷新工作量不呈平方(SQL 监听护栏)。
 - L1:取消后终态 first-writer 且资源清理完成。
 - L2:tree 查询次数按节点批量而非线性增长。

@@ -887,11 +887,7 @@ class SqlAnsichBackend:
                     elif projector_name == "task-budget":
                         await self._project_budget(session, observation)
                     elif projector_name == "task-heartbeat":
-                        await self._project_heartbeat(
-                            session,
-                            observation,
-                            ingest_seq=ingest_seq,
-                        )
+                        await self._project_heartbeat(session, observation)
                     elif projector_name == "task-safety":
                         await self._project_safety(session, observation)
                     elif projector_name == "evaluation-projector":
@@ -6064,9 +6060,17 @@ class SqlAnsichBackend:
         self,
         session: AsyncSession,
         observation: ObservationEnvelope,
-        *,
-        ingest_seq: int,
     ) -> None:
+        """Project heartbeat liveness evidence only.
+
+        ``task.heartbeat`` also belongs to ``_USAGE_PROJECTION_KINDS``, so the
+        task-usage projector turns the same observation into a ``wall_time_ms``
+        contribution and ``_refresh_usage_summary`` owns the resulting
+        ``AnsichTaskUsageRow``. This projector deliberately keeps no wall_time
+        summary of its own: two writers on one projection row would silently
+        diverge once projection jobs interleave across workers (P8-M1).
+        """
+
         if observation.payload is None:
             raise ValueError("task.heartbeat requires inline projection payload")
         if await session.get(AnsichTaskRow, observation.task_id) is None:
@@ -6083,31 +6087,6 @@ class SqlAnsichBackend:
                 elapsed_ms=max(0, int(observation.payload["elapsed_ms"])),
             )
         )
-        elapsed_ms = max(0, int(observation.payload["elapsed_ms"]))
-        usage = await session.get(
-            AnsichTaskUsageRow,
-            (observation.task_id, "wall_time_ms", "local"),
-        )
-        if usage is None:
-            session.add(
-                AnsichTaskUsageRow(
-                    task_id=observation.task_id,
-                    dimension="wall_time_ms",
-                    aggregation_scope="local",
-                    value=elapsed_ms,
-                    as_of=observation.occurred_at,
-                    complete_through_ingest_seq=ingest_seq,
-                    updated_at=observation.recorded_at,
-                )
-            )
-        elif elapsed_ms >= usage.value:
-            usage.value = elapsed_ms
-            usage.as_of = observation.occurred_at
-            usage.complete_through_ingest_seq = max(
-                usage.complete_through_ingest_seq,
-                ingest_seq,
-            )
-            usage.updated_at = observation.recorded_at
 
     async def _project_budget(
         self,
