@@ -14,7 +14,10 @@ import {
   fetchAnsichAlerts,
   fetchAnsichFailedJobDetail,
   fetchAnsichFailedJobs,
+  fetchAnsichReleaseQuality,
   fetchAnsichStepContext,
+  fetchAnsichStepEvaluations,
+  fetchAnsichTaskEvaluations,
   fetchAnsichActiveTasks,
   fetchAnsichAgentReleases,
   fetchAnsichTaskCompressions,
@@ -324,6 +327,59 @@ export function useAnsichAgentReleaseComparison(
       Boolean(leftReleaseId) &&
       Boolean(rightReleaseId) &&
       leftReleaseId !== rightReleaseId,
+    retry: false,
+  });
+}
+
+/**
+ * One Task's quality Beliefs plus the evaluation rows behind them. Polls while
+ * the Task runs, because a late assessor can attach an evaluation after the
+ * Steps themselves stop changing.
+ */
+export function useAnsichTaskEvaluations(
+  taskId: string,
+  enabled = true,
+  polling = true,
+) {
+  return useQuery({
+    queryKey: ["ansich", "task", taskId, "evaluations"],
+    queryFn: () => fetchAnsichTaskEvaluations(taskId),
+    enabled: enabled && Boolean(taskId),
+    retry: false,
+    refetchInterval: () =>
+      polling && pageIsVisible() ? REFRESH_INTERVAL_MS : false,
+    refetchIntervalInBackground: false,
+  });
+}
+
+/** Evaluations recorded against one selected Step; fetched on selection only. */
+export function useAnsichStepEvaluations(
+  stepId: string | null,
+  enabled = true,
+) {
+  return useQuery({
+    queryKey: ["ansich", "step", stepId, "evaluations"],
+    queryFn: () => fetchAnsichStepEvaluations(stepId ?? ""),
+    enabled: enabled && Boolean(stepId),
+    retry: false,
+  });
+}
+
+/**
+ * One AgentRelease's aggregated quality cells. `cohort` is `null` for every
+ * cohort and `""` for the explicit no-cohort bucket; the release read model
+ * never polls, since aggregates change only when an evaluation is recorded.
+ */
+export function useAnsichReleaseQuality(
+  releaseId: string | null,
+  cohort: string | null = null,
+  enabled = true,
+) {
+  return useQuery({
+    queryKey: ["ansich", "release", releaseId, "quality", cohort],
+    queryFn: () =>
+      fetchAnsichReleaseQuality(releaseId ?? "", cohort ?? undefined),
+    enabled: enabled && Boolean(releaseId),
     retry: false,
   });
 }

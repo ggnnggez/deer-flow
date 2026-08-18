@@ -1,4 +1,8 @@
-import type { AnsichAlertType, AnsichLostRange } from "./types";
+import type {
+  AnsichAlertType,
+  AnsichLostRange,
+  AnsichQualityBelief,
+} from "./types";
 
 export type AnsichAlertPresentationCategory =
   | "runaway"
@@ -179,6 +183,50 @@ export function countLostObservations(ranges: AnsichLostRange[]): number {
       total + Math.max(0, range.last_sequence - range.first_sequence + 1),
     0,
   );
+}
+
+/**
+ * Render one evaluation's outcome. A recorded verdict is the assessor's own
+ * word and always wins; a score renders against its scale maximum only when the
+ * whole scale is known, because a bare number out of an unknown range is not a
+ * comparable fact. An evaluation with neither renders as an explicit dash — it
+ * is never summarized into a pass.
+ */
+export function formatEvaluationVerdict(
+  verdict: string | null,
+  score: number | null,
+  scaleMin: number | null,
+  scaleMax: number | null,
+): string {
+  if (verdict) return verdict;
+  if (score === null) return "—";
+  if (scaleMin === null || scaleMax === null) return String(score);
+  return `${score} / ${scaleMax}`;
+}
+
+export type AnsichQualityBeliefTone =
+  | "pass"
+  | "fail"
+  | "partial"
+  | "unassessed"
+  | "unknown";
+
+/**
+ * Classify one quality Belief for display. The backend's `unassessed` flag is
+ * checked before any value inspection, so a dimension nothing assessed can
+ * never be dressed up as a verdict. A value without a recognized verdict is
+ * `unknown`, never a pass: absence of evidence is not evidence of success
+ * (IA §6.2 / §7.3).
+ */
+export function qualityBeliefTone(
+  belief: AnsichQualityBelief,
+): AnsichQualityBeliefTone {
+  if (belief.unassessed) return "unassessed";
+  const verdict = belief.value.verdict;
+  if (verdict === "pass" || verdict === "fail" || verdict === "partial") {
+    return verdict;
+  }
+  return "unknown";
 }
 
 export function formatAnsichTimestamp(

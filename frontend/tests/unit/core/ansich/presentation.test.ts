@@ -4,13 +4,18 @@ import {
   getAlertPresentationCategory,
   countMissingContextItems,
   countLostObservations,
+  formatEvaluationVerdict,
   getBudgetPresentation,
   formatAnsichTimestamp,
+  qualityBeliefTone,
   shortId,
   selectPrimarySignal,
   isProjectionAttention,
 } from "@/core/ansich/presentation";
-import { ANSICH_PRODUCED_ALERT_TYPES } from "@/core/ansich/types";
+import {
+  ANSICH_PRODUCED_ALERT_TYPES,
+  type AnsichQualityBelief,
+} from "@/core/ansich/types";
 
 describe("Ansich presentation", () => {
   it("counts every observation represented by inclusive lost ranges", () => {
@@ -187,6 +192,96 @@ describe("selectPrimarySignal", () => {
     expect(
       selectPrimarySignal({ behaviorState: "unknown", heartbeat: "unknown" }),
     ).toBeNull();
+  });
+});
+
+describe("formatEvaluationVerdict", () => {
+  it("prefers the recorded verdict over a score", () => {
+    expect(formatEvaluationVerdict("fail", 9, 0, 10)).toBe("fail");
+  });
+
+  it("renders a scored evaluation against its scale maximum", () => {
+    expect(formatEvaluationVerdict(null, 7, 0, 10)).toBe("7 / 10");
+    expect(formatEvaluationVerdict("", 3, 1, 5)).toBe("3 / 5");
+  });
+
+  it("renders a bare score when the scale is not fully known", () => {
+    expect(formatEvaluationVerdict(null, 7, null, null)).toBe("7");
+    expect(formatEvaluationVerdict(null, 7, 0, null)).toBe("7");
+    expect(formatEvaluationVerdict(null, 0, null, 10)).toBe("0");
+  });
+
+  it("renders a dash when neither a verdict nor a score exists", () => {
+    expect(formatEvaluationVerdict(null, null, 0, 10)).toBe("—");
+    expect(formatEvaluationVerdict("", null, null, null)).toBe("—");
+  });
+});
+
+describe("qualityBeliefTone", () => {
+  const belief = (
+    overrides: Partial<AnsichQualityBelief> = {},
+  ): AnsichQualityBelief => ({
+    dimension: "task_success",
+    value: { verdict: "pass" },
+    source: { name: "suite-runner", version: "1.0.0" },
+    authority_class: "deterministic",
+    fidelity_class: "hard",
+    as_of: "2026-08-18T00:00:00Z",
+    resolver: { name: "ansich.belief", version: "2" },
+    conflicting_assertion_count: 0,
+    evidence_obs_ids: ["obs-1"],
+    unassessed: false,
+    ...overrides,
+  });
+
+  it("reports unassessed before inspecting any value", () => {
+    expect(
+      qualityBeliefTone(
+        belief({ unassessed: true, value: { verdict: "pass" } }),
+      ),
+    ).toBe("unassessed");
+    expect(
+      qualityBeliefTone(
+        belief({
+          unassessed: true,
+          value: { status: "unassessed" },
+          authority_class: "unknown",
+          fidelity_class: "unknown",
+          as_of: null,
+          resolver: null,
+          evidence_obs_ids: [],
+        }),
+      ),
+    ).toBe("unassessed");
+  });
+
+  it("maps an asserted verdict onto its tone", () => {
+    expect(qualityBeliefTone(belief({ value: { verdict: "pass" } }))).toBe(
+      "pass",
+    );
+    expect(qualityBeliefTone(belief({ value: { verdict: "fail" } }))).toBe(
+      "fail",
+    );
+    expect(qualityBeliefTone(belief({ value: { verdict: "partial" } }))).toBe(
+      "partial",
+    );
+  });
+
+  it("never infers a pass from a missing or unusable verdict", () => {
+    expect(qualityBeliefTone(belief({ value: {} }))).toBe("unknown");
+    expect(qualityBeliefTone(belief({ value: { verdict: null } }))).toBe(
+      "unknown",
+    );
+    expect(qualityBeliefTone(belief({ value: { verdict: "unknown" } }))).toBe(
+      "unknown",
+    );
+    expect(qualityBeliefTone(belief({ value: { verdict: 1 } }))).toBe(
+      "unknown",
+    );
+    expect(qualityBeliefTone(belief({ value: { score: 10 } }))).toBe("unknown");
+    expect(qualityBeliefTone(belief({ value: { status: "unassessed" } }))).toBe(
+      "unknown",
+    );
   });
 });
 

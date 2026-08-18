@@ -365,6 +365,26 @@ export type AnsichAlertWorkflowState =
   | "dismissed"
   | "resolved";
 
+/**
+ * Every authority class the backend Belief resolver can attach to an assertion.
+ * `soft_human` is emitted by resolver v2 (a human annotation that is not a hard
+ * override), and `unknown` is carried by synthesized unassessed quality Beliefs
+ * — absence of an assessment is a first-class state, not a missing field.
+ */
+export type AnsichAuthorityClass =
+  | "human_override"
+  | "deterministic"
+  | "configured_rule"
+  | "automated"
+  | "soft_human"
+  | "unknown";
+
+/**
+ * Belief/evaluation fidelity. `unknown` belongs to synthesized unassessed
+ * quality Beliefs, which have no assessment to take a fidelity from.
+ */
+export type AnsichFidelityClass = "hard" | "rule" | "soft" | "unknown";
+
 export interface AnsichBeliefAssertion {
   assertion_id: string;
   subject_id: string;
@@ -374,12 +394,8 @@ export interface AnsichBeliefAssertion {
   asserted_at: string;
   assessor: AnsichNamedVersion;
   config_hash: string;
-  authority_class:
-    | "human_override"
-    | "deterministic"
-    | "configured_rule"
-    | "automated";
-  fidelity_class: "hard" | "rule" | "soft";
+  authority_class: AnsichAuthorityClass;
+  fidelity_class: AnsichFidelityClass;
   confidence: number | null;
   evidence_obs_ids: string[];
 }
@@ -995,7 +1011,128 @@ export interface AnsichAgentReleaseComparison {
   quality_status: "unassessed";
 }
 
+/**
+ * One dimension of a release-to-release quality comparison. `observed_delta` is
+ * exactly that — an observed difference, never a significance claim — and it
+ * exists only while `comparison_status` is `"comparable"`. `reason` carries the
+ * machine-readable refusal (`no_shared_cohort`, `scale_mismatch`,
+ * `insufficient_samples`, `observability_loss`) so a caller never parses prose.
+ */
+export interface AnsichQualityComparison {
+  dimension: string;
+  cohort_key: string;
+  comparison_status: "comparable" | "not_comparable";
+  reason: string | null;
+  observed_delta: number | null;
+  left_sample_count: number;
+  right_sample_count: number;
+  coverage: Record<string, unknown>;
+  resolver: AnsichNamedVersion;
+}
+
 export interface AnsichAgentReleaseComparisonResponse {
   comparison: AnsichAgentReleaseComparison;
+  /**
+   * Optional: an older backend, or one without evaluation storage, omits the
+   * block entirely. Consumers must render the structural comparison without it
+   * rather than treating absence as "no quality difference".
+   */
+  quality?: {
+    comparisons: AnsichQualityComparison[];
+    cohort: string | null;
+  };
   projection_status: AnsichHealth;
+}
+
+/**
+ * The current semantic quality Belief for one dimension of one subject.
+ *
+ * `unassessed` is a first-class state: such a Belief still carries the complete
+ * structure, with an explicit `{"status": "unassessed"}` value, the `unknown`
+ * authority/fidelity classes and no evidence. Absence of an evaluation must
+ * never be rendered as a verdict.
+ */
+export interface AnsichQualityBelief {
+  dimension: string;
+  value: Record<string, unknown>;
+  source: AnsichNamedVersion;
+  authority_class: AnsichAuthorityClass;
+  fidelity_class: AnsichFidelityClass;
+  as_of: string | null;
+  resolver: AnsichNamedVersion | null;
+  conflicting_assertion_count: number;
+  evidence_obs_ids: string[];
+  unassessed: boolean;
+}
+
+/**
+ * One row of the evaluation query index. This is a metadata projection:
+ * expected/actual/rationale bodies stay in the Observation payload and are read
+ * through the audited raw-payload route.
+ *
+ * `cohort_key` is `null` when the evaluation declared no cohort. The release
+ * quality read model instead uses the empty-string sentinel
+ * (`AnsichReleaseQualityCohort.cohort_key`); the two spellings are deliberate
+ * and must not be normalized into each other.
+ */
+export interface AnsichEvaluation {
+  evaluation_obs_id: string;
+  subject_type: string;
+  subject_id: string;
+  task_id: string;
+  evaluation_kind: string;
+  dimension: string;
+  verdict: string | null;
+  score: number | null;
+  scale_min: number | null;
+  scale_max: number | null;
+  scale_higher_is_better: boolean | null;
+  assessor_name: string;
+  assessor_version: string | null;
+  authority_class: AnsichAuthorityClass;
+  fidelity_class: AnsichFidelityClass;
+  cohort_key: string | null;
+  suite_id: string | null;
+  suite_version: string | null;
+  case_id: string | null;
+  occurred_at: string;
+}
+
+export interface AnsichTaskEvaluationsResponse {
+  task_id: string;
+  quality_beliefs: AnsichQualityBelief[];
+  evaluations: AnsichEvaluation[];
+  projection_status: Partial<AnsichHealth>;
+}
+
+export interface AnsichStepEvaluationsResponse {
+  step_id: string;
+  evaluations: AnsichEvaluation[];
+  projection_status: Partial<AnsichHealth>;
+}
+
+/**
+ * One `(cohort, dimension)` quality cell of one AgentRelease.
+ *
+ * `cohort_key` is the aggregation sentinel, where `""` means the evaluations
+ * declared no cohort. It is a sample list, never a comparison population: the
+ * same empty key on two releases says nothing about the two sample sets sharing
+ * a suite, version, or case set.
+ */
+export interface AnsichReleaseQualityCohort {
+  dimension: string;
+  cohort_key: string;
+  assessed_count: number;
+  pass_count: number;
+  fail_count: number;
+  partial_count: number;
+  mean_score: number | null;
+  scale: Record<string, unknown> | null;
+  as_of: string;
+}
+
+export interface AnsichReleaseQualityResponse {
+  release_id: string;
+  cohorts: AnsichReleaseQualityCohort[];
+  projection_status: Partial<AnsichHealth>;
 }

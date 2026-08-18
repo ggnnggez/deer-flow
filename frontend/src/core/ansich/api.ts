@@ -20,8 +20,11 @@ import type {
   AnsichFailedJobsResponse,
   AnsichFailedJobsRetryResponse,
   AnsichPossibleExposuresResponse,
+  AnsichReleaseQualityResponse,
+  AnsichStepEvaluationsResponse,
   AnsichStepResponse,
   AnsichStepsResponse,
+  AnsichTaskEvaluationsResponse,
   AnsichTaskListResponse,
   AnsichTaskLifecycleScope,
   AnsichTaskBudgetsResponse,
@@ -154,11 +157,17 @@ export async function fetchAnsichTaskAgentRelease(
 export async function compareAnsichAgentReleases(
   leftReleaseId: string,
   rightReleaseId: string,
+  cohort?: string,
 ): Promise<AnsichAgentReleaseComparisonResponse> {
   const query = new URLSearchParams({
     left: leftReleaseId,
     right: rightReleaseId,
   });
+  // An empty cohort is the explicit "declared no cohort" bucket, so only an
+  // omitted argument means "every cohort".
+  if (cohort !== undefined) {
+    query.set("cohort", cohort);
+  }
   const response = await fetch(
     ansichUrl(`/agent-releases/compare?${query.toString()}`),
   );
@@ -166,6 +175,31 @@ export async function compareAnsichAgentReleases(
     await throwAnsichApiError(
       response,
       `Failed to compare Ansich Agent releases: ${response.statusText}`,
+    );
+  }
+  return response.json();
+}
+
+export async function fetchAnsichReleaseQuality(
+  releaseId: string,
+  cohort?: string,
+): Promise<AnsichReleaseQualityResponse> {
+  const query = new URLSearchParams();
+  // `""` is the no-cohort aggregation sentinel and is a real filter; only an
+  // omitted argument asks for every cohort.
+  if (cohort !== undefined) {
+    query.set("cohort", cohort);
+  }
+  const suffix = query.toString() ? `?${query.toString()}` : "";
+  const response = await fetch(
+    ansichUrl(
+      `/agent-releases/${encodeURIComponent(releaseId)}/quality${suffix}`,
+    ),
+  );
+  if (!response.ok) {
+    await throwAnsichApiError(
+      response,
+      `Failed to load Ansich Agent release quality: ${response.statusText}`,
     );
   }
   return response.json();
@@ -451,6 +485,21 @@ export async function fetchAnsichTaskSteps(
   return response.json();
 }
 
+export async function fetchAnsichTaskEvaluations(
+  taskId: string,
+): Promise<AnsichTaskEvaluationsResponse> {
+  const response = await fetch(
+    ansichUrl(`/tasks/${encodeURIComponent(taskId)}/evaluations`),
+  );
+  if (!response.ok) {
+    await throwAnsichApiError(
+      response,
+      `Failed to load Ansich Task evaluations: ${response.statusText}`,
+    );
+  }
+  return response.json();
+}
+
 export async function fetchAnsichStep(
   stepId: string,
 ): Promise<AnsichStepResponse> {
@@ -476,6 +525,21 @@ export async function fetchAnsichStepContext(
     await throwAnsichApiError(
       response,
       `Failed to load Ansich context: ${response.statusText}`,
+    );
+  }
+  return response.json();
+}
+
+export async function fetchAnsichStepEvaluations(
+  stepId: string,
+): Promise<AnsichStepEvaluationsResponse> {
+  const response = await fetch(
+    ansichUrl(`/steps/${encodeURIComponent(stepId)}/evaluations`),
+  );
+  if (!response.ok) {
+    await throwAnsichApiError(
+      response,
+      `Failed to load Ansich Step evaluations: ${response.statusText}`,
     );
   }
   return response.json();
