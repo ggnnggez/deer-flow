@@ -746,13 +746,27 @@ passes `AnsichConfig.terminal_flush_timeout_ms` explicitly (2 seconds by
 default), preserving the runtime's bounded fail-open terminal flush.
 
 Two test-side rules keep that suite deterministic under load, both introduced
-by F10-10 and neither of them a timeout. (1) `_projector_loop` assesses on its
-first iteration unconditionally and then on its own cadence, always with a
-wall-clock `now`; a test that drives `assess_operations(now=...)` itself and
-then asserts on which assessment ran is racing that call, so every such test
-calls `tests/support/ansich_settle.py::only_test_driven_assessments(service)`
-before `start()` — the projector keeps projecting, only its own assessments
-fall silent. (2) `tests/ansich/conftest.py` puts every SQLite engine in that
+by F10-10 and neither of them a timeout.
+
+(1) `_projector_loop` assesses with a wall-clock `now`, so a test that drives
+`assess_operations(now=<simulated>)` itself and then asserts on *which*
+assessment ran is racing it. Which call does the racing depends on how the test
+built its service, and the two shapes need different words: a test that leaves
+`operations_assessment_interval_ms` at the `create_sql_ansich_service` default
+races the **1 Hz cadence** (the loop assesses throughout the test body — this is
+the shape the reproduced budget flake was in, and a 60s interval would have
+helped it), while a test that already passes `operations_assessment_interval_ms=60_000`
+has silenced that cadence and is left racing the **first-iteration call**, which
+`_projector_loop` makes unconditionally (`next_assessment = loop.time()`) and no
+interval can suppress. One gate closes both: every such test calls
+`tests/support/ansich_settle.py::only_test_driven_assessments(service)` before
+`start()` — the projector keeps projecting, only its own assessments fall
+silent. The gate rebinds the public `assess_operations`, which is what the loop
+calls, and `tests/ansich/test_settle_isolation.py` pins that attachment point
+against a real service so a refactor routing the loop around it cannot silently
+disarm every gate.
+
+(2) `tests/ansich/conftest.py` puts every SQLite engine in that
 directory into `journal_mode=WAL` with a 30s `busy_timeout`, matching
 `deerflow/persistence/engine.py`; a bare `create_async_engine` otherwise leaves
 the file in rollback-journal mode, where a read transaction upgrading to a
