@@ -788,6 +788,236 @@ async def test_sql_projects_scopes_authorization_and_effects_as_typed_rows(
 
 
 @pytest.mark.anyio
+async def test_sql_projects_delete_and_permission_effects_as_typed_rows(tmp_path) -> None:
+    """`filesystem_delete`/`permission_change` survive record -> project -> read."""
+
+    engine = create_async_engine(f"sqlite+aiosqlite:///{tmp_path / 'safety-new-classes.db'}")
+
+    @event.listens_for(engine.sync_engine, "connect")
+    def _enable_foreign_keys(dbapi_connection, _connection_record):
+        cursor = dbapi_connection.cursor()
+        cursor.execute("PRAGMA foreign_keys=ON")
+        cursor.close()
+
+    session_factory = async_sessionmaker(engine, expire_on_commit=False)
+    async with engine.begin() as connection:
+        await connection.run_sync(Base.metadata.create_all)
+    service = create_sql_ansich_service(session_factory)
+    await service.start()
+    task_id, step_id = new_id(), new_id()
+    observed_at = datetime.now(UTC)
+    producer = Producer(name="safety-test", version="1", instance_id="test")
+    cases = (
+        ("filesystem_delete", "rm", new_id()),
+        ("permission_change", "chmod", new_id()),
+    )
+
+    try:
+        service.record_batch(
+            (
+                ObservationEnvelope.task_lifecycle(
+                    kind="task.created",
+                    task_id=task_id,
+                    source_kind="deerflow_run",
+                    source_id="safety-run",
+                    occurred_at=observed_at,
+                    source_event_id="safety:task:created",
+                    owner_id="owner-acme",
+                    attributes={"workspace_ref": "/srv/tenants/acme/private-project"},
+                ),
+                ObservationEnvelope(
+                    kind="step.started",
+                    occurred_at=observed_at,
+                    task_id=task_id,
+                    step_id=step_id,
+                    subject_type="step",
+                    subject_id=step_id,
+                    producer=producer,
+                    source_event_id="safety:step:started",
+                    correlation_id="safety-run",
+                    payload={"step_seq": 1, "actor_kind": "lead_agent"},
+                ),
+                *(
+                    ObservationEnvelope(
+                        kind="tool.issued",
+                        occurred_at=observed_at,
+                        task_id=task_id,
+                        step_id=step_id,
+                        subject_type="tool_call",
+                        subject_id=tool_call_id,
+                        producer=producer,
+                        source_event_id=f"safety:tool:issued:{label}",
+                        correlation_id="safety-run",
+                        payload={
+                            "call_seq": index + 1,
+                            "provider_call_id": f"provider-{label}",
+                            "tool_name": "bash",
+                            "args_hash": "a" * 64,
+                            "args_preview": {"command": f"{label} workspace/report.md"},
+                            "tool_schema_block_id": None,
+                        },
+                    )
+                    for index, (_, label, tool_call_id) in enumerate(cases)
+                ),
+            )
+        )
+        await service.flush_task(task_id)
+        async with session_factory() as session:
+            scope_rows = list((await session.execute(select(AnsichScopeRow))).scalars())
+        scopes = {row.scope_kind: row for row in scope_rows}
+
+        recorded_effects: dict[str, tuple[ToolEffect, ...]] = {}
+        for effect_class, label, tool_call_id in cases:
+            snapshot_id, evaluated_obs_id, decision_obs_id = new_id(), new_id(), new_id()
+            snapshot = AuthorizationSnapshot(
+                snapshot_id=snapshot_id,
+                tool_call_id=tool_call_id,
+                principal_scope_ids=(scopes["owner"].entity_id,),
+                policy_id="workspace-policy",
+                policy_version="1",
+                policy_hash="b" * 64,
+                decision="allowed",
+                details_available=True,
+                effective_permissions=(
+                    AuthorizationPermission(
+                        resource="workspace/report.md",
+                        action=label,
+                        scope_id=scopes["workspace"].entity_id,
+                        effect=effect_class,
+                    ),
+                ),
+                resource_scope_ids=(scopes["workspace"].entity_id,),
+                reason_codes=("within_workspace",),
+                evaluated_at=observed_at,
+                evidence_obs_ids=(evaluated_obs_id,),
+            )
+            intended_obs_id, observed_obs_id = new_id(), new_id()
+            intended = ToolEffect(
+                effect_id=new_id(),
+                tool_call_id=tool_call_id,
+                effect_class=effect_class,
+                phase="intended",
+                scope_id=scopes["workspace"].entity_id,
+                target_hash="c" * 64,
+                target_preview="workspace/report.md",
+                fidelity_class="inferred",
+                source_obs_id=intended_obs_id,
+            )
+            observed = intended.model_copy(
+                update={
+                    "effect_id": new_id(),
+                    "phase": "observed",
+                    "fidelity_class": "hard",
+                    "source_obs_id": observed_obs_id,
+                }
+            )
+            recorded_effects[tool_call_id] = (intended, observed)
+            service.record_batch(
+                (
+                    ObservationEnvelope(
+                        obs_id=evaluated_obs_id,
+                        kind="authorization.evaluated",
+                        occurred_at=observed_at,
+                        task_id=task_id,
+                        step_id=step_id,
+                        subject_type="authorization_snapshot",
+                        subject_id=snapshot_id,
+                        producer=producer,
+                        source_event_id=f"safety:authorization:evaluated:{label}",
+                        correlation_id="safety-run",
+                        payload={"snapshot": snapshot.model_dump(mode="json")},
+                    ),
+                    ObservationEnvelope(
+                        obs_id=decision_obs_id,
+                        kind="authorization.allowed",
+                        occurred_at=observed_at,
+                        task_id=task_id,
+                        step_id=step_id,
+                        subject_type="authorization_snapshot",
+                        subject_id=snapshot_id,
+                        producer=producer,
+                        source_event_id=f"safety:authorization:allowed:{label}",
+                        correlation_id="safety-run",
+                        causation_obs_id=evaluated_obs_id,
+                        payload={"snapshot": snapshot.model_dump(mode="json")},
+                    ),
+                    ObservationEnvelope(
+                        obs_id=intended_obs_id,
+                        kind="effect.intended",
+                        occurred_at=observed_at,
+                        task_id=task_id,
+                        step_id=step_id,
+                        subject_type="effect",
+                        subject_id=intended.effect_id,
+                        producer=producer,
+                        source_event_id=f"safety:effect:intended:{label}",
+                        correlation_id="safety-run",
+                        causation_obs_id=decision_obs_id,
+                        payload={"effect": intended.model_dump(mode="json")},
+                    ),
+                    ObservationEnvelope(
+                        obs_id=observed_obs_id,
+                        kind="effect.observed",
+                        occurred_at=observed_at,
+                        task_id=task_id,
+                        step_id=step_id,
+                        subject_type="effect",
+                        subject_id=observed.effect_id,
+                        producer=producer,
+                        source_event_id=f"safety:effect:observed:{label}",
+                        correlation_id="safety-run",
+                        causation_obs_id=decision_obs_id,
+                        payload={"effect": observed.model_dump(mode="json")},
+                    ),
+                )
+            )
+        await service.flush_task(task_id)
+        await service.assess_operations(now=observed_at)
+
+        read_back = {tool_call_id: await service.get_tool_effects(tool_call_id) for _, _, tool_call_id in cases}
+        async with session_factory() as session:
+            row_classes = {
+                tool_call_id: sorted(
+                    (
+                        await session.execute(
+                            select(AnsichToolEffectRow.effect_class).where(AnsichToolEffectRow.tool_call_id == tool_call_id),
+                        )
+                    )
+                    .scalars()
+                    .all()
+                )
+                for _, _, tool_call_id in cases
+            }
+            unverified = {
+                tool_call_id: await session.scalar(
+                    select(AnsichBeliefAssertionRow.value_json)
+                    .join(
+                        AnsichCurrentBeliefRow,
+                        AnsichCurrentBeliefRow.assertion_id == AnsichBeliefAssertionRow.assertion_id,
+                    )
+                    .where(
+                        AnsichCurrentBeliefRow.subject_id == tool_call_id,
+                        AnsichCurrentBeliefRow.field_name == "scope_safety:unverified_effect",
+                    )
+                )
+                for _, _, tool_call_id in cases
+            }
+    finally:
+        await service.stop()
+        await engine.dispose()
+
+    for effect_class, _, tool_call_id in cases:
+        assert row_classes[tool_call_id] == [effect_class, effect_class]
+        view = read_back[tool_call_id]
+        assert view is not None
+        assert sorted(view.effects, key=lambda item: item.phase) == sorted(recorded_effects[tool_call_id], key=lambda item: item.phase)
+        # A fully identified, in-scope effect is concrete evidence, not an
+        # unknown-handled residue.
+        assert unverified[tool_call_id] is not None
+        assert unverified[tool_call_id]["value"] == "cleared"
+
+
+@pytest.mark.anyio
 async def test_externalized_scope_authorization_and_effect_payloads_read_back(tmp_path) -> None:
     engine = create_async_engine(f"sqlite+aiosqlite:///{tmp_path / 'safety-externalized-payloads.db'}")
 

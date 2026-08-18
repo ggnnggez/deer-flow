@@ -3,6 +3,8 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import posixpath
+import re
+import shlex
 import time
 from collections.abc import Awaitable, Callable, Mapping
 from datetime import UTC, datetime
@@ -282,14 +284,76 @@ def _record_authorization(
     invocation.authorization_recorded = True
 
 
-def _effect_class(tool_name: str) -> str:
+# Shell metacharacters that make a command's effect surface unidentifiable.
+# Any of these anywhere in the command string means the shell may chain
+# (`;` `&` `|`), redirect (`<` `>`), substitute (`$` backtick `(` `)`), expand
+# (`{` `}`), or run more than one command (newline) - none of which the leading
+# command word describes. Glob characters are deliberately NOT listed: they only
+# widen the target set of the same single command. See `_leading_command_word`.
+_SHELL_METACHARACTERS = frozenset("|&;<>()`$\n\r{}")
+_ENV_ASSIGNMENT_PREFIX = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=")
+_DELETE_COMMANDS = frozenset({"rm", "unlink", "rmdir"})
+_PERMISSION_COMMANDS = frozenset({"chmod", "chown", "chgrp"})
+
+
+def _leading_command_word(command: str) -> str | None:
+    """Return the basename of the leading command word, or ``None``.
+
+    Deliberately maximally conservative (phase-9 M1 / ruling HR2): a command
+    string is parsed at all only when it is ONE simple command carrying no
+    shell metacharacter whatsoever. Pipes, ``&&``/``||``/``;`` chains,
+    redirections, substitutions, and multi-line scripts all return ``None`` so
+    the caller keeps the honest ``process_execute`` + ``unknown`` pair instead
+    of asserting a narrower class from a command word that only describes the
+    first of several effects.
+
+    Leading ``NAME=value`` environment assignments are skipped so
+    ``DEBUG=1 rm x`` still resolves to ``rm``; the command word itself is
+    reduced to its basename so ``/bin/rm`` resolves to ``rm``.
+    """
+
+    if not command or any(character in _SHELL_METACHARACTERS for character in command):
+        return None
+    try:
+        tokens = shlex.split(command)
+    except ValueError:
+        # Unbalanced quoting: the real argv is unknown, so refuse to guess.
+        return None
+    for token in tokens:
+        if _ENV_ASSIGNMENT_PREFIX.match(token):
+            continue
+        return posixpath.basename(token.replace("\\", "/")) or None
+    return None
+
+
+def _bash_effect_class(args: Mapping[str, object] | None) -> str:
+    command = args.get("command") if isinstance(args, Mapping) else None
+    if not isinstance(command, str):
+        return "process_execute"
+    word = _leading_command_word(command)
+    if word in _DELETE_COMMANDS:
+        return "filesystem_delete"
+    if word in _PERMISSION_COMMANDS:
+        return "permission_change"
+    return "process_execute"
+
+
+def _tool_call_args(request: ToolCallRequest) -> Mapping[str, object] | None:
+    args = request.tool_call.get("args")
+    return args if isinstance(args, Mapping) else None
+
+
+def _effect_class(tool_name: str, args: Mapping[str, object] | None = None) -> str:
     normalized = tool_name.lower().strip("_")
     if normalized in {"read_file", "view_file"} or normalized.endswith("read_file"):
         return "filesystem_read"
     if normalized in {"write_file", "edit_file"} or normalized.endswith("write_file"):
         return "filesystem_write"
     if normalized == "bash" or normalized.endswith("bash_tool"):
-        return "process_execute"
+        # No built-in tool deletes files or changes permissions, so bash argv
+        # patterns are the whole production surface for `filesystem_delete`
+        # and `permission_change`.
+        return _bash_effect_class(args)
     if normalized == "task" or normalized.endswith("task_tool"):
         return "child_task_spawn"
     if "search" in normalized or normalized in {"fetch", "http_get", "web"}:
@@ -361,7 +425,7 @@ def _record_effect_intent(
 ) -> None:
     if invocation.effect_intent_recorded:
         return
-    effect_class = _effect_class(invocation.registration.tool_name)
+    effect_class = _effect_class(invocation.registration.tool_name, _tool_call_args(request))
     observations = [
         _effect_observation(
             execution,
@@ -390,8 +454,9 @@ def _record_effect_intent(
 def _record_observed_effects(
     execution: AnsichExecutionContext,
     invocation: ToolInvocation,
+    tool_args: Mapping[str, object] | None,
 ) -> None:
-    effect_class = _effect_class(invocation.registration.tool_name)
+    effect_class = _effect_class(invocation.registration.tool_name, tool_args)
     # The task tool owns this hard fact: a successful tool return does not by
     # itself prove that the child Task was created.  Its creation boundary
     # emits child_task_spawn only after TaskControlProbe.created().
@@ -411,6 +476,10 @@ def _record_observed_effects(
         )
     ]
     if effect_class == "process_execute":
+        # A shell command we could not reduce to one identified leading command
+        # keeps this honest companion: its real effect surface is unobservable.
+        # A classified `rm`/`chmod` does not, because the metacharacter gate in
+        # `_leading_command_word` already proved there is nothing else running.
         observations.append(
             _effect_observation(
                 execution,
@@ -432,6 +501,7 @@ def _record_raw_result(
     invocation: ToolInvocation,
     capture: ObservedContentCapture,
     *,
+    tool_args: Mapping[str, object] | None,
     terminal_kind: str,
     terminal_payload: dict[str, object] | None = None,
     producer_metadata: Mapping[str, str] | None = None,
@@ -492,7 +562,7 @@ def _record_raw_result(
     invocation.raw_recorded = accepted
     if accepted:
         execution.mark_tool_terminal(registration.tool_call_id)
-        _record_observed_effects(execution, invocation)
+        _record_observed_effects(execution, invocation, tool_args)
 
 
 def _classify_transform(
@@ -756,6 +826,7 @@ class AnsichRawToolMiddleware(AgentMiddleware):
                     execution,
                     invocation,
                     _capture_exception(exc, request),
+                    tool_args=_tool_call_args(request),
                     terminal_kind=terminal_kind,
                     terminal_payload={"error_type": type(exc).__name__},
                 )
@@ -767,6 +838,7 @@ class AnsichRawToolMiddleware(AgentMiddleware):
                 execution,
                 invocation,
                 _capture_result(result, request, kind="tool_result_raw"),
+                tool_args=_tool_call_args(request),
                 terminal_kind="tool.returned_raw",
                 producer_metadata=_result_producer_metadata(result, request),
             )
@@ -799,6 +871,7 @@ class AnsichRawToolMiddleware(AgentMiddleware):
                     execution,
                     invocation,
                     _capture_exception(exc, request),
+                    tool_args=_tool_call_args(request),
                     terminal_kind=terminal_kind,
                     terminal_payload={"error_type": type(exc).__name__},
                 )
@@ -810,6 +883,7 @@ class AnsichRawToolMiddleware(AgentMiddleware):
                 execution,
                 invocation,
                 _capture_result(result, request, kind="tool_result_raw"),
+                tool_args=_tool_call_args(request),
                 terminal_kind="tool.returned_raw",
                 producer_metadata=_result_producer_metadata(result, request),
             )

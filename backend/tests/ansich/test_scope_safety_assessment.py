@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from datetime import UTC, datetime, timedelta
 
+import pytest
 from ansich import AuthorizationSnapshot, ToolEffect
 from ansich.alerts import alert_conditions_from_assessment
 from ansich.assessment.scope_safety import assess_scope_safety
@@ -127,6 +128,40 @@ def test_hard_observed_effect_clears_unverified_when_no_unknown_range_remains() 
 
     assert _present(result) == set()
     assert all(item.value["value"] == "cleared" for item in result.conclusions)
+
+
+@pytest.mark.parametrize("effect_class", ["filesystem_delete", "permission_change"])
+def test_new_effect_classes_are_concrete_not_unknown_handled(effect_class: str) -> None:
+    """`filesystem_delete`/`permission_change` must count as concrete observations."""
+
+    result = assess_scope_safety(
+        tool_call_id="tool-call",
+        authorization_snapshots=(_snapshot(decision="allowed", resource_scope_ids=("workspace",)),),
+        effects=(
+            _effect(effect_class, "potential", source_obs_id="potential"),
+            _effect(effect_class, "intended", scope_id="workspace", source_obs_id="intent"),
+            _effect(effect_class, "observed", scope_id="workspace", source_obs_id="observed"),
+        ),
+        now=datetime.now(UTC),
+    )
+
+    assert _present(result) == set()
+    assert all(item.value["value"] == "cleared" for item in result.conclusions)
+
+
+@pytest.mark.parametrize("effect_class", ["filesystem_delete", "permission_change"])
+def test_new_effect_classes_outside_allowed_scope_are_realized_violations(effect_class: str) -> None:
+    result = assess_scope_safety(
+        tool_call_id="tool-call",
+        authorization_snapshots=(_snapshot(decision="allowed", resource_scope_ids=("workspace",)),),
+        effects=(
+            _effect(effect_class, "intended", scope_id="outside", source_obs_id="intent"),
+            _effect(effect_class, "observed", scope_id="outside", source_obs_id="observed"),
+        ),
+        now=datetime.now(UTC),
+    )
+
+    assert _present(result) == {"realized_scope_violation"}
 
 
 def test_latest_authorization_snapshot_supersedes_an_older_denial() -> None:

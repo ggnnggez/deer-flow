@@ -852,6 +852,12 @@ def _observed_noop(value: str) -> str:
     return value
 
 
+@tool("bash")
+def _observed_bash(command: str) -> str:
+    """Pretend to run a shell command and echo it back."""
+    return f"ran: {command}"
+
+
 @tool
 def _observed_failure(value: str) -> str:
     """Raise a deterministic tool failure."""
@@ -1090,6 +1096,169 @@ def test_tool_decision_is_acting_and_next_decision_closes_with_final_answer() ->
             "content.produced",
             "tool.result_visible",
         ]
+
+    asyncio.run(scenario())
+
+
+class _BashToolModel(_FinalAnswerModel):
+    """Issue exactly one `bash` tool call carrying a caller-supplied command."""
+
+    command: str = ""
+    call_count: int = 0
+
+    def bind_tools(self, tools, **kwargs):
+        return self
+
+    def _generate(self, messages, stop=None, run_manager=None, **kwargs):
+        self.call_count += 1
+        if self.call_count == 1:
+            return ChatResult(
+                generations=[
+                    ChatGeneration(
+                        message=AIMessage(
+                            content="",
+                            tool_calls=[
+                                {
+                                    "id": "provider-bash-1",
+                                    "name": "bash",
+                                    "args": {"command": self.command},
+                                }
+                            ],
+                        )
+                    )
+                ]
+            )
+        return super()._generate(messages, stop=stop, run_manager=run_manager, **kwargs)
+
+
+@pytest.mark.parametrize(
+    ("command", "expected_class", "expects_unknown_companion"),
+    [
+        # Reliably identifiable: one simple command, no shell metacharacters.
+        pytest.param("rm report.txt", "filesystem_delete", False, id="rm"),
+        pytest.param("rm -rf /mnt/user-data/workspace/tmp", "filesystem_delete", False, id="rm-flags"),
+        pytest.param("/bin/rm report.txt", "filesystem_delete", False, id="rm-absolute-path"),
+        pytest.param("rm 'my report.txt'", "filesystem_delete", False, id="rm-quoted-arg"),
+        pytest.param("unlink report.txt", "filesystem_delete", False, id="unlink"),
+        pytest.param("rmdir stale-dir", "filesystem_delete", False, id="rmdir"),
+        pytest.param("DEBUG=1 rm report.txt", "filesystem_delete", False, id="rm-after-env-assignment"),
+        pytest.param("chmod 755 run.sh", "permission_change", False, id="chmod"),
+        pytest.param("/usr/bin/chown deer:deer run.sh", "permission_change", False, id="chown-absolute-path"),
+        pytest.param("chgrp staff run.sh", "permission_change", False, id="chgrp"),
+        # Not reliably identifiable: keep the existing process_execute + unknown pair.
+        pytest.param("echo hello", "process_execute", True, id="plain-command"),
+        pytest.param("rm a.txt && rm b.txt", "process_execute", True, id="and-chain"),
+        pytest.param("rm a.txt || true", "process_execute", True, id="or-chain"),
+        pytest.param("rm a.txt; echo done", "process_execute", True, id="semicolon-chain"),
+        pytest.param("find . -name '*.log' | xargs rm", "process_execute", True, id="pipe"),
+        pytest.param("rm $(cat targets.txt)", "process_execute", True, id="command-substitution"),
+        pytest.param("rm `cat targets.txt`", "process_execute", True, id="backtick-substitution"),
+        pytest.param("rm a.txt > audit.log", "process_execute", True, id="redirection"),
+        pytest.param("rm a.txt\nchmod 777 b.txt", "process_execute", True, id="newline"),
+        pytest.param("rmdirx stale-dir", "process_execute", True, id="not-an-exact-command-match"),
+        pytest.param("sudo rm report.txt", "process_execute", True, id="leading-word-not-in-set"),
+    ],
+)
+def test_bash_leading_command_effect_classification(
+    command: str,
+    expected_class: str,
+    expects_unknown_companion: bool,
+) -> None:
+    async def scenario() -> None:
+        service = AnsichService.in_memory()
+        await service.start()
+        task_id = new_id()
+        execution = AnsichExecutionContext(task_id=task_id, service=service)
+        agent = create_agent(
+            model=_BashToolModel(command=command),
+            tools=[_observed_bash],
+            middleware=[
+                AnsichDecisionMiddleware(),
+                AnsichVisibleToolMiddleware(),
+                AnsichRawToolMiddleware(),
+                AnsichAttemptMiddleware(),
+            ],
+        )
+
+        await agent.ainvoke(
+            {"messages": [HumanMessage(content="run it")]},
+            context={ANSICH_EXECUTION_CONTEXT_KEY: execution},
+        )
+        await service.flush_task(task_id)
+        steps = await service.list_steps(task_id)
+        effects = await service.get_tool_effects(steps[0].tool_calls[0].tool_call_id)
+        await service.stop()
+
+        assert effects is not None
+        by_phase: dict[str, set[str]] = {}
+        for effect in effects.effects:
+            by_phase.setdefault(effect.phase, set()).add(effect.effect_class)
+
+        # Intent and observed probes must agree on the class.
+        assert by_phase["potential"] == {expected_class}
+        assert by_phase["intended"] == {expected_class}
+        expected_observed = {expected_class, "unknown"} if expects_unknown_companion else {expected_class}
+        assert by_phase["observed"] == expected_observed
+
+        # H2 fidelity gating is untouched: a clean tool.returned_raw terminal
+        # keeps the concrete observed effect at hard fidelity.
+        assert {effect.fidelity_class for effect in effects.effects if effect.phase == "observed" and effect.effect_class == expected_class} == {"hard"}
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize(
+    ("command", "expected_class"),
+    [
+        pytest.param("rm report.txt", "filesystem_delete", id="rm"),
+        pytest.param("chmod 600 secrets.env", "permission_change", id="chmod"),
+    ],
+)
+def test_bash_failure_terminal_keeps_new_effect_classes_unverified(
+    monkeypatch,
+    command: str,
+    expected_class: str,
+) -> None:
+    async def scenario() -> None:
+        execution = AnsichExecutionContext(task_id=new_id(), service=MagicMock())
+        provider_call_id = "provider-bash-failure"
+        registration = execution.register_tool_call(
+            tool_call_id=new_id(),
+            step_id=new_id(),
+            step_seq=1,
+            call_seq=1,
+            provider_call_id=provider_call_id,
+            tool_name="bash",
+            args_hash="a" * 64,
+            issued_obs_id=new_id(),
+        )
+        request = SimpleNamespace(
+            runtime=SimpleNamespace(context={ANSICH_EXECUTION_CONTEXT_KEY: execution}),
+            tool_call={
+                "id": provider_call_id,
+                "name": "bash",
+                "args": {"command": command},
+            },
+        )
+        observations: list = []
+
+        def capture_batch(execution, batch, *, batch_kind):
+            observations.extend(batch)
+            return True
+
+        monkeypatch.setattr(tool_observer, "_record_batch", capture_batch)
+
+        async def raise_terminal_error(request):
+            raise RuntimeError("tool did not complete")
+
+        with execution.activate_tool_invocation(registration):
+            with pytest.raises(RuntimeError):
+                await AnsichRawToolMiddleware().awrap_tool_call(request, raise_terminal_error)
+
+        observed = [observation.payload["effect"] for observation in observations if observation.kind == "effect.observed"]
+        assert observed
+        assert {effect["effect_class"] for effect in observed} == {expected_class}
+        assert all(effect["fidelity_class"] != "hard" for effect in observed)
 
     asyncio.run(scenario())
 

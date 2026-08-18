@@ -8,7 +8,7 @@
 | ---- | ---- | ---- | -------- | ------ |
 | H1 | AuthorizationSnapshot 不反映任何真实授权系统:`policy_id`/`policy_version` 硬编码常量,`decision` 只有 `allowed`/`denied` 两个值,`unknown` 在生产路径上永不产生 | ✅ 已修复 | 2026-07-21 | `fa1e0ae7`/`90db5180`/`52594604` |
 | H2 | raw 结果终态为 `tool.failed`/`tool.timed_out`/`tool.cancelled` 时,observed effect 仍无条件以 `fidelity_class="hard"` 记录 | ✅ 已修复 | 2026-07-23 | 本次变更(待提交) |
-| M1 | `_effect_class` 分类法缺 `filesystem_delete`/`permission_change`(bash `rm`、chmod 等无法归类为专属 effect class) | ⬜ 未修复 | — | — |
+| M1 | `_effect_class` 分类法缺 `filesystem_delete`/`permission_change`(bash `rm`、chmod 等无法归类为专属 effect class) | ✅ 已修复 | 2026-08-19 | 本次变更(待提交) |
 | M2 | scope-safety assessor 每次触发都重扫任务全部 Scope 证据并重新评估每个 tool_call,而各 tool_call 结论本互相独立 | ✅ 已修复 | 2026-08-19 | 本次变更(待提交) |
 | L1 | 目标 path 敏感过滤只识别 POSIX 绝对路径(`startswith("/")`),Windows 路径可能绕过 intent 阶段与 API 响应端两层 redaction | ⬜ 未修复 | — | — |
 | L2 | `/operations/safety-events` 把 `tool_call_id` 传给 `service.list_alerts(task_id=...)` 形参名具有误导性 | ⬜ 未修复 | — | — |
@@ -39,7 +39,17 @@
 
 ## M1. Effect class 分类法缺 `filesystem_delete`/`permission_change`
 
-- 状态:⬜ 未修复。
+- 状态:✅ 已修复(2026-08-19,本次变更待提交)。`_effect_class` 现在接收 tool 参数(而不只是 tool name),bash 调用按**首命令词**保守分类:`rm`/`unlink`/`rmdir` → `filesystem_delete`,`chmod`/`chown`/`chgrp` → `permission_change`。
+- **本次落地时确认的三个事实面(survey 结论)**:
+  1. **内置删除工具:无。** sandbox 工具集只有 `bash`/`ls`/`glob`/`grep`/`read_file`/`write_file`/`str_replace`(`sandbox/tools.py` 的 `@tool(...)` 注册点),没有任何内置文件删除或权限变更工具。因此 **bash argv 模式就是这两个 class 的全部生产面**;若将来新增内置删除工具,只需在 `_effect_class` 的 tool-name 分支补一行。
+  2. **不需要 migration。** `ansich.safety.EffectClass` Literal 与 `models.py::ck_ansich_tool_effect_class`、`0020_ansich_scope_safety` 里的 CheckConstraint **本来就完整枚举了** `filesystem_delete`/`permission_change`(Phase 9 建表时按计划 §4 一次写全,只是没有生产者)。本次只补生产路径,schema 零改动,head 仍为 `0025_ansich_assessor_watermarks`。
+  3. **前端无需改动。** `frontend/src/core/ansich/types.ts` 的 `AnsichToolEffect.effect_class` 是 `string`(不是联合类型),`scope-effects-panel.tsx` 以 `<code>{effect.effect_class}</code>` 泛化渲染,没有穷举 Record/switch。
+- **保守解析规则(ruling HR2,写在 `_leading_command_word` 的 docstring 里)**:命令串中只要出现 `|` `&` `;` `<` `>` `(` `)` 反引号 `$` `{` `}` 或换行**中的任何一个**,一律不分类,退回既有的 `process_execute` + `unknown` 组合——管道/`&&`/`||`/`;` 链、重定向、命令替换、多行脚本都被这一条挡住,首命令词只描述其中第一个效果,断言更窄的 class 属于越权。通过闸门后:`shlex.split` 解析(引号不平衡则放弃),跳过前缀 `NAME=value` 环境赋值(`DEBUG=1 rm x` → `rm`),取首命令词的 basename(`/bin/rm` → `rm`),再与两个精确集合匹配(`rmdirx`、`sudo rm` 都不匹配)。glob(`*`/`?`)刻意**不**列入元字符:它只扩大同一条命令的目标集合,不改变效果类别。
+- **`unknown` 伴随行的去留**:`process_execute` 分支保留原有的第二条 `unknown` observed effect(preview `bash internal effects`);被成功分类的 `rm`/`chmod` **不再产生**它——元字符闸门已经证明这条命令串里没有别的东西在跑,再补一条"可能还有看不见的副作用"反而是假的不确定性。这也让分类真正产生可观测价值:`assess_scope_safety` 的 `concrete_observed`(`effect_class != "unknown"`)现在能对一次完全识别的删除给出 `unverified_effect: cleared`。
+- **intent 与 observed 两条路径一致**:`_record_effect_intent`(potential/intended)本来就持有 `request`;`_record_observed_effects` 之前只拿得到 `invocation`,本次把 tool 参数经 `_record_raw_result(tool_args=...)` 从 `AnsichRawToolMiddleware` 的四个调用点透传下去,两侧用同一份 args 分类,potential/intended/observed 三个 phase 的 class 恒等。H2 的 fidelity 门控原样未动:`tool.failed`/`tool.timed_out`/`tool.cancelled` 终态下新 class 同样降级为 `unknown` fidelity。
+- **范围**:MCP 显式 effect metadata 与 `external_write` 仍按原说明留在 Phase 11,本次不碰。
+- 回归覆盖:`tests/ansich/test_execution_context.py::test_bash_leading_command_effect_classification`(21 组参数走真实 `AnsichVisibleToolMiddleware`+`AnsichRawToolMiddleware`+`AnsichService` 管道,record→project→read 校验 potential/intended/observed 三 phase 的 class、`unknown` 伴随行的有无与 hard fidelity;修复前 10 组分类用例全红)、`::test_bash_failure_terminal_keeps_new_effect_classes_unverified`(失败终态下新 class 不得为 hard)、`tests/ansich/test_scope_safety_assessment.py::test_new_effect_classes_are_concrete_not_unknown_handled` / `::test_new_effect_classes_outside_allowed_scope_are_realized_violations`(领域函数把新 class 当一等具体证据)、`tests/ansich/test_sql_safety.py::test_sql_projects_delete_and_permission_effects_as_typed_rows`(FK-on SQLite 下 record→project→read,CheckConstraint 接受、typed row 落库、`unverified_effect` 为 `cleared`)。全量 `tests/ansich` 475 passed。
+- 原始诊断(留档):
 - 位置:`tool_middleware.py::_effect_class`(tool_middleware.py:259-271)。当前分支只能返回 `filesystem_read`/`filesystem_write`/`process_execute`/`child_task_spawn`/`network_read`/`unknown`;`bash rm -rf`、直接文件删除工具、以及任何权限变更操作都落入笼统的 `process_execute` + `unknown`,不会产生计划 §4 明确列出的 `filesystem_delete` 或 `permission_change`。
 - 现状:需要说明的是,Phase 9 的"实现状态"说明已明确把 **MCP 显式 effect metadata** 与 **外部写 adapter 的更细 resource canonicalization** 延后到 Phase 11 加固边界——因此 `external_write`(MCP/外部系统写入)缺失属于已知且已登记的范围,不在本条重复跟进。本条只覆盖该说明未提及的两类:纯本地文件删除(`filesystem_delete`)与权限变更(`permission_change`),它们与"外部写 adapter"无关,理论上可以在当前 DeerFlow 内置 file 工具/bash 层直接识别,但目前完全没有生产路径产生,也没有任何测试覆盖(`grep filesystem_delete/permission_change` 除本文档外全仓库零命中)。
 - 方向:为内置文件删除工具(如有)与识别 `rm`/`unlink`/`chmod`/`chown` 等 bash 子命令模式补充分类;对于无法可靠静态识别的 bash 内部效果,继续按 `unknown` 处理(不越权断言),但至少为已知的内置工具路径补齐两个 class。补充对应 TDD 用例(计划 §8 "Effects" 矩阵要求的 file delete/process execute 分支)。
@@ -137,6 +147,6 @@
 
 - ~~H1:`decision="unknown"` 在生产代码路径(而非手工构造的领域测试)零覆盖;`tool_middleware.py` 新增记录函数没有独立于 `AnsichExecutionContext`/`AnsichService` 集成路径之外的单元测试文件。~~ **已补齐(2026-07-21)**:`test_authorization_outcome.py` 独立单元覆盖桥接契约;`test_execution_context.py::test_raw_probe_records_unknown_when_no_guardrail_outcome` 让 `decision="unknown"` 首次在生产探针路径被断言。
 - ~~H2:失败/超时/取消终态下具名工具(`write_file`/`bash` 等,而非 `_effect_class` 恒返回 `unknown` 的 `timeout_tool`)的 observed effect fidelity 零覆盖。~~ **已补齐(2026-07-23)**:`test_named_tool_failure_terminal_effects_are_not_hard_fidelity` 覆盖两个具名工具与三种非成功终态的完整组合。
-- M1:`filesystem_delete`、`permission_change` 两个 effect class 零生产路径、零测试覆盖。
+- ~~M1:`filesystem_delete`、`permission_change` 两个 effect class 零生产路径、零测试覆盖。~~ **已补齐(2026-08-19)**:bash 首命令词分类(`rm`/`unlink`/`rmdir`、`chmod`/`chown`/`chgrp`)成为两个 class 的生产路径,intent/observed 两侧一致;详见上文 M1 条目。
 - ~~M2:贡献/证据数增长时 scope-safety 重估工作量不随任务历史线性增长——尚无性能护栏测试(参考 phase-6-review-followups.md M1 的 SQL 监听回归写法)。~~ **已补齐(2026-08-19)**:`test_scope_safety_reassessment_work_does_not_grow_with_tool_call_count` 同时用领域函数调用计数与 `ansich_scope_conclusions` 语句监听器钉住"每次触发只重估一个 tool_call"。
 - API/UI:`test_ansich_router.py` 本次仅新增 26 行覆盖 4 个新端点,不足以独立确认 `_safe_effect_payload` 的敏感模式/绝对路径两个分支都被真实触达;建议补充针对性用例,尤其是 L1 的 Windows 路径分支。
