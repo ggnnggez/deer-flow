@@ -891,7 +891,7 @@ async def test_sql_projects_delete_and_permission_effects_as_typed_rows(tmp_path
                 evaluated_at=observed_at,
                 evidence_obs_ids=(evaluated_obs_id,),
             )
-            intended_obs_id, observed_obs_id = new_id(), new_id()
+            intended_obs_id, observed_obs_id, companion_obs_id = new_id(), new_id(), new_id()
             intended = ToolEffect(
                 effect_id=new_id(),
                 tool_call_id=tool_call_id,
@@ -907,11 +907,24 @@ async def test_sql_projects_delete_and_permission_effects_as_typed_rows(tmp_path
                 update={
                     "effect_id": new_id(),
                     "phase": "observed",
-                    "fidelity_class": "hard",
                     "source_obs_id": observed_obs_id,
                 }
             )
-            recorded_effects[tool_call_id] = (intended, observed)
+            # Mirrors what the bash probe actually emits: the argv-derived class
+            # plus the honest `unknown` companion for the rest of the command's
+            # unobservable effect surface.
+            companion = ToolEffect(
+                effect_id=new_id(),
+                tool_call_id=tool_call_id,
+                effect_class="unknown",
+                phase="observed",
+                scope_id=None,
+                target_hash="c" * 64,
+                target_preview="bash internal effects",
+                fidelity_class="unknown",
+                source_obs_id=companion_obs_id,
+            )
+            recorded_effects[tool_call_id] = (intended, observed, companion)
             service.record_batch(
                 (
                     ObservationEnvelope(
@@ -969,6 +982,20 @@ async def test_sql_projects_delete_and_permission_effects_as_typed_rows(tmp_path
                         causation_obs_id=decision_obs_id,
                         payload={"effect": observed.model_dump(mode="json")},
                     ),
+                    ObservationEnvelope(
+                        obs_id=companion_obs_id,
+                        kind="effect.observed",
+                        occurred_at=observed_at,
+                        task_id=task_id,
+                        step_id=step_id,
+                        subject_type="effect",
+                        subject_id=companion.effect_id,
+                        producer=producer,
+                        source_event_id=f"safety:effect:observed-companion:{label}",
+                        correlation_id="safety-run",
+                        causation_obs_id=decision_obs_id,
+                        payload={"effect": companion.model_dump(mode="json")},
+                    ),
                 )
             )
         await service.flush_task(task_id)
@@ -1006,15 +1033,19 @@ async def test_sql_projects_delete_and_permission_effects_as_typed_rows(tmp_path
         await service.stop()
         await engine.dispose()
 
+    def _sort_key(item: ToolEffect) -> tuple[str, str]:
+        return (item.phase, item.effect_class)
+
     for effect_class, _, tool_call_id in cases:
-        assert row_classes[tool_call_id] == [effect_class, effect_class]
+        assert row_classes[tool_call_id] == [effect_class, effect_class, "unknown"]
         view = read_back[tool_call_id]
         assert view is not None
-        assert sorted(view.effects, key=lambda item: item.phase) == sorted(recorded_effects[tool_call_id], key=lambda item: item.phase)
-        # A fully identified, in-scope effect is concrete evidence, not an
-        # unknown-handled residue.
+        assert sorted(view.effects, key=_sort_key) == sorted(recorded_effects[tool_call_id], key=_sort_key)
+        # The argv-derived class is recorded, but the retained `unknown`
+        # companion keeps the call honestly unverified: nothing observed
+        # whether the delete or chmod actually happened.
         assert unverified[tool_call_id] is not None
-        assert unverified[tool_call_id]["value"] == "cleared"
+        assert unverified[tool_call_id]["value"] == "present"
 
 
 @pytest.mark.anyio

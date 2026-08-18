@@ -294,6 +294,18 @@ _SHELL_METACHARACTERS = frozenset("|&;<>()`$\n\r{}")
 _ENV_ASSIGNMENT_PREFIX = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=")
 _DELETE_COMMANDS = frozenset({"rm", "unlink", "rmdir"})
 _PERMISSION_COMMANDS = frozenset({"chmod", "chown", "chgrp"})
+# Effect classes that come from reading the request's argv rather than from
+# observing anything. `bash` does not raise on a non-zero exit — the sandbox
+# appends `Exit Code: N` to the returned string — so a permission-denied `rm`,
+# an `rm` of a missing path, and a real delete all reach the same
+# `tool.returned_raw` terminal. These classes therefore never carry `hard`
+# fidelity: that would assert a side effect completed when nothing observed it.
+_ARGV_DERIVED_EFFECT_CLASSES = frozenset({"filesystem_delete", "permission_change"})
+# Every bash call keeps a second `unknown` observed effect for the part of its
+# effect surface nothing observed. That includes the classified commands: the
+# leading-command match names what the command was asked to do, never what it
+# did.
+_BASH_EFFECT_CLASSES = frozenset({"process_execute", *_ARGV_DERIVED_EFFECT_CLASSES})
 
 
 def _leading_command_word(command: str) -> str | None:
@@ -462,7 +474,12 @@ def _record_observed_effects(
     # emits child_task_spawn only after TaskControlProbe.created().
     if effect_class == "child_task_spawn":
         return
-    fidelity_class = "hard" if (invocation.raw_terminal_kind == "tool.returned_raw" and effect_class != "unknown") else "unknown"
+    if invocation.raw_terminal_kind != "tool.returned_raw" or effect_class == "unknown":
+        fidelity_class = "unknown"
+    elif effect_class in _ARGV_DERIVED_EFFECT_CLASSES:
+        fidelity_class = "inferred"
+    else:
+        fidelity_class = "hard"
     observations = [
         _effect_observation(
             execution,
@@ -475,11 +492,10 @@ def _record_observed_effects(
             causation_obs_id=invocation.raw_terminal_obs_id,
         )
     ]
-    if effect_class == "process_execute":
-        # A shell command we could not reduce to one identified leading command
-        # keeps this honest companion: its real effect surface is unobservable.
-        # A classified `rm`/`chmod` does not, because the metacharacter gate in
-        # `_leading_command_word` already proved there is nothing else running.
+    if effect_class in _BASH_EFFECT_CLASSES:
+        # Every bash call keeps this companion, classified or not: the argv tells
+        # us what was asked for, and a returned bash call is not evidence that it
+        # happened (see `_ARGV_DERIVED_EFFECT_CLASSES`).
         observations.append(
             _effect_observation(
                 execution,

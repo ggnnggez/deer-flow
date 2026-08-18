@@ -491,16 +491,21 @@ No built-in tool deletes files or changes permissions, so bash argv patterns are
 the whole production surface for `filesystem_delete` and `permission_change`.
 `_effect_class` therefore reads the tool's arguments, not just its name, and
 classifies a bash command only when it reduces to one simple command: any `|`,
-`&`, `;`, `<`, `>`, `(`, `)`, backtick, `$`, `{`, `}`, or newline anywhere in the
-string keeps the existing `process_execute` plus `unknown` companion, because the
-leading command word describes only the first of several effects. Past that gate
-the leading `NAME=value` assignments are skipped and the command word's basename
-must match `rm`/`unlink`/`rmdir` or `chmod`/`chown`/`chgrp` exactly; globs are not
-treated as metacharacters since they only widen one command's target set. A
-classified command drops the `unknown` companion — the gate already proved nothing
-else runs — so a fully identified delete can clear `unverified_effect`. The intent
-and observed probes classify from the same arguments, so an effect's class is
-identical across its `potential`, `intended`, and `observed` phases.
+`&`, `;`, `<`, `>`, `(`, `)`, backtick, `$`, `{`, `}`, or any newline character
+anywhere in the string keeps a plain `process_execute`, because the leading
+command word describes only the first of several effects. Past that gate the
+leading `NAME=value` assignments are skipped and the command word's basename must
+match `rm`/`unlink`/`rmdir` or `chmod`/`chown`/`chgrp` exactly; globs are not
+treated as metacharacters since they only widen one command's target set. Those
+two argv-derived classes never carry `hard` fidelity — `bash` does not raise on a
+non-zero exit, so a permission-denied `rm`, an `rm` of a missing path, and a real
+delete all reach the same `tool.returned_raw` terminal — their observed phase is
+`inferred`, while `process_execute` keeps `hard` because a returned bash call
+really does prove a process ran. Every bash call, classified or not, also keeps a
+second `unknown` observed effect for the part of its effect surface nothing
+observed, so scope-safety still reports these calls as `unverified_effect`. The
+intent and observed probes classify from the same arguments, so an effect's class
+is identical across its `potential`, `intended`, and `observed` phases.
 Phase 3 Tool probes record intent before tool middleware, raw execution inside
 `ToolErrorHandlingMiddleware`, and the final model-visible result outside output
 budget/sanitization. Ansich IDs plus `(step_id, call_seq)` are authoritative;

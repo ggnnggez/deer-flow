@@ -1132,37 +1132,40 @@ class _BashToolModel(_FinalAnswerModel):
 
 
 @pytest.mark.parametrize(
-    ("command", "expected_class", "expects_unknown_companion"),
+    ("command", "expected_class", "expected_observed_fidelity"),
     [
         # Reliably identifiable: one simple command, no shell metacharacters.
-        pytest.param("rm report.txt", "filesystem_delete", False, id="rm"),
-        pytest.param("rm -rf /mnt/user-data/workspace/tmp", "filesystem_delete", False, id="rm-flags"),
-        pytest.param("/bin/rm report.txt", "filesystem_delete", False, id="rm-absolute-path"),
-        pytest.param("rm 'my report.txt'", "filesystem_delete", False, id="rm-quoted-arg"),
-        pytest.param("unlink report.txt", "filesystem_delete", False, id="unlink"),
-        pytest.param("rmdir stale-dir", "filesystem_delete", False, id="rmdir"),
-        pytest.param("DEBUG=1 rm report.txt", "filesystem_delete", False, id="rm-after-env-assignment"),
-        pytest.param("chmod 755 run.sh", "permission_change", False, id="chmod"),
-        pytest.param("/usr/bin/chown deer:deer run.sh", "permission_change", False, id="chown-absolute-path"),
-        pytest.param("chgrp staff run.sh", "permission_change", False, id="chgrp"),
-        # Not reliably identifiable: keep the existing process_execute + unknown pair.
-        pytest.param("echo hello", "process_execute", True, id="plain-command"),
-        pytest.param("rm a.txt && rm b.txt", "process_execute", True, id="and-chain"),
-        pytest.param("rm a.txt || true", "process_execute", True, id="or-chain"),
-        pytest.param("rm a.txt; echo done", "process_execute", True, id="semicolon-chain"),
-        pytest.param("find . -name '*.log' | xargs rm", "process_execute", True, id="pipe"),
-        pytest.param("rm $(cat targets.txt)", "process_execute", True, id="command-substitution"),
-        pytest.param("rm `cat targets.txt`", "process_execute", True, id="backtick-substitution"),
-        pytest.param("rm a.txt > audit.log", "process_execute", True, id="redirection"),
-        pytest.param("rm a.txt\nchmod 777 b.txt", "process_execute", True, id="newline"),
-        pytest.param("rmdirx stale-dir", "process_execute", True, id="not-an-exact-command-match"),
-        pytest.param("sudo rm report.txt", "process_execute", True, id="leading-word-not-in-set"),
+        # The class comes from the request argv, never from an observation, so
+        # the observed phase is `inferred` rather than `hard`.
+        pytest.param("rm report.txt", "filesystem_delete", "inferred", id="rm"),
+        pytest.param("rm -rf /mnt/user-data/workspace/tmp", "filesystem_delete", "inferred", id="rm-flags"),
+        pytest.param("/bin/rm report.txt", "filesystem_delete", "inferred", id="rm-absolute-path"),
+        pytest.param("rm 'my report.txt'", "filesystem_delete", "inferred", id="rm-quoted-arg"),
+        pytest.param("unlink report.txt", "filesystem_delete", "inferred", id="unlink"),
+        pytest.param("rmdir stale-dir", "filesystem_delete", "inferred", id="rmdir"),
+        pytest.param("DEBUG=1 rm report.txt", "filesystem_delete", "inferred", id="rm-after-env-assignment"),
+        pytest.param("chmod 755 run.sh", "permission_change", "inferred", id="chmod"),
+        pytest.param("/usr/bin/chown deer:deer run.sh", "permission_change", "inferred", id="chown-absolute-path"),
+        pytest.param("chgrp staff run.sh", "permission_change", "inferred", id="chgrp"),
+        # Not reliably identifiable: stays process_execute, which a completed
+        # bash call really does prove, so that row keeps `hard`.
+        pytest.param("echo hello", "process_execute", "hard", id="plain-command"),
+        pytest.param("rm a.txt && rm b.txt", "process_execute", "hard", id="and-chain"),
+        pytest.param("rm a.txt || true", "process_execute", "hard", id="or-chain"),
+        pytest.param("rm a.txt; echo done", "process_execute", "hard", id="semicolon-chain"),
+        pytest.param("find . -name '*.log' | xargs rm", "process_execute", "hard", id="pipe"),
+        pytest.param("rm $(cat targets.txt)", "process_execute", "hard", id="command-substitution"),
+        pytest.param("rm `cat targets.txt`", "process_execute", "hard", id="backtick-substitution"),
+        pytest.param("rm a.txt > audit.log", "process_execute", "hard", id="redirection"),
+        pytest.param("rm a.txt\nchmod 777 b.txt", "process_execute", "hard", id="newline"),
+        pytest.param("rmdirx stale-dir", "process_execute", "hard", id="not-an-exact-command-match"),
+        pytest.param("sudo rm report.txt", "process_execute", "hard", id="leading-word-not-in-set"),
     ],
 )
 def test_bash_leading_command_effect_classification(
     command: str,
     expected_class: str,
-    expects_unknown_companion: bool,
+    expected_observed_fidelity: str,
 ) -> None:
     async def scenario() -> None:
         service = AnsichService.in_memory()
@@ -1197,12 +1200,12 @@ def test_bash_leading_command_effect_classification(
         # Intent and observed probes must agree on the class.
         assert by_phase["potential"] == {expected_class}
         assert by_phase["intended"] == {expected_class}
-        expected_observed = {expected_class, "unknown"} if expects_unknown_companion else {expected_class}
-        assert by_phase["observed"] == expected_observed
+        # EVERY bash call keeps the honest `unknown` companion: bash does not
+        # raise on a non-zero exit, so a returned tool call is not evidence
+        # that the command's side effect happened.
+        assert by_phase["observed"] == {expected_class, "unknown"}
 
-        # H2 fidelity gating is untouched: a clean tool.returned_raw terminal
-        # keeps the concrete observed effect at hard fidelity.
-        assert {effect.fidelity_class for effect in effects.effects if effect.phase == "observed" and effect.effect_class == expected_class} == {"hard"}
+        assert {effect.fidelity_class for effect in effects.effects if effect.phase == "observed" and effect.effect_class == expected_class} == {expected_observed_fidelity}
 
     asyncio.run(scenario())
 
@@ -1257,7 +1260,7 @@ def test_bash_failure_terminal_keeps_new_effect_classes_unverified(
 
         observed = [observation.payload["effect"] for observation in observations if observation.kind == "effect.observed"]
         assert observed
-        assert {effect["effect_class"] for effect in observed} == {expected_class}
+        assert {effect["effect_class"] for effect in observed} == {expected_class, "unknown"}
         assert all(effect["fidelity_class"] != "hard" for effect in observed)
 
     asyncio.run(scenario())
