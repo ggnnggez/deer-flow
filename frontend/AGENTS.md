@@ -160,8 +160,10 @@ backend-resolved provider-drift Belief/evidence. The normal detail response may
 show only the controlled prompt preview; the full manifest is never prefetched
 or placed in the release query cache. Release comparison always consumes the
 backend typed diff and keeps Tool added/removed/schema/description/source changes
-distinct. Until an evaluator and operational aggregation exist, quality and
-distribution labels remain explicitly `unassessed` and `unavailable`.
+distinct. The release header's quality and distribution badges remain hardcoded
+`unassessed` and `unavailable` — the backend still pins `summary.quality_status`
+to that literal and no operational aggregation exists — and must be requalified
+only when those aggregates land, not from the Phase 10 comparison below.
 Phase 4 keeps lineage lazy as well: each ContentBlock row loads its local
 backward provenance, forward descendants, or possible exposures only after the
 admin selects that action. The graph view must retain depth, transform labels,
@@ -173,6 +175,35 @@ timeline, and offers explicit pagination. It fetches full compression detail
 only on demand and renders typed `source`/`preserved`/`removed` memberships in
 strict disposition/ordinal order. Snapshot, compression, and lineage polling
 must never fetch raw bodies.
+
+Phase 10 adds a fifth question-oriented entry point to Task detail,
+`?view=evaluations`, rendered by `AnsichEvaluationsPanel`. It leads with the
+backend's five quality dimensions, always all five: an `unassessed` dimension
+gets the same neutral muted treatment as `unknown` and may never borrow the pass
+or fail colour, because nothing assessed is not a pass and a completed Task
+never implies one. Each dimension shows the selected assertion's assessor,
+authority/fidelity, `as_of`, resolver, evidence Observation ids, and a conflict
+badge whenever losing assertions were retained — the browser selects nothing and
+derives no verdict of its own. Below it, the
+Recorded evaluations list is metadata only; `expected`/`actual`/`rationale` are
+bodies and follow the same rule as raw Tool and ContentBlock payloads — loaded
+one Observation at a time through the `no-store` payload route after an explicit
+expand click, never polled, prefetched, or written into the query cache. Release
+comparison gains a separate Quality card (`AnsichReleaseQualitySection`) kept
+visually apart from the structural diff: each `(dimension, cohort)` row renders
+exactly one of three distinct states — an observed delta with its sample counts,
+a muted `not_comparable` with the localized reason (muted, never the error
+colour: declining to compare is not a failure), or a neutral unassessed marker
+when the pair was comparable in principle but produced no delta — which is not
+the claim that there is no difference.
+A cohort text box commits on Enter or blur rather than per keystroke, a blank
+box means every cohort, and the empty cohort key stays reachable only as an
+explicit per-row label. Delta copy is observed-only and states its orientation
+(the selected release minus this Task's release); scale polarity is shown only
+when both coverage cells declare it, and the sign alone never implies better.
+The whole card is absent, not empty, when the response carries no `quality`
+block.
+
 Composer drafts are tab-scoped browser state. `core/threads/composer-draft.ts` stores only text plus the selected slash-skill name in `sessionStorage`, keyed by user, agent, and logical conversation scope. New-chat pages pass the stable scope `"new"` because their runtime `threadId` is a fresh UUID on every reload; established conversations use their real thread ID. `InputBox` waits for enabled skills before restoring a skill chip, degrades a missing/disabled skill back to editable slash text, and clears the stored draft through `SendMessageOptions.onSent` only after the send passes the in-flight guard. Attachments, sidecar quotes, voice state, and polish undo state are not persisted.
 
 Auth UI note: the login page's "keep me signed in" option submits only `remember_me` to the Gateway and may persist only the email address through `core/auth/remember-login.ts`. Passwords and tokens must never be stored in frontend storage; the `HttpOnly access_token` and readable `csrf_token` cookies remain Gateway-owned.

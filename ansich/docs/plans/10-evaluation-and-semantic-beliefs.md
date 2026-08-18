@@ -1,5 +1,39 @@
 # Phase 10 — 评估输入与语义 Belief
 
+## 实现状态（2026-08-18）
+
+已形成可运行的本地纵向切片：`evaluation.recorded` v1 契约由唯一的 core validator 把关（verdict/score 至少其一、score 必带 `{min,max,higher_is_better}`、`hard` fidelity 只对带 suite/suite_version/case_id 的 benchmark/unit test 开放、`earliest_erroneous_step` 必须以 Task 为 subject 并在 `actual` 指名该 Task 的 Step）；Belief resolver 升级为 `ansich-default@2.0.0`，在 `configured_rule` 与 `automated` 之间插入 `soft_human`，v1 逐字保留并可按版本重放。`evaluation-projector@1` 写入 `ansich_evaluation_index` 行、五个具名维度的 `quality.<dimension>` assertion 与 `ansich_release_quality_stats` 聚合格；缺 subject Entity 或缺 Step 是可自愈的依赖等待，Step 不属于该 Task 是硬失败。服务层的 `record_evaluation` 返回 `pending|applied|failed` 回执而不阻塞投影，`get_quality_beliefs` 永远返回五个维度并把无人断言的维度合成为 `unassessed`。Gateway 端点、compare 的 quality 区块与 cohort 参数、dismiss 的 `semantic_override`、feedback→evaluation 的 fail-open 桥接，以及 Task 详情第五个入口 `?view=evaluations` 和 release 比较的 Quality 卡片均已落地。
+
+本地验收覆盖 SQLite 迁移/重放、后端 Ansich 回归（430 项）以及前端 lint/typecheck 与单元测试（804 项）。真实 PostgreSQL 升级矩阵、关闭 Ansich 的性能基准和生产 paper drill 仍是最终生产就绪门禁。
+
+### 落地位置
+
+- 契约与核心校验：`backend/packages/ansich/ansich/evaluation.py`（`EvaluationRecord`、`build_evaluation_observation`、`benchmark_source_event_id`、`unassessed_quality_belief`）；envelope 侧的 kind/subject 一致性校验在 `backend/packages/ansich/ansich/contracts.py`。
+- Resolver：`backend/packages/ansich/ansich/belief/resolver.py`；`soft_human` authority class 在 `backend/packages/ansich/ansich/assessment/base.py`。
+- 存储与投影：migration `backend/packages/harness/deerflow/persistence/migrations/versions/0023_ansich_evaluations.py`；ORM 行在 `backend/packages/harness/deerflow/ansich/persistence/models.py`；`evaluation-projector@1` 与 `list_evaluations`/`list_quality_beliefs`/`get_release_quality` 在 `backend/packages/harness/deerflow/ansich/persistence/sql.py`。
+- 服务面与纯规则：`backend/packages/ansich/ansich/service.py`、`backend/packages/ansich/ansich/quality.py`（`compare_release_quality` 独占 cohort 可比性判断，避免规则在 HTTP 层与 UI 之间漂移）。
+- HTTP 与适配器：`backend/app/gateway/routers/ansich.py`、配置快照 `backend/app/gateway/deps.py`、feedback 桥接 `backend/app/gateway/feedback_evaluation.py`。
+- 配置：`ansich.evaluation_min_cohort_samples`（5）与 `ansich.evaluation_max_payload_bytes`（262144），见 `backend/packages/harness/deerflow/config/ansich_config.py` 与 `config.example.yaml`。
+- 前端：`frontend/src/components/workspace/ansich/evaluations-panel.tsx`、`release-quality-section.tsx`、`agent-release-panel.tsx`；类型、hooks 与纯展示函数在 `frontend/src/core/ansich/`。
+- 测试：`backend/tests/ansich/test_evaluation_contracts.py`、`test_belief_resolver.py`、`test_sql_evaluations.py`、`test_evaluation_service.py`、`test_ansich_evaluations_router.py`、`backend/tests/test_feedback_evaluation_adapter.py`；前端 `frontend/tests/unit/core/ansich/*` 与 `frontend/tests/e2e/ansich.spec.ts`。
+
+### 与本计划的偏离
+
+1. §6 要求的 `(release_id, cohort_key, dimension)` 索引没有单独建：这三列正是 `ansich_release_quality_stats` 的复合主键，主键唯一索引已经是该表唯一的访问路径，再建一条同构索引只剩写放大。
+2. `ansich_release_quality_stats` 增加了 §6 未列出的 `scale_higher_is_better` 列：§7 的“相同 score scale”本身包含极性，只保留 `min/max` 会让两个含义相反的量表被当作同一个 scale 比较。
+3. §5 的 `semantic_override` 只对 subject 解析为 Task 的告警生效。以 ToolCall 为 subject 的 scope-safety 告警会以 `alert_subject_is_not_a_task` 标记降级，而不是把 Task 级 quality Belief 挂到 ToolCall id 上；“用人工判断覆盖 hard safety 证据”是另一件事，留待后续阶段。
+4. benchmark 的重放身份是 §3 的 suite 元组 `(suite, suite_version, case_id, run_id, dimension)`，刻意忽略 API 的 `Idempotency-Key`：同一条 benchmark case 无论由谁重新导入都应落到同一条 Observation。
+5. 相对 §8 列出的四条端点，额外增加了 `GET /evaluations/{obs_id}/payload`。`expected`/`actual`/`rationale` 是正文，只有让它们走独立的 `no-store` 审计路由，§8 要求的“lazy payload”才是真的按需，而不是把正文塞进列表响应。
+6. `ansich_evaluation_index` 的列比 §6 列出的多：`task_id`、`scale_higher_is_better`、`authority_class`、`fidelity_class`、`cohort_key`、`projector_version`，并多一条 `(task_id, occurred_at)` 索引。前四项分别支撑 Task 维度的列表读取、量表极性、R2 authority 阶梯与 payload 来源的 fidelity；索引服务于 `GET /tasks/{id}/evaluations`。
+7. §5 提到“Current Belief 按 dimension + cohort key 分开”，实现的 Current Belief 仍只按 `quality.<dimension>` 一个 field 存放：cohort 保存在 assertion value 与 release 聚合格里，跨 suite 的分歧作为被保留的冲突 assertion 参与 resolver 选择并计入 `conflicting_assertion_count`，而不是拆成并行的 Current Belief。真正需要按 cohort 并列展示当前判断时，需要一次显式的 field 命名扩展与迁移。
+
+### 已知限制
+
+- release 聚合格只在“evaluation 落在该 Task 的 `executed_by` 绑定之后”时把这个 Task 计入。绑定晚到会让格暂时保持旧值，直到同一 cohort/dimension 的下一条 evaluation 触发重算；该行为对重放是一致的。
+- 聚合格的 `as_of` 会随格内最新一条 evaluation 前移，即使这条 evaluation 没有改变任何被选中的 Belief。
+- 前端 Recorded evaluations 列表只显示最新 100 条（服务层默认 `limit=100`）且没有截断提示，登记为 UI-2 跟进项。
+- Task 详情 Agent release 头部的质量徽标仍是硬编码的 `unassessed`：后端 `AgentReleaseSummaryView.quality_status` 目前是 `Literal["unassessed"]`，真正的 release 级聚合出现前不改动该徽标。
+
 ## 1. 交付目标
 
 本阶段允许外部评估进入 Ansich，并把“运行完成”和“语义正确”彻底分开。开发者可以记录 expected-versus-actual、人工标注、benchmark/unit test 或 LLM judge 结果；resolver 据此产生带证据的 quality/behavior Current Belief。

@@ -181,7 +181,56 @@ Tool decision/execution 前当时有效授权事实的不可变快照，包含 p
 
 `scope-safety` assessor 使用 intent、AuthorizationSnapshot 和 observed Effect 产生 policy denial、attempted violation、realized violation 或 unverified effect。Tool 文本不能单独支持 realized violation。
 
-## 8. 修改概念时的同步规则
+## 8. 评估与语义 Belief
+
+这组概念从 Phase 10 开始，把“运行完成”和“语义正确”彻底分开：完成不是通过，没有评估也不是通过。
+
+### Evaluation（`evaluation.recorded`）
+
+一次外部评估结果的不可变 Observation。单次 evaluation 不创建 Evaluation Entity，只有将来出现多步骤、可分派、可关闭的 review workflow 时才提升为 Entity。subject 可以是 `task`、`step`、`tool_call`、`content_block` 或 `agent_release`；`evaluation_kind` 为 `user_feedback`、`developer_annotation`、`benchmark_assertion`、`unit_test`、`llm_judge`；`dimension` 为 `correctness`、`completeness`、`relevance`、`safety`、`efficiency`、`earliest_erroneous_step` 或 `custom`。
+
+- 载荷：verdict 与 score 至少有一个；score 必须带 `{min,max,higher_is_better}` scale，裸数字不可比因而被拒绝。`expected`、`actual`、`rationale` 是正文，只留在 Observation payload，查询投影不复制。
+- fidelity：`hard` 只允许 `benchmark_assertion`/`unit_test`，且必须带 suite、suite_version、case_id；来自 admin 本身不构成 hard。`earliest_erroneous_step` 必须 subject 为 Task 且在 `actual` 指名属于该 Task 的 Step，不做内容相似度猜测。
+- 幂等：suite 绑定的评估以 `(suite, suite_version, case_id, run_id, dimension)` 为 replay 身份，刻意不使用 API 的 `Idempotency-Key`；其余入口由调用方 key 派生 source event ID。
+- 入口：Gateway admin API、feedback 适配器与 benchmark 导入都调用同一个 core validator，不在路由里拼 Observation；feedback 主写成功后才 best-effort 发 evaluation，Ansich 失败不改变原 API 结果，也不能反过来掩盖 feedback 主写失败。
+- 实现：`backend/packages/ansich/ansich/evaluation.py`、`backend/app/gateway/routers/ansich.py`、`backend/app/gateway/feedback_evaluation.py`。
+
+### quality Belief
+
+`quality.<dimension>` 是 Assertion 的 field，不是 Observation，也不是 Task 控制状态。`evaluation-projector@1` 把五个具名维度的评估投影成 `quality.<dimension>` assertion；`custom` 只进索引不产生断言，`earliest_erroneous_step` 断言的是 Step 指针而不是质量 verdict。
+
+- authority 映射：suite 绑定且 `hard` → `deterministic`；其余 suite 绑定 → `configured_rule`；显式 human override 的 developer annotation → `human_override`；普通开发者标注与用户反馈 → `soft_human`；LLM judge → `automated`。
+- fidelity 取自 payload；Observation envelope 自身的 `fidelity_class` 恒为 `hard`，描述的是“这条记录被采集到”这一事实，不是判断强度。
+- 未评估：五个具名维度总是返回完整 Belief 结构，`value={"status":"unassessed"}`、`source={name:"none",version:"1"}`、authority/fidelity 为 `unknown`、无 evidence。Task completed 不能推出 pass。
+- 冲突：相冲突的 pass/fail assertion 全部保留，读接口返回 selected assertion 与 `conflicting_assertion_count`。
+- `quality` 与 `behavior` 是两回事：一次 correctness fail 不使 Task 变成 runaway，一个 runaway Task 也可能得到 correct 结果，两个 Belief 同时存在。
+- 实现：`backend/packages/harness/deerflow/ansich/persistence/sql.py` 的 `evaluation-projector@1`。
+
+### Resolver `ansich-default@2`
+
+优先级阶梯为 `human_override > deterministic > configured_rule > soft_human > automated`；同一 class 内按 `as_of`、`asserted_at`、`assertion_id` 取最新。因为新增了 `soft_human` 这一 precedence 语义，所以升版而不是原地改 v1。
+
+- `ansich-default@1.0.0` 逐字保留并可按版本显式选择，历史 resolution 仍可重放；v1 不认识 `soft_human`，遇到该 class 直接报错而不是静默降级。
+- 实现：`backend/packages/ansich/ansich/belief/resolver.py`。
+
+### 评估查询投影
+
+两张可删除、可按 projector version 重放的读模型，都不是 canonical record：
+
+- `ansich_evaluation_index`：每条 evaluation Observation 一行，只存元数据（verdict/score/scale、assessor、authority/fidelity、cohort、suite/case、occurred_at）。索引为 `(subject_type, subject_id, dimension, occurred_at)`、`(suite_id, suite_version, case_id)` 与 `(task_id, occurred_at)`。
+- `ansich_release_quality_stats`：以 `(release_id, cohort_key, dimension)` 为复合主键的聚合格。每个绑定该 release 的 Task 只贡献一个样本，取自它当前的 `quality.<dimension>` Belief，因此被保留的冲突 assertion 不会重复计数；聚合格按格加锁重算，避免并发投影丢失更新。
+- 迁移：`0023_ansich_evaluations`。实现：同 `sql.py`。
+
+### Cohort 可比性
+
+release 之间的语义质量比较只在同一 cohort 内进行。以下条件全部满足才给出 observed delta：cohort key 非空且相同、dimension 相同、score scale 相同（含 `higher_is_better` 极性）、两侧样本数都达到 `ansich.evaluation_min_cohort_samples`、没有未解释的观测丢失。
+
+- 条件不满足时返回 `comparison_status="not_comparable"` 和机器可读 reason：`no_shared_cohort`、`scale_mismatch`、`insufficient_samples`、`observability_loss`（按此优先级），而不是用所有生产 Task 平均分强行比较。
+- 未声明 cohort 的评估聚合在 `""` 哨兵下；它是样本清单而不是比较总体，两个 release 上出现同一个哨兵不代表共享 suite、版本或 case 集合。
+- v1 只报告 observed delta（`right - left`，两侧都有均分时用均分，否则用 pass rate），不做统计显著性结论。
+- 实现：`backend/packages/ansich/ansich/quality.py`。
+
+## 9. 修改概念时的同步规则
 
 新增或改变领域概念时，同一个 change set 至少同步：
 

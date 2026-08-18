@@ -147,4 +147,4 @@ explicit human override
 
 ## 7. 概念同步义务
 
-按 [concepts.md](concepts.md) §8 与 plans/README 合并规则:本设计进入实施时,`annotation.recorded`、taxonomy、`semantic_role` Belief 字段与 trajectory 读模型必须同步登记到 concepts.md、设计文档协议层、对应 Phase 计划与测试矩阵。
+按 [concepts.md](concepts.md) §9 与 plans/README 合并规则:本设计进入实施时,`annotation.recorded`、taxonomy、`semantic_role` Belief 字段与 trajectory 读模型必须同步登记到 concepts.md、设计文档协议层、对应 Phase 计划与测试矩阵。

@@ -412,7 +412,7 @@ Localhost persistence deliberately reads the direct request `Host` and ignores `
 | **Models** (`/api/models`) | `GET /` - list models; `GET /{name}` - model details |
 | **Features** (`/api/features`) | `GET /` - report config-gated feature availability (`agents_api.enabled`, `browser_control.enabled`) for frontend UI gating |
 | **Console** (`/api/console`) | Read-only cross-thread observability for the current user (the data layer for an operations dashboard or external monitoring): `GET /stats` - headline counters (runs/threads/agents/tokens/cost); `GET /runs` - paginated run history joined with thread titles (per-run cost); `GET /usage` - zero-filled daily token series + per-model breakdown with spend. Queries `runs`/`threads_meta` directly as a reporting layer (no new `RunStore` methods); requires a SQL database backend — returns 503 on `database.backend: memory`. Real-cost estimation reads optional `models[*].pricing` (`currency`, `input_per_million`, `output_per_million`, `input_cache_hit_per_million`; `ModelConfig` is `extra="allow"`, so no schema change) and prices each run from its `token_usage_by_model` input/output split. Pricing is **cache-aware**: `RunJournal` accumulates prompt-cache hits from `usage_metadata.input_token_details.cache_read` into a sparse `cache_read_tokens` bucket key (also threaded through `SubagentTokenCollector` → `record_external_llm_usage_records`), and cache-hit input tokens are billed at `input_cache_hit_per_million` (omitted → billed at the miss price, a conservative upper bound). Legacy rows fall back to run-level totals at `model_name`; unpriced models yield `cost: null` and cost fields are null when no pricing is configured |
-| **Ansich** (`/api/ansich`) | Admin-only developer/operator Agent observability, gated by startup-only `ansich.enabled`. Task reads include evidence-backed Control/behavior Beliefs, lifecycle/Step/system-operation history, physical LLM attempts, ordered ContextSnapshot/ToolCall accountability, Task-scoped context-compression inventory, bounded ContentBlock lineage, active-task/local-or-inclusive Usage/Budget reads with source breakdown, typed parent/child Task tree navigation, Alert list/detail/workflow plus interrupt/rollback proxy actions, and immutable AgentRelease bindings/comparison/provider drift. Tool/raw/visible payloads and complete sanitized release manifests stay on separate logged `no-store` endpoints; lineage/snapshot/compression, release detail, and alert-list reads are metadata/preview-only. `GET /health` remains process-local and readable when SQL storage is unavailable; projection reads return 503 with the same health summary when storage is unavailable. Failed-job diagnostics (`GET/POST /operations/failed-jobs*`) list and detail currently-failing projection/assessor jobs with their full attempt-error history and support Task-batch retry (first HTTP exposure of the existing non-destructive `retry_failed_projections`). |
+| **Ansich** (`/api/ansich`) | Admin-only developer/operator Agent observability, gated by startup-only `ansich.enabled`. Task reads include evidence-backed Control/behavior Beliefs, lifecycle/Step/system-operation history, physical LLM attempts, ordered ContextSnapshot/ToolCall accountability, Task-scoped context-compression inventory, bounded ContentBlock lineage, active-task/local-or-inclusive Usage/Budget reads with source breakdown, typed parent/child Task tree navigation, Alert list/detail/workflow plus interrupt/rollback proxy actions, and immutable AgentRelease bindings/comparison/provider drift. Tool/raw/visible payloads and complete sanitized release manifests stay on separate logged `no-store` endpoints; lineage/snapshot/compression, release detail, and alert-list reads are metadata/preview-only. `GET /health` remains process-local and readable when SQL storage is unavailable; projection reads return 503 with the same health summary when storage is unavailable. Failed-job diagnostics (`GET/POST /operations/failed-jobs*`) list and detail currently-failing projection/assessor jobs with their full attempt-error history and support Task-batch retry (first HTTP exposure of the existing non-destructive `retry_failed_projections`). Phase 10 adds the evaluation surface: `POST /evaluations` records one external evaluation (requires `Idempotency-Key`, validates that the subject exists and is the declared Entity type — 404/422 otherwise — and rejects a canonical payload over `ansich.evaluation_max_payload_bytes` with 413), returning the observation id plus `projection_status=pending|applied|failed` without waiting for projection; `GET /tasks/{task_id}/evaluations` returns the Task's five-dimension quality Beliefs (unassessed dimensions included) alongside its recorded evaluations, `GET /steps/{step_id}/evaluations` the Step-scoped rows, and `GET /agent-releases/{release_id}/quality?cohort=` the aggregated `(cohort, dimension)` cells. `GET /agent-releases/compare` gains the same `cohort` parameter and an additive `quality` block whose per-dimension `comparison_status`/`reason` is machine-readable, and `POST /operations/alerts/{alert_id}/dismiss` accepts an optional `semantic_override` that records one human quality assertion beside the workflow write. Evaluation `expected`/`actual`/`rationale` bodies never appear in those lists and load only through the logged `no-store` `GET /evaluations/{obs_id}/payload` route. |
 | **MCP** (`/api/mcp`) | `GET /config` - get config; `PUT /config` - update config (saves to extensions_config.json) |
 | **Skills** (`/api/skills`) | `GET /` - list skills; `GET /{name}` - details; `PUT /{name}` - update enabled; `POST /install` - install from .skill archive (accepts standard optional frontmatter like `version`, `author`, `compatibility`); `POST /reload` - admin-only process-local prompt-cache invalidation after trusted external filesystem changes |
 | **Memory** (`/api/memory`) | `GET /` - memory data; `POST /reload` - force reload; `GET /config` - config; `GET /status` - config + data |
@@ -681,6 +681,86 @@ projection-settle timeout so SQLite integration tests do not confuse transient
 suite load with incomplete projections. Production embedded assembly always
 passes `AnsichConfig.terminal_flush_timeout_ms` explicitly (2 seconds by
 default), preserving the runtime's bounded fail-open terminal flush.
+
+Phase 10 accepts external evaluations as `evaluation.recorded` v1 Observations
+over `task`, `step`, `tool_call`, `content_block`, and `agent_release` subjects;
+one evaluation stays an Observation and never becomes an Entity. The core
+`EvaluationRecord` validator in `packages/ansich/ansich/evaluation.py` is the
+only builder, so no route assembles an envelope by hand. It requires a verdict
+or a score, a score always with its `{min,max,higher_is_better}` scale, and
+gates `fidelity_class="hard"` on a `benchmark_assertion`/`unit_test` kind
+carrying suite, suite version, and case id — an admin origin alone never
+promotes an annotation to hard. `earliest_erroneous_step` must target a Task and
+name the Step in `actual`. Suite-bound evaluations derive their replay identity
+from `(suite, suite_version, case_id, run_id, dimension)` and deliberately
+ignore the API `Idempotency-Key`, so the same benchmark case replays onto the
+same Observation whoever re-imports it; every other kind derives it from the
+caller's key.
+
+`evaluation-projector@1` is registered last because evaluations point at
+subjects the other projectors create. A missing subject Entity — or a missing
+Step for `earliest_erroneous_step` — is a replay-safe dependency wait, while a
+Step belonging to another Task is a hard `ValueError`. The projector writes one
+`ansich_evaluation_index` row per Observation and, for the five named
+dimensions, one `quality.<dimension>` Belief assertion; `custom` stays
+index-only and `earliest_erroneous_step` asserts a Step pointer instead of a
+verdict. The index row's `fidelity_class` is read from the payload: the
+Observation envelope's own column is pinned to `hard` and describes the record,
+not the judgement. Authority follows the R2 ladder — suite-bound hard
+evaluations are `deterministic`, other suite-bound ones `configured_rule`, an
+explicitly flagged developer annotation `human_override`, ordinary annotations
+and user feedback `soft_human`, and an LLM judge stays `automated`. Task-subject
+quality evaluations then recompute one `ansich_release_quality_stats` cell for
+the Task's `executed_by` release; the cell is locked with `SELECT … FOR UPDATE`
+*before* its inputs are read, because independent leased workers project sibling
+Tasks of one release concurrently and an unlocked read-modify-write would lose
+an update under READ COMMITTED. Each Task contributes exactly one sample, taken
+from its current Belief so retained conflicting assertions cannot double-count,
+and evaluations that declare no cohort aggregate under the `""` sentinel — a
+sample list, never a comparison population.
+
+The Belief resolver becomes `ansich-default@2.0.0`, which inserts `soft_human`
+between `configured_rule` and `automated`; `ansich-default@1.0.0` is retained
+verbatim and still selectable by version, so v1 resolutions stay reproducible.
+Losing assertions are never deleted — quality reads return the selected
+assertion plus a `conflicting_assertion_count` counted from the retained ones.
+`AnsichService.get_quality_beliefs()` always reports all five named dimensions:
+one nothing asserted is synthesized as `unassessed` with
+`source={"name": "none", "version": "1"}`, `unknown` authority/fidelity, no
+`as_of`, and no evidence, because a completed Task is not proof of a pass.
+`record_evaluation()` returns a receipt instead of blocking on projection —
+`applied`/`failed` once the job settled, `pending` otherwise — and a rejected
+intake or a flush that did not persist reports `failed` rather than `pending`,
+since no job exists to poll; a replayed intake returns the stored Observation id
+with `idempotent_replay=true`. `GET /evaluations/{obs_id}/payload` is the only
+read that returns `expected`/`actual`/`rationale`: admin-only, actor-logged,
+`Cache-Control: no-store`, and guarded on the Observation kind so it cannot
+become a generic payload reader.
+
+`ansich.evaluation_min_cohort_samples` (5) and
+`ansich.evaluation_max_payload_bytes` (262144) are snapshotted into
+`app.state.ansich_evaluation_settings` during Gateway lifespan next to the
+service, because `ansich` is a startup-only section and reading these two live
+would make them silently hot-reloadable while every other Ansich setting stayed
+frozen. `compare_release_quality()` in `packages/ansich/ansich/quality.py` owns
+the comparability rule so it cannot drift between HTTP and UI: a pair is
+comparable only with the same non-empty cohort key, the same dimension, the same
+scale including polarity, at least the configured samples on both sides, and no
+unexplained observability loss. Every other outcome is `not_comparable` with
+`no_shared_cohort`, `scale_mismatch`, `insufficient_samples`, or
+`observability_loss` in that precedence, and a comparable pair yields an
+observed delta (`right - left`, on mean score or otherwise on pass rate), never
+a significance claim.
+
+`app/gateway/feedback_evaluation.py` bridges run feedback into an evaluation
+after the feedback row is written. It never raises into the route, never changes
+its response, and is skipped entirely when the primary write failed, so Ansich
+can neither block feedback nor let its own success mask a feedback failure. A
+thumb maps only to `relevance` at `soft` fidelity and never infers correctness;
+the free-text comment is deliberately dropped rather than ridden into an
+Observation payload that never needs it; and the rating is part of the
+source-event id, so re-submitting the same rating is absorbed as a replay while
+changing it produces new evidence that coexists with the old assertion.
 
 **Workspace change review**: `packages/harness/deerflow/workspace_changes/`
 captures a pre-run and post-run snapshot of the thread-owned `workspace` and
@@ -1069,6 +1149,7 @@ This invokes `alembic revision --autogenerate` against the live ORM models. Revi
 - `migrations/versions/0020_ansich_scope_safety.py` — Phase 9 typed Scope, authorization, ToolEffect, and scope-safety conclusion storage
 - `migrations/versions/0021_ansich_summary_assertion_fk.py` — nullable Task-summary assertion pointer with `ON DELETE SET NULL` for degraded missing-assertion reads
 - `migrations/versions/0022_ansich_assessor_deadline.py` — durable first-seen time for dependency-pending assessor jobs and their bounded failure deadline
+- `migrations/versions/0023_ansich_evaluations.py` — Phase 10 rebuildable evaluation query index and `(release, cohort, dimension)` release quality statistics
 - `persistence/bootstrap.py` — `bootstrap_schema(engine, backend=...)`, the three-branch decision + locking
 - Tests: `tests/test_persistence_bootstrap.py` (branches), `tests/test_persistence_bootstrap_concurrency.py` (concurrency), `tests/test_persistence_bootstrap_regression.py` (issue #3682), `tests/test_persistence_migrations_env.py` (filter), `tests/blocking_io/test_persistence_bootstrap.py` (asyncio.to_thread anchor)
 
