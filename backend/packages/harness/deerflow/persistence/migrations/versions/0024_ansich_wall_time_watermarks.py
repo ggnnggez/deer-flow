@@ -11,11 +11,29 @@ This revision deletes the dominated heartbeat-sourced rows, leaving exactly one
 high-water row per pair, which is what the reworked projector maintains from
 here on. It is a data-only revision: no schema object changes.
 
-Value-preserving by construction: every wall_time consumer reduces the rows of
-one ``(aggregate, source)`` with ``max``, and deleting non-maximal rows leaves
-that ``max`` untouched. ``ansich_task_usage`` summaries therefore stay correct
-and are deliberately not rewritten. Terminal ``budget.consumed`` wall_time rows
-(one per Task) are untouched so their own evidence survives beside the mark.
+``value`` is preserved unconditionally: every wall_time consumer reduces the
+rows of one ``(aggregate, source)`` with ``max`` over ``delta``, and deleting
+rows that are not the maximum leaves that ``max`` untouched. ``as_of`` and
+``complete_through_ingest_seq`` are preserved under one precondition —
+``occurred_at`` is non-decreasing in ``elapsed_ms`` per source Task, which holds
+whenever the heartbeat probe's monotonic clock and the wall clock agree in
+direction. They can disagree (an NTP step moving the wall clock backwards), and
+then a row this collapse deletes as dominated on ``delta`` may carry the larger
+``as_of``/``ingest_seq``.
+
+``ansich_task_usage`` is deliberately not rewritten, which is what makes that
+case benign rather than a correction this revision must perform: the migrated
+summary keeps its pre-collapse ``as_of``/watermark, i.e. the value derived from
+the full history, and the collapse never lowers it. The next heartbeat tick or
+terminal ``budget.consumed`` for that aggregate calls ``_refresh_usage_summary``,
+which recomputes both fields from the surviving rows — so a clock step can move
+``as_of`` back by that one interval at the next refresh, never the ``value``. A
+replayed-from-scratch database converges on the same rows and the same summary
+under the normal precondition; ``test_wall_time_watermark_migration_matches_a_
+replayed_projection`` pins that agreement.
+
+Terminal ``budget.consumed`` wall_time rows (one per Task) are untouched so
+their own evidence survives beside the mark.
 
 Revision ID: 0024_ansich_wall_time_watermarks
 Revises: 0023_ansich_evaluations

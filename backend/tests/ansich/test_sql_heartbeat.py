@@ -1,4 +1,5 @@
 import asyncio
+import json
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
@@ -1219,3 +1220,269 @@ async def test_late_spawn_backfill_carries_the_wall_time_high_water_mark(tmp_pat
     assert grouped[(root_id, child_id)][0].delta == 5_000
     assert {item.dimension: item.value for item in usage.inclusive}["wall_time_ms"] == 5_000
     assert rebuilt_usage == usage
+
+
+def _task_usage_rows(database_path: Path) -> list[tuple[str, str, str, int, str, int]]:
+    engine = create_engine(f"sqlite:///{database_path}")
+    try:
+        with engine.connect() as connection:
+            return [
+                tuple(row)
+                for row in connection.execute(
+                    text(
+                        """
+                        SELECT task_id, dimension, aggregation_scope, value,
+                               as_of, complete_through_ingest_seq
+                        FROM ansich_task_usage
+                        ORDER BY task_id, dimension, aggregation_scope
+                        """
+                    )
+                )
+            ]
+    finally:
+        engine.dispose()
+
+
+def _expand_to_legacy_per_tick_wall_time(database_path: Path) -> int:
+    """Re-create the pre-0024 shape: one wall_time row per heartbeat tick.
+
+    For every surviving heartbeat-sourced mark, insert the rows the old
+    projector would have written for that source's other ticks, on the same
+    aggregate. Returns how many rows were added.
+    """
+
+    added = 0
+    engine = create_engine(f"sqlite:///{database_path}")
+    try:
+        with engine.begin() as connection:
+            marks = [
+                tuple(row)
+                for row in connection.execute(
+                    text(
+                        """
+                        SELECT contribution.aggregate_task_id, contribution.source_task_id
+                        FROM ansich_usage_contributions AS contribution
+                        JOIN ansich_observations AS observation
+                          ON observation.obs_id = contribution.source_obs_id
+                        WHERE contribution.dimension = 'wall_time_ms'
+                          AND observation.kind = 'task.heartbeat'
+                        """
+                    )
+                )
+            ]
+            for aggregate_task_id, source_task_id in marks:
+                ticks = [
+                    tuple(row)
+                    for row in connection.execute(
+                        text(
+                            """
+                            SELECT obs_id, occurred_at, payload_json
+                            FROM ansich_observations
+                            WHERE kind = 'task.heartbeat' AND task_id = :source_task_id
+                            """
+                        ),
+                        {"source_task_id": source_task_id},
+                    )
+                ]
+                for obs_id, occurred_at, payload_json in ticks:
+                    elapsed_ms = json.loads(payload_json)["elapsed_ms"]
+                    added += connection.execute(
+                        text(
+                            """
+                            INSERT OR IGNORE INTO ansich_usage_contributions (
+                                aggregate_task_id, source_task_id, dimension,
+                                source_obs_id, delta, as_of
+                            ) VALUES (
+                                :aggregate_task_id, :source_task_id, 'wall_time_ms',
+                                :obs_id, :delta, :as_of
+                            )
+                            """
+                        ),
+                        {
+                            "aggregate_task_id": aggregate_task_id,
+                            "source_task_id": source_task_id,
+                            "obs_id": obs_id,
+                            "delta": elapsed_ms,
+                            "as_of": occurred_at,
+                        },
+                    ).rowcount
+    finally:
+        engine.dispose()
+    return added
+
+
+def _legacy_wall_time_summary(database_path: Path) -> dict[tuple[str, str], tuple[int, str, int]]:
+    """Recompute wall_time summaries the way the pre-0024 projector did.
+
+    Max per source Task, then summed across sources, with the maximum ``as_of``
+    and ingest watermark over the FULL per-tick contribution set.
+    """
+
+    engine = create_engine(f"sqlite:///{database_path}")
+    try:
+        with engine.connect() as connection:
+            rows = [
+                tuple(row)
+                for row in connection.execute(
+                    text(
+                        """
+                        SELECT contribution.aggregate_task_id, contribution.source_task_id,
+                               contribution.delta, contribution.as_of, observation.ingest_seq
+                        FROM ansich_usage_contributions AS contribution
+                        JOIN ansich_observations AS observation
+                          ON observation.obs_id = contribution.source_obs_id
+                        WHERE contribution.dimension = 'wall_time_ms'
+                        """
+                    )
+                )
+            ]
+    finally:
+        engine.dispose()
+    summaries: dict[tuple[str, str], tuple[int, str, int]] = {}
+    for scope in ("local", "inclusive"):
+        by_aggregate: dict[str, list[tuple[str, int, str, int]]] = {}
+        for aggregate_task_id, source_task_id, delta, as_of, ingest_seq in rows:
+            if scope == "local" and aggregate_task_id != source_task_id:
+                continue
+            by_aggregate.setdefault(aggregate_task_id, []).append((source_task_id, delta, as_of, ingest_seq))
+        for aggregate_task_id, group in by_aggregate.items():
+            per_source: dict[str, int] = {}
+            for source_task_id, delta, _as_of, _ingest_seq in group:
+                per_source[source_task_id] = max(per_source.get(source_task_id, 0), delta)
+            summaries[(aggregate_task_id, scope)] = (
+                sum(per_source.values()),
+                max(item[2] for item in group),
+                max(item[3] for item in group),
+            )
+    return summaries
+
+
+def test_wall_time_watermark_migration_matches_a_replayed_projection(tmp_path) -> None:
+    """P8-M2: a migrated database and a replayed one agree.
+
+    The migration's central claim is that collapsing history reaches the same
+    state a from-scratch replay produces. This drives the real pipeline over a
+    parent/child tree plus a terminal contribution, replays it with
+    ``rebuild_projections()``, restores the pre-0024 per-tick shape on that same
+    observation stream, then migrates and compares BOTH the contribution rows
+    and the ``ansich_task_usage`` summaries the migration deliberately does not
+    rewrite.
+
+    The fixture is monotonic (``occurred_at`` non-decreasing in ``elapsed_ms``),
+    which is the precondition 0024's docstring states for ``as_of`` and
+    ``complete_through_ingest_seq``; under a clock step the pre-collapse summary
+    is retained until the next refresh recomputes it.
+    """
+
+    async def _drive() -> None:
+        engine = create_async_engine(f"sqlite+aiosqlite:///{database_path}")
+        session_factory = async_sessionmaker(engine, expire_on_commit=False)
+        service = create_sql_ansich_service(
+            session_factory,
+            operations_assessment_interval_ms=60_000,
+        )
+        await service.start()
+        try:
+            service.record_batch(
+                (
+                    _task_created(root_id, "replay-parity-root", observed_at),
+                    ObservationEnvelope.task_lifecycle(
+                        kind="task.started",
+                        task_id=root_id,
+                        source_kind="deerflow_run",
+                        source_id="replay-parity-root",
+                        occurred_at=observed_at,
+                        source_event_id="replay-parity-root:task:started",
+                    ),
+                    _step_started(root_id, root_step, observed_at),
+                    _tool_issued(root_id, root_step, root_tool, observed_at),
+                )
+            )
+            await service.flush_task(root_id)
+            service.record(
+                _task_created(
+                    child_id,
+                    "replay-parity-child",
+                    observed_at,
+                    source_kind="deerflow_subagent",
+                    attributes={
+                        "parent_task_id": root_id,
+                        "spawning_step_id": root_step,
+                        "spawning_tool_call_id": root_tool,
+                    },
+                )
+            )
+            await service.flush_task(child_id)
+            for tick in range(1, 5):
+                service.record(
+                    _heartbeat(
+                        root_id,
+                        "replay-parity-root",
+                        observed_at,
+                        tick=tick,
+                        elapsed_ms=tick * 1_000,
+                    )
+                )
+                service.record(
+                    _heartbeat(
+                        child_id,
+                        "replay-parity-child",
+                        observed_at,
+                        tick=tick,
+                        elapsed_ms=tick * 700,
+                    )
+                )
+            await service.flush_task(root_id)
+            await service.flush_task(child_id)
+            service.record(
+                ObservationEnvelope.budget_consumed(
+                    task_id=child_id,
+                    run_id="replay-parity-child",
+                    occurred_at=observed_at + timedelta(seconds=9),
+                    dimension="wall_time_ms",
+                    delta=9_000,
+                    source_event_id="replay-parity-child:budget:terminal",
+                )
+            )
+            await service.flush_task(child_id)
+            # From-scratch replay of the same observation stream.
+            await service.rebuild_projections()
+        finally:
+            await service.stop()
+            await engine.dispose()
+
+    database_path = tmp_path / "ansich-wall-time-replay-parity.db"
+    config = _alembic_config(database_path)
+    alembic_command.upgrade(config, "head")
+    root_id, child_id = new_id(), new_id()
+    root_step, root_tool = new_id(), new_id()
+    observed_at = datetime(2026, 8, 19, 13, tzinfo=UTC)
+
+    from anyio import run as anyio_run
+
+    anyio_run(_drive)
+
+    replayed_contributions = _wall_time_contribution_rows(database_path)
+    replayed_usage = _task_usage_rows(database_path)
+
+    # Restore the pre-0024 per-tick shape on the very same observations.
+    added = _expand_to_legacy_per_tick_wall_time(database_path)
+    legacy_summary = _legacy_wall_time_summary(database_path)
+
+    alembic_command.stamp(config, PREVIOUS_REVISION)
+    alembic_command.upgrade(config, "head")
+    migrated_contributions = _wall_time_contribution_rows(database_path)
+    migrated_usage = _task_usage_rows(database_path)
+
+    # The legacy shape really was restored (3 extra ticks per heartbeat mark,
+    # over the child's self row, the child's fan-out row, and the root's own).
+    assert added == 9
+    # What the pre-0024 projector computed from the FULL per-tick history is
+    # what the new projector computed from the marks alone.
+    replayed_wall_time = {(task_id, scope): (value, as_of, watermark) for task_id, dimension, scope, value, as_of, watermark in replayed_usage if dimension == "wall_time_ms"}
+    assert legacy_summary == replayed_wall_time
+    # And the migrated database converges on the replayed one, rows and
+    # summaries alike.
+    assert migrated_contributions == replayed_contributions
+    assert migrated_usage == replayed_usage
+    assert _alembic_revision(database_path) == WALL_TIME_WATERMARK_REVISION

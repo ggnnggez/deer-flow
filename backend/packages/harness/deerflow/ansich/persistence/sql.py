@@ -5733,7 +5733,21 @@ class SqlAnsichBackend:
         descendant_task_ids: tuple[str, ...],
         updated_at: datetime,
     ) -> None:
-        """Fan out already-durable descendant usage after a late spawn edge."""
+        """Fan out already-durable descendant usage after a late spawn edge.
+
+        This read is deliberately NOT locked, unlike the one in
+        ``_upsert_high_water_contribution``. It reads the descendants' own self
+        rows and writes only ancestor rows — disjoint row sets, since ancestry
+        is acyclic and self-free — so it is not a read-modify-write of the rows
+        it reads and cannot lose an update. Every write it makes still goes
+        through ``_store_usage_contribution``, so a high-water write takes the
+        locked max path. A concurrent tick committing between this read and its
+        write can therefore only make the copied mark one tick stale, which the
+        next tick's own fan-out raises; ``max`` is monotone, so a stale copy can
+        never lower an ancestor's mark or over-report. A lock here would also
+        not help the sum-type rows: row locks do not block inserts of new rows,
+        which is the only way that set changes.
+        """
 
         local_rows = list(
             (
@@ -6284,6 +6298,20 @@ class SqlAnsichBackend:
         alongside the heartbeat mark.
         """
 
+        # Lock the mark BEFORE reading it. Every tick of one Task is an
+        # independent projection job that separate leased workers claim
+        # concurrently (_claim_projection_job uses skip_locked), and the
+        # ancestry fan-out makes sibling Tasks contend for one ancestor's row,
+        # yet they all read-modify-write that single row. Under Postgres READ
+        # COMMITTED an unlocked reader could load the current mark before a peer
+        # commits a higher one and then delete-and-replace it with a lower
+        # value — a lost update the ON CONFLICT insert this replaced could not
+        # produce, and that a single-loop replay would not reproduce. Locking
+        # first makes the second worker block until the first commits, and READ
+        # COMMITTED then gives its later statements the committed row. Locking
+        # after the read would leave exactly the same window open. FOR UPDATE is
+        # a no-op on SQLite, which has a single writer anyway. Same precedent as
+        # _recompute_release_quality_stats.
         existing = list(
             (
                 await session.execute(
@@ -6298,6 +6326,7 @@ class SqlAnsichBackend:
                         AnsichUsageContributionRow.dimension == dimension,
                         AnsichObservationRow.kind.in_(HIGH_WATER_USAGE_KINDS),
                     )
+                    .with_for_update(of=AnsichUsageContributionRow)
                 )
             ).scalars()
         )
