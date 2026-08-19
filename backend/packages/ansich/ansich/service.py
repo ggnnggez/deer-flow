@@ -33,6 +33,7 @@ from ansich.evaluation import (
 )
 from ansich.heartbeat import TaskHeartbeatView
 from ansich.jobs import FailedJobDetailView, FailedJobKind, FailedJobSummaryView
+from ansich.lifecycle import LifecycleInputs, derive_status
 from ansich.lineage import ContentLineageView, LineageDirection, PossibleExposureView, find_possible_exposures, traverse_content_lineage
 from ansich.memory import InMemoryAnsichBackend
 from ansich.operations import ActiveStepView, ActiveTaskView, HeartbeatBelief
@@ -102,6 +103,9 @@ class AnsichService:
         self._queue_bytes = 0
         self._lock = Lock()
         self._running = False
+        self._started = False
+        self._stopping = False
+        self._stopped = False
         self._backend = backend
         self._unavailable_reason = unavailable_reason
         self._record_sequence = 0
@@ -160,6 +164,9 @@ class AnsichService:
         self._persist_lock = asyncio.Lock()
         self._projection_lock = asyncio.Lock()
         self._running = True
+        self._started = True
+        self._stopping = False
+        self._stopped = False
         self._writer_task = asyncio.create_task(self._writer_loop(), name="ansich-batch-writer")
         if callable(getattr(self._backend, "project_pending", None)):
             self._projector_task = asyncio.create_task(self._projector_loop(), name="ansich-projector")
@@ -258,7 +265,24 @@ class AnsichService:
             metrics_provider = getattr(self._backend, "get_projection_metrics", None)
             metrics = metrics_provider() if callable(metrics_provider) else {}
             failed_jobs = int(metrics.get("failed_jobs", 0))
-            status = "stopped" if not self._running else "failed" if self._unavailable_reason is not None else "degraded" if self._dropped_count or failed_jobs else "healthy"
+            status = derive_status(
+                LifecycleInputs(
+                    started=self._started,
+                    stopping=self._stopping,
+                    stopped=self._stopped,
+                    unavailable_reason=self._unavailable_reason,
+                    # Placeholders until the rest of the write-resilience batch
+                    # lands: Task 4 wires the BatchWriter's retry state here
+                    # (``WriterHealth.consecutive_failures``) and Task 6 wires
+                    # the unreported *global* lost ranges.
+                    consecutive_write_failures=0,
+                    unreported_loss_pending=False,
+                    dropped_count=self._dropped_count,
+                    failed_jobs=failed_jobs,
+                    queue_depth=len(self._queue),
+                    batch_size=self._batch_size,
+                )
+            )
             return AnsichHealth(
                 status=status,
                 queue_depth=len(self._queue),
@@ -1096,18 +1120,28 @@ class AnsichService:
         if not self._running:
             return
         self._running = False
-        if self._wake_event is not None:
-            self._wake_event.set()
-        writer_task = self._writer_task
-        if writer_task is not None:
-            await writer_task
-        self._writer_task = None
-        if self._projector_wake_event is not None:
-            self._projector_wake_event.set()
-        projector_task = self._projector_task
-        if projector_task is not None:
-            await projector_task
-        self._projector_task = None
+        # The drain is its own lifecycle phase: a backlog and write retries are
+        # expected while it runs, so health reports ``shutting_down`` rather
+        # than degradation until the loops have joined. The terminal state is
+        # written in ``finally`` so a loop that raises leaves a stopped service
+        # instead of one that reports shutting down forever.
+        self._stopping = True
+        try:
+            if self._wake_event is not None:
+                self._wake_event.set()
+            writer_task = self._writer_task
+            if writer_task is not None:
+                await writer_task
+            self._writer_task = None
+            if self._projector_wake_event is not None:
+                self._projector_wake_event.set()
+            projector_task = self._projector_task
+            if projector_task is not None:
+                await projector_task
+            self._projector_task = None
+        finally:
+            self._stopping = False
+            self._stopped = True
 
     def _record_loss(
         self,

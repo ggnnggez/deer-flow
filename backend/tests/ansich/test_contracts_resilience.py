@@ -64,6 +64,14 @@ def test_producer_health_carries_per_producer_accounting_and_is_frozen() -> None
         producer.accepted_count = 13  # type: ignore[misc]
 
 
+def test_producer_health_has_no_defaults_so_a_producer_must_be_fully_accounted() -> None:
+    # Unlike ``WriterHealth``, every ``ProducerHealth`` field is a fact about one
+    # producer instance; defaulting any of them would report a producer that was
+    # never measured as a quiet one.
+    with pytest.raises(ValidationError):
+        ProducerHealth()  # type: ignore[call-arg]
+
+
 def test_writer_health_defaults_to_a_quiet_writer_and_is_frozen() -> None:
     writer = WriterHealth()
 

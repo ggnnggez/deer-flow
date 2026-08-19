@@ -21,9 +21,11 @@ from ansich.contracts import (
     NamedVersion,
     ObservationEnvelope,
     Producer,
+    ProducerHealth,
     RecordReceipt,
     TaskLifecycleScope,
     TaskView,
+    WriterHealth,
 )
 from ansich.evaluation import (
     EVALUATION_OBSERVATION_KIND,
@@ -153,6 +155,7 @@ __all__ = [
     "NamedVersion",
     "ObservationEnvelope",
     "Producer",
+    "ProducerHealth",
     "QUALITY_DIMENSIONS",
     "QualityBeliefView",
     "QualityComparisonView",
@@ -184,6 +187,7 @@ __all__ = [
     "ToolEffectsView",
     "ToolResultView",
     "StepView",
+    "WriterHealth",
     "UNASSESSED_CLASS",
     "UNASSESSED_SOURCE",
     "benchmark_source_event_id",
