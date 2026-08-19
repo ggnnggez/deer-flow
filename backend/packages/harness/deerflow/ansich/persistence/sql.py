@@ -1752,8 +1752,12 @@ class SqlAnsichBackend:
                 )
             )
             return
-        # Never lower: a job claimed out of watermark order settles evidence
-        # the higher assessment already covered.
+        # This advance path never lowers: a job claimed out of watermark order
+        # settles evidence the higher assessment already covered. Lowering the
+        # mark is a claim-time act only (``_widen_assessor_watermark``), so a
+        # watermark arriving here below the stored one leaves the row untouched
+        # — which also means a claim-time widening this advance cannot reach is
+        # not restored here (F10-10 hypothesis (c), fix owned by Phase 11).
         if evidence_watermark > mark.evidence_watermark:
             mark.evidence_watermark = evidence_watermark
             mark.updated_at = datetime.now(UTC)

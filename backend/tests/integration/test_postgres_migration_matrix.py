@@ -42,7 +42,7 @@ import os
 import uuid
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 
 import pytest
 import sqlalchemy as sa
@@ -316,12 +316,21 @@ async def test_bootstrap_schema_branches_on_postgres() -> None:
 async def test_ansich_service_records_and_projects_on_postgres() -> None:
     """One real service, on a real migrated postgres, end to end.
 
-    Deliberately narrow -- a Task, a Step, an evaluation, a projection read, a
-    Belief read and a replay. Its job is to prove the migrated schema is usable
-    by the code that owns it (types, FKs, ``SELECT ... FOR UPDATE`` on the
-    release-stats cell), not to re-run the Ansich suite on another backend.
+    Deliberately narrow -- a Task, a Step, a ToolCall with authorization
+    evidence, two heartbeats, an evaluation, a projection read, a Belief read,
+    one assessment pass and a replay. Its job is to prove the migrated schema is
+    usable by the code that owns it (types, FKs, ``SELECT ... FOR UPDATE`` on
+    the release-stats cell and on the wall_time high-water join), not to re-run
+    the Ansich suite on another backend.
+
+    The heartbeat pair and the assessment pass are here because they are the two
+    constructs this batch added that behave differently off SQLite:
+    ``_upsert_high_water_contribution`` takes ``FOR UPDATE OF`` over a two-table
+    join and then deletes-and-inserts, and ``ansich_assessor_watermarks`` is
+    created by ``0025`` but written by nothing else in this tier.
     """
     from ansich import (
+        AuthorizationSnapshot,
         EvaluationRecord,
         NamedVersion,
         ObservationEnvelope,
@@ -334,15 +343,18 @@ async def test_ansich_service_records_and_projects_on_postgres() -> None:
 
     from deerflow.ansich import create_sql_ansich_service
     from deerflow.ansich.persistence.models import (
+        AnsichAssessorWatermarkRow,
         AnsichEvaluationIndexRow,
         AnsichProjectionErrorRow,
         AnsichReleaseQualityStatsRow,
+        AnsichUsageContributionRow,
     )
 
     occurred_at = datetime(2026, 8, 18, 9, tzinfo=UTC)
     producer = Producer(name="ansich-postgres-smoke", version="1", instance_id="test")
     assessor = NamedVersion(name="ansich-benchmark-runner", version="1.0.0")
     task_id, step_id, run_id = new_id(), new_id(), "pg-smoke-run"
+    tool_call_id, snapshot_id = new_id(), new_id()
 
     release = build_agent_release(
         AgentRuntimeDescriptor(
@@ -357,6 +369,32 @@ async def test_ansich_service_records_and_projects_on_postgres() -> None:
             effective_policies={"non_interactive": False},
             runtime_build=RuntimeBuildDescriptor(package_version="2.1.0"),
         )
+    )
+    authorization = AuthorizationSnapshot(
+        snapshot_id=snapshot_id,
+        tool_call_id=tool_call_id,
+        policy_id="pg-smoke-policy",
+        policy_version="1",
+        policy_hash="a" * 64,
+        decision="allowed",
+        details_available=False,
+        evaluated_at=occurred_at,
+    )
+    # Two ticks of the same Task: the second has to replace the first row rather
+    # than add to it, which is the delete-then-insert half of the high-water
+    # upsert. Their values are deliberately not equal and do not sum to either.
+    heartbeats = tuple(
+        ObservationEnvelope.task_heartbeat(
+            task_id=task_id,
+            run_id=run_id,
+            occurred_at=occurred_at + timedelta(milliseconds=elapsed_ms),
+            elapsed_ms=elapsed_ms,
+            worker_id=f"{run_id}-worker",
+            ownership_epoch=f"{run_id}-epoch",
+            source_event_id=f"run:{run_id}:task:heartbeat:{tick}",
+            producer_seq=tick,
+        )
+        for tick, elapsed_ms in enumerate((10_000, 25_000), start=1)
     )
     observations = (
         ObservationEnvelope.task_lifecycle(
@@ -386,6 +424,40 @@ async def test_ansich_service_records_and_projects_on_postgres() -> None:
             correlation_id=task_id,
             payload={"step_seq": 1, "actor_kind": "lead_agent"},
         ),
+        ObservationEnvelope(
+            kind="tool.issued",
+            occurred_at=occurred_at,
+            task_id=task_id,
+            step_id=step_id,
+            subject_type="tool_call",
+            subject_id=tool_call_id,
+            producer=producer,
+            source_event_id=f"tool:{tool_call_id}:issued",
+            correlation_id=task_id,
+            payload={
+                "call_seq": 1,
+                "provider_call_id": f"provider-{tool_call_id}",
+                "tool_name": "write_file",
+                "args_hash": "b" * 64,
+                "args_preview": {"path": "workspace/pg-smoke.md"},
+                "tool_schema_block_id": None,
+            },
+        ),
+        # The only evidence the scope-safety assessor consumes, and therefore the
+        # only thing that makes it write ``ansich_assessor_watermarks`` at all.
+        ObservationEnvelope(
+            kind="authorization.allowed",
+            occurred_at=occurred_at,
+            task_id=task_id,
+            step_id=step_id,
+            subject_type="authorization_snapshot",
+            subject_id=snapshot_id,
+            producer=producer,
+            source_event_id=f"authorization:{snapshot_id}:allowed",
+            correlation_id=task_id,
+            payload={"snapshot": authorization.model_dump(mode="json")},
+        ),
+        *heartbeats,
         build_evaluation_observation(
             EvaluationRecord(
                 subject_type="task",
@@ -422,6 +494,9 @@ async def test_ansich_service_records_and_projects_on_postgres() -> None:
         try:
             service.record_batch(observations)
             await service.flush_task(task_id)
+            # Settles the scope-safety assessor job the authorization evidence
+            # queued, which is what advances ``ansich_assessor_watermarks``.
+            await service.assess_operations(now=occurred_at + timedelta(minutes=1))
 
             task = await service.get_task(task_id)
             step_views = await service.list_steps(task_id)
@@ -430,8 +505,33 @@ async def test_ansich_service_records_and_projects_on_postgres() -> None:
                 index_row = await session.get(AnsichEvaluationIndexRow, evaluation_obs_id)
                 stats = (await session.execute(sa.select(AnsichReleaseQualityStatsRow))).scalars().all()
                 failures = await session.scalar(sa.select(sa.func.count()).select_from(AnsichProjectionErrorRow))
+                wall_time_rows = (
+                    (
+                        await session.execute(
+                            sa.select(AnsichUsageContributionRow)
+                            .where(
+                                AnsichUsageContributionRow.aggregate_task_id == task_id,
+                                AnsichUsageContributionRow.source_task_id == task_id,
+                                AnsichUsageContributionRow.dimension == "wall_time_ms",
+                            )
+                            .order_by(AnsichUsageContributionRow.source_obs_id)
+                        )
+                    )
+                    .scalars()
+                    .all()
+                )
+                assessor_marks = await session.scalar(sa.select(sa.func.count()).select_from(AnsichAssessorWatermarkRow))
 
             assert failures == 0
+            # One row per (aggregate, source) carrying the latest tick, not one
+            # row per tick and not their sum -- the invariant the ``FOR UPDATE
+            # OF`` join plus delete-then-insert exists to hold. Both statements
+            # run for the first time on postgres here.
+            assert [(row.source_obs_id, row.delta) for row in wall_time_rows] == [(heartbeats[-1].obs_id, 25_000)]
+            # ``0025`` creates this table on postgres; nothing else in this tier
+            # reads or writes it, so without this the migration is all that has
+            # ever been proven about it.
+            assert assessor_marks >= 1
             assert task is not None and task.task_id == task_id
             assert [view.step_seq for view in step_views] == [1]
             assert index_row is not None

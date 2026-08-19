@@ -19,7 +19,6 @@ from deerflow.ansich.persistence.models import (
 )
 from deerflow.persistence.base import Base
 
-WALL_TIME_WATERMARK_REVISION = "0024_ansich_wall_time_watermarks"
 PREVIOUS_REVISION = "0023_ansich_evaluations"
 #: Upgrading to ``head`` lands past 0024 once later revisions exist, so the
 #: chain-head assertions track this rather than the revision under test.

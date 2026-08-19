@@ -30,6 +30,7 @@
 | F10-20 | `_refresh_usage_summary` 仍是未加锁的全量重算+无条件赋值——F10-6 的同族问题,就在本批加锁那一层的上面 | ⬜ 未修复 | — | — |
 | F10-21 | 生产路径的 effect 恒 `scope_id=None`,`attempted_/realized_scope_violation` 两类结论在生产上不可达 | ⬜ 未修复 | — | — |
 | F10-22 | `sudo`/`env`/`timeout` 等包装命令下的 effect 分类未裁定,`sudo rm -rf` 目前落回 `process_execute` | ⬜ 未修复 | — | — |
+| F10-23 | `_assess_scope_safety_at` 直接校验原始行的 `payload_json`、不 hydrate externalized payload,externalized 的 `authorization.*`/`effect.*` 证据会把 assessor job 打成 durable failed(F10-8 同一危害类的 assessor 侧兄弟,既存) | ⬜ 未修复 | — | — |
 
 留观标记:F10-10 的第 4 条证据(`test_step_attempt_and_context_are_queryable_after_projection`)**未证实**——只做了排除法,没拿到原始失败文本。若它再轮换红,**先抓失败文本再修**,不要按已有的三条诊断类推。另:F10-10 的门禁只被 Task 8 的验收负载证明过(`e53cefbc` 记录了这条边界),Task 9 的更重负载下仍有 2 条已上门禁的测试翻红,详见该条的「后续观察」。
 
@@ -94,7 +95,7 @@
 
 ## F10-8. 三个 `_validate_subject` 分支缺 payload-None 守卫
 
-- 状态:✅ 已修复(2026-08-19,`d463a604`)。把 `evaluation.recorded` 分支的守卫模式原样复制到 `scope.snapshotted`/`authorization.*`/`effect.*` 三个分支:subject_type 检查保持无条件,只有 payload 交叉校验挪进 `if self.payload is not None:`,payload 在手时的校验强度一字未改(`test_safety_contracts.py` 里 kind/decision、kind/phase 两条冲突拒绝用例未改动仍绿)。回归钉子:`backend/tests/ansich/test_sql_safety.py::test_externalized_scope_authorization_and_effect_payloads_read_back`——服务按 `inline_payload_max_bytes=16` 构造,让每条 payload 都走 externalize,记录 scope/authorization/effect 三条 observation 并 flush,先断言这三行在库里确实是 `payload_json IS NULL AND payload_ref_id IS NOT NULL`,再经 `service.list_timeline()` 与 `service.list_observations()` 两个公共读读回。RED 证据:读路径不是降级成空/degraded,而是直接抛 `ValidationError: Input should be a valid dictionary or instance of ScopeDescriptor [input_value=None]`(`sql.py:5574` 的 `_observation_from_row`);逐个分支补守卫时报错依次换成 `AuthorizationSnapshot`、`ToolEffect`,三个分支各自都被这一条用例钉住。附带确认:`_claim_projection_job` 同样先 `_observation_from_row` 再 hydrate payload,所以修复前这三种 kind 的 externalized observation 连投影都认领不了,job 永远 pending、`flush_task` 只能等到 `projection_settle_timeout`——"能写进去、再也读不出来"比诊断记录的还要广一层。
+- 状态:✅ 已修复(2026-08-19,`d463a604`)。把 `evaluation.recorded` 分支的守卫模式原样复制到 `scope.snapshotted`/`authorization.*`/`effect.*` 三个分支:subject_type 检查保持无条件,只有 payload 交叉校验挪进 `if self.payload is not None:`,payload 在手时的校验强度一字未改(`test_safety_contracts.py` 里 kind/decision、kind/phase 两条冲突拒绝用例未改动仍绿)。回归钉子:`backend/tests/ansich/test_sql_safety.py::test_externalized_scope_authorization_and_effect_payloads_read_back`——服务按 `inline_payload_max_bytes=16` 构造,让每条 payload 都走 externalize,记录 scope/authorization/effect 三条 observation 并 flush,先断言这三行在库里确实是 `payload_json IS NULL AND payload_ref_id IS NOT NULL`,再经 `service.list_timeline()` 与 `service.list_observations()` 两个公共读读回。RED 证据:读路径不是降级成空/degraded,而是直接抛 `ValidationError: Input should be a valid dictionary or instance of ScopeDescriptor [input_value=None]`(`sql.py:5574` 的 `_observation_from_row`);逐个分支补守卫时报错依次换成 `AuthorizationSnapshot`、`ToolEffect`,三个分支各自都被这一条用例钉住。附带确认:`_claim_projection_job` 同样先 `_observation_from_row` 再 hydrate payload,所以修复前这三种 kind 的 externalized observation 连投影都认领不了,job 永远 pending、`flush_task` 只能等到 `projection_settle_timeout`——"能写进去、再也读不出来"比诊断记录的还要广一层。**该危害类并未全部关闭**:assessor 侧的兄弟(`_assess_scope_safety_at` 直接读原始行的 `payload_json`、同样不 hydrate)仍然敞开,已登记为 F10-23,不要把本条的 ✅ 读成 externalized-payload 这一类危害已经清零。
 - 原始诊断(留档):
 - 位置:`backend/packages/ansich/ansich/contracts.py` 的 `scope.snapshotted`/`authorization.*`/`effect.*` 分支(contracts.py:243-271);`evaluation.recorded` 分支(:273-283)是正确的参考写法。
 - 现状:这三个分支无条件 `model_validate((self.payload or {}).get(...))`,payload 为 `None` 时直接抛错。externalize 的 observation 在 `_observation_from_row` 里重新校验时 payload 不在手上,于是这些 kind 一旦走 externalize 路径就是"能写进去、再也读不出来"。`evaluation.recorded` 分支用 `if self.payload is not None:` 把交叉校验包起来,是本仓库里唯一正确的样板。
@@ -116,7 +117,7 @@
   - **60s 档(20 条,显式 `operations_assessment_interval_ms=60_000`,如 alerts 的 coalescing 用例与 safety 的 rollback 用例)**:周期那一半已经被 `e91d9f1c` 的做法压掉了,**剩下的写者是第一轮迭代那次无条件评估**(`next_assessment = loop.time()`,循环第一次迭代必评估),它不受间隔控制,测试侧也没法把它调没。
   
   两种形状调大超时都治不了,因为等的是另一个写者而不是一个慢操作。修复因此不是等更久,而是让这些测试**拥有评估调度**:新增 `backend/tests/support/ansich_settle.py::only_test_driven_assessments(service)`,按发起 task 区分,把 projector loop 自己发起的 `assess_operations()` 变成 no-op(投影照跑,测试的显式调用照跑,`rebuild_projections()` 内部的 `_assess_operations_unlocked` 不受影响)——一把锁同时关掉周期和第一轮。另加 `backend/tests/ansich/conftest.py`,把本目录所有 SQLite 引擎对齐生产的并发 pragma。
-- RED 证据(可复现,不是只靠推理):24 个 CPU 忙循环压着重复跑那四条测试,`test_sql_budget_health_retains_terminal_overshoot_and_evidence` **8/8 失败**,失败点与本会话记录一致——`{'source': {'name': 'absolute-limit', 'version': '1.0.0'}} != {'source': {'name': 'budget-health', 'version': '1'}}`(两次读的 `model_dump` 比对);修复后同一负载 **8/8 通过**。另用一段独立脚本把「后台评估落在两次读之间」显式重放,复现同一条不等式,并验证修复后两次读拿到同一条 assertion。
+- RED 证据(可复现,不是只靠推理):24 个 CPU 忙循环压着重复跑那四条测试,`test_sql_budget_health_retains_terminal_overshoot_and_evidence` **8/8 失败**,失败点与本会话记录一致——`{'source': {'name': 'absolute-limit', 'version': '1.0.0'}} != {'source': {'name': 'budget-health', 'version': '1'}}`(两次读的 `model_dump` 比对);修复后同一负载 **8/8 通过**。另用一段独立脚本把「后台评估落在两次读之间」显式重放,复现同一条不等式,并验证修复后两次读拿到同一条 assertion。**这套负载现在是可重跑的**:`backend/tests/support/ansich_contention_repro.sh`(手动诊断,不进 CI、不被任何测试导入),失败轮次整段存盘——本条「先抓失败文本」的规矩要用它来执行。
 - 逐条诊断:
   1. `test_sql_budget.py::test_sql_budget_health_retains_terminal_overshoot_and_evidence`(最老的一条,`phase-9-review-followups.md` 里就记过「无关的预存 flaky」):`budget_health:total_tokens:local` 这个 field 有两个写者——终态 control 投影里的 `_assess_budget_rows`(source `budget-health@1`,`asserted_at = observation.recorded_at`,墙钟)与 `absolute-limit@1.0.0` assessor job(`asserted_at` = 评估传入的 `now`)。`ansich-default@2.0.0` 在 authority 相同时按 `(as_of, asserted_at, assertion_id)` 取最大,而测试自己的评估用的是 2026-07-18 的模拟时间,永远排在 `recorded_at` 之前,所以 budget-health 稳定胜出;projector loop 用墙钟评估写出的 absolute-limit assertion 则更晚,一旦落在两次读之间就翻转 selected source。**这条属于默认档**:服务按 `create_sql_ansich_service(session_factory)` 构造,没覆写间隔,所以撞上来的是 1 Hz 的周期评估——测试体一旦被负载拖过一秒,后台就有一次机会插进两次读之间(24 个 CPU 忙循环下每次都插得进,故 8/8)。修复:gate,并把两次读的 `source.name` 显式钉成 `budget-health`——让「等的是哪个 assessor 的断言」变成写死的期望,而不是碰巧。
   2. `test_sql_alerts.py::test_sql_assessor_jobs_coalesce_to_highest_pending_watermark`(`e91d9f1c` 修过一轮的同一条):它断言 `pending_count > 1`、`evaluated_watermarks == [highest_watermark]`、`sum(attempts) == 1`,三条都在描述「只有我这一次评估跑过」。第一轮迭代那次后台评估一旦滑到三条 action step 投影之后,就会先把 job drain 掉,三条断言一起塌。修复:gate。
@@ -134,7 +135,14 @@
     - `tests/ansich/test_sql_alerts.py:947::test_failed_assessor_jobs_degrade_health_and_can_be_retried` —— `only_test_driven_assessments(service)` 在 :964,flush 与 ops 评估间隔均为 `60_000`。**只有测试 id,没拿到失败文本**(后台 `-q` 捕获只留了 summary),证据强度与本条第 4 项的留观标记同级。
   - 同一批还翻红了 `tests/ansich/test_summarization_lineage.py:76::test_partial_list_content_trim_records_an_incomplete_compression_inventory`(`assert None is not None`)。它**没有**门禁、用的是 `create_sql_ansich_service(session_factory)` 的默认间隔,属于本条"只登记不修"里那 151 条的形状,不在本条的修复范围内——记在这里只是为了和上面两条区分开。
   - 复现把手:**`[0, 2, 3, 1, 1]` 这个计数**。该测试每轮先清空 `assessed_subjects`、再 `await service.assess_operations(now=...)` 一次、然后记长度;五轮总和是 7(期望 5),且第 0 轮记到 0、第 1 轮记到 2 —— 同一次运行里既有缺也有多。
-  - 若它再轮换红:**先抓失败文本**,然后在两个方向里做判断,不要跳过取证直接下结论——(a) 评估是否经由门禁拦不到的路径到达了这个计数器(门禁重绑的是 `service.assess_operations`,而该计数器打在 `sql_module.assess_scope_safety` 这个领域函数上,两者不是同一个入口);(b) 或者在负载下推动这些计数器的根本不是评估,而是另一个竞争者。**本条不对这两种可能下结论**:Task 9 没有刻意复现,也没有加插桩。
+  - 若它再轮换红:**先抓失败文本**,然后在三个方向里做判断,不要跳过取证直接下结论——(a) 评估是否经由门禁拦不到的路径到达了这个计数器(门禁重绑的是 `service.assess_operations`,而该计数器打在 `sql_module.assess_scope_safety` 这个领域函数上,两者不是同一个入口);(b) 或者在负载下推动这些计数器的根本不是评估,而是另一个竞争者;(c) **批终审新增、目前最可信的一条**——assessor mark 在 dependency-pending 自愈路径上回退,详见下条。Task 9 没有刻意复现也没有加插桩,(c) 抬高的是先验而**不**替代取证:「先抓失败文本再修」这条不变。
+  - **假设 (c):assessor mark 回退(Phase 11 前加固批的批终审登记,2026-08-19;机制经代码核实,但尚未用失败文本证实它就是这条 flake 的成因)**
+    - 机制:`_claim_assessor_job` **无条件**把 mark 下调到「本次 claim 组内最低 watermark − 1」(sql.py:1432-1438),而 `_advance_assessor_watermark` 事后只把它抬回**这次 claim 自己的** watermark(调用点 sql.py:1646,`Never lower` 分支 sql.py:1757)。于是每出现一条 watermark 低于已推进 mark 的 job,mark 就被永久下调一个档。
+    - 可达性是**常规自愈路径**,不是罕见竞态:`_project_safety` 在被引用的 ToolCall/Scope 尚未投影时抛 `_ProjectionDependencyPending`(sql.py:8090、8098、8221、8223),被推迟的那条 observation 的 assessor job 因此在更高 ingest_seq 的兄弟**已经**结算过 mark 之后才建出来——正是 H6 自愈用例天天走的那条路。
+    - 代价:下一次触发的区间横跨整个档;而 scope-safety 用**评估时刻**盖 `as_of`,`_persist_assessment` 的去重对它无效——档内**每个**已收敛 ToolCall 都会多拿一条 assertion 和一行 `ansich_scope_conclusions`。这笔开销有界(每个晚到者一次宽重判)且安全(结论完全相同),但它正是 phase-9 M2 立项要消除的那一笔。
+    - 与 `[0, 2, 3, 1, 1]` 的吻合:先缺一轮(证据被推迟,那一轮的区间里没有它),随后几轮多出来(mark 回退把窗口撑宽),同一次运行里既有缺也有多、总和 7 > 5——正是「证据推迟 → mark 回退 → 后面的窗口变宽」的形状。
+    - Phase 11 候选修法:在 `_claim_assessor_job` 里记住下调**前**的 mark,`_advance_assessor_watermark` 发现「本次 claim 组的最高 watermark 低于它」时把它恢复回去,而不是停在这次 claim 的 watermark。与 F10-6 配对处理(同属 assessor 侧的串行化/水位治理)。
+    - 缺的测试牙齿:`backend/tests/ansich/test_sql_safety.py::test_absorbed_low_watermark_window_survives_an_evaluation_rollback` 已经把这个场景整条驱动出来了,却只断言了安全的那一半(晚到 ToolCall 被判到),从不数已收敛 ToolCall 的 assertion / `ansich_scope_conclusions` 条数。补上这条计数断言,假设 (c) 就能被证实或证伪。
 - 原始诊断(留档):
 - 位置:`backend/tests/ansich/` 的 SQLite 集成测试族(负载下轮换命中,每条单跑必过)。
 - 现状:Task 9 期间观察到一条与被测行为无关的失败,在不同测试之间轮换出现;同族现象在 Phase 7 已经确诊为投影 settle 时序对套件级负载敏感,而不是被测代码的缺陷。它现在的代价是每次全量跑都要人工判断"这条红是不是真的"。
@@ -247,6 +255,16 @@
 - 现状:首命令词取的是**第一个非环境赋值 token 的 basename**,与 `rm`/`unlink`/`rmdir`、`chmod`/`chown`/`chgrp` 两个精确集合比对。因此 `sudo rm -rf /x`、`env rm x`、`timeout 5 rm x`、`xargs rm`、`command rm` 全部落回 `process_execute` + `unknown`。这个方向是**安全的**(不越权断言),但也意味着一次提权删除在 Scope Effects 面板上与一次普通命令执行长得一样。裁决 HR2 只处理了元字符闸门与 `NAME=value` 前缀,没有对"包装器"这一类给出规则。
 - 方向:需要一次独立裁决,而不是顺手加白名单——`sudo`/`env`/`nice`/`timeout`/`xargs`/`command` 各自的参数文法不同(`sudo -u user rm`、`env -i FOO=1 rm`、`timeout 5s rm`),一个"跳过 flag 及其取值"的通用规则很容易把 flag 的**取值**误当成命令词(`sudo -u rm whoami` 里的 `rm` 是用户名,不是命令)。保守可行的中间态是:只解包**无 flag** 的形式(`sudo rm …`、`env rm …`),其余仍退回 `process_execute`。任何方案都要配"包装器带 flag 时不误判"的负向用例。
 - 归属:未定,建议随下次触达 `_effect_class` 的改动一并裁决。
+
+## F10-23. assessor 读证据时不 hydrate externalized payload
+
+- 状态:⬜ 未修复。来源:Phase 11 前加固批的**批终审**(不是 Phase 10 终审)。经核实是**既存缺陷**——在该批的基线 `38767157` 上已经是这个形状,非本批引入。
+- 位置:`backend/packages/harness/deerflow/ansich/persistence/sql.py::_assess_scope_safety_at`(sql.py:1873-1884)。
+- 现状:该函数直接取 observation 行的 `row.payload_json or {}`,随后 `AuthorizationSnapshot.model_validate(payload.get("snapshot"))` / `ToolEffect.model_validate(payload.get("effect"))`,**中间没有任何 `ansich_payloads` 的 hydrate 步骤**。一条走了 externalize 的 `authorization.*`/`effect.*` observation 在库里就是 `payload_json IS NULL`,于是这里拿到 `None`,`model_validate` 直接抛 `ValidationError`。F10-8 修的是**投影认领**那一侧(`contracts.py` 的 envelope 校验器,contracts.py:243-278),这条 assessor 侧的原始行读取是同一危害类下另一条独立的、仍然敞开的兄弟。
+- 出错方向(诚实但吵闹的那个):assessor job 按非依赖类异常耗尽 attempts,转成 durable `failed` 并进入 failed-job 诊断面;**不会**产出被伪造的 scope-safety 结论,fail-open 也保持——业务执行不受影响。真实代价是该 ToolCall 的 safety 姿态从「unknown / 未评估」退化成一条需要运维处理的失败作业。
+- 概率:低。两种 payload 都很小(一个 snapshot / 一个 effect),要越过 `inline_payload_max_bytes` 才会 externalize,默认配置下几乎撞不到——F10-8 的回归用例是把阈值压到 16 字节才逼出来的。
+- 方向:二选一——(a) 让这条读走 F10-8 守卫用的同一条 payload-store 读路径,把 externalized payload hydrate 回来再校验;(b) 读不到 payload 时守卫并跳过,同时给该 tool_call 留一个 `unassessed` 标记,不要静默当成「没有证据」。任选其一都要配「externalized authorization/effect 证据下 assessor 不产生失败作业」的回归。
+- 归属:Phase 11(与 F10-8 同一危害类,与 F10-6/F10-7 的韧性主题同批)。
 
 ## 评审中确认无需跟进的点(留档)
 

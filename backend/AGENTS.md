@@ -110,7 +110,11 @@ that server, so the tier is re-runnable. It covers the migration matrix
 (empty → head, head → `0004_run_ownership` → head, a second `upgrade head` as a
 no-op), all three `bootstrap_schema` branches including the `pg_advisory_lock`
 path SQLite never takes, and one end-to-end Ansich service smoke on the migrated
-schema. It is **not** a Postgres run of the whole suite: everything outside
+schema — the smoke also drives the two constructs whose behaviour is
+Postgres-specific: the wall_time high-water upsert (`FOR UPDATE OF` over a
+two-table join, then delete-then-insert) and one scope-safety assessment pass, so
+`ansich_assessor_watermarks` is written there and not merely created by `0025`.
+It is **not** a Postgres run of the whole suite: everything outside
 `tests/integration/` still runs on SQLite only, so multi-worker behaviour
 (`SELECT … FOR UPDATE`, `skip_locked`, lost-update windows) remains unexercised.
 
@@ -666,7 +670,13 @@ Scope-safety is assessed incrementally: each conclusion depends only on one
 `tool_call_id`'s own snapshots and effects, so a trigger re-judges just the
 ToolCalls named by evidence in the new watermark window and leaves converged
 conclusions unwritten (they are stamped with the assessment time, so a rewrite
-would append an assertion every trigger rather than dedupe). The window's lower
+would append an assertion every trigger rather than dedupe). One case still
+rewrites them: claiming lowers the mark below the group's lowest watermark while
+the later advance only raises it back to that claim's own watermark, so a
+dependency-deferred job landing under an already-advanced mark widens the next
+window across the whole band and re-judges every converged ToolCall in it — see
+F10-10 hypothesis (c) in `ansich/docs/plans/phase-10-review-followups.md`, where
+the fix is scheduled for Phase 11. The window's lower
 bound is `ansich_assessor_watermarks`, written inside the evaluation's own
 transaction and deleted by `rebuild_projections()` with the conclusions it
 describes — an assessor job's `completed` status cannot serve as that bound
@@ -782,6 +792,13 @@ silent. The gate rebinds the public `assess_operations`, which is what the loop
 calls, and `tests/ansich/test_settle_isolation.py` pins that attachment point
 against a real service so a refactor routing the loop around it cannot silently
 disarm every gate.
+
+The load that reproduced these flakes is re-runnable:
+`tests/support/ansich_contention_repro.sh` holds up 24 CPU busy loops and runs
+the settle-family tests N times, saving each failing round whole. It is a manual
+diagnostic — nothing collects or imports it — for the case where one of these
+tests rotates red again and the failure text has to be captured before anything
+is diagnosed.
 
 (2) `tests/ansich/conftest.py` puts every SQLite engine in that
 directory into `journal_mode=WAL` with a 30s `busy_timeout`, matching
@@ -901,7 +918,9 @@ back this: `tests/ansich/test_settle_isolation.py` pins that the settle gate is
 attached to the method `_projector_loop` actually calls (its sufficiency is
 proven only at the load of its acceptance runs, not beyond), and
 `make test-postgres` executes the migration chain and one service smoke against a
-real server. What this batch did **not** establish: the suite outside
+real server — the smoke drives the wall_time high-water upsert and one
+scope-safety pass, so both statements this batch added run at least once on
+Postgres. What this batch did **not** establish: the suite outside
 `tests/integration/` still runs on SQLite, so every multi-worker claim above
 rests on code review plus the lock's presence, not on an executed concurrent test.
 

@@ -187,10 +187,16 @@ class AnsichAssessorWatermarkRow(Base):
 
     An assessor job's own ``status`` cannot answer this: claiming coalesces the
     group's lower jobs to ``completed`` before the evaluation runs, so a failed
-    or crashed evaluation leaves them completed with nothing assessed. This row
-    is written inside the evaluation's own transaction, so it advances only when
-    the conclusions it describes are durable, and it is deleted together with
-    those conclusions by ``rebuild_projections()``.
+    or crashed evaluation leaves them completed with nothing assessed.
+
+    Two transactions write this row. The evaluation's own transaction *raises*
+    it, so it advances only when the conclusions it describes are durable. The
+    claim transaction *lowers* it to just below the claimed group's lowest
+    watermark (``_widen_assessor_watermark``); that widening has to outlive a
+    rolled-back evaluation — the absorbed siblings are already ``completed`` by
+    then — so it cannot live in the evaluation's transaction. Either way the row
+    is deleted together with the conclusions it describes by
+    ``rebuild_projections()``.
     """
 
     __tablename__ = "ansich_assessor_watermarks"

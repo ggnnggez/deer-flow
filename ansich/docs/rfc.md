@@ -99,7 +99,8 @@ instrumentation 时记 `unknown`，绝不推断副作用。
 
 基准 `upstream/main@5f0108f5` 已不在本分支历史里（本分支与 upstream 的 merge-base 是
 `cb698832`），因此下列数字按 `git diff upstream/main@5f0108f5...HEAD`（**三点**，即对
-merge-base 求差）重算，复算时间 2026-08-19：**311 个文件变更，其中 220 个是新增文件、
+merge-base 求差）重算，复算时间 2026-08-19、复算所对的 `HEAD` 是 `e53cefbc`（这些数字随
+分支推进而变，复算前请先把 HEAD 对回这个提交）：**311 个文件变更，其中 220 个是新增文件、
 198 个路径里带 `ansich`**（独立包 `backend/packages/ansich/`、适配层 `deerflow/ansich/`、
 迁移 0005–0025、Gateway 路由、前端页面、测试、`ansich/docs/`）。
 

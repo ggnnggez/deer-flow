@@ -1172,6 +1172,13 @@ async def test_externalized_scope_authorization_and_effect_payloads_read_back(tm
 
         async with session_factory() as session:
             stored_rows = list((await session.execute(select(AnsichObservationRow).where(AnsichObservationRow.obs_id.in_(externalized_obs_ids)))).scalars())
+            # Pin the claim path too, not just the read path: `_project_pending`
+            # swallows projection exceptions, so a claim-time envelope validator
+            # that rejects an externalized payload loses the projection in
+            # silence. `scope.snapshotted` is the probe because it waits on no
+            # ToolCall - its row is either here or the claim dropped it.
+            projected_scope = await session.get(AnsichScopeRow, scope.scope_id)
+            projected_scope_state = None if projected_scope is None else (projected_scope.scope_kind, projected_scope.created_obs_id)
         stored_payload_state = {row.obs_id: (row.payload_json, row.payload_ref_id is not None) for row in stored_rows}
 
         timeline = await service.list_timeline(task_id, limit=50)
@@ -1181,6 +1188,7 @@ async def test_externalized_scope_authorization_and_effect_payloads_read_back(tm
         await engine.dispose()
 
     assert stored_payload_state == {obs_id: (None, True) for obs_id in externalized_obs_ids}
+    assert projected_scope_state == ("workspace", scope_obs_id)
     for read_back in (dict((observation.obs_id, observation) for _, observation in timeline), {observation.obs_id: observation for observation in observations}):
         assert set(externalized_obs_ids) <= set(read_back)
         assert read_back[scope_obs_id].kind == "scope.snapshotted"
