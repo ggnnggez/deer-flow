@@ -3,8 +3,9 @@ from __future__ import annotations
 import asyncio
 import logging
 import time
-from collections import deque
-from collections.abc import Callable
+from collections import OrderedDict, deque
+from collections.abc import Callable, Iterable
+from dataclasses import dataclass
 from datetime import UTC, datetime
 from threading import Lock
 from weakref import ReferenceType, WeakMethod, ref
@@ -14,7 +15,7 @@ from ansich.backend import AnsichBackend
 from ansich.budget import BudgetHealthBelief, TaskBudgetsView
 from ansich.compression import ContextCompressionSummaryView, ContextCompressionView
 from ansich.context_state import ContextStateView
-from ansich.contracts import AnsichHealth, ControlValue, FlushResult, LostRange, ObservationEnvelope, Producer, RecordReceipt, TaskLifecycleScope, TaskView
+from ansich.contracts import AnsichHealth, ControlValue, FlushResult, LostRange, ObservationEnvelope, Producer, ProducerHealth, RecordReceipt, TaskLifecycleScope, TaskView
 from ansich.environment import (
     EnvironmentHistoryView,
     TaskEnvironmentView,
@@ -53,6 +54,7 @@ from ansich.usage import AggregationScope, TaskUsageBreakdownView, TaskUsageByMo
 
 logger = logging.getLogger(__name__)
 _DROP_WARNING_INTERVAL_SECONDS = 60.0
+_PRODUCER_ACCOUNT_LIMIT = 256
 
 
 def _serialized_observation_size(observation: ObservationEnvelope) -> int:
@@ -60,6 +62,23 @@ def _serialized_observation_size(observation: ObservationEnvelope) -> int:
         return len(observation.model_dump_json().encode("utf-8"))
     except Exception:
         return -1
+
+
+@dataclass
+class _ProducerAccount:
+    """One producer instance's running tally, kept behind ``AnsichService._lock``.
+
+    :class:`~ansich.contracts.ProducerHealth` is the frozen report rendered from
+    this; this is the mutable ledger the record and writer paths update in
+    place. Every field starts at the value that means "nothing measured yet"
+    rather than at a value that means "measured, and it was fine".
+    """
+
+    accepted_count: int = 0
+    dropped_count: int = 0
+    last_accepted_sequence: int | None = None
+    serialization_failures: int = 0
+    last_successful_flush_at: datetime | None = None
 
 
 class AnsichService:
@@ -111,6 +130,9 @@ class AnsichService:
         self._record_sequence = 0
         self._accepted_count = 0
         self._dropped_count = 0
+        # LRU-ordered, bounded at `_PRODUCER_ACCOUNT_LIMIT`; see `_producer_account`.
+        self._producer_accounts: OrderedDict[tuple[str, str], _ProducerAccount] = OrderedDict()
+        self._evicted_producer_count = 0
         self._queue_high_watermark = 0
         self._queue_byte_high_watermark = 0
         self._snapshot_request_count = 0
@@ -205,6 +227,14 @@ class AnsichService:
             sequences = tuple(range(first_sequence, self._record_sequence + 1))
             if batch_kind == "context_snapshot":
                 self._snapshot_request_count += 1
+            # Charged before the reject decision below, and deliberately so: one
+            # unserializable item rejects the whole batch, so counting these on
+            # the accept path would mean nobody is ever charged for the failure
+            # that caused the rejection. A non-envelope item is measured as 0
+            # rather than -1 and has no producer identity to charge.
+            for observation, observation_size in zip(batch, observation_sizes, strict=True):
+                if observation_size < 0 and isinstance(observation, ObservationEnvelope):
+                    self._producer_account(observation.producer.name, observation.producer.instance_id).serialization_failures += 1
             reason = None
             if any(not isinstance(observation, ObservationEnvelope) for observation in batch):
                 reason = "validation_failed"
@@ -243,6 +273,11 @@ class AnsichService:
                 strict=True,
             ):
                 self._queue.append((sequence, observation, observation_size))
+                account = self._producer_account(observation.producer.name, observation.producer.instance_id)
+                account.accepted_count += 1
+                # Sequences are allocated and appended inside this one locked
+                # section, so they only ever move forward for a given producer.
+                account.last_accepted_sequence = sequence
             self._queue_bytes += batch_bytes
             self._accepted_count += len(batch)
             self._queue_high_watermark = max(self._queue_high_watermark, len(self._queue))
@@ -261,12 +296,21 @@ class AnsichService:
                 with self._lock:
                     sequence_set = set(sequences)
                     retained = deque(item for item in self._queue if item[0] not in sequence_set)
-                    removed_bytes = sum(item[2] for item in self._queue if item[0] in sequence_set)
-                    removed_count = len(self._queue) - len(retained)
+                    removed = [item for item in self._queue if item[0] in sequence_set]
+                    removed_bytes = sum(item[2] for item in removed)
+                    removed_count = len(removed)
                     if removed_count:
                         self._queue = retained
                         self._queue_bytes -= removed_bytes
                         self._accepted_count -= removed_count
+                        for _, removed_observation, _ in removed:
+                            # Mirror the process-wide un-accept above: the loss
+                            # recorded below charges these to their producer, so
+                            # leaving them counted as accepted as well would
+                            # report one observation twice. `last_accepted_sequence`
+                            # is left alone — the range is reported as lost, and
+                            # the producer's previous sequence is not kept.
+                            self._producer_account(removed_observation.producer.name, removed_observation.producer.instance_id).accepted_count -= 1
                         self._record_batch_loss(sequences, batch)
                         if batch_kind == "context_snapshot":
                             self._snapshot_observations_accepted -= removed_count
@@ -322,6 +366,22 @@ class AnsichService:
                 snapshot_visible_bytes=int(metrics.get("snapshot_visible_bytes", 0)),
                 incomplete_snapshot_count=int(metrics.get("incomplete_snapshot_count", 0)),
                 missing_content_block_count=int(metrics.get("missing_content_block_count", 0)),
+                # Ordered by identity rather than by arrival or LRU position, so
+                # two health reads of an unchanged ledger are diffable even while
+                # the map itself churns.
+                producers=tuple(
+                    ProducerHealth(
+                        producer_name=producer_name,
+                        producer_instance_id=producer_instance_id,
+                        accepted_count=account.accepted_count,
+                        dropped_count=account.dropped_count,
+                        last_accepted_sequence=account.last_accepted_sequence,
+                        serialization_failures=account.serialization_failures,
+                        last_successful_flush_at=account.last_successful_flush_at,
+                    )
+                    for (producer_name, producer_instance_id), account in sorted(self._producer_accounts.items(), key=lambda item: item[0])
+                ),
+                evicted_producer_count=self._evicted_producer_count,
             )
 
     def register_persistence_listener(
@@ -1160,6 +1220,46 @@ class AnsichService:
             self._stopped = True
             self._stopping = False
 
+    def _producer_account(self, producer_name: str, producer_instance_id: str) -> _ProducerAccount:
+        """Return one producer instance's account, creating it on first sighting.
+
+        Callers must already hold ``self._lock``: this is pure dict work, which
+        is what keeps it legal on ``record()``'s non-blocking path.
+
+        The map is bounded at ``_PRODUCER_ACCOUNT_LIMIT`` and evicts the least
+        recently touched entry first, so a pathological ``instance_id`` cannot
+        grow it without limit. Eviction is only ever triggered by a *new*
+        producer arriving — an existing producer's own traffic never costs
+        anybody their entry — and always increments ``_evicted_producer_count``:
+        a producer may drop out of health, but never silently (RA3).
+        """
+
+        key = (producer_name, producer_instance_id)
+        account = self._producer_accounts.get(key)
+        if account is not None:
+            self._producer_accounts.move_to_end(key)
+            return account
+        while len(self._producer_accounts) >= _PRODUCER_ACCOUNT_LIMIT:
+            self._producer_accounts.popitem(last=False)
+            self._evicted_producer_count += 1
+        account = _ProducerAccount()
+        self._producer_accounts[key] = account
+        return account
+
+    def _record_successful_flush(self, observations: Iterable[ObservationEnvelope]) -> None:
+        """Stamp ``last_successful_flush_at`` for every producer in a persisted batch.
+
+        This is the only writer of that field, and it runs in the writer
+        coroutine after storage accepted the batch, so the timestamp can only
+        ever mean "this producer's work reached storage". The clock is read
+        before the lock is taken; under it there is nothing but dict work.
+        """
+
+        flushed_at = datetime.now(UTC)
+        with self._lock:
+            for observation in observations:
+                self._producer_account(observation.producer.name, observation.producer.instance_id).last_successful_flush_at = flushed_at
+
     def _record_loss(
         self,
         sequence: int,
@@ -1169,6 +1269,13 @@ class AnsichService:
         producer_instance_id: str | None = None,
     ) -> None:
         self._dropped_count += 1
+        # Every loss path in the service funnels through here, so charging the
+        # producer here rather than at each call site is what keeps a later
+        # caller from forgetting to. An item with no producer identity (a
+        # non-envelope) is counted process-wide only — unattributable loss is
+        # reported as unattributed rather than guessed onto somebody.
+        if producer_name is not None and producer_instance_id is not None:
+            self._producer_account(producer_name, producer_instance_id).dropped_count += 1
         if self._lost_ranges:
             previous = self._lost_ranges[-1]
             if previous.task_id == task_id and previous.producer_name == producer_name and previous.producer_instance_id == producer_instance_id and previous.last_sequence + 1 == sequence:
@@ -1352,6 +1459,10 @@ class AnsichService:
                 for _, observation in selected:
                     self._record_observation_loss(observation)
             return FlushResult(persisted=False, processed_count=0, reason="storage_failure")
+        # Task 4 rewrites this method (retry/backoff + in-flight buffer) and must
+        # keep calling this on whatever its success path becomes: it is the only
+        # writer of `ProducerHealth.last_successful_flush_at`.
+        self._record_successful_flush(observation for _, observation in selected)
         self._notify_persisted(selected)
         if self._projector_wake_event is not None:
             self._projector_wake_event.set()
