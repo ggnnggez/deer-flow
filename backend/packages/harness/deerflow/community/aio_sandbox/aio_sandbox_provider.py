@@ -1756,6 +1756,24 @@ class AioSandboxProvider(WarmPoolLifecycleMixin[SandboxInfo], SandboxProvider):
                 self._last_activity[sandbox_id] = time.time()
         return sandbox
 
+    def peek_thread_sandbox(self, user_id: str | None, thread_id: str) -> Sandbox | None:
+        """In-memory-only lookup of the thread's active sandbox.
+
+        Mirrors ``get()``'s event-loop-safety contract: no ownership store or
+        docker backend round trip, only the existing ``_thread_sandboxes``
+        (user_id, thread_id) -> sandbox_id map and the ``_sandboxes`` id ->
+        AioSandbox map, read under ``self._lock`` per this provider's usual
+        convention. Does not touch ``_last_activity`` (unlike ``get()``) since
+        a peek is not a real use of the sandbox.
+        """
+        effective_user_id = self._effective_acquire_user_id(user_id)
+        key = self._thread_key(thread_id, effective_user_id)
+        with self._lock:
+            sandbox_id = self._thread_sandboxes.get(key)
+            if sandbox_id is None:
+                return None
+            return self._sandboxes.get(sandbox_id)
+
     def release(self, sandbox_id: str) -> None:
         """Release a sandbox from active use into the warm pool.
 

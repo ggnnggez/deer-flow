@@ -54,6 +54,14 @@ class SandboxProvider(ABC):
         """Clear cached state that survives provider instance replacement."""
         pass
 
+    def peek_thread_sandbox(self, user_id: str | None, thread_id: str) -> "Sandbox | None":
+        """In-memory-only lookup of the thread's sandbox; never touches a store/backend.
+
+        Default None: providers without a cheap in-memory answer stay honest
+        (the environment probe then records uninstrumented coverage).
+        """
+        return None
+
 
 _default_sandbox_provider: SandboxProvider | None = None
 # Guards every read and write of `_default_sandbox_provider`. The singleton is

@@ -411,6 +411,17 @@ class LocalSandboxProvider(SandboxProvider):
                 return cached
         return None
 
+    def peek_thread_sandbox(self, user_id: str | None, thread_id: str) -> Sandbox | None:
+        """In-memory-only lookup of the thread's sandbox.
+
+        ``acquire()`` doubles as the peek here: for a local sandbox it only
+        creates a directory and inserts into the LRU cache (no
+        store/backend round trip), so it is cheap and idempotent enough to
+        call on every peek instead of duplicating its cache logic.
+        """
+        sandbox_id = self.acquire(thread_id, user_id=user_id)
+        return self.get(sandbox_id)
+
     def release(self, sandbox_id: str) -> None:
         # LocalSandbox has no resources to release; keep the cached instance so
         # that ``_agent_written_paths`` (used to reverse-resolve agent-authored
