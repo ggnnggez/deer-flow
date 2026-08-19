@@ -17,7 +17,7 @@ export interface SparklineGeometry {
    * must not disappear just because its neighbours are far away.
    */
   dots: { x: number; y: number }[];
-  /** `y` for the limit reference line, or null when no usable limit exists. */
+  /** `y` for the limit reference line, or null when no limit was reported. */
   limitY: number | null;
   min: number;
   max: number;
@@ -40,7 +40,10 @@ export function buildSparklinePath(
   options: {
     width: number;
     height: number;
-    /** Drawn as a dashed reference line when it falls inside the y domain. */
+    /**
+     * Drawn as a dashed reference line. The y domain is widened to include
+     * it, so a limit far above every reading is always on screen.
+     */
     limit?: number | null;
     gapFactor?: number;
     /** Vertical inset so a stroke at the extremes is not clipped. */
@@ -130,10 +133,9 @@ export function buildSparklinePath(
     );
   }
 
-  const limitY =
-    limit !== null && limit >= domainMin && limit <= domainMax
-      ? toY(limit)
-      : null;
+  // No range check: the domain above was widened to include the limit, so it
+  // is inside it by construction.
+  const limitY = limit !== null ? toY(limit) : null;
   return { segments, dots, limitY, min, max };
 }
 

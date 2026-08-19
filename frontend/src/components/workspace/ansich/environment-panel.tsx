@@ -226,7 +226,9 @@ function MetricRow({
     <div className="rounded-lg border p-3 text-sm">
       <div className="flex flex-wrap items-center justify-between gap-2">
         <span className="font-mono text-xs">{metric.metric}</span>
-        <span className="flex items-center gap-3">
+        {/* A div, not a span: the trend's loading state is a Skeleton, which
+            renders a div — nesting it in a span is invalid HTML. */}
+        <div className="flex items-center gap-3">
           {trendEnabled ? (
             <MetricTrend
               scopeId={scopeId}
@@ -242,7 +244,7 @@ function MetricRow({
                 }`
               : ""}
           </span>
-        </span>
+        </div>
       </div>
       <div className="text-muted-foreground mt-1 text-xs">
         {t.ansich.asOf}: {formatAnsichTimestamp(metric.as_of, locale)}
