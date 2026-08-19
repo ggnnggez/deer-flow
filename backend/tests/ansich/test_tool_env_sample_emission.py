@@ -15,6 +15,7 @@ lifted from ``tests/ansich/test_execution_context.py``.
 from __future__ import annotations
 
 import asyncio
+import json
 from datetime import UTC, datetime
 from types import SimpleNamespace
 from unittest.mock import MagicMock
@@ -45,12 +46,20 @@ def _register_call(execution, provider_call_id, tool_name):
     )
 
 
-def _make_execution_and_request(tool_name: str, provider_call_id: str, *, thread_id: str | None = THREAD_ID):
+def _make_execution_and_request(
+    tool_name: str,
+    provider_call_id: str,
+    *,
+    thread_id: str | None = THREAD_ID,
+    run_id: str | None = None,
+):
     execution = AnsichExecutionContext(task_id=new_id(), service=MagicMock())
     registration = _register_call(execution, provider_call_id, tool_name)
     context: dict[str, object] = {ANSICH_EXECUTION_CONTEXT_KEY: execution}
     if thread_id is not None:
         context["thread_id"] = thread_id
+    if run_id is not None:
+        context["run_id"] = run_id
     request = SimpleNamespace(
         runtime=SimpleNamespace(context=context),
         tool_call={"id": provider_call_id, "name": tool_name, "args": {}},
@@ -106,8 +115,8 @@ def test_bash_success_emits_environment_sampled_with_expected_shape(monkeypatch)
     assert payload["provider"] == "local"
     assert payload["tool_call_id"] == registration.tool_call_id
     assert payload["window"] == {
-        "started_at": _sample().started_at,
-        "ended_at": _sample().ended_at,
+        "started_at": _sample().started_at.isoformat(),
+        "ended_at": _sample().ended_at.isoformat(),
         "sample_count": 3,
     }
     assert payload["metrics"] == {
@@ -116,6 +125,13 @@ def test_bash_success_emits_environment_sampled_with_expected_shape(monkeypatch)
         "io_write_bytes": {"value": 8192, "limit": None},
     }
     assert envelope.source_event_id == f"tool:{registration.tool_call_id}:env"
+    # Regression: the payload must be plain-JSON-serializable exactly as the
+    # persistence writer serializes it (ansich/persistence/sql.py does a bare
+    # json.dumps with no default= converter) — a raw datetime in `window`
+    # (rather than an ISO string) would TypeError there and lose the whole
+    # flush batch with reason="storage_failure" while still passing here if
+    # this assertion were absent.
+    assert json.dumps(payload)
 
 
 def test_metrics_include_only_non_none_dimensions(monkeypatch) -> None:
@@ -196,6 +212,64 @@ def test_emission_failure_is_fail_open_and_tool_message_unaffected(monkeypatch) 
 
     assert isinstance(result, ToolMessage)
     assert result.content == "still ok"
+
+
+def test_run_id_from_runtime_context_lands_in_correlation_id(monkeypatch) -> None:
+    execution, registration, request = _make_execution_and_request("bash", "prov-runid", run_id="run-context-42")
+    monkeypatch.setattr(tool_observer, "_record_batch", lambda e, b, *, batch_kind: True)
+    telemetry.publish_command_sample(_sample())
+
+    with execution.activate_tool_invocation(registration):
+        AnsichRawToolMiddleware().wrap_tool_call(
+            request,
+            lambda r: ToolMessage(content="ok", tool_call_id="prov-runid", name="bash"),
+        )
+
+    calls = _env_sampled_calls(execution.service)
+    assert len(calls) == 1
+    envelope = calls[0].args[0]
+    # environment.sampled's correlation_id IS the run_id (see
+    # ObservationEnvelope.environment_sampled), unlike every other Observation
+    # this file emits (those use task_id) — so a context-provided run_id must
+    # land there distinctly from execution.task_id.
+    assert envelope.correlation_id == "run-context-42"
+    assert envelope.correlation_id != execution.task_id
+
+
+def test_run_id_falls_back_to_task_id_when_context_has_none(monkeypatch) -> None:
+    execution, registration, request = _make_execution_and_request("bash", "prov-norunid")
+    monkeypatch.setattr(tool_observer, "_record_batch", lambda e, b, *, batch_kind: True)
+    telemetry.publish_command_sample(_sample())
+
+    with execution.activate_tool_invocation(registration):
+        AnsichRawToolMiddleware().wrap_tool_call(
+            request,
+            lambda r: ToolMessage(content="ok", tool_call_id="prov-norunid", name="bash"),
+        )
+
+    calls = _env_sampled_calls(execution.service)
+    assert len(calls) == 1
+    assert calls[0].args[0].correlation_id == execution.task_id
+
+
+def test_bash_error_does_not_leave_a_stray_sample_for_the_next_call(monkeypatch) -> None:
+    execution, registration, request = _make_execution_and_request("bash", "prov-raises")
+    monkeypatch.setattr(tool_observer, "_record_batch", lambda e, b, *, batch_kind: True)
+    telemetry.publish_command_sample(_sample())
+
+    def raising_handler(r):
+        raise RuntimeError("command blew up")
+
+    with execution.activate_tool_invocation(registration):
+        with pytest.raises(RuntimeError):
+            AnsichRawToolMiddleware().wrap_tool_call(request, raising_handler)
+
+    # The failed call must not emit (raised before the success path), and —
+    # the actual point of this test — must not leave the sample sitting in
+    # the ContextVar where a later, unrelated bash call in this same context
+    # would pick it up and misattribute it to its own tool_call_id.
+    assert _env_sampled_calls(execution.service) == []
+    assert telemetry.consume_command_sample() is None
 
 
 def test_async_bash_success_emits_environment_sampled(monkeypatch) -> None:

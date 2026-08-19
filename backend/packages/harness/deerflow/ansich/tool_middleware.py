@@ -63,6 +63,20 @@ def _thread_id_from_request(request: ToolCallRequest) -> str | None:
     return thread_id if isinstance(thread_id, str) else None
 
 
+def _run_id_from_request(request: ToolCallRequest) -> str | None:
+    """Best-effort DeerFlow ``run_id`` lookup from ``runtime.context``.
+
+    ``runtime/runs/worker.py::_build_runtime_context`` always seeds
+    ``runtime.context["run_id"]`` alongside ``"thread_id"``, so this mirrors
+    ``_thread_id_from_request`` exactly.
+    """
+    context = _runtime_context(request)
+    if not isinstance(context, Mapping):
+        return None
+    run_id = context.get("run_id")
+    return run_id if isinstance(run_id, str) else None
+
+
 def _known_secrets(request: ToolCallRequest) -> list[str]:
     context = getattr(getattr(request, "runtime", None), "context", None)
     return [
@@ -643,8 +657,8 @@ def _emit_command_environment_sample(
                     "environment_scope": "process_group",
                     "coverage": "per_command",
                     "window": {
-                        "started_at": sample.started_at,
-                        "ended_at": sample.ended_at,
+                        "started_at": sample.started_at.isoformat(),
+                        "ended_at": sample.ended_at.isoformat(),
                         "sample_count": sample.sample_count,
                     },
                     "provider": "local",
@@ -656,6 +670,25 @@ def _emit_command_environment_sample(
         )
     except Exception:
         logger.debug("per-command environment sample emission failed", exc_info=True)
+
+
+def _discard_stray_command_sample(tool_name: str) -> None:
+    """Drop a per-command resource sample left behind by a ``bash`` call that
+    ended in the error/timeout/cancelled branch, before it ever reaches
+    ``_emit_command_environment_sample``. Left unconsumed, the ContextVar
+    would still hold it; a *later* bash call in the same context (sync path)
+    could then pick it up via ``consume_command_sample()`` and get it
+    attributed to the wrong ``tool_call_id``. Fail-open and silent — this is
+    best-effort hygiene, not an observation of its own.
+    """
+    if tool_name != "bash":
+        return
+    try:
+        from deerflow.sandbox.telemetry import consume_command_sample
+
+        consume_command_sample()
+    except Exception:
+        pass
 
 
 def _classify_transform(
@@ -925,6 +958,7 @@ class AnsichRawToolMiddleware(AgentMiddleware):
                 )
             except Exception:
                 pass
+            _discard_stray_command_sample(invocation.registration.tool_name)
             raise
         try:
             _record_raw_result(
@@ -937,10 +971,14 @@ class AnsichRawToolMiddleware(AgentMiddleware):
             )
         except Exception:
             pass
+        # environment.sampled's correlation_id is the DeerFlow run_id (unlike
+        # this file's tool observations, which all use task_id) — read the
+        # real run_id from runtime.context, falling back to task_id only when
+        # it is absent (e.g. non-Gateway callers that never seeded it).
         _emit_command_environment_sample(
             service=execution.service,
             task_id=execution.task_id,
-            run_id=execution.task_id,
+            run_id=_run_id_from_request(request) or execution.task_id,
             tool_name=invocation.registration.tool_name,
             tool_call_id=invocation.registration.tool_call_id,
             thread_id=_thread_id_from_request(request),
@@ -978,6 +1016,7 @@ class AnsichRawToolMiddleware(AgentMiddleware):
                 )
             except Exception:
                 pass
+            _discard_stray_command_sample(invocation.registration.tool_name)
             raise
         try:
             _record_raw_result(
@@ -990,10 +1029,14 @@ class AnsichRawToolMiddleware(AgentMiddleware):
             )
         except Exception:
             pass
+        # environment.sampled's correlation_id is the DeerFlow run_id (unlike
+        # this file's tool observations, which all use task_id) — read the
+        # real run_id from runtime.context, falling back to task_id only when
+        # it is absent (e.g. non-Gateway callers that never seeded it).
         _emit_command_environment_sample(
             service=execution.service,
             task_id=execution.task_id,
-            run_id=execution.task_id,
+            run_id=_run_id_from_request(request) or execution.task_id,
             tool_name=invocation.registration.tool_name,
             tool_call_id=invocation.registration.tool_call_id,
             thread_id=_thread_id_from_request(request),
