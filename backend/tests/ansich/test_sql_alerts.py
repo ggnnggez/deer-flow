@@ -938,8 +938,16 @@ async def test_periodic_alert_reconciliation_skips_historical_episode_evidence(
     assert stable_changes == 0
     alert_episode_queries = [statement for statement in reconciliation_statements if "from ansich_alerts" in statement]
     alert_evidence_queries = [statement for statement in reconciliation_statements if "from ansich_alert_evidence" in statement]
-    assert len(alert_episode_queries) == 1
-    assert "max(ansich_alerts.episode)" in alert_episode_queries[0]
+    reconciliation_queries = [statement for statement in alert_episode_queries if "max(ansich_alerts.episode)" in statement]
+    # Environment assessment adds exactly one bounded candidate lookup per
+    # tick — the still-unresolved environment episodes, which is what keeps an
+    # environment Scope in the candidate set after its Tasks end. It reads no
+    # historical episode and does not scale with them, so it does not weaken
+    # what this test protects.
+    environment_candidate_queries = [statement for statement in alert_episode_queries if "resolved_at is null" in statement]
+    assert len(reconciliation_queries) == 1
+    assert len(environment_candidate_queries) == 1
+    assert len(alert_episode_queries) == 2
     assert alert_evidence_queries == []
 
 

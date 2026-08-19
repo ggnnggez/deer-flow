@@ -1,4 +1,5 @@
 from ansich import AnsichService
+from ansich.environment import EnvironmentThresholds
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from deerflow.ansich.persistence.sql import SqlAnsichBackend
@@ -66,6 +67,8 @@ def create_sql_ansich_service(
     exact_repetition_window: int = 5,
     tool_frequency_window_seconds: int = 300,
     tool_frequency_threshold: int = 30,
+    environment_sample_interval_seconds: int = 10,
+    environment_thresholds: EnvironmentThresholds | None = None,
 ) -> AnsichService:
     return AnsichService(
         SqlAnsichBackend(
@@ -79,6 +82,8 @@ def create_sql_ansich_service(
             exact_repetition_window=exact_repetition_window,
             tool_frequency_window_seconds=tool_frequency_window_seconds,
             tool_frequency_threshold=tool_frequency_threshold,
+            environment_sample_interval_seconds=environment_sample_interval_seconds,
+            environment_thresholds=environment_thresholds,
         ),
         queue_capacity=queue_capacity,
         queue_byte_capacity=queue_byte_capacity,
@@ -87,6 +92,27 @@ def create_sql_ansich_service(
         terminal_flush_timeout_ms=terminal_flush_timeout_ms,
         projector_poll_interval_ms=projector_poll_interval_ms,
         operations_assessment_interval_ms=operations_assessment_interval_ms,
+    )
+
+
+def environment_thresholds_from_config(assessors) -> EnvironmentThresholds:
+    """Map ``AnsichAssessorConfig``'s ``environment_*`` knobs onto the rule model.
+
+    One field per knob, prefix dropped. Kept as a named function so the mapping
+    is testable without assembling a service, and so a new threshold has exactly
+    one place to be threaded through.
+    """
+
+    return EnvironmentThresholds(
+        fd_warn_ratio=assessors.environment_fd_warn_ratio,
+        fd_critical_ratio=assessors.environment_fd_critical_ratio,
+        disk_free_warn_ratio=assessors.environment_disk_free_warn_ratio,
+        disk_free_critical_ratio=assessors.environment_disk_free_critical_ratio,
+        psi_warn_milli=assessors.environment_psi_warn_milli,
+        psi_critical_milli=assessors.environment_psi_critical_milli,
+        leak_min_samples=assessors.environment_leak_min_samples,
+        leak_window_seconds=assessors.environment_leak_window_seconds,
+        leak_min_growth=assessors.environment_leak_min_growth,
     )
 
 
@@ -119,7 +145,13 @@ def create_embedded_ansich_service(config, session_factory):
         exact_repetition_window=config.assessors.exact_repetition_window,
         tool_frequency_window_seconds=config.assessors.tool_frequency_window_seconds,
         tool_frequency_threshold=config.assessors.tool_frequency_threshold,
+        environment_sample_interval_seconds=config.effective_environment_sample_interval_seconds,
+        environment_thresholds=environment_thresholds_from_config(config.assessors),
     )
 
 
-__all__ = ["create_embedded_ansich_service", "create_sql_ansich_service"]
+__all__ = [
+    "create_embedded_ansich_service",
+    "create_sql_ansich_service",
+    "environment_thresholds_from_config",
+]

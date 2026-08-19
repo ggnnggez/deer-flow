@@ -21,6 +21,8 @@ AlertType = Literal[
     "attempted_scope_violation",
     "realized_scope_violation",
     "unverified_effect",
+    "environment_pressure",
+    "environment_leak_suspected",
     "observability_degradation",
     "projection_failure",
 ]
@@ -445,6 +447,33 @@ def alert_conditions_from_assessment(
                 stable_condition_key=conclusion,
                 active=value == "present",
                 severity=severity,
+            ),
+        )
+    if assessment.field_name.startswith("environment_pressure:"):
+        metric = assessment.field_name.split(":", 1)[1]
+        # "unknown" is deliberately inactive: an unobserved Scope is not a
+        # healthy one, but it is also not evidence of pressure, so it resolves
+        # an open episode rather than sustaining it.
+        pressure_severity: AlertSeverity = "critical" if value == "critical" else "warning"
+        return (
+            _condition(
+                assessment,
+                source_assertion_id=source_assertion_id,
+                alert_type="environment_pressure",
+                stable_condition_key=f"env:{metric}",
+                active=value in {"warning", "critical"},
+                severity=pressure_severity,
+            ),
+        )
+    if assessment.field_name == "environment_leak:fd_open":
+        return (
+            _condition(
+                assessment,
+                source_assertion_id=source_assertion_id,
+                alert_type="environment_leak_suspected",
+                stable_condition_key="env-leak:fd_open",
+                active=value == "suspected",
+                severity="warning",
             ),
         )
     return ()

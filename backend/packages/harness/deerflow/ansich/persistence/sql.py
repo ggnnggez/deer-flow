@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+from collections.abc import Sequence
 from datetime import UTC, datetime, timedelta
 from typing import Literal, cast
 from uuid import uuid4
@@ -42,6 +43,7 @@ from ansich import (
     scope_reference_hash,
 )
 from ansich.alerts.episodes import (
+    AlertCondition,
     AlertEpisode,
     AlertReconciliation,
     acknowledge_alert,
@@ -104,6 +106,11 @@ from ansich.contracts import (
     control_values_for_lifecycle_scope,
 )
 from ansich.control import should_select_control_candidate
+from ansich.environment import (
+    EnvironmentThresholds,
+    assess_environment_leak,
+    assess_environment_pressure,
+)
 from ansich.evaluation import (
     EVALUATION_OBSERVATION_KIND,
     EvaluationProjectionStatus,
@@ -693,6 +700,8 @@ class SqlAnsichBackend:
         exact_repetition_window: int = 5,
         tool_frequency_window_seconds: int = 300,
         tool_frequency_threshold: int = 30,
+        environment_sample_interval_seconds: int = 10,
+        environment_thresholds: EnvironmentThresholds | None = None,
     ) -> None:
         self._session_factory = session_factory
         self._projector_lease_seconds = projector_lease_seconds
@@ -707,9 +716,13 @@ class SqlAnsichBackend:
             raise ValueError("tool_frequency_window_seconds must be positive")
         if tool_frequency_threshold < 1:
             raise ValueError("tool_frequency_threshold must be positive")
+        if environment_sample_interval_seconds < 1:
+            raise ValueError("environment_sample_interval_seconds must be positive")
         self._exact_repetition_window = exact_repetition_window
         self._tool_frequency_window_seconds = tool_frequency_window_seconds
         self._tool_frequency_threshold = tool_frequency_threshold
+        self._environment_sample_interval_seconds = environment_sample_interval_seconds
+        self._environment_thresholds = environment_thresholds or EnvironmentThresholds()
         self._lease_owner = str(uuid4())
         self._watermark: int | None = None
         self._failed_jobs = 0
@@ -2566,15 +2579,51 @@ class SqlAnsichBackend:
         source_assertion_id: str,
         now: datetime,
     ) -> int:
-        conditions = alert_conditions_from_assessment(
-            assessment,
-            source_assertion_id=source_assertion_id,
+        return await self._reconcile_alerts_for_assessments(
+            session,
+            subject_id=assessment.subject_id,
+            assessments=((assessment, source_assertion_id),),
+            now=now,
         )
+
+    async def _reconcile_alerts_for_assessments(
+        self,
+        session: AsyncSession,
+        *,
+        subject_id: str,
+        assessments: Sequence[tuple[Assessment, str]],
+        now: datetime,
+        possibly_affected_task_ids: list[str] | None = None,
+    ) -> int:
+        """Reconcile one subject's whole assessment result against its episodes.
+
+        ``reconcile_alert_conditions`` resolves any unresolved episode in an
+        evaluated ``(subject, rule, alert_type)`` scope whose stable key is not
+        reported. That is only correct if the conditions handed to it are
+        *exhaustive* for that scope, so a subject with several stable keys under
+        one rule and type — an environment Scope carrying ``env:fd_open`` beside
+        ``env:disk_free_bytes`` — must be reconciled in one call. Reconciling it
+        metric by metric would make each metric resolve its siblings' episodes.
+
+        ``possibly_affected_task_ids`` is written onto every Alert read-model row
+        this call creates or updates; it stays ``None`` (and the column
+        untouched) for Task-subject assessments, where the subject already is
+        the affected Task.
+        """
+
+        conditions: list[AlertCondition] = []
+        for assessment, source_assertion_id in assessments:
+            conditions.extend(
+                alert_conditions_from_assessment(
+                    assessment,
+                    source_assertion_id=source_assertion_id,
+                )
+            )
         if not conditions:
             return 0
         summary = await session.get(
             AnsichTaskSummaryRow,
-            assessment.subject_id,
+            subject_id,
         )
         if summary is not None and summary.control_value in {
             "completed",
@@ -2584,7 +2633,7 @@ class SqlAnsichBackend:
             return 0
         episodes = await self._load_reconciliation_alert_episodes(
             session,
-            task_id=assessment.subject_id,
+            task_id=subject_id,
         )
         reconciliations = reconcile_alert_conditions(
             episodes,
@@ -2620,6 +2669,7 @@ class SqlAnsichBackend:
             await self._persist_alert_episode(
                 session,
                 reconciliation=reconciliation,
+                possibly_affected_task_ids=possibly_affected_task_ids,
             )
             by_id[candidate.alert_id] = candidate
             changed += 1
@@ -2637,6 +2687,7 @@ class SqlAnsichBackend:
         session: AsyncSession,
         *,
         reconciliation: AlertReconciliation,
+        possibly_affected_task_ids: list[str] | None = None,
     ) -> None:
         alert = reconciliation.alert
         if alert is None:
@@ -2737,6 +2788,7 @@ class SqlAnsichBackend:
                     resolved_at=alert.resolved_at,
                     summary_json=summary_json,
                     evidence_count=len(alert.evidence),
+                    possibly_affected_task_ids=possibly_affected_task_ids,
                 )
             )
         else:
@@ -2749,6 +2801,8 @@ class SqlAnsichBackend:
             read_model.resolved_at = alert.resolved_at
             read_model.summary_json = summary_json
             read_model.evidence_count = len(alert.evidence)
+            if possibly_affected_task_ids is not None:
+                read_model.possibly_affected_task_ids = possibly_affected_task_ids
 
     async def _resolve_terminal_alerts(
         self,
@@ -4413,11 +4467,225 @@ class SqlAnsichBackend:
                 incomplete_tasks=incomplete_tasks,
                 global_loss=global_loss,
             )
+            changed += await self._assess_environment(session, asserted_at)
         await self._refresh_active_task_read_model(
             now=asserted_at,
             lost_ranges=lost_ranges,
         )
         return changed
+
+    #: Alert types produced by ``environment-pressure@1``. An unresolved
+    #: episode of one of these keeps its Scope in the assessment candidate set
+    #: even after every Task attached to it has ended, so the episode can still
+    #: be resolved instead of being stranded open forever.
+    _ENVIRONMENT_ALERT_TYPES = ("environment_pressure", "environment_leak_suspected")
+
+    async def _assess_environment(
+        self,
+        session: AsyncSession,
+        asserted_at: datetime,
+    ) -> int:
+        """Assess every environment Scope that still matters, once per tick.
+
+        A Scope is a candidate when a running Task is attached to it, or when it
+        still carries an unresolved environment Alert. Everything else is
+        historical: its readings are frozen and re-judging them would only
+        append noise.
+        """
+
+        running_by_scope: dict[str, list[str]] = {}
+        rows = await session.execute(
+            select(AnsichRelationRow.object_id, AnsichRelationRow.subject_id)
+            .join(
+                AnsichTaskSummaryRow,
+                AnsichTaskSummaryRow.task_id == AnsichRelationRow.subject_id,
+            )
+            .where(
+                AnsichRelationRow.predicate == "within_scope",
+                AnsichRelationRow.relation_role.in_(("sandbox_boundary", "host_environment")),
+                AnsichTaskSummaryRow.control_value == "running",
+            )
+        )
+        for scope_id, task_id in rows:
+            running_by_scope.setdefault(scope_id, []).append(task_id)
+        open_alert_scopes = set(
+            (
+                await session.execute(
+                    select(AnsichAlertRow.subject_id).where(
+                        AnsichAlertRow.alert_type.in_(self._ENVIRONMENT_ALERT_TYPES),
+                        AnsichAlertRow.resolved_at.is_(None),
+                    )
+                )
+            ).scalars()
+        )
+        candidate_scopes = sorted(set(running_by_scope) | open_alert_scopes)
+        if not candidate_scopes:
+            return 0
+        state_by_scope: dict[str, list[AnsichEnvironmentStateRow]] = {}
+        for row in (await session.execute(select(AnsichEnvironmentStateRow).where(AnsichEnvironmentStateRow.scope_id.in_(candidate_scopes)).order_by(AnsichEnvironmentStateRow.environment_scope, AnsichEnvironmentStateRow.metric))).scalars():
+            state_by_scope.setdefault(row.scope_id, []).append(row)
+        coverage_by_scope: dict[str, dict[str, AnsichEnvironmentCoverageRow]] = {}
+        for row in (await session.execute(select(AnsichEnvironmentCoverageRow).where(AnsichEnvironmentCoverageRow.scope_id.in_(candidate_scopes)).order_by(AnsichEnvironmentCoverageRow.environment_scope))).scalars():
+            coverage_by_scope.setdefault(row.scope_id, {})[row.environment_scope] = row
+        thresholds = self._environment_thresholds
+        changed = 0
+        for scope_id in candidate_scopes:
+            coverage_rows = coverage_by_scope.get(scope_id, {})
+            assessments: list[Assessment] = []
+            observed_environment_scopes = {row.environment_scope for row in state_by_scope.get(scope_id, ())}
+            for row in state_by_scope.get(scope_id, ()):
+                coverage = coverage_rows.get(row.environment_scope)
+                # A state row without a coverage row can only come from a
+                # partially projected Scope; the sample itself proves continuous
+                # collection, so assume that rather than skipping the reading.
+                coverage_value = coverage.coverage if coverage is not None else "continuous"
+                pressure = assess_environment_pressure(
+                    scope_id=scope_id,
+                    metric=row.metric,
+                    environment_scope=row.environment_scope,
+                    coverage=coverage_value,
+                    latest_value=row.latest_value,
+                    limit=row.limit_value,
+                    as_of=_as_utc(row.as_of),
+                    last_obs_id=row.last_obs_id,
+                    now=asserted_at,
+                    sample_interval_seconds=self._environment_sample_interval_seconds,
+                    thresholds=thresholds,
+                )
+                if pressure is not None:
+                    assessments.append(pressure)
+                if row.metric == "fd_open":
+                    leak = assess_environment_leak(
+                        scope_id=scope_id,
+                        environment_scope=row.environment_scope,
+                        coverage=coverage_value,
+                        consecutive_growth_count=row.consecutive_growth_count,
+                        growth_started_at=(_as_utc(row.growth_started_at) if row.growth_started_at is not None else None),
+                        window_min_value=row.window_min_value,
+                        latest_value=row.latest_value,
+                        as_of=_as_utc(row.as_of),
+                        last_obs_id=row.last_obs_id,
+                        now=asserted_at,
+                        thresholds=thresholds,
+                    )
+                    if leak is not None:
+                        assessments.append(leak)
+            for environment_scope, coverage in coverage_rows.items():
+                if coverage.coverage != "uninstrumented":
+                    continue
+                if environment_scope in observed_environment_scopes:
+                    # A Scope that went uninstrumented after being sampled keeps
+                    # its state rows, and those already produced the unknown
+                    # assertions above; a synthetic declaration here would only
+                    # duplicate one of them under the same field name.
+                    continue
+                # An uninstrumented declaration has no state rows at all, so it
+                # would otherwise leave no Belief. Recording the unknown makes
+                # "we cannot see this Scope" queryable instead of invisible.
+                declaration = assess_environment_pressure(
+                    scope_id=scope_id,
+                    metric="fd_open",
+                    environment_scope=environment_scope,
+                    coverage="uninstrumented",
+                    latest_value=0,
+                    limit=None,
+                    as_of=_as_utc(coverage.as_of),
+                    last_obs_id=coverage.last_obs_id,
+                    now=asserted_at,
+                    sample_interval_seconds=self._environment_sample_interval_seconds,
+                    thresholds=thresholds,
+                )
+                if declaration is not None:
+                    assessments.append(declaration)
+            if not assessments:
+                continue
+            reconciled: list[tuple[Assessment, str]] = []
+            for assessment in assessments:
+                assertion, did_change = await self._persist_environment_assessment(
+                    session,
+                    assessment,
+                )
+                changed += int(did_change)
+                reconciled.append((assessment, assertion.assertion_id))
+            await self._reconcile_alerts_for_assessments(
+                session,
+                subject_id=scope_id,
+                assessments=reconciled,
+                now=asserted_at,
+                # Sorted so the persisted read-model list is a function of the
+                # running set, not of row order.
+                possibly_affected_task_ids=sorted(running_by_scope.get(scope_id, ())),
+            )
+        return changed
+
+    async def _persist_environment_assessment(
+        self,
+        session: AsyncSession,
+        assessment: Assessment,
+    ) -> tuple[AnsichBeliefAssertionRow, bool]:
+        """Append an environment Assertion only when the category transitions.
+
+        This mirrors the heartbeat block's unchanged-skip rather than
+        ``_persist_assessment``'s, with one deliberate difference: neither
+        ``as_of`` nor the evidence Observation participates in the comparison.
+        Both advance with every accepted sample, so including them would append
+        an Assertion per sample and defeat the transition-only property the
+        stable value dict exists to provide. The retained Assertion keeps
+        pointing at the Observation that first established the state, which is
+        exactly what it asserts; the current numbers live in the environment
+        read-model rows.
+        """
+
+        latest = await session.scalar(
+            select(AnsichBeliefAssertionRow)
+            .where(
+                AnsichBeliefAssertionRow.subject_id == assessment.subject_id,
+                AnsichBeliefAssertionRow.field_name == assessment.field_name,
+                AnsichBeliefAssertionRow.assessor_name == assessment.assessor.name,
+                AnsichBeliefAssertionRow.assessor_version == assessment.assessor.version,
+                AnsichBeliefAssertionRow.config_hash == assessment.config_hash,
+            )
+            .order_by(
+                AnsichBeliefAssertionRow.asserted_at.desc(),
+                AnsichBeliefAssertionRow.assertion_id.desc(),
+            )
+            .limit(1)
+        )
+        if latest is not None and latest.value_json == assessment.value:
+            return latest, False
+        assertion = AnsichBeliefAssertionRow(
+            assertion_id=new_id(),
+            subject_id=assessment.subject_id,
+            field_name=assessment.field_name,
+            value_json=assessment.value,
+            as_of=assessment.as_of,
+            asserted_at=assessment.asserted_at,
+            source_name=assessment.assessor.name,
+            source_version=assessment.assessor.version,
+            assessor_name=assessment.assessor.name,
+            assessor_version=assessment.assessor.version,
+            config_hash=assessment.config_hash,
+            authority_class=assessment.authority_class,
+            fidelity_class=assessment.fidelity_class,
+            confidence=assessment.confidence,
+        )
+        session.add(assertion)
+        for ordinal, evidence in enumerate(assessment.evidence):
+            session.add(
+                AnsichBeliefEvidenceRow(
+                    assertion_id=assertion.assertion_id,
+                    obs_id=evidence.obs_id,
+                    evidence_role=evidence.role,
+                    ordinal=ordinal,
+                )
+            )
+        await session.flush()
+        await self._resolve_current_assessment(
+            session,
+            subject_id=assessment.subject_id,
+            field_name=assessment.field_name,
+        )
+        return assertion, True
 
     async def _assess_and_reconcile_dwell(
         self,
