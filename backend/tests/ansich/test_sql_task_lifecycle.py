@@ -935,7 +935,7 @@ def test_projection_dependency_deadline_migration_upgrades_sqlite(tmp_path) -> N
         engine.dispose()
 
     assert "dependency_pending_since" in column_names
-    assert revision == "0025_ansich_assessor_watermarks"
+    assert revision == "0026_ansich_environment"
     assert len(revision) <= 32
 
 
@@ -959,7 +959,7 @@ def test_assessor_dependency_deadline_migration_upgrades_sqlite(tmp_path) -> Non
         engine.dispose()
 
     assert "dependency_pending_since" in column_names
-    assert revision == "0025_ansich_assessor_watermarks"
+    assert revision == "0026_ansich_environment"
     assert len(revision) <= 32
 
 

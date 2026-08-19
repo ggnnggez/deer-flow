@@ -51,7 +51,7 @@ from deerflow.persistence.migrations._helpers import _normalize_default
 asyncio_test = pytest.mark.asyncio
 
 
-HEAD = "0025_ansich_assessor_watermarks"
+HEAD = "0026_ansich_environment"
 BASELINE = "0001_baseline"
 
 
@@ -1064,7 +1064,7 @@ class TestDecideState:
 # ---------------------------------------------------------------------------
 
 
-def test_head_revision_is_ansich_assessor_watermarks_revision() -> None:
+def test_head_revision_is_ansich_environment_revision() -> None:
     assert _get_head_revision() == HEAD
 
 

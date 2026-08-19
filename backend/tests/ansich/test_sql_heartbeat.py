@@ -22,7 +22,7 @@ from deerflow.persistence.base import Base
 PREVIOUS_REVISION = "0023_ansich_evaluations"
 #: Upgrading to ``head`` lands past 0024 once later revisions exist, so the
 #: chain-head assertions track this rather than the revision under test.
-HEAD_REVISION = "0025_ansich_assessor_watermarks"
+HEAD_REVISION = "0026_ansich_environment"
 
 
 def _alembic_config(database_path: Path) -> AlembicConfig:

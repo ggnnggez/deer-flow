@@ -1242,6 +1242,7 @@ class AnsichAlertReadModelRow(Base):
     resolved_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     summary_json: Mapped[dict] = mapped_column(JSON, nullable=False)
     evidence_count: Mapped[int] = mapped_column(Integer, nullable=False)
+    possibly_affected_task_ids: Mapped[list | None] = mapped_column(JSON)
 
     __table_args__ = (
         Index(
@@ -1585,3 +1586,83 @@ class AnsichReleaseQualityStatsRow(Base):
     scale_higher_is_better: Mapped[bool | None] = mapped_column(Boolean)
     as_of: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
     projector_version: Mapped[str] = mapped_column(String(32), nullable=False)
+
+
+class AnsichEnvironmentCoverageRow(Base):
+    """Per-(Scope, environment_scope) materialized observability coverage.
+
+    Tracks how well an environment probe (e.g. cgroup/procfs/docker-stats) is
+    currently covering a Scope, so operations can distinguish "no growth
+    observed" from "not observed at all".
+    """
+
+    __tablename__ = "ansich_environment_coverage"
+
+    scope_id: Mapped[str] = mapped_column(
+        String(36),
+        ForeignKey("ansich_entities.entity_id", ondelete="CASCADE"),
+        primary_key=True,
+    )
+    environment_scope: Mapped[str] = mapped_column(String(64), primary_key=True)
+    coverage: Mapped[str] = mapped_column(String(32), nullable=False)
+    provider: Mapped[str] = mapped_column(String(64), nullable=False)
+    as_of: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    last_obs_id: Mapped[str] = mapped_column(String(36), nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, default=_utc_now)
+
+
+class AnsichEnvironmentStateRow(Base):
+    """Per-(Scope, environment_scope, metric) materialized environment reading.
+
+    Carries both the latest observed value and a bounded growth window
+    (``window_started_at`` / ``window_min_value`` / ``consecutive_growth_count``
+    / ``growth_started_at``) so an assessor can detect sustained monotonic
+    growth (e.g. a leaking fd count) without rescanning raw observations.
+    """
+
+    __tablename__ = "ansich_environment_state"
+
+    scope_id: Mapped[str] = mapped_column(
+        String(36),
+        ForeignKey("ansich_entities.entity_id", ondelete="CASCADE"),
+        primary_key=True,
+    )
+    environment_scope: Mapped[str] = mapped_column(String(64), primary_key=True)
+    metric: Mapped[str] = mapped_column(String(64), primary_key=True)
+    latest_value: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    limit_value: Mapped[int | None] = mapped_column(BigInteger)
+    as_of: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    window_started_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    window_min_value: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    sample_count: Mapped[int] = mapped_column(Integer, nullable=False)
+    consecutive_growth_count: Mapped[int] = mapped_column(Integer, nullable=False)
+    growth_started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    last_obs_id: Mapped[str] = mapped_column(String(36), nullable=False)
+    provider: Mapped[str] = mapped_column(String(64), nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, default=_utc_now)
+
+    __table_args__ = (Index("ix_ansich_env_state_scope", "scope_id"),)
+
+
+class AnsichToolEnvSampleRow(Base):
+    """Per-tool-call environment sample (I/O bytes, peak fd count).
+
+    Deliberately carries no foreign keys: per-command environment rows do not
+    participate in dependency-wait projection (see Task 8), so a sample can be
+    written even when its Task/Scope/ToolCall projections have not landed yet.
+    """
+
+    __tablename__ = "ansich_tool_env_samples"
+
+    tool_call_id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    task_id: Mapped[str] = mapped_column(String(36), nullable=False)
+    scope_id: Mapped[str] = mapped_column(String(36), nullable=False)
+    io_read_bytes: Mapped[int | None] = mapped_column(BigInteger)
+    io_write_bytes: Mapped[int | None] = mapped_column(BigInteger)
+    fd_peak: Mapped[int | None] = mapped_column(BigInteger)
+    sample_count: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    started_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    ended_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    obs_id: Mapped[str] = mapped_column(String(36), nullable=False)
+
+    __table_args__ = (Index("ix_ansich_tool_env_samples_task", "task_id"),)
