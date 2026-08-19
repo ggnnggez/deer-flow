@@ -263,8 +263,9 @@ async def test_bootstrap_schema_branches_on_postgres() -> None:
     """The three-branch bootstrap, including the postgres advisory lock path.
 
     * empty -- ``create_all`` + ``stamp head``. This is the branch that renders
-      ``Base.metadata`` through the postgres dialect (JSONB, partial indexes),
-      so it is also the check that the ORM models compile as DDL here at all.
+      ``Base.metadata`` through the postgres dialect (``sa.JSON`` -> ``json``,
+      partial indexes, timezone-aware timestamps), so it is also the check that
+      the ORM models compile as DDL here at all.
     * versioned -- an existing ``alembic_version`` at an older revision must be
       upgraded rather than stamped over.
     * legacy -- DeerFlow tables but no ``alembic_version``: baseline backfill,

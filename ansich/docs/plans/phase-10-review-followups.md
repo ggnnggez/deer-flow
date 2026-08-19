@@ -124,6 +124,13 @@
   - `tests/ansich/test_task_lifecycle.py::test_background_writer_makes_running_task_queryable_without_explicit_flush`(`anyio.fail_after(0.5)`)与 `tests/ansich/test_sql_heartbeat.py::test_background_assessor_materializes_running_task_heartbeat_belief`(`asyncio.timeout(1)`):等的是确定性条件(轮询到 Task / heartbeat Belief 出现),但**期限本身**对负载敏感。它们真轮换红的话,唯一正确的改法是放宽那个期限——完成信号已经是确定性的,不需要再加 sleep。
   - `tests/ansich/test_task_lifecycle.py::test_rebuild_is_mutually_exclusive_with_background_projection` 里的 `anyio.sleep(0.05)`:那是给 projector loop「有机会」抢 job 的否定式断言窗口(`project_pending_during_rebuild == 0`),负载下只会让机会更少,方向是安全的,但它是一个时间窗而不是信号。
 - 验收:`uv run pytest tests/ansich -q` 背靠背连跑三次全绿——`483 passed` / 200.87s、`483 passed` / 210.40s、`483 passed` / 287.95s;评审第一轮补钉之后再全量跑一次,`484 passed` / 250.33s(改动前 481,本次新增三条机制钉子)。三条钉子都在 `tests/ansich/test_settle_isolation.py`:gate 只放行测试自己发起的调用;gate 挂的确实是 projector loop 真正走的那个方法(用**真 service** + 1ms 评估间隔,数后端边界上的调用数,断言 loop 发起 0 次、测试发起 1 次,含 `stop()` 收尾那次);本目录的裸引擎报 `wal` / `30000`。这三个机制坏掉时都是静默的(空闲机器上照样全绿),所以必须钉住。
+- 后续观察(Task 9 会话,2026-08-19,**不改状态、不是新诊断**):在 Task 9 的高并发负载下(与 dockerless PostgreSQL 集成层同机跑,`tests/ansich` 连跑 5 次),**29 条已上门禁的测试里有 2 条仍然翻红**。这不推翻本条的修复,但把验收的边界说清楚:**门禁只被 Task 8 那三次(外加复审后一次)背靠背验收跑证明过,没有被证明在更重的负载下充分。**
+  - 翻红的两条(都已核对源码,确认带门禁):
+    - `tests/ansich/test_sql_safety.py:1410::test_scope_safety_reassessment_work_does_not_grow_with_tool_call_count` —— `only_test_driven_assessments(service)` 在 :1435,三个间隔全是 `60_000`(正是本条"同型清扫"里点名的 safety 第 1435 行)。失败文本:`assert [0, 2, 3, 1, 1] == [1, 1, 1, 1, 1]`。
+    - `tests/ansich/test_sql_alerts.py:947::test_failed_assessor_jobs_degrade_health_and_can_be_retried` —— `only_test_driven_assessments(service)` 在 :966,flush 与 ops 评估间隔均为 `60_000`。**只有测试 id,没拿到失败文本**(后台 `-q` 捕获只留了 summary),证据强度与本条第 4 项的留观标记同级。
+  - 同一批还翻红了 `tests/ansich/test_summarization_lineage.py:76::test_partial_list_content_trim_records_an_incomplete_compression_inventory`(`assert None is not None`)。它**没有**门禁、用的是 `create_sql_ansich_service(session_factory)` 的默认间隔,属于本条"只登记不修"里那 151 条的形状,不在本条的修复范围内——记在这里只是为了和上面两条区分开。
+  - 复现把手:**`[0, 2, 3, 1, 1]` 这个计数**。该测试每轮先清空 `assessed_subjects`、再 `await service.assess_operations(now=...)` 一次、然后记长度;五轮总和是 7(期望 5),且第 0 轮记到 0、第 1 轮记到 2 —— 同一次运行里既有缺也有多。
+  - 若它再轮换红:**先抓失败文本**,然后在两个方向里做判断,不要跳过取证直接下结论——(a) 评估是否经由门禁拦不到的路径到达了这个计数器(门禁重绑的是 `service.assess_operations`,而该计数器打在 `sql_module.assess_scope_safety` 这个领域函数上,两者不是同一个入口);(b) 或者在负载下推动这些计数器的根本不是评估,而是另一个竞争者。**本条不对这两种可能下结论**:Task 9 没有刻意复现,也没有加插桩。
 - 原始诊断(留档):
 - 位置:`backend/tests/ansich/` 的 SQLite 集成测试族(负载下轮换命中,每条单跑必过)。
 - 现状:Task 9 期间观察到一条与被测行为无关的失败,在不同测试之间轮换出现;同族现象在 Phase 7 已经确诊为投影 settle 时序对套件级负载敏感,而不是被测代码的缺陷。它现在的代价是每次全量跑都要人工判断"这条红是不是真的"。
