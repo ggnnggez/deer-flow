@@ -9,6 +9,25 @@ class AnsichAssessorConfig(BaseModel):
     exact_repetition_window: int = Field(default=5, ge=2)
     tool_frequency_window_seconds: int = Field(default=300, ge=1)
     tool_frequency_threshold: int = Field(default=30, ge=1)
+    environment_fd_warn_ratio: float = Field(default=0.8, gt=0, le=1)
+    environment_fd_critical_ratio: float = Field(default=0.95, gt=0, le=1)
+    environment_disk_free_warn_ratio: float = Field(default=0.10, gt=0, le=1)
+    environment_disk_free_critical_ratio: float = Field(default=0.05, gt=0, le=1)
+    environment_psi_warn_milli: int = Field(default=40000, ge=1)
+    environment_psi_critical_milli: int = Field(default=80000, ge=1)
+    environment_leak_min_samples: int = Field(default=6, ge=1)
+    environment_leak_window_seconds: int = Field(default=60, ge=1)
+    environment_leak_min_growth: int = Field(default=50, ge=1)
+
+    @model_validator(mode="after")
+    def _validate_environment_thresholds(self) -> Self:
+        if self.environment_fd_warn_ratio >= self.environment_fd_critical_ratio:
+            raise ValueError("environment_fd_warn_ratio must be less than environment_fd_critical_ratio")
+        if self.environment_psi_warn_milli >= self.environment_psi_critical_milli:
+            raise ValueError("environment_psi_warn_milli must be less than environment_psi_critical_milli")
+        if self.environment_disk_free_critical_ratio >= self.environment_disk_free_warn_ratio:
+            raise ValueError("environment_disk_free_critical_ratio must be less than environment_disk_free_warn_ratio")
+        return self
 
 
 class AnsichConfig(BaseModel):
@@ -62,10 +81,27 @@ class AnsichConfig(BaseModel):
         ge=1,
         description="Largest accepted evaluation record payload; larger submissions are rejected rather than truncated.",
     )
+    environment_probe_enabled: bool = Field(
+        default=True,
+        description="Enable environment probe collection.",
+    )
+    environment_sample_interval_seconds: int | None = Field(
+        default=None,
+        ge=1,
+        description="Interval for environment sampling; None uses heartbeat_interval_seconds.",
+    )
+    environment_per_command_sampling: bool = Field(
+        default=True,
+        description="Enable per-command environment sampling.",
+    )
     assessors: AnsichAssessorConfig = Field(
         default_factory=AnsichAssessorConfig,
         description="Versioned runaway and frequency assessor thresholds.",
     )
+
+    @property
+    def effective_environment_sample_interval_seconds(self) -> int:
+        return self.environment_sample_interval_seconds or self.heartbeat_interval_seconds
 
     @model_validator(mode="after")
     def _validate_heartbeat_window(self) -> Self:

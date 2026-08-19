@@ -111,3 +111,24 @@ async def test_enabled_ansich_without_sql_storage_reports_failed_and_rejects_rec
     assert receipt.accepted is False
     assert receipt.reason == "storage_unavailable"
     assert health.status == "failed"
+
+
+def test_environment_defaults():
+    config = AnsichConfig()
+    assert config.environment_probe_enabled is True
+    assert config.environment_sample_interval_seconds is None
+    assert config.effective_environment_sample_interval_seconds == config.heartbeat_interval_seconds
+    assert config.environment_per_command_sampling is True
+    assert config.assessors.environment_leak_min_samples == 6
+
+
+def test_environment_interval_override_and_bounds():
+    config = AnsichConfig(environment_sample_interval_seconds=5)
+    assert config.effective_environment_sample_interval_seconds == 5
+    with pytest.raises(ValidationError):
+        AnsichConfig(environment_sample_interval_seconds=0)
+
+
+def test_environment_threshold_ordering():
+    with pytest.raises(ValidationError):
+        AnsichConfig(assessors={"environment_fd_warn_ratio": 0.96, "environment_fd_critical_ratio": 0.95})
