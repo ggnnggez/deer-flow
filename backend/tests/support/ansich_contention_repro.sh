@@ -75,7 +75,11 @@ cleanup() {
         wait "${hog_pids[@]}" 2>/dev/null
     fi
 }
-trap cleanup EXIT INT TERM
+# INT/TERM must also *stop*: without the explicit exit the loop would keep
+# running its remaining rounds unloaded (hogs dead) and count them as data.
+trap cleanup EXIT
+trap 'trap - EXIT; cleanup; exit 130' INT
+trap 'trap - EXIT; cleanup; exit 143' TERM
 
 cd "$BACKEND_DIR" || exit 1
 
@@ -116,7 +120,7 @@ echo "TOTAL FAILURES: $failures / $ROUNDS"
 if [ "$failures" -gt 0 ]; then
     echo "Read the saved rounds before changing anything -- F10-10's standing rule"
     echo "is failure text first, diagnosis second."
-else
-    rmdir "$OUT_DIR" 2>/dev/null
+    exit 1
 fi
+rmdir "$OUT_DIR" 2>/dev/null
 exit 0

@@ -261,7 +261,7 @@
 - 状态:⬜ 未修复。来源:Phase 11 前加固批的**批终审**(不是 Phase 10 终审)。经核实是**既存缺陷**——在该批的基线 `38767157` 上已经是这个形状,非本批引入。
 - 位置:`backend/packages/harness/deerflow/ansich/persistence/sql.py::_assess_scope_safety_at`(sql.py:1873-1884)。
 - 现状:该函数直接取 observation 行的 `row.payload_json or {}`,随后 `AuthorizationSnapshot.model_validate(payload.get("snapshot"))` / `ToolEffect.model_validate(payload.get("effect"))`,**中间没有任何 `ansich_payloads` 的 hydrate 步骤**。一条走了 externalize 的 `authorization.*`/`effect.*` observation 在库里就是 `payload_json IS NULL`,于是这里拿到 `None`,`model_validate` 直接抛 `ValidationError`。F10-8 修的是**投影认领**那一侧(`contracts.py` 的 envelope 校验器,contracts.py:243-278),这条 assessor 侧的原始行读取是同一危害类下另一条独立的、仍然敞开的兄弟。
-- 出错方向(诚实但吵闹的那个):assessor job 按非依赖类异常耗尽 attempts,转成 durable `failed` 并进入 failed-job 诊断面;**不会**产出被伪造的 scope-safety 结论,fail-open 也保持——业务执行不受影响。真实代价是该 ToolCall 的 safety 姿态从「unknown / 未评估」退化成一条需要运维处理的失败作业。
+- 出错方向(诚实但吵闹的那个):assessor job 按非依赖类异常耗尽 attempts,转成 durable `failed` 并进入 failed-job 诊断面;**不会**产出被伪造的 scope-safety 结论,fail-open 也保持——业务执行不受影响。真实代价是该 ToolCall 的 safety 姿态从「unknown / 未评估」退化成一条需要运维处理的失败作业——且影响面不止这一条 ToolCall:失败的评估会回滚水位推进,`affected` 过滤器也跳不过读不出的行(`_scope_safety_evidence_subject` 对 externalized 行返回 `None`),毒行因此落进之后每一个评估窗口,该 **Task** 的 scope-safety 评估整体停摆,直到失败作业被处理。
 - 概率:低。两种 payload 都很小(一个 snapshot / 一个 effect),要越过 `inline_payload_max_bytes` 才会 externalize,默认配置下几乎撞不到——F10-8 的回归用例是把阈值压到 16 字节才逼出来的。
 - 方向:二选一——(a) 让这条读走 F10-8 守卫用的同一条 payload-store 读路径,把 externalized payload hydrate 回来再校验;(b) 读不到 payload 时守卫并跳过,同时给该 tool_call 留一个 `unassessed` 标记,不要静默当成「没有证据」。任选其一都要配「externalized authorization/effect 证据下 assessor 不产生失败作业」的回归。
 - 归属:Phase 11(与 F10-8 同一危害类,与 F10-6/F10-7 的韧性主题同批)。
