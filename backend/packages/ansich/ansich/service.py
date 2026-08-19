@@ -158,6 +158,13 @@ class AnsichService:
         self._evicted_producer_count = 0
         self._writer_consecutive_failures = 0
         self._writer_backoff_until: datetime | None = None
+        # Rows storage refused on their own, past `writer_item_max_attempts`,
+        # after the batch they arrived in had already been bisected. Each one is
+        # also charged as loss; this counter is what names the *reason*, which
+        # `dropped_count` alone cannot — and it is monotonic, so an incident
+        # stays legible while the writer oscillates between degraded and
+        # recovering around it.
+        self._poison_observation_count = 0
         # The batches the writer has taken off the queue and not yet placed.
         # Keyed by an opaque token so a batch can be released exactly once from
         # either the success path or the caller's `finally`, and kept whole so
@@ -435,9 +442,12 @@ class AnsichService:
                     backoff_until=self._writer_backoff_until,
                     # Items the writer holds are out of `queue_depth` — they no
                     # longer consume queue capacity — so this is the only place
-                    # they are visible. `poison_observation_count` keeps its
-                    # default until Task 5 isolates poison items.
+                    # they are visible.
                     in_flight_count=self._in_flight_observation_count(),
+                    # The one signal that separates "a row is unwritable" from
+                    # "storage was down": both charge loss, only one of them
+                    # will still be charging it after the outage clears.
+                    poison_observation_count=self._poison_observation_count,
                 ),
                 evicted_producer_count=self._evicted_producer_count,
             )
@@ -478,8 +488,8 @@ class AnsichService:
             with self._lock:
                 if not selected:
                     selected = self._take_task_items(task_id)
-                for _, observation in selected:
-                    self._record_observation_loss(observation)
+                for sequence, observation in selected:
+                    self._record_observation_loss(sequence, observation)
             return FlushResult(persisted=False, processed_count=0, reason="terminal_flush_timeout")
 
     async def get_task(self, task_id: str) -> TaskView | None:
@@ -1429,9 +1439,24 @@ class AnsichService:
         self._last_drop_warning_at = warning_at
         self._suppressed_drop_warning_count = 0
 
-    def _record_observation_loss(self, observation: ObservationEnvelope) -> None:
+    def _record_observation_loss(self, sequence: int, observation: ObservationEnvelope) -> None:
+        """Charge one observation at the **collector** sequence it was accepted under.
+
+        RA8①. The accept path allocates collector sequences, and every
+        `LostRange` a reader holds is numbered in them — including the ones the
+        reject path records through `_record_batch_loss`. Recording a loss at
+        `producer_seq` instead described the same gap in a *different*
+        numbering: that field is a producer's own per-producer counter, so two
+        producers legitimately share values and one producer's counter says
+        nothing about where its rows landed in the collector's order. Nothing
+        needed to change to fix it — every caller already carries the collector
+        sequence beside the observation in its `(sequence, observation)` tuple.
+
+        Callers must already hold ``self._lock``.
+        """
+
         self._record_loss(
-            observation.producer_seq,
+            sequence,
             observation.task_id,
             producer_name=observation.producer.name,
             producer_instance_id=observation.producer.instance_id,
@@ -1512,8 +1537,8 @@ class AnsichService:
         §2 keeps backoff inside the writer coroutine so it can never sit on an
         Agent call stack. A refused batch leaves the queue but is *not* charged
         as loss — it is parked in flight and retried until storage takes it, the
-        batch-level attempts run out (Task 5's isolation seam), or the service
-        starts draining.
+        batch-level attempts run out (`_isolate_poison_batch` then places it row
+        by row), or the service starts draining.
 
         **The persist lock covers taking the batch and writing it, and is given
         back before every wait.** Both halves of that are load-bearing:
@@ -1531,11 +1556,12 @@ class AnsichService:
           unwritable row would take the write path down with it.
 
         **Ordering contract.** The writer coroutine keeps FIFO for its own
-        processing: a parked batch is always retried to a conclusion before the
-        next batch is popped. The terminal barrier may interleave ahead of a
-        writer that is *waiting* — backing off or parked on an unwritable batch
-        — so during an incident rows can reach storage in a different order than
-        the collector sequence assigned them. That is the system's existing
+        processing: a parked batch is always resolved to a conclusion — placed,
+        bisected, or charged — before the next batch is popped. The terminal
+        barrier may interleave ahead of a writer that is *waiting* — backing off
+        or between two attempts of an isolated row — so during an incident rows
+        can reach storage in a different order than the collector sequence
+        assigned them. That is the system's existing
         late-arrival shape, not a new one: the assessor watermark exists
         precisely because evidence can be ingested after evidence that logically
         follows it, and collector sequence remains the authoritative order for
@@ -1591,35 +1617,157 @@ class AnsichService:
         *,
         in_flight_token: int,
     ) -> FlushResult:
-        """Seam for per-item poison isolation once batch retries are exhausted.
+        """Place the exhausted batch row by row, charging only what stays unwritable.
 
-        TODO(Task 5): persist the batch item by item, retry each item up to
-        ``writer_item_max_attempts``, and charge only the item storage keeps
-        refusing as a ``poison_observation`` loss so its neighbours still land.
+        Batch-level retries answer one question: *is storage down?* Once they
+        run out the answer is no — storage is up and something about this batch
+        is not writable — so the writer stops asking about the batch and starts
+        asking about each row. Each row gets its own
+        ``persist_and_project([obs])`` up to ``writer_item_max_attempts``; the
+        rows storage takes land, and a row it keeps refusing on its own is
+        declared poison: charged as loss at its **collector** sequence, counted
+        in ``WriterHealth.poison_observation_count``, warned about once, and
+        left behind so its batch-mates still reach storage.
 
-        Interim behaviour, and its honest system-level cost:
+        This is what removes the interim's real cost. A parked batch used to be
+        retried whole, forever, and the queue behind it filled to capacity and
+        tail-dropped — one unwritable row bought its neighbours' loss *plus*
+        every observation recorded during the park. Now the loss is exactly one
+        row wide.
 
-        * The parked batch is **preserved**, never dropped. It is retried at the
-          capped backoff interval until storage takes it or the service drains.
-        * Because one batch can be parked indefinitely, the queue behind it
-          fills to capacity and then tail-drops — the documented outage
-          semantics, and every dropped range is charged to its producer like any
-          other loss. Until Task 5 lands, a genuinely unwritable row therefore
-          costs new work, not just latency.
-        * The terminal flush barrier is **not** blocked: the persist lock is
-          held only for the attempts here, never across the waits, so healthy
-          Tasks keep reaching storage while this batch is stuck.
-        * The one exit is shutdown: a batch the drain still cannot place is
-          charged as loss instead of holding `stop()` open forever.
+        The properties that hold through the bisect:
+
+        * **Lock discipline is unchanged** (PA11): each row's attempt is taken
+          under ``persist_lock`` and every wait gives it back, so a terminal
+          barrier writes straight through an isolation phase rather than
+          spending its budget waiting for a lock.
+        * **One backoff schedule, not two.** The capped delay opens the phase —
+          the batch attempt that preceded it did just fail — and a row's own
+          retry uses the same exponential-from-initial schedule as the batch
+          path. A row that lands costs no wait at all, and neither does the row
+          after a poison verdict: that verdict *is* the finding that storage is
+          healthy.
+        * **Warnings are rate-limited**, sharing ``_warn_batch_loss``'s 60s
+          window with every other drop reason. A batch full of poison reports
+          the first row and counts the rest as suppressed rather than emitting
+          one WARNING per row.
+        * **The in-flight buffer shrinks as rows resolve**, so health, the flush
+          barrier and the stop drain never see the writer holding rows that are
+          already durable — or already charged.
+        * **Draining still wins.** A wait cut short by ``stop()`` charges the
+          remainder rather than holding shutdown open; Task 7 gives that drain
+          its own budget.
         """
 
-        while True:
-            await self._wait_before_retry(self._backoff_delay_seconds(None))
-            if not self._running:
-                return self._charge_batch_loss(selected, in_flight_token=in_flight_token)
-            result = await self._attempt_persist_locked(selected, in_flight_token=in_flight_token)
+        remaining = list(selected)
+        processed = 0
+        poison_count = 0
+        # The batch attempt that sent us here failed, so the first per-item
+        # attempt is a retry like any other and waits like one.
+        delay = self._backoff_delay_seconds(None)
+        while remaining:
+            item = remaining[0]
+            attempt = 0
+            result: FlushResult | None = None
+            while True:
+                if delay > 0:
+                    await self._wait_before_retry(delay)
+                    if not self._running:
+                        # Draining, and this row has already refused a write.
+                        # Retrying the rest would hold `stop()` open for as long
+                        # as storage stays unhappy, so the remainder is charged
+                        # and reported instead — the same trade `_flush_batch`
+                        # makes, and the same one Task 7 gives a budget to.
+                        self._charge_lost_batch(remaining, in_flight_token=in_flight_token)
+                        return FlushResult(persisted=False, processed_count=processed, reason="storage_failure")
+                attempt += 1
+                result = await self._attempt_persist_locked([item])
+                if result is not None or attempt >= self._writer_item_max_attempts:
+                    break
+                delay = self._backoff_delay_seconds(attempt)
+            remaining.pop(0)
             if result is not None:
-                return result
+                processed += result.processed_count
+            else:
+                self._charge_poison_observation(*item)
+                poison_count += 1
+            self._release_isolated_item(in_flight_token, remaining)
+            # Storage just answered about this row — it took it, or it refused
+            # this row alone every time it was asked while taking others. Either
+            # way the next row starts without a wait; only a failure buys one.
+            delay = 0.0
+        if poison_count:
+            return FlushResult(persisted=False, processed_count=processed, reason="poison_observation")
+        return FlushResult(persisted=True, processed_count=processed)
+
+    def _charge_poison_observation(self, sequence: int, observation: ObservationEnvelope) -> None:
+        """Charge one unwritable row, count it, and say so once per window.
+
+        The charge itself is the ordinary loss path — every loss in the service
+        funnels through ``_record_loss`` so the producer ledger cannot be
+        forgotten — at the collector sequence the accept path allocated for this
+        row (RA8①). ``poison_observation_count`` is the part loss accounting
+        cannot express: ``dropped_count`` says how much was lost, not that the
+        cause was one row rather than an outage, and during an incident the
+        writer's own failure count keeps being zeroed by every neighbour that
+        lands. The counter is monotonic, so it names the incident even while the
+        derived status oscillates between ``degraded`` and ``recovering``.
+
+        The WARNING reuses ``_warn_batch_loss`` verbatim, rate limit included:
+        a poison flurry must not become one log line per row.
+        """
+
+        lost_range = LostRange(
+            first_sequence=sequence,
+            last_sequence=sequence,
+            task_id=observation.task_id,
+            producer_name=observation.producer.name,
+            producer_instance_id=observation.producer.instance_id,
+        )
+        with self._lock:
+            self._poison_observation_count += 1
+            self._record_observation_loss(sequence, observation)
+            self._warn_batch_loss(
+                reason="poison_observation",
+                observation_count=1,
+                lost_ranges=(lost_range,),
+            )
+
+    def _release_isolated_item(
+        self,
+        in_flight_token: int,
+        remaining: list[tuple[int, ObservationEnvelope]],
+    ) -> None:
+        """Shrink the in-flight entry to what the bisect still holds.
+
+        The batch entered isolation as one in-flight unit and is resolved one
+        row at a time, so the buffer has to shrink with it: an entry still
+        naming rows that are already durable would report them as held, and a
+        cancellation reading that entry would charge them as lost.
+
+        The per-item attempts deliberately do **not** carry the batch's token —
+        `_record_write_success` releases the whole token, so the first row to
+        land would release its still-held neighbours — which is why the
+        caught-up rule that normally lives there is applied here instead, once
+        the last row has resolved.
+
+        It is applied whatever that last row's verdict was, poison included. The
+        latch means "still catching up on what a write failure left behind", and
+        a finished bisect is not catching up on anything: the writer holds
+        nothing and the queue is short. Nothing is hidden by clearing it either
+        — a bisect that charged a row leaves `dropped_count > 0`, which reports
+        ``degraded`` permanently, so the incident outlives the residue that was
+        evidence of it.
+        """
+
+        with self._lock:
+            if remaining:
+                if in_flight_token in self._in_flight:
+                    self._in_flight[in_flight_token] = tuple(remaining)
+                return
+            self._in_flight.pop(in_flight_token, None)
+            if not self._in_flight and len(self._queue) <= self._batch_size:
+                self._writer_retry_backlog = False
 
     async def _attempt_persist_locked(
         self,
@@ -1726,18 +1874,26 @@ class AnsichService:
         as lost and still reported as held would report the same observations
         twice to whoever is reading health at that moment.
 
-        ``only_if_parked`` is the cancellation path's guard — a batch that
-        already landed and was released has nothing to charge, and charging it
-        anyway would invent a loss that never happened.
+        ``only_if_parked`` is the cancellation path's guard, and it decides two
+        things at once. A batch that already landed and was released has nothing
+        to charge, and charging it anyway would invent a loss that never
+        happened. And what a still-parked batch may be charged is **what the
+        buffer says it holds**, not the list that entered: per-item isolation
+        shrinks that entry as rows resolve, so `selected` there names rows that
+        are already durable and rows already charged as poison. Reading the
+        released tuple keeps the charge exactly as wide as the remainder.
         """
 
+        charged: tuple[tuple[int, ObservationEnvelope], ...] | list[tuple[int, ObservationEnvelope]] = selected
         with self._lock:
             if in_flight_token is not None:
                 released = self._in_flight.pop(in_flight_token, None)
-                if only_if_parked and released is None:
-                    return False
-            for _, observation in selected:
-                self._record_observation_loss(observation)
+                if only_if_parked:
+                    if released is None:
+                        return False
+                    charged = released
+            for sequence, observation in charged:
+                self._record_observation_loss(sequence, observation)
             self._writer_backoff_until = None
         return True
 

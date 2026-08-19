@@ -7,6 +7,12 @@ only place a backoff wait is allowed to happen (spec §2: never on the Agent
 call stack) — with a backend that can be programmed to refuse a given number of
 writes.
 
+Where the batch budget runs out this file hands over: ``_isolate_poison_batch``
+then places the batch row by row, and what that costs a row storage will never
+take is ``test_poison_isolation.py``'s subject. The two tests here that reach
+that seam stay on this side of it — one lands the row inside the bisect, the
+other only asks whether the persist lock was held across the wait.
+
 No test here sits through a real backoff. ``_CapturingService`` overrides the
 single sleeping point of the retry path, so the schedule is asserted from the
 delays the production code computed rather than from wall-clock time. The one
@@ -348,15 +354,20 @@ async def test_records_keep_queueing_during_a_backoff_and_the_full_queue_tail_dr
 
 
 @pytest.mark.anyio
-async def test_an_exhausted_batch_is_kept_in_flight_instead_of_being_dropped() -> None:
-    """Past ``writer_retry_max_attempts`` the batch is parked, never charged.
+async def test_an_exhausted_batch_is_handed_to_per_item_isolation_not_charged_whole() -> None:
+    """Past ``writer_retry_max_attempts`` the batch is bisected, never charged.
 
-    Task 5 replaces that parking with per-item isolation. Until it does, the
-    contract this pins is the one that matters: exhausting the batch-level
-    attempts must not turn a retryable outage into a whole-batch loss.
+    Exhausting the batch budget is a change of question, not a verdict: the
+    writer stops asking "is storage down?" and starts asking about each row
+    (``_isolate_poison_batch``). A row that lands there was never poison, so an
+    outage lasting one attempt longer than the batch budget still costs nothing
+    — what it costs when the row really is unwritable is
+    ``test_poison_isolation.py``'s subject.
     """
 
-    backend = _RefusingBackend(failures=7)
+    # Five batch attempts, then the bisect's first per-item attempt, and storage
+    # is back for the row's second one.
+    backend = _RefusingBackend(failures=6)
     service = _CapturingService(backend, batch_size=1, flush_interval_ms=1)
     await service.start()
     try:
@@ -366,15 +377,19 @@ async def test_an_exhausted_batch_is_kept_in_flight_instead_of_being_dropped() -
     finally:
         await service.stop()
 
-    assert backend.attempts == 8
-    assert len(service.backoff_delays) == 7
-    # Every read taken while the writer was past its attempt budget still shows
-    # the batch held, not lost.
-    for entry in service.backoff_health[5:]:
+    assert backend.attempts == 7
+    # One schedule, not two: the batch's exponential run, the capped wait that
+    # opens the bisect, then the same exponential again for the row itself.
+    assert service.backoff_delays == pytest.approx([0.1, 0.2, 0.4, 0.8, 5.0, 0.1])
+    # Every read taken while the writer was past its batch budget still shows
+    # the work held, not lost.
+    for entry in service.backoff_health[4:]:
         assert entry.dropped_count == 0
         assert entry.writer.in_flight_count == 1
+        assert entry.writer.poison_observation_count == 0
     assert health.dropped_count == 0
     assert health.lost_ranges == ()
+    assert health.writer.poison_observation_count == 0
     assert len(backend.persisted) == 1
 
 
@@ -382,11 +397,14 @@ async def test_an_exhausted_batch_is_kept_in_flight_instead_of_being_dropped() -
 async def test_a_parked_poison_batch_does_not_block_the_terminal_barrier() -> None:
     """One unwritable row must not stop every other Task from being persisted.
 
-    The writer parks that row and retries it forever (Task 5 replaces the
-    parking with per-item isolation). If it held ``persist_lock`` across those
-    waits, every terminal barrier after it would spend its whole budget waiting
-    for a lock, never reach storage, and charge its own rows as lost — a single
-    constraint violation would take the collector's write path down with it.
+    The writer is inside ``_isolate_poison_batch``, holding the capped wait that
+    opens the bisect. If it held ``persist_lock`` across that wait, every
+    terminal barrier after it would spend its whole budget waiting for a lock,
+    never reach storage, and charge its own rows as lost — a single constraint
+    violation would take the collector's write path down with it. What the
+    bisect then does with the row is ``test_poison_isolation.py``'s subject;
+    here it is only the lock that is on trial, so the capped wait is left long
+    enough that the row is still held when the barrier's own budget expires.
     """
 
     poison_task = new_id()
@@ -399,13 +417,13 @@ async def test_a_parked_poison_batch_does_not_block_the_terminal_barrier() -> No
         terminal_flush_timeout_ms=200,
         writer_retry_max_attempts=3,
         writer_backoff_initial_ms=1,
-        writer_backoff_max_ms=1_000,
+        writer_backoff_max_ms=5_000,
     )
     await service.start()
     try:
         service.record(_observation("poison", task_id=poison_task))
-        # Batch attempts exhausted and the batch parked in the isolation seam,
-        # which is where the writer now spends its (capped) waits.
+        # Batch attempts exhausted and the row parked on the bisect's opening
+        # wait, which is where the writer now spends its (capped) waits.
         await _wait_until(lambda: service.get_health().writer.consecutive_failures >= 3 and service.get_health().writer.in_flight_count == 1)
         before = service.get_health()
 
