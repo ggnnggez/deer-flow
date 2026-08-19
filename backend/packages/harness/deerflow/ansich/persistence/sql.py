@@ -4411,19 +4411,25 @@ class SqlAnsichBackend:
                     evidence_by_assertion.setdefault(evidence_assertion_id, []).append(obs_id)
 
             alerts_by_scope: dict[str, list[AnsichAlertRow]] = {}
-            for alert_row in (
+            possibly_affected_by_alert_id: dict[str, tuple[str, ...] | None] = {}
+            for alert_row, read_model_row in (
                 await session.execute(
-                    select(AnsichAlertRow)
+                    select(AnsichAlertRow, AnsichAlertReadModelRow)
+                    .join(
+                        AnsichAlertReadModelRow,
+                        AnsichAlertReadModelRow.alert_id == AnsichAlertRow.entity_id,
+                    )
                     .where(
                         AnsichAlertRow.subject_id.in_(scope_ids),
                         AnsichAlertRow.alert_type.in_(self._ENVIRONMENT_ALERT_TYPES),
                     )
                     .order_by(AnsichAlertRow.subject_id, AnsichAlertRow.opened_at.desc())
                 )
-            ).scalars():
+            ).all():
                 group = alerts_by_scope.setdefault(alert_row.subject_id, [])
                 if len(group) < self._ENVIRONMENT_ALERT_CARD_LIMIT:
                     group.append(alert_row)
+                    possibly_affected_by_alert_id[alert_row.entity_id] = None if read_model_row.possibly_affected_task_ids is None else tuple(read_model_row.possibly_affected_task_ids)
 
         scopes: list[EnvironmentScopeView] = []
         for coverage in coverage_rows:
@@ -4507,6 +4513,7 @@ class SqlAnsichBackend:
                             workflow_state=row.workflow_state,
                             opened_at=_as_utc(row.opened_at),
                             resolved_at=(None if row.resolved_at is None else _as_utc(row.resolved_at)),
+                            possibly_affected_task_ids=possibly_affected_by_alert_id.get(row.entity_id),
                         )
                         for row in alerts_by_scope.get(coverage.scope_id, [])
                     ),

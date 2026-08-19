@@ -232,22 +232,48 @@ function AlertRow({
   const typeLabel =
     t.ansich.alertTypeLabel[alert.alert_type as AnsichAlertType] ??
     alert.alert_type;
+  // Rendered only from the backend's own recorded set — never derived from
+  // evidence Observations, whose task_id only names the one Task that
+  // happened to record a given sample, not the full running set. Absent/null
+  // means the read model never recorded one: render nothing, no fallback.
+  const affected = alert.possibly_affected_task_ids;
   return (
-    <Link
-      href="/workspace/ansich/operations"
-      className="hover:bg-accent/40 flex flex-wrap items-center justify-between gap-2 rounded-lg border p-3 text-sm transition-colors"
-    >
-      <span>{typeLabel}</span>
-      <span className="text-muted-foreground flex items-center gap-2 text-xs">
-        <Badge
-          variant={alert.severity === "critical" ? "destructive" : "secondary"}
-        >
-          {t.ansich.alertSeverity[
-            alert.severity as "info" | "warning" | "critical"
-          ] ?? alert.severity}
-        </Badge>
-        {formatAnsichTimestamp(alert.opened_at, locale)}
-      </span>
-    </Link>
+    <div className="space-y-2 rounded-lg border p-3 text-sm">
+      <Link
+        href="/workspace/ansich/operations"
+        className="hover:text-accent-foreground flex flex-wrap items-center justify-between gap-2 transition-colors"
+      >
+        <span>{typeLabel}</span>
+        <span className="text-muted-foreground flex items-center gap-2 text-xs">
+          <Badge
+            variant={alert.severity === "critical" ? "destructive" : "secondary"}
+          >
+            {t.ansich.alertSeverity[
+              alert.severity as "info" | "warning" | "critical"
+            ] ?? alert.severity}
+          </Badge>
+          {formatAnsichTimestamp(alert.opened_at, locale)}
+        </span>
+      </Link>
+      {affected?.length ? (
+        <div className="space-y-1">
+          <div className="text-muted-foreground text-xs">
+            {t.ansich.environmentPossiblyAffectedTitle}
+          </div>
+          <div className="flex flex-wrap gap-1">
+            {affected.map((taskId) => (
+              <Link
+                key={taskId}
+                href={`/workspace/ansich/tasks/${encodeURIComponent(taskId)}`}
+              >
+                <Badge variant="outline" className="font-mono">
+                  {taskId}
+                </Badge>
+              </Link>
+            ))}
+          </div>
+        </div>
+      ) : null}
+    </div>
   );
 }

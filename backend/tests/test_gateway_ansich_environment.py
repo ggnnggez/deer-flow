@@ -304,6 +304,7 @@ async def test_alert_filter_accepts_environment_types_and_rejects_unknown(tmp_pa
         async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
             filtered = await client.get("/api/ansich/operations/alerts?type=environment_pressure")
             invalid = await client.get("/api/ansich/operations/alerts?type=not_a_real_alert_type")
+            environment = await client.get(f"/api/ansich/tasks/{task_id}/environment")
     finally:
         await service.stop()
         await engine.dispose()
@@ -313,6 +314,16 @@ async def test_alert_filter_accepts_environment_types_and_rejects_unknown(tmp_pa
     assert items
     assert all(item["alert_type"] == "environment_pressure" for item in items)
     assert invalid.status_code == 422
+
+    # The Task was never terminated (created + started only), so the assessor
+    # found it `running` in this Scope when the triggering sample landed —
+    # the environment card's own alert summary must carry that id, not the
+    # evidence Observations' recording task_id (a different, narrower fact).
+    assert environment.status_code == 200
+    card = environment.json()["scopes"][0]
+    assert card["alerts"]
+    assert card["alerts"][0]["alert_type"] == "environment_pressure"
+    assert card["alerts"][0]["possibly_affected_task_ids"] == [task_id]
 
 
 @pytest.mark.anyio

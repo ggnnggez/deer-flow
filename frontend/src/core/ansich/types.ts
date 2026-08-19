@@ -854,6 +854,12 @@ export interface AnsichEnvironmentAlertSummary {
   workflow_state: string;
   opened_at: string;
   resolved_at: string | null;
+  // The Tasks the assessor found `running` in this Scope when the triggering
+  // sample was recorded (correlation, not causality). `null` means the read
+  // model never recorded a set — render nothing, never a fallback derived
+  // from evidence Observations (those only name the one Task that happened
+  // to record a given sample, not the full running set).
+  possibly_affected_task_ids: string[] | null;
 }
 
 export interface AnsichEnvironmentScope {

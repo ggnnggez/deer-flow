@@ -136,7 +136,16 @@ class EnvironmentBeliefView(_FrozenModel):
 
 
 class EnvironmentAlertSummaryView(_FrozenModel):
-    """One environment Alert episode summary, scoped to a Scope subject."""
+    """One environment Alert episode summary, scoped to a Scope subject.
+
+    ``possibly_affected_task_ids`` mirrors ``AnsichAlertReadModelRow`` verbatim:
+    the Tasks the assessor found ``running`` in this Scope at the moment the
+    triggering sample was recorded (correlation, not causality — same
+    discipline as ``possible_exposure``). ``None`` means the read model never
+    recorded a set (e.g. an older Alert, or none were running); it is never
+    invented from evidence Observations, whose ``task_id`` only names the one
+    Task that happened to record a given sample, not the full running set.
+    """
 
     alert_id: str
     alert_type: str
@@ -144,6 +153,7 @@ class EnvironmentAlertSummaryView(_FrozenModel):
     workflow_state: str
     opened_at: datetime
     resolved_at: datetime | None = None
+    possibly_affected_task_ids: tuple[str, ...] | None = None
 
 
 class EnvironmentScopeView(_FrozenModel):
