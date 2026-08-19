@@ -328,17 +328,25 @@ const HEALTH_STATUS_RANK: Record<AnsichHealthStatus, number> = {
 /**
  * Whether the projection got worse than the state an operator dismissed. Only
  * a rise re-promotes the banner: a steady or improving incident stays collapsed
- * behind its badge. An unknown failure count on either side is no evidence of a
- * rise, so it counts as no change rather than as a jump from or to zero.
+ * behind its badge.
+ *
+ * An unknown failure count is handled asymmetrically, because dismissal
+ * acknowledges evidence and unknown is the absence of it. A count that *goes*
+ * unknown is never a rise — unknown is not a bigger number, it is no number —
+ * so it fails open and leaves the banner collapsed. But a snapshot taken while
+ * the count was unknown acknowledged no failure count at all, so a count that
+ * later resolves with failures in it is new evidence and re-surfaces. Resolving
+ * to zero is better news than what was acknowledged and stays collapsed.
  */
 export function projectionHealthWorsened(
   dismissed: AnsichHealthSnapshot,
   current: AnsichHealthSnapshot,
 ): boolean {
   const failedJobsRose =
-    dismissed.failedJobs !== null &&
     current.failedJobs !== null &&
-    current.failedJobs > dismissed.failedJobs;
+    (dismissed.failedJobs === null
+      ? current.failedJobs > 0
+      : current.failedJobs > dismissed.failedJobs);
   return (
     failedJobsRose ||
     current.lostObservations > dismissed.lostObservations ||

@@ -575,19 +575,38 @@ describe("projectionHealthWorsened", () => {
     ).toBe(false);
   });
 
-  it("treats an unknown failure count on either side as no change", () => {
+  it("never treats a count that went unknown as a rise", () => {
+    // Fail open: unknown is not a bigger number, it is no number at all.
     expect(
       projectionHealthWorsened(snapshot, { ...snapshot, failedJobs: null }),
     ).toBe(false);
-    expect(
-      projectionHealthWorsened({ ...snapshot, failedJobs: null }, snapshot),
-    ).toBe(false);
+    // The other dimensions are still compared across an unknown count.
     expect(
       projectionHealthWorsened(
         { ...snapshot, failedJobs: null },
         { ...snapshot, failedJobs: null, lostObservations: 9 },
       ),
     ).toBe(true);
+  });
+
+  it("re-surfaces when a never-acknowledged count resolves to real failures", () => {
+    // A snapshot with an unknown count means the operator acknowledged no
+    // failure count at all, so a count that arrives with failures in it is new
+    // evidence rather than the state they dismissed.
+    expect(
+      projectionHealthWorsened(
+        { ...snapshot, failedJobs: null },
+        { ...snapshot, failedJobs: 3 },
+      ),
+    ).toBe(true);
+    // Resolving to zero is better news than what was acknowledged, not new
+    // trouble: it must not re-interrupt.
+    expect(
+      projectionHealthWorsened(
+        { ...snapshot, failedJobs: null },
+        { ...snapshot, failedJobs: 0 },
+      ),
+    ).toBe(false);
   });
 });
 

@@ -114,8 +114,11 @@ the Task's own numbers come from the same projection and must not be reported as
 clean. A Task failed-job count that has not answered — pending, or failed with
 no retry — is carried as `null`, not 0: unknown never promotes a banner or
 counts into the badge, but it does replace the green completeness line with a
-neutral "count unavailable" one, and compares as no change against a dismissal
-snapshot. The banner is dismissible: it hides entirely and leaves an amber `⚠ N`
+neutral "count unavailable" one. Against a dismissal snapshot it compares
+asymmetrically: a count that goes unknown is never a rise, but a snapshot taken
+while the count was unknown acknowledged no count at all, so one that later
+resolves with failures in it re-promotes the banner (resolving to zero does
+not). The banner is dismissible: it hides entirely and leaves an amber `⚠ N`
 button in the page title row that restores it, so the warning moves rather than
 leaving the accessibility tree. The dismissed state (failed/lost counts plus
 status) is kept per scope in `sessionStorage` (`core/ansich/health-dismissal.ts`,
