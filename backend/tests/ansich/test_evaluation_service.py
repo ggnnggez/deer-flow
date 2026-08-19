@@ -514,16 +514,25 @@ class _StalledStorageBackend:
 
 
 @pytest.mark.anyio
-async def test_record_evaluation_receipt_is_failed_when_the_flush_loses_the_observation() -> None:
+async def test_record_evaluation_receipt_is_failed_when_the_flush_does_not_persist() -> None:
+    """The intake's own write did not land, so the receipt may not say `pending`.
+
+    A `pending` receipt is a promise that a projection job exists to poll, and
+    nothing was written here — that part is F10-7's subject and is unchanged.
+    What changed under RA5② is the fate of the Observation: the terminal window
+    closing is not a refusal, so the row goes back on the queue for the writer
+    instead of being charged as lost. The receipt is therefore *conservative*
+    rather than final — the row may still land — which is the direction Task 7
+    revisits when receipt terminality gets its own rules.
+    """
+
     task_id = new_id()
     backend = _StalledStorageBackend()
     service = AnsichService(
         backend,
         flush_interval_ms=60_000,
         # The write is still in flight when the terminal window closes, so
-        # flush_task times out BEFORE persisting and records the Observation as
-        # lost. A receipt that then read "pending" would poll a job that will
-        # never exist.
+        # flush_task returns without having persisted anything.
         terminal_flush_timeout_ms=50,
     )
     await service.start()
@@ -538,12 +547,15 @@ async def test_record_evaluation_receipt_is_failed_when_the_flush_loses_the_obse
         backend.released.set()
         await service.stop()
 
-    assert backend.persist_calls == 1
+    assert backend.persist_calls >= 1
     assert receipt.projection_status == "failed"
     assert receipt.idempotent_replay is False
-    assert health.loss_detected is True
-    assert health.dropped_count == 1
-    assert [(item.first_sequence, item.last_sequence, item.task_id) for item in health.lost_ranges] == [(1, 1, task_id)]
+    # Nothing refused the write, so nothing is charged: the Observation is in
+    # the queue or in the writer's hands, never nowhere.
+    assert health.loss_detected is False
+    assert health.dropped_count == 0
+    assert health.lost_ranges == ()
+    assert health.queue_depth + health.writer.in_flight_count == 1
 
 
 @pytest.mark.anyio

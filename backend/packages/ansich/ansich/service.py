@@ -182,7 +182,20 @@ class AnsichService:
         self._snapshot_observations_accepted = 0
         self._snapshot_observations_dropped = 0
         self._lost_ranges: list[LostRange] = []
-        self._reported_lost_range_count = 0
+        # How far the degradation-reporting pass has scanned `_lost_ranges`.
+        # Deliberately *not* called a reported count (RA8②): a Task-scoped range
+        # below it was written into the Observation stream, a process-wide one
+        # was filed in `_unreported_global_ranges` instead, and the two must not
+        # be counted as the same thing.
+        self._lost_range_report_cursor = 0
+        # Process-wide loss — a range with no Task to subject an
+        # `observability.degraded` Observation against. Nothing in this batch
+        # persists these (the subject design is P11-B's host-Scope work), so
+        # they are held here, counted in health, and never claimed as reported.
+        self._unreported_global_ranges: list[LostRange] = []
+        # Lowest sequence ever charged as lost. A lost sequence is a permanent
+        # hole: the contiguous persistence watermark can never pass it.
+        self._lowest_lost_sequence: int | None = None
         self._last_drop_warning_at: float | None = None
         self._suppressed_drop_warning_count = 0
         self._loop: asyncio.AbstractEventLoop | None = None
@@ -388,8 +401,13 @@ class AnsichService:
                     stopped=self._stopped,
                     unavailable_reason=self._unavailable_reason,
                     consecutive_write_failures=self._writer_consecutive_failures,
-                    # Task 6 wires the unreported *global* lost ranges here.
-                    unreported_loss_pending=False,
+                    # Real residue rather than a placeholder (RA8②). It changes
+                    # no answer today — `dropped_count` is raised by the same
+                    # `_record_loss` call that files the range, and loss is
+                    # permanent `degraded`, which outranks `recovering` — but
+                    # the derivation now reads the fact instead of a constant,
+                    # so a future rule that separates the two has its input.
+                    unreported_loss_pending=bool(self._unreported_global_ranges),
                     writer_retry_backlog=self._writer_retry_backlog,
                     dropped_count=self._dropped_count,
                     failed_jobs=failed_jobs,
@@ -450,6 +468,11 @@ class AnsichService:
                     poison_observation_count=self._poison_observation_count,
                 ),
                 evicted_producer_count=self._evicted_producer_count,
+                # Loss nothing has reported and nothing in this batch will: a
+                # range with no Task has no subject to be written against.
+                # Visible so an operator sees the gap instead of inferring it
+                # from a reported count that used to include it (RA8②).
+                unreported_global_lost_range_count=len(self._unreported_global_ranges),
             )
 
     def register_persistence_listener(
@@ -465,32 +488,103 @@ class AnsichService:
             self._persistence_listeners.setdefault(task_id, []).append(listener_ref)
 
     async def flush_task(self, task_id: str) -> FlushResult:
+        """Persist every queued Observation up to this Task's last one.
+
+        RA5①. The bound is a **collector sequence**, not a Task: ``S`` is the
+        highest queued sequence belonging to ``task_id`` at call time, and every
+        queued row at or below it is placed, in order. Flushing one Task
+        therefore places a neighbour's earlier rows — which is not a side effect
+        to tolerate but what "flushed up to ``S``" means. The by-Task extraction
+        this replaces lifted one Task's rows out of the middle of the queue and
+        left everything recorded before them behind, a reordering of the one
+        sequence every reader of these rows treats as authoritative.
+
+        **What the two success flags each claim.** ``persisted`` keeps its
+        coarse meaning: *this call's* rows reached storage. ``persisted_through``
+        is the precise one — the highest sequence with nothing missing
+        underneath it — and the two legitimately disagree. The barrier takes
+        queued rows only; a batch the writer has parked in flight is the
+        writer's to resolve, so this call can place rows recorded *after* rows
+        that are not durable yet. ``persisted=True`` beside a
+        ``persisted_through`` below the caller's own sequences is that
+        situation, stated rather than hidden.
+
+        **A timeout no longer kills what it took** (RA5②). A budget running out
+        is not evidence that storage refused anything, so rows this call never
+        managed to place go back to the head of the queue in collector order and
+        the writer places them once storage answers; the result reports
+        ``timed_out=True`` and how far persistence actually got — including when
+        the budget was spent settling projections for rows that are already
+        durable, which is a lagging read model and never loss. A *refusal* is
+        the only thing charged as loss, and the ranges this call charged come
+        back in ``lost_ranges`` so the caller need not diff process-wide health
+        to find its own.
+
+        The single attempt behind that refusal is deliberate: retries and their
+        backoff belong to the writer loop, never to an Agent's call stack.
+        """
+
         persist_lock = self._persist_lock
         if persist_lock is None:
             return FlushResult(persisted=False, processed_count=0, reason="service_not_running")
-        selected: list[tuple[int, ObservationEnvelope]] = []
+        # Rows this call has taken off the queue and not yet resolved. Emptied
+        # the moment they are placed or charged, so the `finally` below returns
+        # exactly what is still unaccounted — including under a cancellation
+        # that is not this call's own timeout.
+        taken: list[tuple[int, ObservationEnvelope, int]] = []
         persist_result: FlushResult | None = None
         try:
-            async with asyncio.timeout(self._terminal_flush_timeout_seconds):
-                async with persist_lock:
-                    with self._lock:
-                        selected = self._take_task_items(task_id)
-                    result = await self._persist_items(selected)
-                    if result.persisted:
-                        persist_result = result
+            try:
+                async with asyncio.timeout(self._terminal_flush_timeout_seconds):
+                    async with persist_lock:
+                        with self._lock:
+                            taken = self._take_barrier_items(task_id)
+                        selected = [(sequence, observation) for sequence, observation, _ in taken]
+                        result = await self._persist_items(selected)
+                        if not result.persisted:
+                            # `_persist_items` charged what it was refused, so
+                            # these rows are accounted; reporting the ranges is
+                            # all that is left.
+                            charged = self._observation_lost_ranges(selected)
+                            taken = []
+                            with self._lock:
+                                watermark = self._persisted_through()
+                            return result.model_copy(update={"persisted_through": watermark, "lost_ranges": charged})
+                        taken = []
+                        with self._lock:
+                            watermark = self._persisted_through()
+                        persist_result = result.model_copy(update={"persisted_through": watermark})
                         await self._project_until_task_settled(task_id)
-                    return result
-        except TimeoutError:
-            if persist_result is not None:
-                # Observations are already durable; only projection settling
-                # timed out, so the read model is lagging — never data loss.
-                return persist_result.model_copy(update={"reason": "projection_settle_timeout"})
-            with self._lock:
-                if not selected:
-                    selected = self._take_task_items(task_id)
-                for sequence, observation in selected:
-                    self._record_observation_loss(sequence, observation)
-            return FlushResult(persisted=False, processed_count=0, reason="terminal_flush_timeout")
+                        return persist_result
+            except TimeoutError:
+                if persist_result is not None:
+                    # Observations are already durable; only projection settling
+                    # timed out, so the read model is lagging — never data loss.
+                    return persist_result.model_copy(update={"reason": "projection_settle_timeout", "timed_out": True})
+                with self._lock:
+                    self._return_barrier_items(taken)
+                    taken = []
+                    watermark = self._persisted_through()
+                self._wake_writer()
+                return FlushResult(
+                    persisted=False,
+                    processed_count=0,
+                    reason="terminal_flush_timeout",
+                    persisted_through=watermark,
+                    timed_out=True,
+                )
+        finally:
+            # Anything still unresolved goes back, whatever ended this call: an
+            # outer cancellation, or a failure raised past the write by
+            # something downstream of it. Both used to leave rows that were off
+            # the queue and charged to nobody. The cost is that a failure raised
+            # *after* storage accepted them returns durable rows to the queue —
+            # a re-write the backends' dedupe absorbs, which is the cheaper of
+            # the two mistakes.
+            if taken:
+                with self._lock:
+                    self._return_barrier_items(taken)
+                self._wake_writer()
 
     async def get_task(self, task_id: str) -> TaskView | None:
         return await self._backend.get_task(task_id)
@@ -1346,20 +1440,33 @@ class AnsichService:
         # reported as unattributed rather than guessed onto somebody.
         if producer_name is not None and producer_instance_id is not None:
             self._producer_account(producer_name, producer_instance_id).dropped_count += 1
+        # A lost sequence is a permanent hole: nothing will ever write it, so
+        # the contiguous persistence watermark can never pass it. Kept as one
+        # number rather than rescanned out of `_lost_ranges`, which coalesces.
+        if self._lowest_lost_sequence is None or sequence < self._lowest_lost_sequence:
+            self._lowest_lost_sequence = sequence
         if self._lost_ranges:
             previous = self._lost_ranges[-1]
             if previous.task_id == task_id and previous.producer_name == producer_name and previous.producer_instance_id == producer_instance_id and previous.last_sequence + 1 == sequence:
-                self._lost_ranges[-1] = previous.model_copy(update={"last_sequence": sequence})
+                extended = previous.model_copy(update={"last_sequence": sequence})
+                self._lost_ranges[-1] = extended
+                # RA8②: a process-wide range is filed unreported the moment it
+                # exists, so the bucket has to follow the same coalescing. The
+                # identity check is what keeps the two lists in lockstep — only
+                # the range that *is* the bucket's last entry may extend it.
+                if task_id is None and self._unreported_global_ranges and self._unreported_global_ranges[-1] is previous:
+                    self._unreported_global_ranges[-1] = extended
                 return
-        self._lost_ranges.append(
-            LostRange(
-                first_sequence=sequence,
-                last_sequence=sequence,
-                task_id=task_id,
-                producer_name=producer_name,
-                producer_instance_id=producer_instance_id,
-            )
+        lost_range = LostRange(
+            first_sequence=sequence,
+            last_sequence=sequence,
+            task_id=task_id,
+            producer_name=producer_name,
+            producer_instance_id=producer_instance_id,
         )
+        self._lost_ranges.append(lost_range)
+        if task_id is None:
+            self._unreported_global_ranges.append(lost_range)
 
     def _record_batch_loss(
         self,
@@ -1462,20 +1569,155 @@ class AnsichService:
             producer_instance_id=observation.producer.instance_id,
         )
 
-    def _take_task_items(self, task_id: str) -> list[tuple[int, ObservationEnvelope]]:
-        selected: list[tuple[int, ObservationEnvelope]] = []
+    def _take_barrier_items(self, task_id: str) -> list[tuple[int, ObservationEnvelope, int]]:
+        """Take every queued row up to this Task's highest queued sequence.
+
+        RA5①. The predecessor took the Task's own rows and left their queue
+        neighbours behind, which reordered the collector sequence — the one
+        order every reader of these rows is entitled to rely on — on the
+        ordinary terminal path, with nothing wrong at all. The barrier is
+        defined against that sequence instead: ``S`` is the highest queued
+        sequence this Task owns right now, and everything at or below it goes,
+        whoever recorded it.
+
+        A Task with nothing queued returns an empty selection rather than
+        searching the writer's hands: rows already in flight belong to the
+        writer, and a barrier that took them back would be a second writer for
+        the same batch.
+
+        Callers must already hold ``self._lock``.
+        """
+
+        barrier_sequence: int | None = None
+        for sequence, observation, _ in self._queue:
+            # The highest sequence, not the last one seen: RA5① defines the
+            # bound on the sequence itself, so it holds without leaning on the
+            # queue's ordering.
+            if observation.task_id == task_id and (barrier_sequence is None or sequence > barrier_sequence):
+                barrier_sequence = sequence
+        if barrier_sequence is None:
+            return []
+        taken: list[tuple[int, ObservationEnvelope, int]] = []
         retained: deque[tuple[int, ObservationEnvelope, int]] = deque()
         retained_bytes = 0
-        while self._queue:
-            sequence, observation, observation_size = self._queue.popleft()
-            if observation.task_id == task_id:
-                selected.append((sequence, observation))
+        for item in self._queue:
+            if item[0] <= barrier_sequence:
+                taken.append(item)
             else:
-                retained.append((sequence, observation, observation_size))
-                retained_bytes += observation_size
+                retained.append(item)
+                retained_bytes += item[2]
         self._queue = retained
         self._queue_bytes = retained_bytes
-        return selected
+        return taken
+
+    def _return_barrier_items(self, taken: list[tuple[int, ObservationEnvelope, int]]) -> None:
+        """Put an unplaced barrier selection back at the head of the queue.
+
+        RA5②. A budget running out says nothing about whether storage would
+        have taken these rows — it was never asked, or had not answered — so
+        charging them as lost invents an incident. They go back where they came
+        from: at the head, in collector order, which is still ahead of
+        everything left in the queue because they were taken as a prefix of it.
+
+        The queue watermarks are re-raised here on purpose: these rows were
+        counted into them when they were accepted, but anything recorded while
+        this call held them was counted against a queue that was missing them,
+        so the restored depth can be a peak no reader has seen yet. For the same
+        reason the return may briefly carry the queue past its capacity — rows
+        accepted in the gap took the space these had. That overshoot is bounded
+        by the selection itself and drains with the next flush; enforcing the
+        cap here would mean dropping rows nothing has refused, which is the loss
+        this method exists to prevent.
+
+        Callers must already hold ``self._lock``.
+        """
+
+        if not taken:
+            return
+        for item in reversed(taken):
+            self._queue.appendleft(item)
+        self._queue_bytes += sum(item[2] for item in taken)
+        self._queue_high_watermark = max(self._queue_high_watermark, len(self._queue))
+        self._queue_byte_high_watermark = max(self._queue_byte_high_watermark, self._queue_bytes)
+
+    def _wake_writer(self) -> None:
+        """Nudge the writer loop. Safe only on the event loop's own thread."""
+
+        wake_event = self._wake_event
+        if wake_event is not None:
+            wake_event.set()
+
+    def _persisted_through(self) -> int | None:
+        """Highest collector sequence with nothing missing underneath it.
+
+        "Contiguous" is the whole of it: ``persisted_through=N`` claims that
+        every sequence up to ``N`` is durable, so the answer stops *below* the
+        first sequence that is not — whether it is still queued, still in the
+        writer's hands, or lost for good.
+
+        Derived rather than accumulated. Every sequence the accept path handed
+        out is in exactly one of four states, and three of them are already
+        tracked: queued, held in flight, or charged as lost. A sequence in none
+        of them, at or below the last one allocated, has been persisted — so
+        the lowest sequence across those three answers the question, and no
+        separate watermark can drift away from the facts it summarises.
+
+        Two of the three are what keeps it honest where a simpler rule lies.
+        "One below the lowest row the writer is holding" survives a parked
+        batch but not a poison verdict: once the unwritable row is charged the
+        writer holds nothing, and that rule would happily claim the *lost*
+        sequence as persisted. Consulting the lowest charged sequence is what
+        makes the hole permanent — which is what a hole in this stream is.
+
+        Callers must already hold ``self._lock``, and must have resolved their
+        own selection first: rows taken off the queue and not yet placed are in
+        none of the three states and would read as durable.
+        """
+
+        # One past the last allocated sequence: with nothing outstanding, every
+        # sequence the accept path handed out is durable.
+        boundary = self._record_sequence + 1
+        if self._queue:
+            # Scanned rather than read off the head: the queue is kept in
+            # sequence order, but an over-claim is exactly what this field
+            # exists to prevent, so the answer does not rest on that invariant.
+            boundary = min(boundary, min(item[0] for item in self._queue))
+        in_flight_bounds = self._in_flight_sequence_bounds()
+        if in_flight_bounds is not None:
+            boundary = min(boundary, in_flight_bounds[0])
+        if self._lowest_lost_sequence is not None:
+            boundary = min(boundary, self._lowest_lost_sequence)
+        watermark = boundary - 1
+        return watermark if watermark > 0 else None
+
+    @staticmethod
+    def _observation_lost_ranges(selected: list[tuple[int, ObservationEnvelope]]) -> tuple[LostRange, ...]:
+        """Coalesce a charged selection into the ranges its caller is handed.
+
+        Reports only what *this* call lost. Process-wide health accumulates
+        every range the collector ever charged and coalesces across calls, so a
+        caller diffing it could not tell its own loss from a neighbour's.
+        """
+
+        ranges: list[LostRange] = []
+        for sequence, observation in selected:
+            producer_name = observation.producer.name
+            producer_instance_id = observation.producer.instance_id
+            if ranges:
+                previous = ranges[-1]
+                if previous.task_id == observation.task_id and previous.producer_name == producer_name and previous.producer_instance_id == producer_instance_id and previous.last_sequence + 1 == sequence:
+                    ranges[-1] = previous.model_copy(update={"last_sequence": sequence})
+                    continue
+            ranges.append(
+                LostRange(
+                    first_sequence=sequence,
+                    last_sequence=sequence,
+                    task_id=observation.task_id,
+                    producer_name=producer_name,
+                    producer_instance_id=producer_instance_id,
+                )
+            )
+        return tuple(ranges)
 
     async def _writer_loop(self) -> None:
         wake_event = self._wake_event
@@ -1991,8 +2233,24 @@ class AnsichService:
                 continue
 
     async def _report_degradation_if_storage_recovered(self) -> None:
+        """Write the loss the collector charged back into the Observation stream.
+
+        RA8②. An ``observability.degraded`` Observation is subjected to the lost
+        range's Task, so a **process-wide** range — one charged for something
+        that never was an Observation, and so has no Task — cannot be written
+        at all. The cursor used to walk past those anyway, which marked as
+        reported ranges nothing had ever written; they are instead filed in
+        ``_unreported_global_ranges`` when they are charged, counted in health,
+        and left for P11-B's host-Scope subject work to report.
+
+        The cursor advances only after storage accepted the write, so a refused
+        report is retried whole rather than skipped.
+        """
+
         with self._lock:
-            ranges = tuple(self._lost_ranges[self._reported_lost_range_count :])
+            ranges = tuple(self._lost_ranges[self._lost_range_report_cursor :])
+        if not ranges:
+            return
         observations = [
             ObservationEnvelope(
                 kind="observability.degraded",
@@ -2017,15 +2275,20 @@ class AnsichService:
             for lost_range in ranges
             if lost_range.task_id is not None
         ]
-        if not observations:
-            return
-        try:
-            await self._backend.persist_and_project(observations)
-        except Exception:
-            return
+        if observations:
+            try:
+                await self._backend.persist_and_project(observations)
+            except Exception:
+                # Nothing is consumed: the Task-scoped ranges in this window
+                # must be offered again, and advancing past them here would be
+                # the same lie in the other direction.
+                return
+        # The process-wide ranges in this window are already in the unreported
+        # bucket, so advancing past them consumes nothing and claims nothing —
+        # it only stops the pass re-scanning ranges it can never write.
         with self._lock:
-            self._reported_lost_range_count += len(ranges)
-        if self._projector_wake_event is not None:
+            self._lost_range_report_cursor += len(ranges)
+        if observations and self._projector_wake_event is not None:
             self._projector_wake_event.set()
 
     async def _project_pending(self) -> int:

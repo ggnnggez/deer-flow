@@ -17,9 +17,25 @@ class UnavailableBackend:
 
 
 class BlockingBackend(UnavailableBackend):
+    """Storage that holds a write open until the test releases it.
+
+    It used to block forever, which was safe while a timed-out terminal flush
+    charged its rows as lost: the queue was empty by the time ``stop()`` ran, so
+    the writer never called this. RA5② returns those rows to the queue instead,
+    so the writer *does* pick them up — and a write that never returns is one
+    `stop()` cannot join, because nothing cancels an in-flight backend call.
+    The gate lets the test hand that call back before shutting down; bounding it
+    inside the collector is the stop-drain budget's job (RA7).
+    """
+
+    def __init__(self) -> None:
+        self.released = anyio.Event()
+        self.persist_calls = 0
+
     async def persist_and_project(self, observations: list[ObservationEnvelope]) -> int:
-        await anyio.sleep_forever()
-        return 0
+        self.persist_calls += 1
+        await self.released.wait()
+        return len(observations)
 
 
 class SlowProjectionBackend:
@@ -517,9 +533,22 @@ async def test_invalid_record_input_is_rejected_without_raising_into_agent_code(
 
 
 @pytest.mark.anyio
-async def test_terminal_flush_timeout_is_fail_open_and_reports_loss():
+async def test_terminal_flush_timeout_is_fail_open_and_keeps_the_rows():
+    """RA5②: the budget ran out; storage never refused anything.
+
+    This test used to assert the opposite half of the same fail-open promise —
+    that the timed-out rows were charged as lost and the collector reported
+    `degraded`. That was the collector calling its own impatience a data loss:
+    the write had not been answered, not rejected. The rows now go back to the
+    queue for the writer, the result says the call timed out, and nothing is
+    charged. Fail-open (the Agent's terminal path returns on time, whatever
+    storage is doing) is unchanged and is what `flush_task` returning at all
+    demonstrates.
+    """
+
+    backend = BlockingBackend()
     service = AnsichService(
-        BlockingBackend(),
+        backend,
         flush_interval_ms=60_000,
         terminal_flush_timeout_ms=10,
     )
@@ -540,11 +569,21 @@ async def test_terminal_flush_timeout_is_fail_open_and_reports_loss():
         result = await service.flush_task(task_id)
         health = service.get_health()
     finally:
+        backend.released.set()
         await service.stop()
 
     assert result.persisted is False
     assert result.reason == "terminal_flush_timeout"
-    assert health.status == "degraded"
+    assert result.timed_out is True
+    assert result.persisted_through is None
+    assert result.lost_ranges == ()
+    # Nothing was refused, so nothing is lost — and with no loss to report there
+    # is no degradation either. The row is either back in the queue or already
+    # in the writer's hands; it is never nowhere.
+    assert health.dropped_count == 0
+    assert health.lost_ranges == ()
+    assert health.status == "healthy"
+    assert health.queue_depth + health.writer.in_flight_count == 1
 
 
 @pytest.mark.anyio
