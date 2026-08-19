@@ -13,6 +13,7 @@ from ansich.compression import (
 from ansich.context_state import ContextStateDelta, ContextStateItem, ContextStateView, materialize_context_state
 from ansich.contracts import ControlBelief, ControlValue, NamedVersion, ObservationEnvelope, TaskLifecycleScope, TaskView, control_values_for_lifecycle_scope
 from ansich.control import should_select_control_candidate
+from ansich.environment import TaskEnvironmentView, ToolEnvironmentSampleView
 from ansich.heartbeat import TaskHeartbeatView
 from ansich.lineage import ContentBlockView, ContentProducerView, LineageDirection, PossibleExposureItemView
 from ansich.release import (
@@ -562,6 +563,12 @@ class InMemoryAnsichBackend:
         budgets.sort(key=lambda item: (order[item.dimension], item.aggregation_scope))
         return TaskBudgetsView(task_id=task_id, budgets=tuple(budgets))
 
+    async def get_task_environment(self, task_id: str) -> TaskEnvironmentView:
+        # Minimal implementation: the in-memory backend backs pure-projection
+        # unit tests, not the environment-projector's coverage/state/belief
+        # tables, so it always reports "nothing observed" rather than raising.
+        return TaskEnvironmentView(task_id=task_id, scopes=())
+
     async def get_task_heartbeat(self, task_id: str) -> TaskHeartbeatView | None:
         observation = max(
             (item for item in self._observations if item.task_id == task_id and item.kind == "task.heartbeat" and item.payload is not None),
@@ -687,6 +694,12 @@ class InMemoryAnsichBackend:
             None,
         )
         return None if issued is None else self._tool_call_view(issued)
+
+    async def get_tool_environment_sample(self, tool_call_id: str) -> ToolEnvironmentSampleView | None:
+        # Minimal implementation: per-command environment samples are a SQL
+        # projection (``ansich_tool_env_samples``) the in-memory backend does
+        # not materialize.
+        return None
 
     async def get_task_scopes(self, task_id: str) -> TaskScopesView:
         scopes: dict[str, TaskScopeView] = {}

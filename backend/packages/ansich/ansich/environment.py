@@ -82,13 +82,111 @@ ENVIRONMENT_PRESSURE_ASSESSOR = NamedVersion(name="environment-pressure", versio
 #: Metrics judged as "closeness to a saturation point" rather than raw level.
 _PSI_METRICS = frozenset({"psi_io_some_avg10_milli", "psi_memory_some_avg10_milli"})
 
+#: Every metric ``environment-pressure@1`` has a rule for (mirrors
+#: ``_pressure_state``'s branching). Read-side callers (the Gateway task
+#: environment view) use this to decide which ``environment_pressure:{metric}``
+#: Belief dimensions to expect for an observed metric, without duplicating the
+#: rule's own branching.
+PRESSURE_RULED_METRICS: frozenset[str] = frozenset({"fd_open", "disk_free_bytes"}) | _PSI_METRICS
+
 #: The leak rule is only defined for a Scope whose whole process tree is
 #: observed for the whole window. ``process_group`` sees one command's own fds
 #: (the count legitimately returns to zero between calls) and ``host_shared``
 #: mixes in every other process on the box, so neither can support "this Agent
 #: is leaking". Feeding either one in is a caller error the rule refuses rather
 #: than answers.
-_LEAK_ELIGIBLE_ENVIRONMENT_SCOPES = frozenset({"container"})
+LEAK_ELIGIBLE_ENVIRONMENT_SCOPES: frozenset[str] = frozenset({"container"})
+
+
+class EnvironmentMetricView(_FrozenModel):
+    """One (Scope, environment_scope, metric) reading for the Gateway read side.
+
+    Mirrors ``ansich_environment_state`` columns directly; ``limit`` is
+    ``None`` when the projector never observed a limit for this metric.
+    """
+
+    metric: str
+    latest_value: int = Field(ge=0)
+    limit: int | None = Field(default=None, ge=0)
+    as_of: datetime
+    sample_count: int = Field(ge=0)
+    window_started_at: datetime
+    consecutive_growth_count: int = Field(ge=0)
+
+
+class EnvironmentBeliefView(_FrozenModel):
+    """The current Belief for one environment field on one Scope.
+
+    An ``environment_pressure``/``environment_leak`` dimension nothing has
+    assessed yet is synthesized the same way ``unassessed_quality_belief``
+    synthesizes a missing quality dimension: ``source=NamedVersion(name="none",
+    version="1")``, unknown authority/fidelity, no ``as_of``/``asserted_at``,
+    and no evidence — so a Scope with data but no judgement yet is never
+    silently omitted (concepts 第 9 条第 6 款).
+    """
+
+    field_name: str
+    value: dict[str, object]
+    as_of: datetime | None = None
+    asserted_at: datetime | None = None
+    source: NamedVersion
+    authority_class: str
+    fidelity_class: str
+    evidence_obs_ids: tuple[str, ...] = ()
+
+
+class EnvironmentAlertSummaryView(_FrozenModel):
+    """One environment Alert episode summary, scoped to a Scope subject."""
+
+    alert_id: str
+    alert_type: str
+    severity: str
+    workflow_state: str
+    opened_at: datetime
+    resolved_at: datetime | None = None
+
+
+class EnvironmentScopeView(_FrozenModel):
+    """One (Scope, environment_scope) card: coverage, metrics, Beliefs, Alerts.
+
+    A Scope entity can carry more than one ``environment_scope`` coverage row
+    (e.g. continuous ``container`` collection alongside per-command
+    ``process_group`` samples for individual tool calls), so the read side is
+    keyed one card per ``ansich_environment_coverage`` row rather than one per
+    Scope entity.
+    """
+
+    scope_id: str
+    scope_kind: str
+    display_label: str
+    environment_scope: str
+    coverage: str
+    provider: str
+    metrics: tuple[EnvironmentMetricView, ...] = ()
+    beliefs: tuple[EnvironmentBeliefView, ...] = ()
+    alerts: tuple[EnvironmentAlertSummaryView, ...] = ()
+
+
+class TaskEnvironmentView(_FrozenModel):
+    """A Task's environment observability: every attached Scope's card(s)."""
+
+    task_id: str
+    scopes: tuple[EnvironmentScopeView, ...] = ()
+
+
+class ToolEnvironmentSampleView(_FrozenModel):
+    """One per-tool-call environment sample (mirrors ``ansich_tool_env_samples``)."""
+
+    tool_call_id: str
+    task_id: str
+    scope_id: str
+    io_read_bytes: int | None = None
+    io_write_bytes: int | None = None
+    fd_peak: int | None = None
+    sample_count: int = Field(ge=0)
+    started_at: datetime
+    ended_at: datetime
+    obs_id: str
 
 
 class EnvironmentThresholds(BaseModel):
@@ -266,7 +364,7 @@ def assess_environment_leak(
     uncompensated on purpose.
     """
 
-    if environment_scope not in _LEAK_ELIGIBLE_ENVIRONMENT_SCOPES:
+    if environment_scope not in LEAK_ELIGIBLE_ENVIRONMENT_SCOPES:
         return None
     if coverage != "continuous":
         return None

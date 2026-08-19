@@ -42,6 +42,14 @@ class _UnavailableBackend:
 
         return TaskUsageBreakdownView(task_id=task_id, scope=scope, sources=())
 
+    async def get_task_environment(self, task_id):
+        from ansich.environment import TaskEnvironmentView
+
+        return TaskEnvironmentView(task_id=task_id, scopes=())
+
+    async def get_tool_environment_sample(self, tool_call_id):
+        return None
+
 
 def create_sql_ansich_service(
     session_factory: async_sessionmaker[AsyncSession],

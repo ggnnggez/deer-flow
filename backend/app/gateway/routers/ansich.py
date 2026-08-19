@@ -514,6 +514,8 @@ async def list_alerts(
         "attempted_scope_violation",
         "realized_scope_violation",
         "unverified_effect",
+        "environment_pressure",
+        "environment_leak_suspected",
     ]
     | None = Query(default=None, alias="type"),
     workflow_state: Literal[
@@ -1121,6 +1123,24 @@ async def get_task_budgets(task_id: str, request: Request) -> dict:
     }
 
 
+@router.get("/tasks/{task_id}/environment")
+async def get_task_environment(task_id: str, request: Request) -> dict:
+    await require_admin_user(request, detail=_ADMIN_REQUIRED)
+    service = _service_or_503(request)
+    _ensure_queryable(service)
+    try:
+        environment = await service.get_task_environment(task_id)
+    except Exception as exc:
+        raise HTTPException(
+            status_code=503,
+            detail={
+                "message": "Ansich Environment query failed",
+                "projection_status": _projection_status(service),
+            },
+        ) from exc
+    return environment.model_dump(mode="json")
+
+
 @router.get("/tasks")
 async def list_tasks(
     request: Request,
@@ -1625,8 +1645,21 @@ async def get_tool_call(tool_call_id: str, request: Request) -> dict:
     service = _service_or_503(request)
     _ensure_queryable(service)
     tool_call = await _tool_call_or_404(service, tool_call_id)
+    try:
+        environment_sample = await service.get_tool_environment_sample(tool_call_id)
+    except Exception as exc:
+        raise HTTPException(
+            status_code=503,
+            detail={
+                "message": "Ansich ToolCall query failed",
+                "projection_status": _projection_status(service),
+            },
+        ) from exc
     return {
         "tool_call": tool_call.model_dump(mode="json"),
+        # Additive: null when no per-command environment sample was recorded
+        # for this ToolCall; existing fields are unchanged.
+        "environment_sample": (None if environment_sample is None else environment_sample.model_dump(mode="json")),
         "projection_status": _projection_status(service),
     }
 

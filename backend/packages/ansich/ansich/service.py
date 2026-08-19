@@ -15,6 +15,7 @@ from ansich.budget import BudgetHealthBelief, TaskBudgetsView
 from ansich.compression import ContextCompressionSummaryView, ContextCompressionView
 from ansich.context_state import ContextStateView
 from ansich.contracts import AnsichHealth, ControlValue, FlushResult, LostRange, ObservationEnvelope, Producer, RecordReceipt, TaskLifecycleScope, TaskView
+from ansich.environment import TaskEnvironmentView, ToolEnvironmentSampleView
 from ansich.evaluation import (
     QUALITY_DIMENSIONS,
     EvaluationProjectionStatus,
@@ -800,6 +801,9 @@ class AnsichService:
     async def get_task_budgets(self, task_id: str) -> TaskBudgetsView:
         return await self._backend.get_task_budgets(task_id)
 
+    async def get_task_environment(self, task_id: str) -> TaskEnvironmentView:
+        return await self._backend.get_task_environment(task_id)
+
     async def get_task_budget_health(
         self,
         task_id: str,
@@ -924,6 +928,9 @@ class AnsichService:
 
     async def get_tool_call(self, tool_call_id: str) -> ToolCallView | None:
         return await self._backend.get_tool_call(tool_call_id)
+
+    async def get_tool_environment_sample(self, tool_call_id: str) -> ToolEnvironmentSampleView | None:
+        return await self._backend.get_tool_environment_sample(tool_call_id)
 
     async def get_task_scopes(self, task_id: str) -> TaskScopesView:
         return await self._backend.get_task_scopes(task_id)

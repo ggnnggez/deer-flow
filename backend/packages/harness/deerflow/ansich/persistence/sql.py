@@ -107,7 +107,15 @@ from ansich.contracts import (
 )
 from ansich.control import should_select_control_candidate
 from ansich.environment import (
+    LEAK_ELIGIBLE_ENVIRONMENT_SCOPES,
+    PRESSURE_RULED_METRICS,
+    EnvironmentAlertSummaryView,
+    EnvironmentBeliefView,
+    EnvironmentMetricView,
+    EnvironmentScopeView,
     EnvironmentThresholds,
+    TaskEnvironmentView,
+    ToolEnvironmentSampleView,
     assess_environment_leak,
     assess_environment_pressure,
 )
@@ -4308,6 +4316,221 @@ class SqlAnsichBackend:
                 )
                 for row in rows
             ),
+        )
+
+    #: Alert cap per Scope card, matching the brief's read-side bound (mirrors
+    #: the operator Alert list's own recency-ordered per-subject cap).
+    _ENVIRONMENT_ALERT_CARD_LIMIT = 20
+
+    async def get_task_environment(self, task_id: str) -> TaskEnvironmentView:
+        """Every Scope this Task is attached to, with its environment card(s).
+
+        One card per ``(Scope, environment_scope)`` coverage row — a Scope can
+        carry more than one (e.g. continuous ``container`` collection alongside
+        per-command ``process_group`` samples). A dimension with a coverage/
+        state row but no current Belief yet (assessment lags projection, or the
+        Scope is not an assessment candidate) is synthesized as an ``unknown``
+        Belief with no evidence, mirroring ``unassessed_quality_belief`` — see
+        ``EnvironmentBeliefView``.
+        """
+
+        async with self._session_factory() as session:
+            relation_rows = list(
+                (
+                    await session.execute(
+                        select(AnsichScopeRow)
+                        .join(AnsichRelationRow, AnsichRelationRow.object_id == AnsichScopeRow.entity_id)
+                        .where(
+                            AnsichRelationRow.subject_id == task_id,
+                            AnsichRelationRow.predicate == "within_scope",
+                            AnsichRelationRow.relation_role.in_(("sandbox_boundary", "host_environment")),
+                        )
+                    )
+                ).scalars()
+            )
+            if not relation_rows:
+                return TaskEnvironmentView(task_id=task_id, scopes=())
+            scope_by_id = {row.entity_id: row for row in relation_rows}
+            scope_ids = sorted(scope_by_id)
+
+            coverage_rows = list(
+                (
+                    await session.execute(
+                        select(AnsichEnvironmentCoverageRow)
+                        .where(AnsichEnvironmentCoverageRow.scope_id.in_(scope_ids))
+                        .order_by(
+                            AnsichEnvironmentCoverageRow.scope_id,
+                            AnsichEnvironmentCoverageRow.environment_scope,
+                        )
+                    )
+                ).scalars()
+            )
+            if not coverage_rows:
+                return TaskEnvironmentView(task_id=task_id, scopes=())
+
+            state_by_scope_env: dict[tuple[str, str], list[AnsichEnvironmentStateRow]] = {}
+            for state_row in (
+                await session.execute(
+                    select(AnsichEnvironmentStateRow)
+                    .where(AnsichEnvironmentStateRow.scope_id.in_(scope_ids))
+                    .order_by(
+                        AnsichEnvironmentStateRow.scope_id,
+                        AnsichEnvironmentStateRow.environment_scope,
+                        AnsichEnvironmentStateRow.metric,
+                    )
+                )
+            ).scalars():
+                state_by_scope_env.setdefault((state_row.scope_id, state_row.environment_scope), []).append(state_row)
+
+            belief_pairs = list(
+                (
+                    await session.execute(
+                        select(AnsichCurrentBeliefRow, AnsichBeliefAssertionRow)
+                        .join(
+                            AnsichBeliefAssertionRow,
+                            AnsichBeliefAssertionRow.assertion_id == AnsichCurrentBeliefRow.assertion_id,
+                        )
+                        .where(AnsichCurrentBeliefRow.subject_id.in_(scope_ids))
+                    )
+                ).all()
+            )
+            # ``field_name`` deliberately omits ``environment_scope`` — today
+            # exactly one environment_scope per Scope is ever assessed, so a
+            # (scope_id, field_name) key is unambiguous. A Scope observed under
+            # more than one continuously-covered environment_scope would need a
+            # richer key; that shape does not occur yet.
+            belief_by_field: dict[tuple[str, str], tuple[AnsichCurrentBeliefRow, AnsichBeliefAssertionRow]] = {
+                (current.subject_id, current.field_name): (current, assertion) for current, assertion in belief_pairs if current.field_name.startswith("environment_")
+            }
+            assertion_ids = [assertion.assertion_id for _, assertion in belief_by_field.values()]
+            evidence_by_assertion: dict[str, list[str]] = {}
+            if assertion_ids:
+                for evidence_assertion_id, obs_id in await session.execute(
+                    select(AnsichBeliefEvidenceRow.assertion_id, AnsichBeliefEvidenceRow.obs_id).where(AnsichBeliefEvidenceRow.assertion_id.in_(assertion_ids)).order_by(AnsichBeliefEvidenceRow.assertion_id, AnsichBeliefEvidenceRow.ordinal)
+                ):
+                    evidence_by_assertion.setdefault(evidence_assertion_id, []).append(obs_id)
+
+            alerts_by_scope: dict[str, list[AnsichAlertRow]] = {}
+            for alert_row in (
+                await session.execute(
+                    select(AnsichAlertRow)
+                    .where(
+                        AnsichAlertRow.subject_id.in_(scope_ids),
+                        AnsichAlertRow.alert_type.in_(self._ENVIRONMENT_ALERT_TYPES),
+                    )
+                    .order_by(AnsichAlertRow.subject_id, AnsichAlertRow.opened_at.desc())
+                )
+            ).scalars():
+                group = alerts_by_scope.setdefault(alert_row.subject_id, [])
+                if len(group) < self._ENVIRONMENT_ALERT_CARD_LIMIT:
+                    group.append(alert_row)
+
+        scopes: list[EnvironmentScopeView] = []
+        for coverage in coverage_rows:
+            scope_row = scope_by_id[coverage.scope_id]
+            state_rows = state_by_scope_env.get((coverage.scope_id, coverage.environment_scope), ())
+            observed_metrics = {row.metric for row in state_rows}
+
+            expected: list[tuple[str, str]] = [(f"environment_pressure:{metric}", metric) for metric in sorted(observed_metrics & PRESSURE_RULED_METRICS)]
+            if coverage.environment_scope in LEAK_ELIGIBLE_ENVIRONMENT_SCOPES and "fd_open" in observed_metrics:
+                expected.append(("environment_leak:fd_open", "fd_open"))
+            if coverage.coverage == "uninstrumented":
+                # No state row exists to read a metric from; fd_open is the
+                # canonical placeholder metric, matching the periodic
+                # assessor's own uninstrumented-declaration convention
+                # (``_assess_environment``'s synthetic ``declaration`` pass).
+                expected.append(("environment_pressure:fd_open", "fd_open"))
+
+            beliefs: list[EnvironmentBeliefView] = []
+            seen_fields: set[str] = set()
+            for field_name, metric in expected:
+                if field_name in seen_fields:
+                    continue
+                seen_fields.add(field_name)
+                pair = belief_by_field.get((coverage.scope_id, field_name))
+                if pair is None:
+                    beliefs.append(
+                        EnvironmentBeliefView(
+                            field_name=field_name,
+                            value={
+                                "value": "unknown",
+                                "metric": metric,
+                                "environment_scope": coverage.environment_scope,
+                                "coverage": coverage.coverage,
+                            },
+                            source=NamedVersion(name="none", version="1"),
+                            authority_class="unknown",
+                            fidelity_class="unknown",
+                        )
+                    )
+                    continue
+                current, assertion = pair
+                beliefs.append(
+                    EnvironmentBeliefView(
+                        field_name=field_name,
+                        value=dict(assertion.value_json),
+                        as_of=_as_utc(assertion.as_of),
+                        asserted_at=_as_utc(assertion.asserted_at),
+                        source=NamedVersion(name=assertion.source_name, version=assertion.source_version),
+                        authority_class=assertion.authority_class,
+                        fidelity_class=assertion.fidelity_class,
+                        evidence_obs_ids=tuple(evidence_by_assertion.get(assertion.assertion_id, ())),
+                    )
+                )
+
+            scopes.append(
+                EnvironmentScopeView(
+                    scope_id=coverage.scope_id,
+                    scope_kind=scope_row.scope_kind,
+                    display_label=scope_row.display_label,
+                    environment_scope=coverage.environment_scope,
+                    coverage=coverage.coverage,
+                    provider=coverage.provider,
+                    metrics=tuple(
+                        EnvironmentMetricView(
+                            metric=row.metric,
+                            latest_value=row.latest_value,
+                            limit=row.limit_value,
+                            as_of=_as_utc(row.as_of),
+                            sample_count=row.sample_count,
+                            window_started_at=_as_utc(row.window_started_at),
+                            consecutive_growth_count=row.consecutive_growth_count,
+                        )
+                        for row in state_rows
+                    ),
+                    beliefs=tuple(beliefs),
+                    alerts=tuple(
+                        EnvironmentAlertSummaryView(
+                            alert_id=row.entity_id,
+                            alert_type=row.alert_type,
+                            severity=row.severity,
+                            workflow_state=row.workflow_state,
+                            opened_at=_as_utc(row.opened_at),
+                            resolved_at=(None if row.resolved_at is None else _as_utc(row.resolved_at)),
+                        )
+                        for row in alerts_by_scope.get(coverage.scope_id, [])
+                    ),
+                )
+            )
+
+        return TaskEnvironmentView(task_id=task_id, scopes=tuple(scopes))
+
+    async def get_tool_environment_sample(self, tool_call_id: str) -> ToolEnvironmentSampleView | None:
+        async with self._session_factory() as session:
+            row = await session.get(AnsichToolEnvSampleRow, tool_call_id)
+        if row is None:
+            return None
+        return ToolEnvironmentSampleView(
+            tool_call_id=row.tool_call_id,
+            task_id=row.task_id,
+            scope_id=row.scope_id,
+            io_read_bytes=row.io_read_bytes,
+            io_write_bytes=row.io_write_bytes,
+            fd_peak=row.fd_peak,
+            sample_count=row.sample_count,
+            started_at=_as_utc(row.started_at),
+            ended_at=_as_utc(row.ended_at),
+            obs_id=row.obs_id,
         )
 
     async def get_task_heartbeat(self, task_id: str) -> TaskHeartbeatView | None:
