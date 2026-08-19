@@ -1,4 +1,5 @@
 import asyncio
+import contextvars
 import json
 import logging
 import os
@@ -17,6 +18,7 @@ from deerflow.config.paths import VIRTUAL_PATH_PREFIX
 from deerflow.constants import DEFAULT_SKILLS_CONTAINER_PATH
 from deerflow.runtime.secret_context import read_active_secrets
 from deerflow.runtime.user_context import resolve_runtime_user_id
+from deerflow.sandbox import telemetry
 from deerflow.sandbox.exceptions import (
     SandboxError,
     SandboxNotFoundError,
@@ -1445,7 +1447,22 @@ async def _run_sync_tool_after_async_sandbox_init(
     runtime: Runtime,
     *args: object,
 ) -> str:
-    """Initialize lazily via async provider, then run sync tool body off-thread."""
+    """Initialize lazily via async provider, then run sync tool body off-thread.
+
+    ``asyncio.to_thread`` copies the *current* context and runs ``func``
+    inside that copy (``contextvars.copy_context()`` + ``ctx.run(...)``) on a
+    worker thread. Any ``ContextVar.set()`` performed by ``func`` — e.g.
+    ``deerflow.sandbox.telemetry.publish_command_sample`` inside
+    ``execute_command`` — lands only in that copied ``Context`` object and is
+    invisible to the awaiting coroutine once ``await asyncio.to_thread(...)``
+    returns, because the caller keeps running in its own (different) context.
+    Passing our own ``copy_context()`` result explicitly, rather than letting
+    ``to_thread`` make its own copy, keeps a reference to the exact context
+    ``func`` ran in, so we can read back anything it published there before
+    the copy is discarded — the per-command environment sample tool probes
+    (Ansich Task 6) depend on this hand-back to observe samples published by
+    the offloaded sandbox body.
+    """
     try:
         await ensure_sandbox_initialized_async(runtime)
     except SandboxError as e:
@@ -1456,7 +1473,19 @@ async def _run_sync_tool_after_async_sandbox_init(
     if func is None:
         return "Error: Tool implementation not available"
 
-    return await asyncio.to_thread(func, runtime, *args)
+    ctx = contextvars.copy_context()
+    try:
+        return await asyncio.to_thread(ctx.run, func, runtime, *args)
+    finally:
+        # ContextVar writes made inside the offloaded sync body live in
+        # ``ctx``, not the caller's context; hand the command resource sample
+        # back so the awaiting tool-middleware chain can consume it.
+        try:
+            sample = ctx.run(telemetry.consume_command_sample)
+            if sample is not None:
+                telemetry.publish_command_sample(sample)
+        except Exception:
+            logger.debug("command resource sample hand-back failed", exc_info=True)
 
 
 def ensure_thread_directories_exist(runtime: Runtime | None) -> None:

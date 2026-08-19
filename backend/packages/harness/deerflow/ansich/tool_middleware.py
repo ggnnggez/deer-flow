@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import logging
 import posixpath
 import re
 import shlex
@@ -38,6 +39,8 @@ from deerflow.ansich.middleware import execution_context_from_runtime
 from deerflow.authz.outcome import AuthorizationOutcome, pop_authorization_outcome
 from deerflow.runtime.secret_context import extract_request_secrets, read_active_secrets
 
+logger = logging.getLogger(__name__)
+
 _PRODUCER_INSTANCE_ID = str(uuid4())
 _TRANSFORM_KINDS = frozenset(get_args(ToolTransformKind))
 
@@ -48,6 +51,16 @@ def _producer() -> Producer:
 
 def _runtime_context(request: ToolCallRequest) -> object:
     return getattr(getattr(request, "runtime", None), "context", None)
+
+
+def _thread_id_from_request(request: ToolCallRequest) -> str | None:
+    """Best-effort ``thread_id`` lookup, mirroring ``sandbox/middleware.py``'s
+    ``(runtime.context or {}).get("thread_id")`` convention."""
+    context = _runtime_context(request)
+    if not isinstance(context, Mapping):
+        return None
+    thread_id = context.get("thread_id")
+    return thread_id if isinstance(thread_id, str) else None
 
 
 def _known_secrets(request: ToolCallRequest) -> list[str]:
@@ -581,6 +594,70 @@ def _record_raw_result(
         _record_observed_effects(execution, invocation, tool_args)
 
 
+def _emit_command_environment_sample(
+    *,
+    service: object,
+    task_id: str,
+    run_id: str,
+    tool_name: str,
+    tool_call_id: str,
+    thread_id: str | None,
+) -> None:
+    """Emit one ``environment.sampled`` Observation from the per-command probe.
+
+    Bash-only, local-provider-only: ``deerflow.sandbox.telemetry.consume_command_sample()``
+    reads (and clears) a ContextVar the local sandbox's ``execute_command``
+    publishes to for its process-group resource sampler. Non-bash tools and an
+    empty ContextVar are silent no-ops. The subject Scope mirrors Task 5's
+    convention (``sandbox``, ``local:{thread_id}``). Fail-open: any failure
+    here is swallowed and logged at debug level, never surfacing to the tool
+    caller or affecting the recorded ToolMessage.
+    """
+    if tool_name != "bash" or thread_id is None:
+        return
+    try:
+        from deerflow.sandbox.telemetry import consume_command_sample
+
+        sample = consume_command_sample()
+        if sample is None:
+            return
+        from ansich.safety import scope_entity_id, scope_reference_hash
+
+        ref_hash = scope_reference_hash("sandbox", f"local:{thread_id}")
+        metrics: dict[str, object] = {}
+        if sample.fd_peak is not None:
+            metrics["fd_open"] = {"value": sample.fd_peak, "limit": None}
+        if sample.io_read_bytes is not None:
+            metrics["io_read_bytes"] = {"value": sample.io_read_bytes, "limit": None}
+        if sample.io_write_bytes is not None:
+            metrics["io_write_bytes"] = {"value": sample.io_write_bytes, "limit": None}
+        if not metrics:
+            return
+        service.record(
+            ObservationEnvelope.environment_sampled(
+                task_id=task_id,
+                run_id=run_id,
+                occurred_at=sample.ended_at,
+                scope_id=scope_entity_id("sandbox", ref_hash),
+                payload={
+                    "environment_scope": "process_group",
+                    "coverage": "per_command",
+                    "window": {
+                        "started_at": sample.started_at,
+                        "ended_at": sample.ended_at,
+                        "sample_count": sample.sample_count,
+                    },
+                    "provider": "local",
+                    "metrics": metrics,
+                    "tool_call_id": tool_call_id,
+                },
+                source_event_id=f"tool:{tool_call_id}:env",
+            )
+        )
+    except Exception:
+        logger.debug("per-command environment sample emission failed", exc_info=True)
+
+
 def _classify_transform(
     invocation: ToolInvocation,
     visible: ObservedContentCapture,
@@ -860,6 +937,14 @@ class AnsichRawToolMiddleware(AgentMiddleware):
             )
         except Exception:
             pass
+        _emit_command_environment_sample(
+            service=execution.service,
+            task_id=execution.task_id,
+            run_id=execution.task_id,
+            tool_name=invocation.registration.tool_name,
+            tool_call_id=invocation.registration.tool_call_id,
+            thread_id=_thread_id_from_request(request),
+        )
         return result
 
     async def awrap_tool_call(
@@ -905,6 +990,14 @@ class AnsichRawToolMiddleware(AgentMiddleware):
             )
         except Exception:
             pass
+        _emit_command_environment_sample(
+            service=execution.service,
+            task_id=execution.task_id,
+            run_id=execution.task_id,
+            tool_name=invocation.registration.tool_name,
+            tool_call_id=invocation.registration.tool_call_id,
+            thread_id=_thread_id_from_request(request),
+        )
         return result
 
 
