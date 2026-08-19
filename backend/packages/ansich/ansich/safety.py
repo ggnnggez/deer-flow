@@ -17,6 +17,7 @@ ScopeKind = Literal[
     "sandbox",
     "authorization",
     "external_origin",
+    "host",
 ]
 ScopeRelationRole = Literal[
     "owner",
@@ -25,6 +26,7 @@ ScopeRelationRole = Literal[
     "sandbox_boundary",
     "auth_context",
     "trigger_origin",
+    "host_environment",
 ]
 AuthorizationDecision = Literal["allowed", "denied", "unknown"]
 EffectClass = Literal[

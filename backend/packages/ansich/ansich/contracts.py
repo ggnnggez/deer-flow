@@ -43,6 +43,7 @@ OperatorObservationKind = Literal[
     "operator.alert_dismissed",
 ]
 ScopeObservationKind = Literal["scope.snapshotted"]
+EnvironmentObservationKind = Literal["environment.sampled"]
 AuthorizationObservationKind = Literal[
     "authorization.evaluated",
     "authorization.allowed",
@@ -78,6 +79,7 @@ ObservationKind = (
     | AuthorizationObservationKind
     | EffectObservationKind
     | EvaluationObservationKind
+    | EnvironmentObservationKind
     | Literal[
         "agent_release.resolved",
         "task.heartbeat",
@@ -249,6 +251,14 @@ class ObservationEnvelope(BaseModel):
                 scope = ScopeDescriptor.model_validate(self.payload.get("scope"), strict=False)
                 if scope.scope_id != self.subject_id:
                     raise ValueError("scope observation subject must identify payload scope")
+        elif self.kind == "environment.sampled":
+            if self.subject_type != "scope":
+                raise ValueError("environment observation subject_type must be scope")
+            if self.payload is None:
+                raise ValueError("environment observation requires a payload")
+            from ansich.environment import EnvironmentSamplePayload
+
+            EnvironmentSamplePayload.model_validate(self.payload, strict=False)
         elif self.kind.startswith("authorization."):
             if self.subject_type != "authorization_snapshot":
                 raise ValueError("authorization observation subject_type must be authorization_snapshot")
@@ -414,6 +424,82 @@ class ObservationEnvelope(BaseModel):
                 "ownership_epoch": ownership_epoch,
                 "elapsed_ms": elapsed_ms,
             },
+        )
+
+    @classmethod
+    def environment_sampled(
+        cls,
+        *,
+        task_id: str,
+        run_id: str,
+        occurred_at: datetime,
+        scope_id: str,
+        payload: dict[str, object],
+        source_event_id: str,
+        producer_seq: int = 1,
+        producer_name: str = "environment-probe",
+        producer_version: str = "1",
+        producer_instance_id: str = "local",
+    ) -> Self:
+        return cls(
+            kind="environment.sampled",
+            occurred_at=occurred_at,
+            task_id=task_id,
+            subject_type="scope",
+            subject_id=scope_id,
+            producer=Producer(name=producer_name, version=producer_version, instance_id=producer_instance_id),
+            producer_seq=producer_seq,
+            source_event_id=source_event_id,
+            correlation_id=run_id,
+            payload=payload,
+        )
+
+    @classmethod
+    def scope_snapshotted(
+        cls,
+        *,
+        task_id: str,
+        run_id: str,
+        occurred_at: datetime,
+        scope_kind: str,
+        external_ref: str,
+        relation_role: str | None,
+        source_event_id: str,
+        parent_scope_id: str | None = None,
+        producer_seq: int = 1,
+        producer_name: str = "environment-probe",
+        producer_version: str = "1",
+        producer_instance_id: str = "local",
+    ) -> Self:
+        from ansich.safety import scope_display_label, scope_entity_id, scope_reference_hash
+
+        ref_hash = scope_reference_hash(scope_kind, external_ref)  # type: ignore[arg-type]
+        scope_id = scope_entity_id(scope_kind, ref_hash)  # type: ignore[arg-type]
+        obs_id = new_id()
+        payload: dict[str, object] = {
+            "scope": {
+                "scope_id": scope_id,
+                "scope_kind": scope_kind,
+                "external_ref_hash": ref_hash,
+                "display_label": scope_display_label(scope_kind, external_ref),  # type: ignore[arg-type]
+                "parent_scope_id": parent_scope_id,
+                "created_obs_id": obs_id,
+            }
+        }
+        if relation_role is not None:
+            payload["relation_role"] = relation_role
+        return cls(
+            obs_id=obs_id,
+            kind="scope.snapshotted",
+            occurred_at=occurred_at,
+            task_id=task_id,
+            subject_type="scope",
+            subject_id=scope_id,
+            producer=Producer(name=producer_name, version=producer_version, instance_id=producer_instance_id),
+            producer_seq=producer_seq,
+            source_event_id=source_event_id,
+            correlation_id=run_id,
+            payload=payload,
         )
 
     @classmethod
