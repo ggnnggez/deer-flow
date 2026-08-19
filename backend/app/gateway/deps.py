@@ -342,6 +342,10 @@ async def langgraph_runtime(app: FastAPI, startup_config: AppConfig) -> AsyncGen
             except Exception:
                 logger.exception("Ansich startup failed; continuing without collection")
 
+        from deerflow.sandbox import telemetry as sandbox_telemetry
+
+        sandbox_telemetry.set_per_command_sampling_enabled(bool(ansich_config is not None and ansich_config.enabled and ansich_config.environment_probe_enabled and ansich_config.environment_per_command_sampling))
+
         from deerflow.persistence.thread_meta import make_thread_store
 
         app.state.thread_store = make_thread_store(sf, app.state.store)

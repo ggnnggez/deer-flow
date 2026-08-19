@@ -307,6 +307,7 @@ async def run_agent(
     subagent_events: _SubagentEventBuffer | None = None
     ansich_execution_context: Any | None = None
     ansich_heartbeat: Any | None = None
+    ansich_environment_probe: Any | None = None
 
     if ansich_task is None and ctx.ansich_service is not None:
         from deerflow.ansich.probes import create_task_control_probe
@@ -405,6 +406,22 @@ async def run_agent(
                         run_id,
                         exc_info=True,
                     )
+
+                if getattr(ansich_config, "environment_probe_enabled", False):
+                    try:
+                        from deerflow.ansich.probes.environment import AnsichEnvironmentProbe, build_environment_resolver
+
+                        ansich_environment_probe = AnsichEnvironmentProbe(
+                            ctx.ansich_service,
+                            task_id=ansich_task.task_id,
+                            run_id=run_id,
+                            interval_seconds=float(ansich_config.effective_environment_sample_interval_seconds),
+                            is_owner=lambda: record.owner_worker_id == worker_id,
+                            resolve=build_environment_resolver(ctx.app_config, user_id=get_effective_user_id(), thread_id=thread_id),
+                        )
+                        ansich_environment_probe.start()
+                    except Exception:
+                        logger.warning("Run %s: could not start Ansich environment probe", run_id, exc_info=True)
 
         if event_store is not None:
             workspace_changes_user_id = get_effective_user_id()
@@ -784,6 +801,8 @@ async def run_agent(
     finally:
         if ansich_heartbeat is not None:
             await ansich_heartbeat.stop()
+        if ansich_environment_probe is not None:
+            await ansich_environment_probe.stop()
         if ansich_execution_context is not None:
             try:
                 from deerflow.ansich.tool_middleware import reconcile_open_tool_calls
