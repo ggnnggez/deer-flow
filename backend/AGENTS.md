@@ -956,8 +956,10 @@ ref hash — Phase 11's reserved `observability_degradation`/
 and a `sandbox` Scope; every other provider declares one `uninstrumented`
 sample and stops rather than fabricating a reading); its blocking reads
 (`/proc`, docker) go through `asyncio.to_thread`, and its own `stop()` is
-time-bounded (`AnsichConfig`'s 2s default) so a wedged resolver cannot delay
-the worker's terminal-Task reconciliation. The second path is local-only and
+time-bounded (`stop_timeout_seconds`, a 2s default on the
+`AnsichEnvironmentProbe` constructor itself, not an `AnsichConfig` key — the
+worker never overrides it) so a wedged resolver cannot delay the worker's
+terminal-Task reconciliation. The second path is local-only and
 finer-grained: `sandbox/telemetry.py::ProcessGroupSampler` runs beside each
 `bash` command and is deliberately Ansich-free (the sandbox layer never
 imports `ansich`, mirroring the harness→app import firewall's spirit one
@@ -985,8 +987,12 @@ models via migration `0026_ansich_environment`:
 `ansich_environment_coverage` (per-Scope current coverage/provider),
 `ansich_environment_state` (one current-state row per
 `(scope_id, environment_scope, metric)`, lock-then-read on update, plus a
-`consecutive_growth_count` trend counter maintained only for `container` +
-`continuous` evidence), and `ansich_tool_env_samples` (at most one row per
+`consecutive_growth_count` trend counter the projector maintains for
+`fd_open` only — `_GROWTH_TRACKED_METRICS`; today that is effectively
+container-only because no `host_shared` sampler reports `fd_open`, an
+emergent property of what the collectors emit rather than something the
+projector enforces by checking `environment_scope`), and
+`ansich_tool_env_samples` (at most one row per
 `tool_call_id`, deliberately carrying no foreign keys so a per-command
 sample never blocks on Task/Scope/ToolCall dependency-wait projection).
 `environment-pressure@1` runs inside the existing periodic operations
