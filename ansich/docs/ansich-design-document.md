@@ -486,7 +486,16 @@ may define shadow thresholds only when marked `enforcement = false`.
 ### 4.9 Scope
 
 A Task participates in multiple Scopes: owner, thread, workspace, sandbox,
-authorization, and external origin. A single `scope_ref` is insufficient.
+authorization, external origin, and host. A single `scope_ref` is insufficient.
+
+`host` was added for environment observability (§10.7): a stable Scope keyed by
+the hostname's ref hash rather than the process/thread/sandbox identity, so
+signals shared across every process on the box (disk free space, `/proc`
+pressure counters) are not attributed to one sandbox's exclusive footprint. On a
+single-machine deployment it resolves to one fixed Scope. Phase 11's reserved
+`observability_degradation`/`projection_failure` Alert subjects are expected to
+reuse this same `host` Scope mechanism for process-wide health facts rather than
+introduce a second one.
 
 AuthorizationSnapshot records the effective permissions at a ToolCall decision
 time. Tool intent, authorization decision, and actual side effects are separate.
@@ -1090,6 +1099,52 @@ RunJournal continues serving current `run_events`, chat history, and convenience
 usage fields. Ansich writes its own ObservationEnvelope and tables. Shared event
 normalization may be extracted later, but v1 must not change `run_events`
 semantics to fit Ansich.
+
+### 10.7 Environment probe
+
+A second evidence source alongside the DeerFlow-runtime probes above: OS-level
+signals about the execution environment itself (fd, io, memory, disk, pressure),
+answering "is the environment the Agent is running in under resource pressure"
+rather than "what did the Agent decide or do." It ships as `environment.sampled`
+Observations against a sandbox or host Scope subject, never as a Task-level
+Belief — v1 deliberately stops at "the environment has an Alert," and a Task
+side only joins back to it through the read model (§4.9, §11).
+
+`AnsichEnvironmentProbe` (`deerflow/ansich/probes/environment.py`) mirrors the
+outer Task Control Probe's liveness-loop skeleton: the worker starts it beside
+the heartbeat after `task.started`, only the owning worker samples, and every
+tick is fail-open. Because different sandbox providers give physically
+different environment shapes — an AIO container is long-lived (standing state
+is meaningful) while a local sandbox's bash calls are short-lived child
+processes (no cross-command standing state, only per-command process-group
+consumption and host-shared signals) — the probe dispatches by provider
+identity rather than sampling one uniform shape: AIO reads container cgroup
+counters, local sandboxes read host-shared disk/PSI signals and declare both a
+`host` and a `sandbox` Scope, and every other provider declares a single
+`uninstrumented` sample once and stops rather than fabricating a reading.
+Blocking reads (`/proc`, docker) are offloaded via `asyncio.to_thread`; the
+probe's `stop()` is time-bounded so a stuck resolver cannot delay the worker's
+terminal-Task reconciliation.
+
+Local sandboxes get one additional, finer-grained evidence path: a per-command
+process-group sampler (`deerflow/sandbox/telemetry.py::ProcessGroupSampler`,
+deliberately Ansich-free — the sandbox layer never imports `ansich`) runs
+alongside each `bash` command, and its result crosses back over the
+`asyncio.to_thread` boundary into the awaiting coroutine through an explicit
+`contextvars.Context` round trip in
+`sandbox/tools.py::_run_sync_tool_after_async_sandbox_init`, because a plain
+`ContextVar.set()` inside the offloaded sync body is invisible to the caller's
+own context once the thread call returns. The existing Ansich tool probe chain
+picks the sample up from there and emits it as a `process_group`/`per_command`
+Observation carrying the authoritative `tool_call_id` — process-group readings
+never claim to be a standing count, only that one command's own snapshot.
+
+The evidence payload's `environment_scope` mark (`container` |
+`process_group` | `host_shared`) is a hard semantic-tier discipline that the
+projector, assessor, API, and frontend must all preserve rather than collapse:
+it is what lets the leak-suspicion rule refuse a `process_group` or
+`host_shared` reading instead of mistaking a per-command peak or a
+box-wide signal for sandbox standing state.
 
 ---
 

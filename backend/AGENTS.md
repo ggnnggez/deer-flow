@@ -924,6 +924,101 @@ Postgres. What this batch did **not** establish: the suite outside
 `tests/integration/` still runs on SQLite, so every multi-worker claim above
 rests on code review plus the lock's presence, not on an executed concurrent test.
 
+**Environment observability** (one slice, 2026-08-19, landed after the
+pre-Phase-11 hardening batch above and before Phase 11 itself; see
+`ansich/docs/plans/environment-observability.md`) adds a second evidence
+source alongside everything above: OS-level signals about the execution
+environment (fd, io, disk, pressure) rather than what the Agent decided or
+did. This exists because fd/io counters are sandbox-granular, not
+Task-granular — a sandbox is allocated per thread and outlives any one Task
+(warm pool, root + concurrent subagents sharing the parent's sandbox), so a
+leak accumulates across many Tasks and there is no honest way to attribute it
+to a single one; that is also why the resulting Alerts subject a Scope, never
+a Task, and a Task detail view only joins back to them. `environment.sampled`
+Observations (`subject_type="scope"`) carry a payload-level
+`environment_scope` mark — `container`, `process_group`, or `host_shared` —
+that is a hard semantic-tier discipline the whole chain (projector, assessor,
+API, frontend) must preserve, because the three tiers measure physically
+different things: only `container` (AIO cgroup) is a real standing count;
+`process_group` is one command's own peak (local sandboxes are short-lived
+child processes, so there is no cross-command state to measure); and
+`host_shared` (local disk free space, `/proc` pressure) is shared with every
+other process on the box and must never be presented as sandbox-exclusive.
+`ScopeKind` gained `host` for the shared signals, keyed by a stable hostname
+ref hash — Phase 11's reserved `observability_degradation`/
+`projection_failure` process-subject mapping is expected to reuse this same
+`host` Scope rather than add a second one. Collection is two paths:
+`AnsichEnvironmentProbe` (`deerflow/ansich/probes/environment.py`) mirrors
+`AnsichTaskHeartbeat`'s ownership/fail-open loop and is wired into
+`runtime/runs/worker.py` right beside the heartbeat start, dispatching by
+`sandbox.use` class-path substring the same way `is_local_sandbox` does
+(AIO → container cgroup; local → host disk/PSI plus declares both a `host`
+and a `sandbox` Scope; every other provider declares one `uninstrumented`
+sample and stops rather than fabricating a reading); its blocking reads
+(`/proc`, docker) go through `asyncio.to_thread`, and its own `stop()` is
+time-bounded (`AnsichConfig`'s 2s default) so a wedged resolver cannot delay
+the worker's terminal-Task reconciliation. The second path is local-only and
+finer-grained: `sandbox/telemetry.py::ProcessGroupSampler` runs beside each
+`bash` command and is deliberately Ansich-free (the sandbox layer never
+imports `ansich`, mirroring the harness→app import firewall's spirit one
+layer down); because `_run_sync_tool_after_async_sandbox_init` offloads the
+sync tool body onto `asyncio.to_thread` with its own copied `Context`, a
+plain `ContextVar.set()` inside that body is invisible to the awaiting
+coroutine once the thread call returns — the fix is an explicit
+`contextvars.copy_context()` round trip: the offload runs inside that
+captured context and the function reads the sample back out of the same
+`ctx` object in its `finally`, handing it to the existing Ansich tool probe
+chain to emit as `process_group`/`per_command`, carrying the authoritative
+`tool_call_id`. Config: `AnsichConfig.environment_probe_enabled` (default
+on), `environment_sample_interval_seconds` (`None` falls back to
+`heartbeat_interval_seconds` via `effective_environment_sample_interval_seconds`),
+and `environment_per_command_sampling` (local-only) are all startup-only,
+same as the rest of `ansich`; the per-command switch is wired at Gateway
+service assembly (`app/gateway/deps.py`) into
+`sandbox.telemetry.set_per_command_sampling_enabled(...)` only when the
+Ansich service actually assembled (`enabled` **and** the probe **and** the
+per-command flag all true), so a disabled Ansich service cannot leave the
+sandbox layer silently sampling for nobody. `environment-projector@1`
+registers immediately after `task-safety` (it projects onto the Scope
+entities that projector establishes) and writes three rebuildable read
+models via migration `0026_ansich_environment`:
+`ansich_environment_coverage` (per-Scope current coverage/provider),
+`ansich_environment_state` (one current-state row per
+`(scope_id, environment_scope, metric)`, lock-then-read on update, plus a
+`consecutive_growth_count` trend counter maintained only for `container` +
+`continuous` evidence), and `ansich_tool_env_samples` (at most one row per
+`tool_call_id`, deliberately carrying no foreign keys so a per-command
+sample never blocks on Task/Scope/ToolCall dependency-wait projection).
+`environment-pressure@1` runs inside the existing periodic operations
+assessment loop and produces two Assertion families, both transition-only
+(appended only when the categorical value changes, never every tick):
+`environment_pressure:<metric>` (fd/disk/PSI ratio crossing configured
+warn/critical thresholds) and `environment_leak:fd_open` (sustained
+monotonic fd growth). Both downgrade to `unknown` — never `ok` — when a
+running Task's Scope has gone more than 3× the sample interval without a
+fresh sample, or when coverage is `uninstrumented`; the leak rule additionally
+refuses any input whose `environment_scope` is not `container` or whose
+coverage is not `continuous` (a `process_group` snapshot cannot prove
+standing growth, and `host_shared` mixes in every other process on the box),
+so per-command evidence structurally cannot feed it. Two new `AlertType`
+values (`environment_pressure`, `environment_leak_suspected`) join the
+public filter and reuse the existing episode state machine unchanged; their
+evidence carries `possibly_affected_task_ids` — the Tasks the assessor found
+`running` in that Scope at sample time — which is correlation, not
+causality, the same discipline as `possible_exposure`. Per-command data
+deliberately produces zero Alerts in v1: it is read-side only
+(`GET /tasks/{id}/environment`, the additive `environment_sample` field on
+ToolCall detail, and the frontend's coverage-badged "运行环境" panel), because
+forcing a point-in-time command spike through the episode state machine
+would just produce open/resolve noise. All nine assessor thresholds
+(`environment_fd_warn_ratio` / `environment_fd_critical_ratio`,
+`environment_disk_free_warn_ratio` / `environment_disk_free_critical_ratio`,
+`environment_psi_warn_milli` / `environment_psi_critical_milli`,
+`environment_leak_min_samples` / `environment_leak_window_seconds` /
+`environment_leak_min_growth`) live on `AnsichAssessorConfig` beside the
+existing repetition/frequency thresholds and are hashed into every Belief
+Assertion's config identity, same as the rest of the assessor family.
+
 **Workspace change review**: `packages/harness/deerflow/workspace_changes/`
 captures a pre-run and post-run snapshot of the thread-owned `workspace` and
 `outputs` directories. `runtime/runs/worker.py` performs the filesystem scan via

@@ -86,6 +86,17 @@ This section accumulates work toward the **2.1.0** milestone
   uncached paths; a Redis stream bridge enables distributed event streaming; and
   manual context compaction is exposed to the user. ([#3920], [#3191], [#3969])
 
+#### Observability
+
+- **ansich:** Environment observability adds OS-level environment signals
+  (fd/io/disk/pressure) as a second Ansich evidence source, subject to
+  sandbox/host Scopes rather than Tasks: a continuous probe beside the
+  existing heartbeat (container cgroup metrics on the AIO sandbox, host
+  disk/PSI signals on local), local per-command process-group sampling, a
+  transition-only `environment-pressure@1` assessor (fd/disk/PSI thresholds
+  plus a leak-suspicion rule scoped to container-only continuous evidence),
+  and a Task-detail "运行环境" panel with explicit unknown/coverage badges.
+
 #### Memory
 
 - **memory:** Memory consolidation synthesizes fragmented facts, and a staleness

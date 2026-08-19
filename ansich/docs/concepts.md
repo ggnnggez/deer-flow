@@ -156,7 +156,7 @@ Budget 是 policy limit，Usage 是事实贡献，breach 是判断，三者不�
 
 ### Scope
 
-一个稳定的归属、执行或资源边界。v1 scope kind 包括 `owner`、`thread`、`workspace`、`sandbox`、`authorization`、`external_origin`。Task 可以同时位于多个 Scope；`within_scope` relation 的 role 说明关系含义，例如 owner、conversation、execution workspace 或 auth context。
+一个稳定的归属、执行或资源边界。v1 scope kind 包括 `owner`、`thread`、`workspace`、`sandbox`、`authorization`、`external_origin`、`host`。Task 可以同时位于多个 Scope；`within_scope` relation 的 role 说明关系含义，例如 owner、conversation、execution workspace、auth context 或 `host_environment`。`host` kind 用 hostname 的 stable ref hash 规范化身份（不把敏感绝对路径/凭证当 ID）；单机部署下是一个固定 Scope，供环境观测的宿主共享信号（磁盘余量、PSI）挂载，Phase 11 预留的 `observability_degradation`/`projection_failure` process-subject 映射与本节共享同一个 `host` Scope 机制，不另造。
 
 - 路径和外部标识先规范化为受控 label 与 stable ref hash，不把 tenant credential 或敏感绝对路径当 ID。
 - child Task 继承 Scope 必须有 relation evidence，不能只在读取时隐式猜测。
@@ -240,3 +240,41 @@ release 之间的语义质量比较只在同一 cohort 内进行。以下条件�
 4. `contracts.py` 的 Observation/subject contract；
 5. SQLite migration、SQL typed projection 与 replay 测试；
 6. API DTO 和前端类型，确保 `unknown`、completeness 与 evidence 不在传输中丢失。
+
+## 10. 环境观测
+
+Ansich 的第二类证据来源：执行环境的 OS 级观测信号（fd、io、内存、磁盘、压力），与 DeerFlow runtime 采集（决策、attempt、ToolCall、heartbeat、预算等）并列，但语义分级更严格，因为不同 provider 的“环境”物理形态不同（AIO 容器是长驻环境，local 每条 bash 是短命子进程）。
+
+### `environment.sampled`（Observation）
+
+`subject_type = "scope"`，`subject_id` 是 sandbox Scope 或 host Scope 的 scope_id；`fidelity_class` 依惯例恒为 `hard`（描述“采到了这条样本”这一事实），判断强度由 assessor 依据 payload 的 `environment_scope`/`coverage` 决定。payload 强制字段：`environment_scope`、`coverage`、`window`、`provider`、`metrics`、`tool_call_id`（仅 `per_command` 填写）。
+
+**硬规则一：`environment_scope` 决定语义等级，全链路（投影、assessor、API、前端）不可丢失：**
+
+- `container`：沙箱隔离环境的真实存量（仅 AIO 容器 cgroup/fd）；
+- `process_group`：单条命令进程组的消耗快照——测不到存量，fd 值是该命令峰值，不是“沙箱当前打开数”；
+- `host_shared`：与宿主机所有进程共享的信号（磁盘余量、PSI），永远不冒充沙箱指标。
+
+缺失的 metric 维度不写零，直接不出现（沿用 usage 的“未报告 ≠ 0”纪律）；`coverage = "uninstrumented"` 仅允许空 `metrics`、`sample_count = 0`，每 run 至多发一条声明。
+
+### 采集器
+
+`AnsichEnvironmentProbe`（`deerflow/ansich/probes/environment.py`）完全仿照 `AnsichTaskHeartbeat`：worker 在 `task.started` 后与 heartbeat 并排启动，按 provider 分派——AIO 读容器 cgroup 指标（`container`/`continuous`），local 采宿主磁盘余量与 PSI（`host_shared`/`continuous`，同时声明 host 与 sandbox 两个 Scope），其余 provider 只在 run 启动时发一条 `uninstrumented` 声明后自行停止。每次采样经 `asyncio.to_thread` 下放（`/proc`、docker 读取是阻塞 IO，必须过 blocking-io 门禁）；`stop()` 有界（默认 2 秒），避免拖慢 Task 终态收尾。
+
+local sandbox 还有按命令采样：`LocalSandbox` 在命令运行期间用 ansich 无关的轻量 `ProcessGroupSampler`（`deerflow/sandbox/telemetry.py`）后台线程枚举进程组成员，累计 io/fd 峰值；结果经 `asyncio.to_thread` 边界的显式 `Context` 回传（`sandbox/tools.py::_run_sync_tool_after_async_sandbox_init`），由 Ansich tool probe 链发出 `process_group/per_command` 观测，携带权威 `tool_call_id`。sandbox 层不 import ansich。
+
+### 投影与评估
+
+`environment-projector@1` 注册在 `task-safety` 之后（挂在其建立的 Scope 实体上），产出三张读模型（migration `0026_ansich_environment`）：`ansich_environment_coverage`（per-Scope 覆盖态）、`ansich_environment_state`（每 `(scope_id, environment_scope, metric)` 一行的现状行，先锁后读，含 `consecutive_growth_count` 趋势字段）、`ansich_tool_env_samples`（每 `tool_call_id` 至多一行，供 ToolCall 详情读；无外键，不参与依赖等待投影）。
+
+`environment-pressure@1` assessor 挂进现有周期 operations 评估循环，产出两类结论：`environment_pressure:<metric>`（fd/disk/PSI 越阈，authority=`configured_rule`）与 `environment_leak:fd_open`（container + continuous 下 fd 连续增长的“suspected”判断）。Alert evidence 附采样时刻该 Scope 内 `running` 的 Task 列表，字段名 `possibly_affected_task_ids`——**硬规则二：这是时间相关性，不是因果**，措辞与建模都不得声称因果，同 `possible_exposure` 的纪律。
+
+**硬规则三：缺数据永远是 unknown，不是 ok。** run 活跃但超过 3× 采样间隔无样本，或 `coverage = uninstrumented`，assessor 一律降级为 `unknown`；环境评估绝不写 Task 控制状态。
+
+**硬规则四：`per_command` 数据永远不喂泄漏规则。** 进程组快照测不到存量，`environment_leak` 规则的输入被硬限制为 `container` + `continuous`；v1 也不从单命令样本产生任何 Alert——episode 状态机建模持续 condition，单命令尖峰是点事件，硬塞会产生秒开秒关的 episode 噪音；per_command 的价值只在读侧（ToolCall 详情、Task 时间线），点事件告警通道待真实使用证据后另行设计。
+
+### 读侧
+
+`GET /api/ansich/tasks/{task_id}/environment` 沿 `within_scope` 找 sandbox/host Scope，返回每 scope 的现状行（metrics + coverage + environment_scope）、当前 `environment_pressure`/`environment_leak` Belief（unknown 完整下发）、以及活跃/历史环境 Alert 摘要；两个新 `AlertType`（`environment_pressure`、`environment_leak_suspected`）进公共 filter，list/detail/acknowledge/dismiss 复用现有机制。ToolCall 详情读模型加 additive 可空字段 `environment_sample`。前端 Task 详情“运行环境”面板每 scope 一张卡，`environment_scope` 徽标（容器实测/进程组快照/宿主共享）+ coverage 徽标（含“未观测”态），unknown 显式渲染为“未知”，不用空白或绿色。
+
+- 实现：`backend/packages/ansich/ansich/environment.py`（契约/assessor）、`backend/packages/harness/deerflow/ansich/probes/environment.py`（连续 probe）、`backend/packages/harness/deerflow/sandbox/telemetry.py`（按命令 sampler）、`backend/packages/harness/deerflow/ansich/persistence/sql.py`（`environment-projector@1`）、`backend/app/gateway/routers/ansich.py`。

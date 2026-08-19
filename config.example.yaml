@@ -15,7 +15,7 @@
 # ============================================================================
 # Bump this number when the config schema changes.
 # Run `make config-upgrade` to merge new fields into your local config.yaml.
-config_version: 32
+config_version: 33
 
 # ============================================================================
 # Logging
@@ -1838,12 +1838,37 @@ ansich:
   # Evaluation submissions larger than this are rejected rather than truncated,
   # so an expected/actual body cannot silently lose its evidence.
   evaluation_max_payload_bytes: 262144
+  # Enable OS-level environment sampling (fd/io/disk/pressure) as a second
+  # Ansich evidence source, subject to sandbox/host Scopes rather than Tasks.
+  environment_probe_enabled: true
+  # Interval for continuous environment sampling; null falls back to
+  # heartbeat_interval_seconds.
+  environment_sample_interval_seconds: null
+  # Enable local-sandbox per-command process-group sampling (io/fd). Read-side
+  # only (ToolCall detail) — per-command samples never feed an Alert rule.
+  environment_per_command_sampling: true
   # Assessor thresholds are hashed into every Belief Assertion. Changing one
   # changes the rule config identity without rewriting earlier assertions.
   assessors:
     exact_repetition_window: 5
     tool_frequency_window_seconds: 300
     tool_frequency_threshold: 30
+    # environment_pressure@1 thresholds below. fd ratio is value/limit; disk
+    # free ratio is inverted (a *small* ratio is the bad end); PSI is in
+    # milli-units (some_avg10 * 1000) from /proc/pressure/{io,memory}.
+    environment_fd_warn_ratio: 0.8
+    environment_fd_critical_ratio: 0.95
+    environment_disk_free_warn_ratio: 0.10
+    environment_disk_free_critical_ratio: 0.05
+    environment_psi_warn_milli: 40000
+    environment_psi_critical_milli: 80000
+    # environment_leak_suspected: container + continuous fd_open only, never
+    # process_group or host_shared. Fires when fd grows monotonically across
+    # at least this many samples, over at least this many seconds, with at
+    # least this net increase.
+    environment_leak_min_samples: 6
+    environment_leak_window_seconds: 60
+    environment_leak_min_growth: 50
 
 # ============================================================================
 # Run Events Configuration
