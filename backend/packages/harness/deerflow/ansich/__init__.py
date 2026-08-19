@@ -47,6 +47,31 @@ class _UnavailableBackend:
 
         return TaskEnvironmentView(task_id=task_id, scopes=())
 
+    async def get_environment_history(
+        self,
+        scope_id,
+        *,
+        environment_scope,
+        metric,
+        window_minutes,
+        max_points,
+    ):
+        from ansich.environment import EnvironmentHistoryView
+
+        return EnvironmentHistoryView(
+            scope_id=scope_id,
+            environment_scope=environment_scope,
+            metric=metric,
+            window_minutes=window_minutes,
+            truncated=False,
+            points=(),
+        )
+
+    async def get_task_tool_env_samples(self, task_id):
+        from ansich.environment import TaskToolEnvSamplesView
+
+        return TaskToolEnvSamplesView(task_id=task_id, truncated=False, samples=())
+
     async def get_tool_environment_sample(self, tool_call_id):
         return None
 

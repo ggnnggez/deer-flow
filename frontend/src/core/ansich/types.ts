@@ -879,6 +879,43 @@ export interface AnsichTaskEnvironmentResponse {
   scopes: AnsichEnvironmentScope[];
 }
 
+export interface AnsichEnvironmentHistoryPoint {
+  occurred_at: string;
+  value: number;
+  // Whatever that sample itself reported; null when it carried no limit.
+  limit: number | null;
+}
+
+export interface AnsichEnvironmentHistoryResponse {
+  scope_id: string;
+  environment_scope: string;
+  metric: string;
+  window_minutes: number;
+  // The window held more surviving points than `max_points`; the newest were
+  // kept. Older readings exist but are not in this series.
+  truncated: boolean;
+  // Oldest first. A sample that never reported this metric is absent, never
+  // present as a 0 — a gap here is an honest gap, not a zero reading.
+  points: AnsichEnvironmentHistoryPoint[];
+}
+
+export interface AnsichToolEnvSample {
+  tool_call_id: string;
+  started_at: string;
+  ended_at: string;
+  sample_count: number;
+  fd_peak: number | null;
+  io_read_bytes: number | null;
+  io_write_bytes: number | null;
+}
+
+export interface AnsichTaskToolEnvSamplesResponse {
+  task_id: string;
+  truncated: boolean;
+  // In execution order (oldest first).
+  samples: AnsichToolEnvSample[];
+}
+
 export interface AnsichToolEnvironmentSample {
   tool_call_id: string;
   task_id: string;

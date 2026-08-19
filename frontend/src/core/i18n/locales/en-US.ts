@@ -596,12 +596,22 @@ export const enUS: Translations = {
     unknownEffectCoverage:
       "Effect coverage is unknown. Missing rows do not mean that no side effects occurred.",
     environment: "Runtime environment",
-    environmentEmpty: "No environment observations were recorded for this Task.",
+    environmentEmpty:
+      "No environment observations were recorded for this Task.",
     environmentProcessGroupNote:
       "Single-command consumption snapshot, not sandbox-wide state.",
     environmentPossiblyAffectedTitle: "Tasks running at sample time",
     environmentMetrics: "Metrics",
     environmentBeliefs: "Assessment",
+    environmentTrend: "Last 60 minutes",
+    environmentTrendTruncated:
+      "Too many samples; only the most recent stretch is shown.",
+    environmentPerCommand: "Per command",
+    environmentPerCommandOrderNote:
+      "The x axis is command execution order, not a time axis.",
+    environmentFdPeak: "FD peak",
+    environmentIoRead: "read",
+    environmentIoWrite: "write",
     agentRelease: "Agent release",
     noAgentRelease: "No Agent release was resolved for this Task.",
     releaseHash: "Release hash",

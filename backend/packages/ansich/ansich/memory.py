@@ -13,7 +13,12 @@ from ansich.compression import (
 from ansich.context_state import ContextStateDelta, ContextStateItem, ContextStateView, materialize_context_state
 from ansich.contracts import ControlBelief, ControlValue, NamedVersion, ObservationEnvelope, TaskLifecycleScope, TaskView, control_values_for_lifecycle_scope
 from ansich.control import should_select_control_candidate
-from ansich.environment import TaskEnvironmentView, ToolEnvironmentSampleView
+from ansich.environment import (
+    EnvironmentHistoryView,
+    TaskEnvironmentView,
+    TaskToolEnvSamplesView,
+    ToolEnvironmentSampleView,
+)
 from ansich.heartbeat import TaskHeartbeatView
 from ansich.lineage import ContentBlockView, ContentProducerView, LineageDirection, PossibleExposureItemView
 from ansich.release import (
@@ -568,6 +573,33 @@ class InMemoryAnsichBackend:
         # unit tests, not the environment-projector's coverage/state/belief
         # tables, so it always reports "nothing observed" rather than raising.
         return TaskEnvironmentView(task_id=task_id, scopes=())
+
+    async def get_environment_history(
+        self,
+        scope_id: str,
+        *,
+        environment_scope: str,
+        metric: str,
+        window_minutes: int,
+        max_points: int,
+    ) -> EnvironmentHistoryView:
+        # Minimal implementation, same reason as ``get_task_environment``: the
+        # trend read replays projected environment Observations, which this
+        # backend does not retain. An empty window is "nothing observed", not
+        # an error.
+        return EnvironmentHistoryView(
+            scope_id=scope_id,
+            environment_scope=environment_scope,
+            metric=metric,
+            window_minutes=window_minutes,
+            truncated=False,
+            points=(),
+        )
+
+    async def get_task_tool_env_samples(self, task_id: str) -> TaskToolEnvSamplesView:
+        # Minimal implementation: ``ansich_tool_env_samples`` is a SQL
+        # projection this backend does not materialize.
+        return TaskToolEnvSamplesView(task_id=task_id, truncated=False, samples=())
 
     async def get_task_heartbeat(self, task_id: str) -> TaskHeartbeatView | None:
         observation = max(

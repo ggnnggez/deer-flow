@@ -111,11 +111,15 @@ from ansich.environment import (
     PRESSURE_RULED_METRICS,
     EnvironmentAlertSummaryView,
     EnvironmentBeliefView,
+    EnvironmentHistoryPoint,
+    EnvironmentHistoryView,
     EnvironmentMetricView,
     EnvironmentScopeView,
     EnvironmentThresholds,
     TaskEnvironmentView,
+    TaskToolEnvSamplesView,
     ToolEnvironmentSampleView,
+    ToolEnvSampleView,
     assess_environment_leak,
     assess_environment_pressure,
 )
@@ -531,6 +535,20 @@ def _as_utc(value: datetime) -> datetime:
     if value.tzinfo is None:
         return value.replace(tzinfo=UTC)
     return value.astimezone(UTC)
+
+
+def _as_non_negative_int(value: object) -> int | None:
+    """Return a metric reading only when it really is one.
+
+    ``bool`` is excluded deliberately (it is an ``int`` subclass in Python but
+    never a metric), and anything else — a string, a float, a missing key —
+    yields ``None`` so the caller skips the sample instead of coercing an
+    unreadable payload into a number.
+    """
+
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        return None
+    return value
 
 
 def _read_model_values_equal(current: object, candidate: object) -> bool:
@@ -4521,6 +4539,139 @@ class SqlAnsichBackend:
             )
 
         return TaskEnvironmentView(task_id=task_id, scopes=tuple(scopes))
+
+    #: Read-side bound on the per-command sequence a single Task can return.
+    #: A Task with more commands than this is truncated rather than paged: the
+    #: consumer is a trend curve, not an audit list, and the ordered ToolCall
+    #: accountability read is where a complete enumeration lives.
+    _TOOL_ENV_SAMPLE_LIMIT = 500
+
+    async def get_environment_history(
+        self,
+        scope_id: str,
+        *,
+        environment_scope: str,
+        metric: str,
+        window_minutes: int,
+        max_points: int,
+    ) -> EnvironmentHistoryView:
+        """Replay one metric's recent readings straight off the Observation log.
+
+        Deliberately not a read model: the trend is a lazy, bounded, on-demand
+        read, so it is derived from the immutable ``environment.sampled``
+        Observations rather than adding a fourth rebuildable table whose only
+        consumer is a sparkline. A sample that does not carry ``metric`` is
+        skipped, not zeroed — see ``EnvironmentHistoryView``.
+
+        Note: this filters by ``subject_id`` while the available index is
+        ``(kind, occurred_at)``. Environment observation volume is the same
+        order of magnitude as heartbeats, so the residual scan is acceptable
+        today; a ``(subject_id, kind, occurred_at)`` index is the registered
+        follow-up if that volume rises.
+        """
+
+        window_start = datetime.now(UTC) - timedelta(minutes=window_minutes)
+        async with self._session_factory() as session:
+            rows = list(
+                (
+                    await session.execute(
+                        select(AnsichObservationRow)
+                        .where(
+                            AnsichObservationRow.kind == "environment.sampled",
+                            AnsichObservationRow.subject_id == scope_id,
+                            AnsichObservationRow.occurred_at >= window_start,
+                        )
+                        .order_by(
+                            AnsichObservationRow.occurred_at.asc(),
+                            AnsichObservationRow.ingest_seq.asc(),
+                        )
+                    )
+                ).scalars()
+            )
+
+        points: list[EnvironmentHistoryPoint] = []
+        for row in rows:
+            payload = row.payload_json
+            if payload is None:
+                # Environment payloads are small and never externalized, but a
+                # payload-ref row would carry no readable metrics here, so it
+                # is skipped rather than counted as a reading.
+                continue
+            if payload.get("environment_scope") != environment_scope:
+                continue
+            metrics = payload.get("metrics")
+            if not isinstance(metrics, dict):
+                continue
+            reading = metrics.get(metric)
+            if not isinstance(reading, dict):
+                continue
+            value = _as_non_negative_int(reading.get("value"))
+            if value is None:
+                continue
+            points.append(
+                EnvironmentHistoryPoint(
+                    occurred_at=_as_utc(row.occurred_at),
+                    value=value,
+                    limit=_as_non_negative_int(reading.get("limit")),
+                )
+            )
+
+        truncated = len(points) > max_points
+        if truncated:
+            # Keep the newest window: a trend read answers "what is happening
+            # now", so dropping the oldest points is the honest truncation.
+            points = points[-max_points:]
+        return EnvironmentHistoryView(
+            scope_id=scope_id,
+            environment_scope=environment_scope,
+            metric=metric,
+            window_minutes=window_minutes,
+            truncated=truncated,
+            points=tuple(points),
+        )
+
+    async def get_task_tool_env_samples(self, task_id: str) -> TaskToolEnvSamplesView:
+        """The Task's per-command samples in execution order."""
+
+        async with self._session_factory() as session:
+            rows = list(
+                (
+                    await session.execute(
+                        select(AnsichToolEnvSampleRow)
+                        .where(AnsichToolEnvSampleRow.task_id == task_id)
+                        .order_by(
+                            AnsichToolEnvSampleRow.started_at.asc(),
+                            # Commands sharing a start instant (a sampler
+                            # window that opened with the tool call) are still
+                            # ordered by when they finished; the id is only the
+                            # last deterministic tiebreak, never the ordering
+                            # anyone reads meaning from.
+                            AnsichToolEnvSampleRow.ended_at.asc(),
+                            AnsichToolEnvSampleRow.tool_call_id.asc(),
+                        )
+                        # One row past the cap, so "there are more" is a fact
+                        # read off the query rather than a separate count.
+                        .limit(self._TOOL_ENV_SAMPLE_LIMIT + 1)
+                    )
+                ).scalars()
+            )
+        truncated = len(rows) > self._TOOL_ENV_SAMPLE_LIMIT
+        return TaskToolEnvSamplesView(
+            task_id=task_id,
+            truncated=truncated,
+            samples=tuple(
+                ToolEnvSampleView(
+                    tool_call_id=row.tool_call_id,
+                    started_at=_as_utc(row.started_at),
+                    ended_at=_as_utc(row.ended_at),
+                    sample_count=row.sample_count,
+                    fd_peak=row.fd_peak,
+                    io_read_bytes=row.io_read_bytes,
+                    io_write_bytes=row.io_write_bytes,
+                )
+                for row in rows[: self._TOOL_ENV_SAMPLE_LIMIT]
+            ),
+        )
 
     async def get_tool_environment_sample(self, tool_call_id: str) -> ToolEnvironmentSampleView | None:
         async with self._session_factory() as session:

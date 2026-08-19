@@ -96,6 +96,11 @@ This section accumulates work toward the **2.1.0** milestone
   transition-only `environment-pressure@1` assessor (fd/disk/PSI thresholds
   plus a leak-suspicion rule scoped to container-only continuous evidence),
   and a Task-detail "运行环境" panel with explicit unknown/coverage badges.
+- **ansich:** The environment panel gains trend sparklines, backed by two new
+  lazy admin reads (`GET /api/ansich/scopes/{id}/environment/history` and
+  `GET /api/ansich/tasks/{id}/environment/tool-samples`), and ToolCall rows now
+  show each command's fd peak and read/write bytes; unsampled metrics stay
+  absent from a series rather than being drawn as zero.
 
 #### Memory
 

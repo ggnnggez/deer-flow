@@ -1027,6 +1027,23 @@ would just produce open/resolve noise. All nine assessor thresholds
 `environment_leak_min_growth`) live on `AnsichAssessorConfig` beside the
 existing repetition/frequency thresholds and are hashed into every Belief
 Assertion's config identity, same as the rest of the assessor family.
+Two lazy, unpolled admin reads back the panel's trend curves:
+`GET /scopes/{scope_id}/environment/history` replays one
+`(Scope, environment_scope, metric)` series straight off the immutable
+`environment.sampled` Observations rather than adding a fourth read model —
+a sample that never reported that metric is **absent** from the series, never
+a zero, so a gap stays an honest gap the sparkline breaks the line across
+instead of interpolating; it 422s a non-canonical `environment_scope`/`metric`
+and, past `max_points`, keeps the newest stretch with `truncated=true`.
+`GET /tasks/{task_id}/environment/tool-samples` returns the Task's
+`ansich_tool_env_samples` rows in `started_at` order (cap 500, same truncation
+flag), which is what feeds both the per-command curves and the ToolCall row's
+fd/io line — the frontend reads that batched route rather than one ToolCall
+detail fetch per row, so the additive `environment_sample` field on ToolCall
+detail stays the single-call API read. The history filter is by `subject_id`
+while the available index is `(kind, occurred_at)`; environment volume is
+heartbeat-order, so the residual scan is accepted and a
+`(subject_id, kind, occurred_at)` index is the registered follow-up.
 
 **Workspace change review**: `packages/harness/deerflow/workspace_changes/`
 captures a pre-run and post-run snapshot of the thread-owned `workspace` and

@@ -493,6 +493,13 @@ export interface Translations {
     environmentPossiblyAffectedTitle: string;
     environmentMetrics: string;
     environmentBeliefs: string;
+    environmentTrend: string;
+    environmentTrendTruncated: string;
+    environmentPerCommand: string;
+    environmentPerCommandOrderNote: string;
+    environmentFdPeak: string;
+    environmentIoRead: string;
+    environmentIoWrite: string;
     agentRelease: string;
     noAgentRelease: string;
     releaseHash: string;

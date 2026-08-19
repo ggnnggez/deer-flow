@@ -1141,6 +1141,64 @@ async def get_task_environment(task_id: str, request: Request) -> dict:
     return environment.model_dump(mode="json")
 
 
+@router.get("/scopes/{scope_id}/environment/history")
+async def get_environment_history(
+    scope_id: str,
+    request: Request,
+    environment_scope: Literal["container", "process_group", "host_shared"] = Query(),
+    metric: str = Query(pattern=r"^[a-z][a-z0-9_]{0,63}$"),
+    window_minutes: int = Query(default=60, ge=1, le=1440),
+    max_points: int = Query(default=360, ge=1, le=1000),
+) -> dict:
+    """One metric's bounded recent trend on one Scope.
+
+    Lazy and metadata-only, like the other trend/detail reads: nothing polls
+    it, and a sample that never reported ``metric`` is absent from the series
+    rather than present as a zero.
+    """
+
+    await require_admin_user(request, detail=_ADMIN_REQUIRED)
+    service = _service_or_503(request)
+    _ensure_queryable(service)
+    try:
+        history = await service.get_environment_history(
+            scope_id,
+            environment_scope=environment_scope,
+            metric=metric,
+            window_minutes=window_minutes,
+            max_points=max_points,
+        )
+    except Exception as exc:
+        raise HTTPException(
+            status_code=503,
+            detail={
+                "message": "Ansich Environment history query failed",
+                "projection_status": _projection_status(service),
+            },
+        ) from exc
+    return history.model_dump(mode="json")
+
+
+@router.get("/tasks/{task_id}/environment/tool-samples")
+async def get_task_tool_env_samples(task_id: str, request: Request) -> dict:
+    """The Task's per-command environment samples, in execution order."""
+
+    await require_admin_user(request, detail=_ADMIN_REQUIRED)
+    service = _service_or_503(request)
+    _ensure_queryable(service)
+    try:
+        samples = await service.get_task_tool_env_samples(task_id)
+    except Exception as exc:
+        raise HTTPException(
+            status_code=503,
+            detail={
+                "message": "Ansich Environment tool-sample query failed",
+                "projection_status": _projection_status(service),
+            },
+        ) from exc
+    return samples.model_dump(mode="json")
+
+
 @router.get("/tasks")
 async def list_tasks(
     request: Request,

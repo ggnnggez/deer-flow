@@ -100,6 +100,7 @@ def _environment_sampled(
     environment_scope: str = "container",
     sample_count: int = 1,
     tool_call_id: str | None = None,
+    window_started_at: datetime | None = None,
 ) -> ObservationEnvelope:
     payload: dict[str, object] = {
         "environment_scope": environment_scope,
@@ -107,7 +108,7 @@ def _environment_sampled(
         "provider": "local",
         "metrics": metrics or {},
         "window": {
-            "started_at": _STARTED_AT.isoformat(),
+            "started_at": (window_started_at or _STARTED_AT).isoformat(),
             "ended_at": occurred_at.isoformat(),
             "sample_count": sample_count,
         },
@@ -435,6 +436,208 @@ async def test_tool_call_detail_has_additive_environment_sample_with_and_without
     assert without_sample.json()["environment_sample"] is None
     # Additive: the pre-existing field is untouched.
     assert without_sample.json()["tool_call"]["tool_call_id"] == bare_tool_call_id
+
+
+@pytest.mark.anyio
+async def test_environment_history_returns_ordered_points_and_skips_missing_metric(tmp_path) -> None:
+    """Ordered oldest-first, and a sample without the metric is absent — not 0.
+
+    The window is anchored on wall-clock ``now`` inside the backend, so the
+    samples are recorded at recent timestamps rather than the file's fixed
+    ``_STARTED_AT``; that is the same clock the production read uses.
+    """
+
+    task_id, run_id = new_id(), "env-history-run"
+    now = datetime.now(UTC)
+    scope_id = ObservationEnvelope.scope_snapshotted(
+        task_id=task_id,
+        run_id=run_id,
+        occurred_at=_STARTED_AT,
+        scope_kind=_SCOPE_KIND,
+        external_ref="local:thread-history",
+        relation_role="sandbox_boundary",
+        source_event_id=f"run:{run_id}:scope",
+    ).subject_id
+
+    service, engine = await _service(tmp_path, "ansich-env-history.db")
+    try:
+        service.record_batch(
+            (
+                _task_created(task_id, run_id),
+                _task_started(task_id, run_id),
+                _scope_snapshotted(task_id, run_id, external_ref="local:thread-history"),
+                _environment_sampled(task_id, run_id, scope_id=scope_id, tick=1, occurred_at=now - timedelta(minutes=3), metrics=_fd(100)),
+                # No fd_open in this tick: it must be skipped, never zeroed.
+                _environment_sampled(
+                    task_id,
+                    run_id,
+                    scope_id=scope_id,
+                    tick=2,
+                    occurred_at=now - timedelta(minutes=2),
+                    metrics={"disk_free_bytes": {"value": 4096, "limit": 8192}},
+                ),
+                _environment_sampled(task_id, run_id, scope_id=scope_id, tick=3, occurred_at=now - timedelta(minutes=1), metrics=_fd(140)),
+                # Another environment_scope on the same Scope must not leak in.
+                _environment_sampled(
+                    task_id,
+                    run_id,
+                    scope_id=scope_id,
+                    tick=4,
+                    occurred_at=now - timedelta(seconds=30),
+                    environment_scope="host_shared",
+                    metrics=_fd(999, None),
+                ),
+            )
+        )
+        await service.flush_task(task_id)
+
+        app = make_authed_test_app(user_factory=_admin_user)
+        app.state.ansich_service = service
+        app.include_router(ansich_router.router)
+        base = f"/api/ansich/scopes/{scope_id}/environment/history"
+        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+            ordered = await client.get(f"{base}?environment_scope=container&metric=fd_open")
+            truncated = await client.get(f"{base}?environment_scope=container&metric=fd_open&max_points=1")
+            unobserved = await client.get(f"{base}?environment_scope=container&metric=psi_io_some_avg10_milli")
+            bad_scope = await client.get(f"{base}?environment_scope=not_a_tier&metric=fd_open")
+            bad_metric = await client.get(f"{base}?environment_scope=container&metric=NotCanonical")
+    finally:
+        await service.stop()
+        await engine.dispose()
+
+    assert ordered.status_code == 200
+    body = ordered.json()
+    assert body["scope_id"] == scope_id
+    assert body["environment_scope"] == "container"
+    assert body["metric"] == "fd_open"
+    assert body["window_minutes"] == 60
+    assert body["truncated"] is False
+    # Exactly the two ticks that reported fd_open, oldest first. The
+    # disk-only tick contributes nothing at all — no zero-valued point.
+    assert [point["value"] for point in body["points"]] == [100, 140]
+    assert [point["limit"] for point in body["points"]] == [1024, 1024]
+    assert body["points"][0]["occurred_at"] < body["points"][1]["occurred_at"]
+
+    assert truncated.status_code == 200
+    truncated_body = truncated.json()
+    assert truncated_body["truncated"] is True
+    # Newest kept, oldest dropped.
+    assert [point["value"] for point in truncated_body["points"]] == [140]
+
+    # A metric nothing reported is an empty series, not an error and not zeros.
+    assert unobserved.status_code == 200
+    assert unobserved.json()["points"] == []
+
+    assert bad_scope.status_code == 422
+    assert bad_metric.status_code == 422
+
+
+@pytest.mark.anyio
+async def test_task_tool_env_samples_returns_per_command_rows_in_order(tmp_path) -> None:
+    task_id, run_id = new_id(), "env-tool-samples-run"
+    step_id = new_id()
+    first_tool_call_id, second_tool_call_id = new_id(), new_id()
+    producer = Producer(name="env-tool-samples-test", version="1", instance_id="test")
+    scope_id = ObservationEnvelope.scope_snapshotted(
+        task_id=task_id,
+        run_id=run_id,
+        occurred_at=_STARTED_AT,
+        scope_kind=_SCOPE_KIND,
+        external_ref="local:thread-tool-samples",
+        relation_role="sandbox_boundary",
+        source_event_id=f"run:{run_id}:scope",
+    ).subject_id
+
+    def _per_command(tool_call_id: str, tick: int, *, fd_peak: int, write_bytes: int) -> ObservationEnvelope:
+        return _environment_sampled(
+            task_id,
+            run_id,
+            scope_id=scope_id,
+            tick=tick,
+            occurred_at=_STARTED_AT + timedelta(seconds=tick + 1),
+            # Each command's sampler window opens with the command itself, so
+            # the rows really do carry distinct start instants — the read must
+            # order by those, not by the order the Observations arrived.
+            window_started_at=_STARTED_AT + timedelta(seconds=tick),
+            coverage="per_command",
+            environment_scope="process_group",
+            sample_count=2,
+            tool_call_id=tool_call_id,
+            metrics={
+                "fd_open": {"value": fd_peak, "limit": None},
+                "io_read_bytes": {"value": 512, "limit": None},
+                "io_write_bytes": {"value": write_bytes, "limit": None},
+            },
+        )
+
+    service, engine = await _service(tmp_path, "ansich-env-tool-samples.db")
+    try:
+        service.record_batch(
+            (
+                _task_created(task_id, run_id),
+                _task_started(task_id, run_id),
+                _scope_snapshotted(task_id, run_id, external_ref="local:thread-tool-samples"),
+                ObservationEnvelope(
+                    kind="step.started",
+                    occurred_at=_STARTED_AT,
+                    task_id=task_id,
+                    step_id=step_id,
+                    subject_type="step",
+                    subject_id=step_id,
+                    producer=producer,
+                    source_event_id=f"run:{run_id}:step:started",
+                    correlation_id=task_id,
+                    payload={"step_seq": 1, "actor_kind": "lead_agent"},
+                ),
+                # Deliberately recorded newest-first: the read must order by
+                # started_at, not by arrival.
+                _per_command(second_tool_call_id, 20, fd_peak=31, write_bytes=8192),
+                _per_command(first_tool_call_id, 10, fd_peak=12, write_bytes=256),
+            )
+        )
+        await service.flush_task(task_id)
+
+        app = make_authed_test_app(user_factory=_admin_user)
+        app.state.ansich_service = service
+        app.include_router(ansich_router.router)
+        empty_task_id = new_id()
+        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+            populated = await client.get(f"/api/ansich/tasks/{task_id}/environment/tool-samples")
+            empty = await client.get(f"/api/ansich/tasks/{empty_task_id}/environment/tool-samples")
+    finally:
+        await service.stop()
+        await engine.dispose()
+
+    assert populated.status_code == 200
+    body = populated.json()
+    assert body["task_id"] == task_id
+    assert body["truncated"] is False
+    assert [sample["tool_call_id"] for sample in body["samples"]] == [first_tool_call_id, second_tool_call_id]
+    assert [sample["fd_peak"] for sample in body["samples"]] == [12, 31]
+    assert [sample["io_write_bytes"] for sample in body["samples"]] == [256, 8192]
+    assert body["samples"][0]["io_read_bytes"] == 512
+    assert body["samples"][0]["sample_count"] == 2
+
+    assert empty.status_code == 200
+    assert empty.json() == {"task_id": empty_task_id, "truncated": False, "samples": []}
+
+
+@pytest.mark.anyio
+async def test_regular_user_is_forbidden_from_environment_history_and_tool_samples(tmp_path) -> None:
+    service, engine = await _service(tmp_path, "ansich-env-history-forbidden.db")
+    try:
+        app = make_authed_test_app(user_factory=_regular_user)
+        app.state.ansich_service = service
+        app.include_router(ansich_router.router)
+        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+            history = await client.get(f"/api/ansich/scopes/{new_id()}/environment/history?environment_scope=container&metric=fd_open")
+            tool_samples = await client.get(f"/api/ansich/tasks/{new_id()}/environment/tool-samples")
+    finally:
+        await service.stop()
+        await engine.dispose()
+
+    assert history.status_code == 403
+    assert tool_samples.status_code == 403
 
 
 @pytest.mark.anyio

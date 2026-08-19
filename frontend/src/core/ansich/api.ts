@@ -15,6 +15,7 @@ import type {
   AnsichContextCompressionResponse,
   AnsichContextCompressionListResponse,
   AnsichContextResponse,
+  AnsichEnvironmentHistoryResponse,
   AnsichEvaluationPayloadResponse,
   AnsichFailedJobDetailResponse,
   AnsichFailedJobKind,
@@ -30,6 +31,7 @@ import type {
   AnsichTaskLifecycleScope,
   AnsichTaskBudgetsResponse,
   AnsichTaskEnvironmentResponse,
+  AnsichTaskToolEnvSamplesResponse,
   AnsichTaskResponse,
   AnsichTaskUsageResponse,
   AnsichTaskAgentReleaseResponse,
@@ -452,6 +454,46 @@ export async function fetchAnsichTaskEnvironment(
     await throwAnsichApiError(
       response,
       `Failed to load Ansich task environment: ${response.statusText}`,
+    );
+  }
+  return response.json();
+}
+
+export async function fetchAnsichEnvironmentHistory(
+  scopeId: string,
+  environmentScope: string,
+  metric: string,
+  windowMinutes = 60,
+): Promise<AnsichEnvironmentHistoryResponse> {
+  const query = new URLSearchParams({
+    environment_scope: environmentScope,
+    metric,
+    window_minutes: String(windowMinutes),
+  });
+  const response = await fetch(
+    ansichUrl(
+      `/scopes/${encodeURIComponent(scopeId)}/environment/history?${query.toString()}`,
+    ),
+  );
+  if (!response.ok) {
+    await throwAnsichApiError(
+      response,
+      `Failed to load Ansich environment history: ${response.statusText}`,
+    );
+  }
+  return response.json();
+}
+
+export async function fetchAnsichTaskToolEnvSamples(
+  taskId: string,
+): Promise<AnsichTaskToolEnvSamplesResponse> {
+  const response = await fetch(
+    ansichUrl(`/tasks/${encodeURIComponent(taskId)}/environment/tool-samples`),
+  );
+  if (!response.ok) {
+    await throwAnsichApiError(
+      response,
+      `Failed to load Ansich per-command environment samples: ${response.statusText}`,
     );
   }
   return response.json();

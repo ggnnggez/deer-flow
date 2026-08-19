@@ -25,6 +25,8 @@ import {
   fetchAnsichTaskBudgets,
   fetchAnsichTask,
   fetchAnsichTaskEnvironment,
+  fetchAnsichEnvironmentHistory,
+  fetchAnsichTaskToolEnvSamples,
   fetchAnsichTaskTimeline,
   fetchAnsichTaskUsage,
   fetchAnsichTaskAgentRelease,
@@ -568,6 +570,60 @@ export function useAnsichTaskEnvironment(
     refetchInterval: () =>
       polling && pageIsVisible() ? REFRESH_INTERVAL_MS : false,
     refetchIntervalInBackground: false,
+  });
+}
+
+/**
+ * One metric's recent trend on one Scope, for the panel's sparkline.
+ *
+ * Deliberately lazy and non-polling: the metric row's current value already
+ * refreshes with the panel's own 5-second environment poll, so re-fetching a
+ * whole 60-minute window per metric on that same tick would multiply request
+ * volume for a curve whose shape barely moves. It fetches once per mounted
+ * metric row and is refreshed by remounting (tab switch / navigation).
+ */
+export function useAnsichEnvironmentHistory(
+  scopeId: string,
+  environmentScope: string,
+  metric: string,
+  windowMinutes = 60,
+  enabled = true,
+) {
+  return useQuery({
+    queryKey: [
+      "ansich",
+      "scopes",
+      scopeId,
+      "environment-history",
+      environmentScope,
+      metric,
+      windowMinutes,
+    ],
+    queryFn: () =>
+      fetchAnsichEnvironmentHistory(
+        scopeId,
+        environmentScope,
+        metric,
+        windowMinutes,
+      ),
+    enabled: enabled && Boolean(scopeId) && Boolean(metric),
+    retry: false,
+  });
+}
+
+/**
+ * The Task's per-command environment samples (one row per `tool_call_id`).
+ *
+ * Bounded by construction (at most one row per ToolCall), fetched once, and
+ * not polled: the sequence only grows as commands finish, and the panel it
+ * feeds is a trend view rather than a live counter.
+ */
+export function useAnsichTaskToolEnvSamples(taskId: string, enabled = true) {
+  return useQuery({
+    queryKey: ["ansich", "tasks", taskId, "environment", "tool-samples"],
+    queryFn: () => fetchAnsichTaskToolEnvSamples(taskId),
+    enabled: enabled && Boolean(taskId),
+    retry: false,
   });
 }
 

@@ -15,7 +15,12 @@ from ansich.budget import BudgetHealthBelief, TaskBudgetsView
 from ansich.compression import ContextCompressionSummaryView, ContextCompressionView
 from ansich.context_state import ContextStateView
 from ansich.contracts import AnsichHealth, ControlValue, FlushResult, LostRange, ObservationEnvelope, Producer, RecordReceipt, TaskLifecycleScope, TaskView
-from ansich.environment import TaskEnvironmentView, ToolEnvironmentSampleView
+from ansich.environment import (
+    EnvironmentHistoryView,
+    TaskEnvironmentView,
+    TaskToolEnvSamplesView,
+    ToolEnvironmentSampleView,
+)
 from ansich.evaluation import (
     QUALITY_DIMENSIONS,
     EvaluationProjectionStatus,
@@ -803,6 +808,30 @@ class AnsichService:
 
     async def get_task_environment(self, task_id: str) -> TaskEnvironmentView:
         return await self._backend.get_task_environment(task_id)
+
+    async def get_environment_history(
+        self,
+        scope_id: str,
+        *,
+        environment_scope: str,
+        metric: str,
+        window_minutes: int,
+        max_points: int,
+    ) -> EnvironmentHistoryView:
+        """One metric's bounded recent trend on one Scope (lazy, on-demand)."""
+
+        return await self._backend.get_environment_history(
+            scope_id,
+            environment_scope=environment_scope,
+            metric=metric,
+            window_minutes=window_minutes,
+            max_points=max_points,
+        )
+
+    async def get_task_tool_env_samples(self, task_id: str) -> TaskToolEnvSamplesView:
+        """The Task's per-command environment samples, in execution order."""
+
+        return await self._backend.get_task_tool_env_samples(task_id)
 
     async def get_task_budget_health(
         self,

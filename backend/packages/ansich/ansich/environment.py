@@ -184,6 +184,63 @@ class TaskEnvironmentView(_FrozenModel):
     scopes: tuple[EnvironmentScopeView, ...] = ()
 
 
+class EnvironmentHistoryPoint(_FrozenModel):
+    """One historical reading of a single metric on one Scope.
+
+    ``limit`` is whatever that sample itself reported, so a limit that moved
+    mid-window is visible instead of being flattened to the current one; it is
+    ``None`` when the sample carried no limit.
+    """
+
+    occurred_at: datetime
+    value: int = Field(ge=0)
+    limit: int | None = Field(default=None, ge=0)
+
+
+class EnvironmentHistoryView(_FrozenModel):
+    """A bounded ``(Scope, environment_scope, metric)`` trend window.
+
+    Points are ordered oldest-first. A sample that did not carry the requested
+    metric is **skipped**, never reported as ``0`` — missing is not zero
+    (concepts 第 9 条第 6 款), so a gap in this series is an honest gap the
+    renderer must not interpolate across. ``truncated`` says the window held
+    more surviving points than ``max_points`` and the **newest** ones were
+    kept.
+    """
+
+    scope_id: str
+    environment_scope: str
+    metric: str
+    window_minutes: int = Field(ge=1)
+    truncated: bool = False
+    points: tuple[EnvironmentHistoryPoint, ...] = ()
+
+
+class ToolEnvSampleView(_FrozenModel):
+    """One per-command sample in a Task's command sequence.
+
+    Narrower than ``ToolEnvironmentSampleView`` on purpose: the Task-scoped
+    sequence read needs only what a per-command trend renders, not the
+    scope/obs identity a single-ToolCall lookup returns.
+    """
+
+    tool_call_id: str
+    started_at: datetime
+    ended_at: datetime
+    sample_count: int = Field(ge=0)
+    fd_peak: int | None = Field(default=None, ge=0)
+    io_read_bytes: int | None = Field(default=None, ge=0)
+    io_write_bytes: int | None = Field(default=None, ge=0)
+
+
+class TaskToolEnvSamplesView(_FrozenModel):
+    """A Task's per-command samples in execution order (oldest first)."""
+
+    task_id: str
+    truncated: bool = False
+    samples: tuple[ToolEnvSampleView, ...] = ()
+
+
 class ToolEnvironmentSampleView(_FrozenModel):
     """One per-tool-call environment sample (mirrors ``ansich_tool_env_samples``)."""
 

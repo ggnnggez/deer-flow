@@ -8,7 +8,12 @@ from ansich.budget import BudgetHealthBelief, TaskBudgetsView
 from ansich.compression import ContextCompressionSummaryView, ContextCompressionView
 from ansich.context_state import ContextStateView
 from ansich.contracts import ControlValue, LostRange, ObservationEnvelope, TaskLifecycleScope, TaskView
-from ansich.environment import TaskEnvironmentView, ToolEnvironmentSampleView
+from ansich.environment import (
+    EnvironmentHistoryView,
+    TaskEnvironmentView,
+    TaskToolEnvSamplesView,
+    ToolEnvironmentSampleView,
+)
 from ansich.heartbeat import TaskHeartbeatView
 from ansich.lineage import ContentBlockView, LineageDirection, PossibleExposureItemView
 from ansich.operations import ActiveTaskView, HeartbeatBelief
@@ -153,6 +158,18 @@ class AnsichBackend(Protocol):
     async def get_task_budgets(self, task_id: str) -> TaskBudgetsView: ...
 
     async def get_task_environment(self, task_id: str) -> TaskEnvironmentView: ...
+
+    async def get_environment_history(
+        self,
+        scope_id: str,
+        *,
+        environment_scope: str,
+        metric: str,
+        window_minutes: int,
+        max_points: int,
+    ) -> EnvironmentHistoryView: ...
+
+    async def get_task_tool_env_samples(self, task_id: str) -> TaskToolEnvSamplesView: ...
 
     async def get_task_budget_health(
         self,

@@ -11,7 +11,11 @@ import {
   fetchAnsichToolRawResult,
   fetchAnsichToolVisibleResult,
 } from "@/core/ansich/api";
-import { useAnsichStepContext, useAnsichTaskSteps } from "@/core/ansich/hooks";
+import {
+  useAnsichStepContext,
+  useAnsichTaskSteps,
+  useAnsichTaskToolEnvSamples,
+} from "@/core/ansich/hooks";
 import { countMissingContextItems } from "@/core/ansich/presentation";
 import type {
   AnsichContextItem,
@@ -19,6 +23,7 @@ import type {
   AnsichLlmAttempt,
   AnsichStep,
   AnsichToolCall,
+  AnsichToolEnvSample,
 } from "@/core/ansich/types";
 import { useI18n } from "@/core/i18n/hooks";
 
@@ -26,6 +31,7 @@ import {
   AnsichBlockLineageExplorer,
   AnsichCompressionExplorer,
 } from "./lineage-explorer";
+import { formatBytes } from "./system-health-drawer";
 
 export function AnsichStepsPanel({
   taskId,
@@ -36,6 +42,16 @@ export function AnsichStepsPanel({
 }) {
   const { t } = useI18n();
   const query = useAnsichTaskSteps(taskId, true, polling);
+  // One bounded, non-polling read for the whole Task rather than a detail
+  // fetch per ToolCall row. Fails quiet: no samples means the rows render
+  // exactly as they did before this line existed.
+  const environmentSamples = useAnsichTaskToolEnvSamples(taskId);
+  const sampleByToolCallId = new Map(
+    (environmentSamples.data?.samples ?? []).map((sample) => [
+      sample.tool_call_id,
+      sample,
+    ]),
+  );
 
   if (query.isPending) return <Skeleton className="h-48 w-full" />;
   if (query.error) return <InlineError message={query.error.message} />;
@@ -49,7 +65,11 @@ export function AnsichStepsPanel({
       ) : (
         <div className="space-y-3">
           {steps.map((step) => (
-            <StepCard key={step.step_id} step={step} />
+            <StepCard
+              key={step.step_id}
+              step={step}
+              sampleByToolCallId={sampleByToolCallId}
+            />
           ))}
         </div>
       )}
@@ -193,7 +213,13 @@ export function AnsichContextPanel({
   );
 }
 
-function StepCard({ step }: { step: AnsichStep }) {
+function StepCard({
+  step,
+  sampleByToolCallId,
+}: {
+  step: AnsichStep;
+  sampleByToolCallId: Map<string, AnsichToolEnvSample>;
+}) {
   const { t } = useI18n();
   return (
     <Card>
@@ -238,7 +264,13 @@ function StepCard({ step }: { step: AnsichStep }) {
           </div>
         ))}
         {step.tool_calls.map((toolCall) => (
-          <ToolCallChain key={toolCall.tool_call_id} toolCall={toolCall} />
+          <ToolCallChain
+            key={toolCall.tool_call_id}
+            toolCall={toolCall}
+            environmentSample={
+              sampleByToolCallId.get(toolCall.tool_call_id) ?? null
+            }
+          />
         ))}
         {step.tool_calls.length === 0 && step.issued_tools.length > 0 && (
           <div className="text-sm">
@@ -260,7 +292,13 @@ function StepCard({ step }: { step: AnsichStep }) {
   );
 }
 
-function ToolCallChain({ toolCall }: { toolCall: AnsichToolCall }) {
+function ToolCallChain({
+  toolCall,
+  environmentSample,
+}: {
+  toolCall: AnsichToolCall;
+  environmentSample: AnsichToolEnvSample | null;
+}) {
   const { t } = useI18n();
   const [raw, setRaw] = useState<unknown>(undefined);
   const [visible, setVisible] = useState<unknown>(undefined);
@@ -301,6 +339,9 @@ function ToolCallChain({ toolCall }: { toolCall: AnsichToolCall }) {
           {toolCall.tool_call_id}
         </code>
       </div>
+      {environmentSample ? (
+        <ToolCallEnvironmentLine sample={environmentSample} />
+      ) : null}
       <div className="grid gap-2 lg:grid-cols-4">
         <ToolStage
           label={t.ansich.issued}
@@ -367,6 +408,35 @@ function ToolCallChain({ toolCall }: { toolCall: AnsichToolCall }) {
         <ResultPayload label={t.ansich.visibleResult} value={visible} />
       )}
     </section>
+  );
+}
+
+/**
+ * The per-command environment sample for one ToolCall, as sibling metadata.
+ *
+ * Rendered only when the sampler actually produced a row for this call
+ * (local sandbox bash, per-command sampling on); a counter the sampler did
+ * not report is omitted rather than shown as 0 — missing is not zero.
+ */
+function ToolCallEnvironmentLine({ sample }: { sample: AnsichToolEnvSample }) {
+  const { t } = useI18n();
+  const parts: string[] = [];
+  if (sample.fd_peak !== null) {
+    parts.push(`${t.ansich.environmentFdPeak} ${sample.fd_peak}`);
+  }
+  if (sample.io_read_bytes !== null) {
+    parts.push(
+      `${t.ansich.environmentIoRead} ${formatBytes(sample.io_read_bytes)}`,
+    );
+  }
+  if (sample.io_write_bytes !== null) {
+    parts.push(
+      `${t.ansich.environmentIoWrite} ${formatBytes(sample.io_write_bytes)}`,
+    );
+  }
+  if (parts.length === 0) return null;
+  return (
+    <div className="text-muted-foreground text-xs">{parts.join(" · ")}</div>
   );
 }
 

@@ -36,7 +36,7 @@ Phase 11（生产韧性、重放与保留策略）尚未开始实现。本切片
 | projector | 幂等重放；现状行先锁后读；`consecutive_growth_count` 重放确定性 | `tests/ansich/test_environment_projector.py` |
 | assessor | 仅类别跃迁追加断言；缺样本/未观测 → unknown 而非 ok；泄漏规则拒收 per_command 与 host_shared 输入；episode open→更新→resolve→复发编号 | `tests/ansich/test_environment_assessor.py`、`tests/ansich/test_environment_alerts.py` |
 | API/DTO | task environment 读；unknown/coverage/environment_scope 全链路不丢；alert filter 放行新类型 | `tests/test_gateway_ansich_environment.py` |
-| 前端 | 新组件单测 + 类型对齐 | `frontend/tests/unit/core/ansich/environment-presentation.test.ts`（组件：`frontend/src/components/workspace/ansich/environment-panel.tsx`） |
+| 前端 | 新组件单测 + 类型对齐；sparkline 投影与断线规则 | `frontend/tests/unit/core/ansich/environment-presentation.test.ts`、`frontend/tests/unit/components/workspace/ansich/sparkline.test.ts`（组件：`frontend/src/components/workspace/ansich/environment-panel.tsx`、`.../sparkline.tsx`） |
 
 ## 4. 已知边界（v1 明确不做）
 
@@ -53,6 +53,17 @@ Phase 11（生产韧性、重放与保留策略）尚未开始实现。本切片
 
 1. **`possibly_affected_task_ids` 不进 assertion value，也不作为 alert evidence obs**：它随运行中 Task 集合变化，放进 `value_json` 会破坏「仅跃迁追加」去重。落点改为 **Alert 读模型行**的附加 JSON 列（reconcile 变更时按非空覆盖语义刷新），evidence 仍是贡献样本的 obs 引用。语义不变（「采样时正在运行」），存储位置从 evidence 挪到读模型。
 2. **local 的连续 tick 同时声明两个 Scope**：host Scope（承载 host_shared 读数）与 sandbox Scope（`local:{thread_id}`，per_command 样本的 subject）。因为 per_command 观测需要 sandbox Scope 实体存在，而 local 的连续读数挂在 host Scope 上。
-3. **spec §6.2 的「ToolCall 行有样本时显示 io/fd 小字」v1 未实现**：additive 的 `environment_sample` 字段已由 `GET /api/ansich/tasks/{task_id}/tool-calls/...` 详情返回，并在 `frontend/src/core/ansich/types.ts` 中有对应 TS 类型，但前端 ToolCall 行没有任何消费它的渲染。这是有意推迟：读侧接口与类型先落地，UI 呈现待 UI-2 的 ToolCall 行信息密度一并裁定，不在本切片内实现。
+3. ~~**spec §6.2 的「ToolCall 行有样本时显示 io/fd 小字」v1 未实现**~~ **已解决（2026-08-19 后续批次）**：ToolCall 行现在渲染 fd 峰值与读/写字节的小字（`frontend/src/components/workspace/ansich/step-explorer.tsx` 的 `ToolCallEnvironmentLine`）。数据来源是下面新增的 **B2 task 级批量读** 而不是每行一次的 ToolCall 详情请求：一个 Step 面板可能同时渲染数十个 ToolCall，逐行详情请求会把一次面板渲染放大成数十次 HTTP 调用，而 task 级读天然有界（每 `tool_call_id` 至多一行）。因此 ToolCall 详情上的 additive `environment_sample` 字段保留为**单调用 API 读**（外部 API 消费者用），前端不再是它的消费者——这是本条的实现级取舍，不是字段被废弃。采样器没报的计数器留空而不是渲染 0。
+
+## 6. 环境趋势读侧（2026-08-19 后续批次）
+
+两个**惰性、有界、不轮询**的 admin-only 读接口，服务于面板的 sparkline 趋势曲线：
+
+- `GET /api/ansich/scopes/{scope_id}/environment/history?environment_scope=&metric=&window_minutes=&max_points=`：单个 `(Scope, environment_scope, metric)` 的近期读数序列，按 `occurred_at` 升序。**不新建读模型**——直接重放不可变的 `environment.sampled` Observation，因为它唯一的消费者是一条曲线，为此再加第四张可重建表不划算。`environment_scope` 非三档之一即 422，`metric` 不符合 `^[a-z][a-z0-9_]{0,63}$` 即 422。**没报该 metric 的样本被跳过而不是记 0**（concepts 第 9 条第 6 款：缺失不是零），所以序列里的空档是真实空档，前端按「相邻间隔超过中位采样间隔 3 倍即断线」渲染，绝不插值。存活点超过 `max_points` 时保留**最新**的一段并置 `truncated=true`。
+- `GET /api/ansich/tasks/{task_id}/environment/tool-samples`：该 Task 的逐命令样本序列（`ansich_tool_env_samples`，按 `started_at` 升序，上限 500 行，超出置 `truncated=true`）。前端用它渲染「逐命令」段的 fd 峰值 / 读写字节曲线（**横轴是命令执行顺序，不是时间轴**——这些样本各自描述一条命令自己的窗口，按时间戳排布会暗示一段从未做过的连续测量），以及 ToolCall 行的 io/fd 小字。
+
+两者都走与同族读相同的 admin guard 与 503 降级路径；in-memory 后端与降级后端返回空视图而不抛错。
+
+**已登记的后续项**：history 查询按 subject 过滤未建 (subject_id, kind, occurred_at) 索引 —— 环境观测体量与 heartbeat 同级故可接受，量级上升时补索引。
 
 
