@@ -39,7 +39,7 @@ from collections.abc import Callable
 from datetime import UTC, datetime
 
 import pytest
-from ansich import AnsichService, ObservationEnvelope, new_id
+from ansich import AnsichService, FlushResult, ObservationEnvelope, new_id
 from ansich.lifecycle import LifecycleInputs, derive_status
 from ansich.memory import InMemoryAnsichBackend
 
@@ -323,6 +323,175 @@ async def test_a_barrier_that_times_out_returns_its_rows_to_the_queue_head() -> 
         "run:timeout-second:task:created",
         "run:timeout-trailing:task:created",
     ]
+
+
+@pytest.mark.anyio
+async def test_rows_a_barrier_is_writing_are_outstanding_not_durable() -> None:
+    """A barrier's own selection is a fifth state, and it must be counted.
+
+    Rows the barrier has taken are off the queue and not yet in storage. If
+    nothing tracks them they are in none of the states ``persisted_through``
+    reads, so they read as *durable* — the one direction that field must never
+    lie in — and ``in_flight_count`` reports 0 while two rows are outstanding.
+    Registering the selection for the duration of the write is what makes both
+    answers honest, and it costs nothing once the call resolves.
+    """
+
+    task_id = new_id()
+    backend = _GatedBackend()
+    service = _HeldWriterService(
+        backend,
+        batch_size=10,
+        flush_interval_ms=1,
+        terminal_flush_timeout_ms=10_000,
+    )
+    await service.start()
+    barrier: asyncio.Task[FlushResult] | None = None
+    try:
+        assert all(
+            receipt.accepted
+            for receipt in service.record_batch(
+                [
+                    _observation("outstanding-first", task_id=task_id),
+                    _observation("outstanding-second", task_id=task_id),
+                ]
+            )
+        )
+        assert service.record(_observation("outstanding-trailing")).accepted
+        backend.hold_writes()
+
+        barrier = asyncio.create_task(service.flush_task(task_id))
+        await asyncio.wait_for(backend.holding.wait(), timeout=5)
+        held = service.get_health()
+
+        backend.release_writes()
+        result = await asyncio.wait_for(barrier, timeout=5)
+        after = service.get_health()
+    finally:
+        backend.release_writes()
+        service.release_writer()
+        if barrier is not None:
+            await asyncio.gather(barrier, return_exceptions=True)
+        await service.stop()
+
+    # Two rows in the barrier's hands, one still queued behind the barrier.
+    assert held.queue_depth == 1
+    assert held.writer.in_flight_count == 2
+    assert held.dropped_count == 0
+    assert result.persisted is True
+    assert result.persisted_through == 2
+    # And the registration is released with the call, not left behind.
+    assert after.writer.in_flight_count == 0
+
+
+def test_a_barriers_outstanding_rows_are_not_the_writers_backlog() -> None:
+    """A barrier's write is outstanding work, but it is not writer backlog.
+
+    ``_writer_retry_backlog`` means "still working through what a write failure
+    left behind", and ``recovering`` is derived from it. A barrier's in-progress
+    write has refused nothing, so the writer reaching the end of *its own* work
+    must clear the latch even while barrier rows are outstanding — otherwise an
+    ordinary terminal flush would hold the collector in ``recovering`` for as
+    long as its write takes. Every other reader of the buffer sees those rows,
+    which is the whole point of tracking them.
+
+    Driven at the rule rather than through the loops on purpose. The persist
+    lock currently serializes a barrier's write against every writer attempt, so
+    the two cannot overlap today and no scenario reaches this branch; the guard
+    is a precondition for the writes that will happen outside the writer loop
+    (the stop drain), and this pins the rule it encodes instead of today's
+    locking coincidence.
+    """
+
+    service = AnsichService.in_memory(batch_size=10)
+    rows = [(1, _observation("outstanding"))]
+
+    writer_token = service._enter_in_flight(rows)
+    barrier_token = service._enter_in_flight(rows, barrier=True)
+    with service._lock:
+        assert service._writer_holds_nothing() is False
+        assert service._in_flight_observation_count() == 2
+        assert service._in_flight_sequence_bounds() == (1, 1)
+
+    service._exit_in_flight(writer_token)
+    with service._lock:
+        # The writer is caught up; the rows are still outstanding for everyone.
+        assert service._writer_holds_nothing() is True
+        assert service._in_flight_observation_count() == 1
+
+    service._writer_retry_backlog = True
+    service._record_write_success()
+    assert service._writer_retry_backlog is False
+
+    service._exit_in_flight(barrier_token)
+    with service._lock:
+        assert service._in_flight_observation_count() == 0
+        assert service._in_flight_sequence_bounds() is None
+
+
+@pytest.mark.anyio
+async def test_a_second_barrier_on_a_shorter_budget_cannot_claim_the_first_ones_rows() -> None:
+    """Two barriers, two deadlines: the shorter one must not over-claim.
+
+    The budget is per service today, so the second caller can only read the
+    watermark after the first's deadline has already fired — a coincidence, and
+    Task 7's per-call drain budget plus a driver that unwinds a cancelled write
+    on its own schedule both end it. Diverging the deadlines here is what tests
+    the invariant rather than the coincidence: while the first barrier still
+    holds sequences 1-2, no other caller may be told they are durable.
+    """
+
+    task_a = new_id()
+    task_b = new_id()
+    backend = _GatedBackend()
+    service = _HeldWriterService(
+        backend,
+        batch_size=10,
+        flush_interval_ms=1,
+        terminal_flush_timeout_ms=10_000,
+    )
+    await service.start()
+    first: asyncio.Task[FlushResult] | None = None
+    try:
+        assert all(
+            receipt.accepted
+            for receipt in service.record_batch(
+                [
+                    _observation("slow-first", task_id=task_a),
+                    _observation("slow-second", task_id=task_a),
+                ]
+            )
+        )
+        assert service.record(_observation("fast", task_id=task_b)).accepted
+        backend.hold_writes()
+
+        first = asyncio.create_task(service.flush_task(task_a))
+        await asyncio.wait_for(backend.holding.wait(), timeout=5)
+        # Per-call deadline divergence, simulated: the second caller's budget
+        # expires while the first still holds the persist lock and its rows.
+        service._terminal_flush_timeout_seconds = 0.05
+        second = await service.flush_task(task_b)
+
+        backend.release_writes()
+        first_result = await asyncio.wait_for(first, timeout=5)
+        health = service.get_health()
+    finally:
+        backend.release_writes()
+        service.release_writer()
+        if first is not None:
+            await asyncio.gather(first, return_exceptions=True)
+        await service.stop()
+
+    assert second.timed_out is True
+    assert second.reason == "terminal_flush_timeout"
+    # Sequences 1-2 were in the other barrier's hands, so nothing below them is
+    # durable either: the honest answer is "no contiguous prefix yet".
+    assert second.persisted_through is None
+    assert second.lost_ranges == ()
+    # The first call's own answer, once its rows really did land.
+    assert first_result.persisted is True
+    assert first_result.persisted_through == 2
+    assert health.dropped_count == 0
 
 
 @pytest.mark.anyio

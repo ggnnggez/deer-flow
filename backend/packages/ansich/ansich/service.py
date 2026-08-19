@@ -172,6 +172,11 @@ class AnsichService:
         # its size and its collector-sequence span.
         self._in_flight: dict[int, tuple[tuple[int, ObservationEnvelope], ...]] = {}
         self._in_flight_token = 0
+        # Which of those tokens belong to a terminal barrier rather than to the
+        # writer. The rows are tracked in the same map — health counts them and
+        # the persistence watermark stops below them either way — but "has the
+        # writer caught up" must not be answered by a barrier's write.
+        self._barrier_in_flight_tokens: set[int] = set()
         # PA6's recovery evidence: raised by a write failure, lowered only once
         # the writer has caught up again. `recovering` may be derived from this
         # and never from a bare queue backlog — see `ansich.lifecycle`.
@@ -458,9 +463,10 @@ class AnsichService:
                 writer=WriterHealth(
                     consecutive_failures=self._writer_consecutive_failures,
                     backoff_until=self._writer_backoff_until,
-                    # Items the writer holds are out of `queue_depth` — they no
-                    # longer consume queue capacity — so this is the only place
-                    # they are visible.
+                    # Rows outstanding — the writer's parked batches and a
+                    # terminal barrier's own write alike — are out of
+                    # `queue_depth`, since they no longer consume queue
+                    # capacity, so this is the only place they are visible.
                     in_flight_count=self._in_flight_observation_count(),
                     # The one signal that separates "a row is unwritable" from
                     # "storage was down": both charge loss, only one of them
@@ -507,7 +513,10 @@ class AnsichService:
         writer's to resolve, so this call can place rows recorded *after* rows
         that are not durable yet. ``persisted=True`` beside a
         ``persisted_through`` below the caller's own sequences is that
-        situation, stated rather than hidden.
+        situation, stated rather than hidden. This call's own selection is
+        tracked as outstanding for the duration of its write for the same
+        reason: rows off the queue and not yet in storage must not read as
+        durable to whoever asks while they are in the air.
 
         **A timeout no longer kills what it took** (RA5②). A budget running out
         is not evidence that storage refused anything, so rows this call never
@@ -532,6 +541,7 @@ class AnsichService:
         # exactly what is still unaccounted — including under a cancellation
         # that is not this call's own timeout.
         taken: list[tuple[int, ObservationEnvelope, int]] = []
+        token: int | None = None
         persist_result: FlushResult | None = None
         try:
             try:
@@ -539,8 +549,14 @@ class AnsichService:
                     async with persist_lock:
                         with self._lock:
                             taken = self._take_barrier_items(task_id)
-                        selected = [(sequence, observation) for sequence, observation, _ in taken]
-                        result = await self._persist_items(selected)
+                            selected = [(sequence, observation) for sequence, observation, _ in taken]
+                            # Taken and registered in one locked section: rows
+                            # off the queue and not yet in storage are in none
+                            # of the states `_persisted_through` reads, so a
+                            # gap here is a window in which they read as
+                            # durable to anyone else asking.
+                            token = self._register_in_flight(selected, barrier=True) if selected else None
+                        result = await self._persist_items(selected, in_flight_token=token)
                         if not result.persisted:
                             # `_persist_items` charged what it was refused, so
                             # these rows are accounted; reporting the ranges is
@@ -562,6 +578,11 @@ class AnsichService:
                     # timed out, so the read model is lagging — never data loss.
                     return persist_result.model_copy(update={"reason": "projection_settle_timeout", "timed_out": True})
                 with self._lock:
+                    # Released beside the return, not before it: between the two
+                    # the rows would be counted both queued and outstanding.
+                    if token is not None:
+                        self._discard_in_flight(token)
+                        token = None
                     self._return_barrier_items(taken)
                     taken = []
                     watermark = self._persisted_through()
@@ -583,8 +604,16 @@ class AnsichService:
             # the two mistakes.
             if taken:
                 with self._lock:
+                    if token is not None:
+                        self._discard_in_flight(token)
+                        token = None
                     self._return_barrier_items(taken)
                 self._wake_writer()
+            if token is not None:
+                # Idempotent: the placed and charged paths release it alongside
+                # their own accounting. This covers the ways out that have
+                # neither, so a token cannot outlive the call that made it.
+                self._exit_in_flight(token)
 
     async def get_task(self, task_id: str) -> TaskView | None:
         return await self._backend.get_task(task_id)
@@ -673,12 +702,14 @@ class AnsichService:
             )
         if not (await self.flush_task(record.task_id)).persisted:
             # The same reasoning one branch up, for the write rather than the
-            # intake: a terminal-flush timeout before persistence, or a storage
-            # failure, drops the Observation and records it as a lost range.
-            # There is no job to poll, so reporting "pending" would leave the
-            # caller waiting on a projection that can never arrive. A settle
-            # timeout AFTER a successful write keeps ``persisted=True`` and
-            # correctly falls through to the real job status below.
+            # intake: nothing was persisted, so no projection job exists and
+            # reporting "pending" would leave the caller waiting on one that
+            # cannot arrive. A storage failure charged the Observation as lost;
+            # a terminal-flush timeout returned it to the queue for the writer
+            # (RA5②), which makes this answer conservative rather than final —
+            # the row may still land. A settle timeout AFTER a successful write
+            # keeps ``persisted=True`` and correctly falls through to the real
+            # job status below.
             return EvaluationRecordReceipt(
                 observation_id=observation.obs_id,
                 projection_status="failed",
@@ -1585,6 +1616,13 @@ class AnsichService:
         writer, and a barrier that took them back would be a second writer for
         the same batch.
 
+        The queue is ordered by collector sequence — the accept path appends
+        monotonically under ``_lock`` — so a bound on the sequence is also a
+        prefix of the queue, and what stays behind is exactly the rows above it.
+        ``_return_barrier_items`` puts an unplaced prefix back at the front and
+        ``_persisted_through`` reads the head as the lowest queued sequence;
+        all three depend on that one ordering.
+
         Callers must already hold ``self._lock``.
         """
 
@@ -1617,7 +1655,10 @@ class AnsichService:
         have taken these rows — it was never asked, or had not answered — so
         charging them as lost invents an incident. They go back where they came
         from: at the head, in collector order, which is still ahead of
-        everything left in the queue because they were taken as a prefix of it.
+        everything left in the queue because ``_take_barrier_items`` took them
+        as a prefix of it. That restores the queue's sequence ordering rather
+        than merely preserving it, which is what lets ``_persisted_through``
+        read the head as the lowest queued sequence.
 
         The queue watermarks are re-raised here on purpose: these rows were
         counted into them when they were accepted, but anything recorded while
@@ -1634,6 +1675,11 @@ class AnsichService:
 
         if not taken:
             return
+        # The queue is ordered by collector sequence, and this is the only
+        # method that writes to its front. Everything in `taken` came off that
+        # front, so it goes back below whatever is left — the invariant
+        # `_persisted_through` reads the head for, asserted where it is made.
+        assert not self._queue or taken[-1][0] < self._queue[0][0]
         for item in reversed(taken):
             self._queue.appendleft(item)
         self._queue_bytes += sum(item[2] for item in taken)
@@ -1678,10 +1724,11 @@ class AnsichService:
         # sequence the accept path handed out is durable.
         boundary = self._record_sequence + 1
         if self._queue:
-            # Scanned rather than read off the head: the queue is kept in
-            # sequence order, but an over-claim is exactly what this field
-            # exists to prevent, so the answer does not rest on that invariant.
-            boundary = min(boundary, min(item[0] for item in self._queue))
+            # The head is the lowest queued sequence: the accept path appends
+            # monotonically under `_lock` and the only thing that ever writes to
+            # the front — `_return_barrier_items` — puts back a prefix it took
+            # from there, which its own assertion pins.
+            boundary = min(boundary, self._queue[0][0])
         in_flight_bounds = self._in_flight_sequence_bounds()
         if in_flight_bounds is not None:
             boundary = min(boundary, in_flight_bounds[0])
@@ -2007,8 +2054,8 @@ class AnsichService:
                 if in_flight_token in self._in_flight:
                     self._in_flight[in_flight_token] = tuple(remaining)
                 return
-            self._in_flight.pop(in_flight_token, None)
-            if not self._in_flight and len(self._queue) <= self._batch_size:
+            self._discard_in_flight(in_flight_token)
+            if self._writer_holds_nothing() and len(self._queue) <= self._batch_size:
                 self._writer_retry_backlog = False
 
     async def _attempt_persist_locked(
@@ -2029,21 +2076,32 @@ class AnsichService:
         async with persist_lock:
             return await self._attempt_persist(selected, in_flight_token=in_flight_token)
 
-    async def _persist_items(self, selected: list[tuple[int, ObservationEnvelope]]) -> FlushResult:
+    async def _persist_items(
+        self,
+        selected: list[tuple[int, ObservationEnvelope]],
+        *,
+        in_flight_token: int | None = None,
+    ) -> FlushResult:
         """Place a batch with a single attempt; a refusal is charged as loss.
 
         The terminal flush barrier runs here, on the Agent's own call stack and
         inside its own timeout budget, which is exactly where spec §2 forbids a
         backoff wait. Retries therefore belong to `_flush_batch`; what a failure
         means for this caller is unchanged.
+
+        ``in_flight_token`` is the caller's outstanding-batch registration, and
+        it is threaded down rather than released by the caller afterwards so
+        that whichever way this ends — placed or charged — the release happens
+        in the same locked section as the accounting. A batch counted as lost
+        while still reported as held would report the same rows twice.
         """
 
         if not selected:
             return FlushResult(persisted=True, processed_count=0)
-        result = await self._attempt_persist(selected)
+        result = await self._attempt_persist(selected, in_flight_token=in_flight_token)
         if result is not None:
             return result
-        return self._charge_batch_loss(selected)
+        return self._charge_batch_loss(selected, in_flight_token=in_flight_token)
 
     async def _attempt_persist(
         self,
@@ -2088,10 +2146,10 @@ class AnsichService:
             self._writer_consecutive_failures = 0
             self._writer_backoff_until = None
             if in_flight_token is not None:
-                self._in_flight.pop(in_flight_token, None)
-            # Caught up: nothing held, and no more than the one batch the next
-            # flush empties. Until then the collector is still `recovering`.
-            if not self._in_flight and len(self._queue) <= self._batch_size:
+                self._discard_in_flight(in_flight_token)
+            # Caught up: the writer holds nothing, and no more than the one
+            # batch the next flush empties. Until then it is still `recovering`.
+            if self._writer_holds_nothing() and len(self._queue) <= self._batch_size:
                 self._writer_retry_backlog = False
 
     def _charge_batch_loss(
@@ -2129,7 +2187,8 @@ class AnsichService:
         charged: tuple[tuple[int, ObservationEnvelope], ...] | list[tuple[int, ObservationEnvelope]] = selected
         with self._lock:
             if in_flight_token is not None:
-                released = self._in_flight.pop(in_flight_token, None)
+                released = self._in_flight.get(in_flight_token)
+                self._discard_in_flight(in_flight_token)
                 if only_if_parked:
                     if released is None:
                         return False
@@ -2139,28 +2198,65 @@ class AnsichService:
             self._writer_backoff_until = None
         return True
 
-    def _enter_in_flight(self, selected: list[tuple[int, ObservationEnvelope]]) -> int:
+    def _enter_in_flight(self, selected: list[tuple[int, ObservationEnvelope]], *, barrier: bool = False) -> int:
         with self._lock:
-            self._in_flight_token += 1
-            token = self._in_flight_token
-            self._in_flight[token] = tuple(selected)
-            return token
+            return self._register_in_flight(selected, barrier=barrier)
+
+    def _register_in_flight(self, selected: list[tuple[int, ObservationEnvelope]], *, barrier: bool = False) -> int:
+        """Track a batch as outstanding under a fresh token.
+
+        ``barrier=True`` marks a terminal flush's own selection. It is tracked
+        in the same map on purpose — rows taken off the queue and not yet in
+        storage exist whoever is writing them, and both the health count and the
+        persistence watermark have to see them — while the mark keeps them out
+        of the writer's caught-up rule.
+
+        The token counter is shared, so a token identifies its batch uniquely
+        whichever writer produced it. Callers must already hold ``self._lock``.
+        """
+
+        self._in_flight_token += 1
+        token = self._in_flight_token
+        self._in_flight[token] = tuple(selected)
+        if barrier:
+            self._barrier_in_flight_tokens.add(token)
+        return token
 
     def _exit_in_flight(self, token: int) -> None:
         with self._lock:
-            self._in_flight.pop(token, None)
+            self._discard_in_flight(token)
+
+    def _discard_in_flight(self, token: int) -> None:
+        """Stop tracking a batch. Idempotent; callers must already hold ``_lock``."""
+
+        self._in_flight.pop(token, None)
+        self._barrier_in_flight_tokens.discard(token)
+
+    def _writer_holds_nothing(self) -> bool:
+        """True when nothing outstanding belongs to the writer.
+
+        The caught-up latch means "still working through what a write failure
+        left behind", which a terminal barrier's in-progress write is not: it
+        has refused nothing and is somebody else's call. Callers must already
+        hold ``_lock``.
+        """
+
+        return self._in_flight.keys() <= self._barrier_in_flight_tokens
 
     def _in_flight_observation_count(self) -> int:
-        """Observations the writer holds. Callers must already hold ``_lock``."""
+        """Observations outstanding — writer-parked and barrier-held alike.
+
+        Callers must already hold ``_lock``.
+        """
 
         return sum(len(batch) for batch in self._in_flight.values())
 
     def _in_flight_sequence_bounds(self) -> tuple[int, int] | None:
-        """Lowest and highest collector sequence held, or ``None`` if nothing is.
+        """Lowest and highest collector sequence outstanding, or ``None``.
 
         The flush barrier (Task 6) and the stop drain (Task 7) both need to know
-        which sequences are in the writer's hands rather than in the queue, so
-        the buffer answers that here instead of each of them reaching into it.
+        which sequences are in a writer's hands rather than in the queue, so the
+        buffer answers that here instead of each of them reaching into it.
         Callers must already hold ``_lock``.
         """
 
