@@ -6,11 +6,19 @@ Spec 11 §2 fixes the in-process state machine::
                              \\-> failed
     healthy/degraded -> shutting_down -> stopped
 
-:data:`LEGAL_TRANSITIONS` is that graph enumerated edge for edge, and
-:func:`derive_status` answers "which state is this" from the collector's current
-facts alone. The derivation is deliberately memoryless: it holds no previous
-state, so it cannot drift out of sync with the service it describes, and every
-caller reading the same inputs gets the same answer.
+That sketch is the *nominal story* — one clean run from start to stop. It is
+not the closure of what a collector can do, and :data:`LEGAL_TRANSITIONS` is
+therefore wider than it: real operation also takes operator-recovery shortcuts
+(a retried projection job clears outright), boundary failures (the first
+post-start read already sees a loaded failure), and restart. Treating the
+sketch as exhaustive would make a clamp that fails on ordinary operation, so
+this widening is a deliberate, recorded deviation from the spec text rather
+than a re-reading of it.
+
+:func:`derive_status` answers "which state is this" from the collector's
+current facts alone. The derivation is deliberately memoryless: it holds no
+previous state, so it cannot drift out of sync with the service it describes,
+and every caller reading the same inputs gets the same answer.
 
 This module is framework-independent (pydantic only) like the rest of
 ``ansich``: no ``deerflow`` or ``app`` imports.
@@ -22,6 +30,7 @@ from pydantic import BaseModel, ConfigDict
 
 LEGAL_TRANSITIONS: frozenset[tuple[str, str]] = frozenset(
     {
+        # -- spec §2's nominal arc, edge for edge ------------------------------
         ("starting", "healthy"),
         ("healthy", "degraded"),
         ("degraded", "recovering"),
@@ -30,12 +39,45 @@ LEGAL_TRANSITIONS: frozenset[tuple[str, str]] = frozenset(
         ("healthy", "shutting_down"),
         ("degraded", "shutting_down"),
         ("shutting_down", "stopped"),
+        # -- operator recovery -------------------------------------------------
+        # A retried projection job clears `failed_jobs` outright, leaving no
+        # residue to catch up on, so degradation can end without `recovering`.
+        ("degraded", "healthy"),
+        # A fresh failure arrives while the previous one is still catching up.
+        ("recovering", "degraded"),
+        # -- shutdown does not wait for the arc to finish ----------------------
+        # `stop()` may be called in any running state, including mid-recovery
+        # and on a service whose storage was never available.
+        ("recovering", "shutting_down"),
+        ("failed", "shutting_down"),
+        # -- boundary: the first read after start ------------------------------
+        # `initialize_metrics` can load `failed_jobs > 0` before the service is
+        # marked started, so the first post-start read is already degraded.
+        ("starting", "degraded"),
+        # `unavailable_reason` is fixed at construction, so an unavailable
+        # service is failed from its very first post-start read.
+        ("starting", "failed"),
+        # A restarted instance inherits the previous run's residue in process.
+        ("starting", "recovering"),
+        # A `start()` that raises leaves the service as stopped as it was.
+        ("starting", "stopped"),
+        # -- restart -----------------------------------------------------------
+        # `start()` re-arms its flags before the first await, so a stopped
+        # service is seen starting again rather than jumping back into service.
+        ("stopped", "starting"),
     }
 )
-"""Spec 11 §2's graph, edge for edge.
+"""Every status change a live collector can take.
 
-Staying in one state is not a transition and is therefore not listed; a
-consumer clamping a sequence compares only the pairs where the state changed.
+Contains spec §2's arc plus the reachable edges enumerated above. Staying in
+one state is not a transition and is therefore not listed; a consumer clamping a
+sequence compares only the pairs where the state changed.
+
+The closure is computed for the *post-PA6* derivation, where ``recovering``
+comes from the recovery residue (``unreported_loss_pending``, and from Task 4
+the writer's retry backlog) rather than from a bare queue backlog. Task 4
+removes that backlog clause and re-verifies this set against the real writer
+state.
 """
 
 
@@ -44,10 +86,12 @@ class LifecycleInputs(BaseModel):
 
     No field carries a default: each one is a fact somebody has to measure, and
     a default would let a caller that forgot to wire a signal report a quiet
-    collector instead of an unknown one.
+    collector instead of an unknown one. ``extra="forbid"`` closes the other
+    half of that mis-wire: a misspelled signal is an error, not a value the
+    derivation silently ignores.
     """
 
-    model_config = ConfigDict(frozen=True)
+    model_config = ConfigDict(frozen=True, extra="forbid")
 
     started: bool
     stopping: bool

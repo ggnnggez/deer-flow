@@ -155,21 +155,35 @@ class AnsichService:
     async def start(self) -> None:
         if self._running:
             return
-        initialize_metrics = getattr(self._backend, "initialize_metrics", None)
-        if callable(initialize_metrics):
-            await initialize_metrics()
-        self._loop = asyncio.get_running_loop()
-        self._wake_event = asyncio.Event()
-        self._projector_wake_event = asyncio.Event()
-        self._persist_lock = asyncio.Lock()
-        self._projection_lock = asyncio.Lock()
-        self._running = True
-        self._started = True
+        # Re-arm the lifecycle flags before the first await, `_started` first:
+        # a restart must be observed as stopped -> starting -> healthy, and
+        # clearing `_stopped` first would let a reader see the service back in
+        # service before it is. Every flag is written on the loop thread and
+        # read under `_lock`, so a reader only ever sees whole assignments; the
+        # ordering is what keeps the sequence of those reads legal.
+        self._started = False
         self._stopping = False
         self._stopped = False
-        self._writer_task = asyncio.create_task(self._writer_loop(), name="ansich-batch-writer")
-        if callable(getattr(self._backend, "project_pending", None)):
-            self._projector_task = asyncio.create_task(self._projector_loop(), name="ansich-projector")
+        try:
+            initialize_metrics = getattr(self._backend, "initialize_metrics", None)
+            if callable(initialize_metrics):
+                await initialize_metrics()
+            self._loop = asyncio.get_running_loop()
+            self._wake_event = asyncio.Event()
+            self._projector_wake_event = asyncio.Event()
+            self._persist_lock = asyncio.Lock()
+            self._projection_lock = asyncio.Lock()
+            self._running = True
+            self._started = True
+            self._writer_task = asyncio.create_task(self._writer_loop(), name="ansich-batch-writer")
+            if callable(getattr(self._backend, "project_pending", None)):
+                self._projector_task = asyncio.create_task(self._projector_loop(), name="ansich-projector")
+        except BaseException:
+            # A start that never finished leaves the service exactly as stopped
+            # as it was before the attempt: reporting `starting` forever would
+            # claim a collector is on its way up when nothing is coming.
+            self._stopped = True
+            raise
 
     def record(self, observation: ObservationEnvelope) -> RecordReceipt:
         return self.record_batch((observation,))[0]
@@ -1119,13 +1133,14 @@ class AnsichService:
     async def stop(self) -> None:
         if not self._running:
             return
-        self._running = False
         # The drain is its own lifecycle phase: a backlog and write retries are
         # expected while it runs, so health reports ``shutting_down`` rather
-        # than degradation until the loops have joined. The terminal state is
-        # written in ``finally`` so a loop that raises leaves a stopped service
-        # instead of one that reports shutting down forever.
+        # than degradation until the loops have joined. Each flag is set before
+        # the one it replaces is cleared, so a reader on another thread never
+        # observes an in-between phase: `_stopping` goes up before `_running`
+        # comes down, and `_stopped` before `_stopping` is cleared below.
         self._stopping = True
+        self._running = False
         try:
             if self._wake_event is not None:
                 self._wake_event.set()
@@ -1140,8 +1155,10 @@ class AnsichService:
                 await projector_task
             self._projector_task = None
         finally:
-            self._stopping = False
+            # The terminal state is written here so a loop that raises leaves a
+            # stopped service instead of one that reports shutting down forever.
             self._stopped = True
+            self._stopping = False
 
     def _record_loss(
         self,

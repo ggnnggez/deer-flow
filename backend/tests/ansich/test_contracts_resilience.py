@@ -67,7 +67,10 @@ def test_producer_health_carries_per_producer_accounting_and_is_frozen() -> None
 def test_producer_health_has_no_defaults_so_a_producer_must_be_fully_accounted() -> None:
     # Unlike ``WriterHealth``, every ``ProducerHealth`` field is a fact about one
     # producer instance; defaulting any of them would report a producer that was
-    # never measured as a quiet one.
+    # never measured as a quiet one. Asserted field by field, so adding a
+    # defaulted field later fails here rather than passing on the first missing
+    # required one.
+    assert all(field.is_required() for field in ProducerHealth.model_fields.values())
     with pytest.raises(ValidationError):
         ProducerHealth()  # type: ignore[call-arg]
 

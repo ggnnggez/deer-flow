@@ -47,6 +47,7 @@ from ansich.evaluation import (
     unassessed_quality_belief,
 )
 from ansich.ids import new_id
+from ansich.lifecycle import LEGAL_TRANSITIONS, LifecycleInputs, derive_status
 from ansich.lineage import (
     ContentBlockView,
     ContentLineageView,
@@ -146,6 +147,8 @@ __all__ = [
     "EvaluationView",
     "EvidenceRef",
     "FlushResult",
+    "LEGAL_TRANSITIONS",
+    "LifecycleInputs",
     "LostRange",
     "LineageGapView",
     "LineageNodeView",
@@ -194,6 +197,7 @@ __all__ = [
     "build_evaluation_observation",
     "canonical_config_hash",
     "compare_release_quality",
+    "derive_status",
     "new_id",
     "resolve_current_belief",
     "scope_display_label",
