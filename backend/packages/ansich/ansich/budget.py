@@ -2,8 +2,9 @@ from __future__ import annotations
 
 import hashlib
 import math
+from collections.abc import Iterable
 from datetime import datetime
-from typing import Literal
+from typing import Literal, NamedTuple
 
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -11,6 +12,49 @@ from ansich.contracts import NamedVersion, UsageDimension
 from ansich.usage import AggregationScope, TaskUsageValue
 
 BudgetSourceKind = Literal["release_default", "runtime_override", "shadow"]
+
+
+class WallTimeEvidenceRow(NamedTuple):
+    """One ``wall_time_ms`` usage contribution, as the evidence rule sees it."""
+
+    source_task_id: str
+    source_obs_id: str
+    delta: int
+    from_heartbeat: bool
+
+
+def order_wall_time_evidence(rows: Iterable[WallTimeEvidenceRow]) -> tuple[str, ...]:
+    """Order ``wall_time_ms`` evidence the way the absolute-limit rule reads it.
+
+    Wall time is the one dimension whose usage is a maximum rather than a sum,
+    so it carries two independent measurements of the same quantity: the
+    terminal ``budget.consumed`` contribution (Task monotonic clock, once per
+    Task) and the heartbeat high-water mark (one collapsed row per
+    ``(aggregate, source)`` since P8-M2). Both are retained so a final interval
+    after the last heartbeat cannot erase a terminal breach.
+
+    The order is part of that retention contract: terminal contributions first,
+    then one heartbeat mark per source Task keyed by source Task id so an
+    ancestry fan-out stays stable. Every writer of a
+    ``budget_health:wall_time_ms:*`` Belief Assertion must order evidence
+    through this function. Two writers with two orders emit two assertions that
+    the Belief resolver then separates on ``asserted_at`` — and because the
+    terminal-projection writer asserts at ingest wall time while the
+    absolute-limit assessor asserts at event time, that turns the stored
+    evidence order into a race between two clocks rather than a property of the
+    evidence.
+    """
+
+    terminal: list[str] = []
+    heartbeat: dict[str, tuple[int, str]] = {}
+    for row in rows:
+        if row.from_heartbeat:
+            previous = heartbeat.get(row.source_task_id)
+            if previous is None or row.delta >= previous[0]:
+                heartbeat[row.source_task_id] = (row.delta, row.source_obs_id)
+        else:
+            terminal.append(row.source_obs_id)
+    return (*terminal, *(obs_id for _, (_, obs_id) in sorted(heartbeat.items())))
 
 
 class ResolvedBudget(BaseModel):

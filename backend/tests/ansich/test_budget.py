@@ -3,7 +3,13 @@ from types import SimpleNamespace
 
 import pytest
 from ansich import AnsichService
-from ansich.budget import TaskBudgetView, assess_budget_health, resolve_budget_limit
+from ansich.budget import (
+    TaskBudgetView,
+    WallTimeEvidenceRow,
+    assess_budget_health,
+    order_wall_time_evidence,
+    resolve_budget_limit,
+)
 from ansich.usage import TaskUsageValue
 
 from deerflow.ansich.budgets import resolve_deerflow_task_budgets
@@ -232,3 +238,40 @@ def test_budget_health_is_unknown_when_usage_is_missing_or_incomplete():
     assert missing.usage_value is None
     assert incomplete.value == "unknown"
     assert incomplete.usage_value == 4
+
+
+def test_wall_time_evidence_puts_the_terminal_contribution_before_the_heartbeat_mark():
+    """P11-A HOTFIX-0: the wall_time evidence order is a rule, not a clock race.
+
+    ``budget_health:wall_time_ms:*`` is written both by the terminal-projection
+    pass and by the absolute-limit assessor. They assert at different clocks
+    (ingest ``recorded_at`` vs. event time), so the Belief resolver's
+    ``asserted_at`` tiebreak decides which one a reader sees. Both must
+    therefore emit the same order, which is this function's job: terminal
+    contributions first, then one heartbeat high-water mark per source Task.
+    """
+
+    ordered = order_wall_time_evidence(
+        (
+            # Ingest order is (as_of, source_obs_id): the heartbeat ticks land
+            # before the terminal budget.consumed, which is exactly the order
+            # the retention contract must NOT preserve.
+            WallTimeEvidenceRow("task-a", "obs-hb-a1", 10_000, True),
+            WallTimeEvidenceRow("task-a", "obs-hb-a2", 20_000, True),
+            WallTimeEvidenceRow("task-b", "obs-hb-b1", 5_000, True),
+            WallTimeEvidenceRow("task-a", "obs-terminal", 30_000, False),
+        )
+    )
+
+    assert ordered == ("obs-terminal", "obs-hb-a2", "obs-hb-b1")
+
+
+def test_wall_time_evidence_keeps_the_highest_heartbeat_mark_when_ticks_arrive_out_of_order():
+    ordered = order_wall_time_evidence(
+        (
+            WallTimeEvidenceRow("task-a", "obs-hb-high", 30_000, True),
+            WallTimeEvidenceRow("task-a", "obs-hb-low", 10_000, True),
+        )
+    )
+
+    assert ordered == ("obs-hb-high",)

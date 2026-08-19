@@ -695,7 +695,16 @@ verdicts are sequence properties, not per-subject ones.
 Absolute wall-time assessment takes the maximum of
 the accumulated terminal contribution and the latest heartbeat elapsed value,
 and retains both evidence paths, so the final interval after heartbeats stop
-cannot erase a terminal breach. The wall-clock loop scans running Tasks and appends
+cannot erase a terminal breach. Their order is a rule, not an ingest artefact:
+`ansich.budget.order_wall_time_evidence` puts terminal contributions first and
+then one heartbeat high-water mark per source Task, and *both* writers of a
+`budget_health:wall_time_ms:*` assertion go through it — the absolute-limit
+assessor and `_assess_budget_rows` on terminal projection. They must agree,
+because the two assert at different clocks (terminal projection at ingest
+`recorded_at`, the assessor at event time) and the Belief resolver separates
+same-authority assertions on `as_of` then `asserted_at`; any disagreement makes
+the stored evidence order a race between those clocks rather than a property of
+the evidence. The wall-clock loop scans running Tasks and appends
 heartbeat/dwell assertions only on categorical transitions; age and duration
 remain dynamic read-model fields. Alert episodes use stable condition keys,
 retain ordered Observation evidence, resolve operational episodes on terminal

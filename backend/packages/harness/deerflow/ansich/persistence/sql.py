@@ -94,7 +94,9 @@ from ansich.budget import (
     BudgetSourceKind,
     TaskBudgetsView,
     TaskBudgetView,
+    WallTimeEvidenceRow,
     assess_budget_health,
+    order_wall_time_evidence,
 )
 from ansich.compression import CompressionDisposition
 from ansich.context_state import context_state_hash, materialize_context_state
@@ -2196,10 +2198,9 @@ class SqlAnsichBackend:
         as_of: dict[tuple[UsageDimension, AggregationScope], datetime] = {}
         evidence: dict[tuple[UsageDimension, AggregationScope], list[str]] = {}
         wall_time_by_source: dict[tuple[UsageDimension, AggregationScope], dict[str, int]] = {}
-        wall_time_terminal_evidence: dict[tuple[UsageDimension, AggregationScope], list[str]] = {}
-        wall_time_heartbeat_evidence: dict[
+        wall_time_evidence_rows: dict[
             tuple[UsageDimension, AggregationScope],
-            dict[str, tuple[int, str]],
+            list[WallTimeEvidenceRow],
         ] = {}
         for contribution, source_observation in contribution_rows:
             scopes: tuple[AggregationScope, ...] = ("local", "inclusive") if contribution.source_task_id == task_id else ("inclusive",)
@@ -2219,22 +2220,18 @@ class SqlAnsichBackend:
                 )
                 if contribution.dimension != "wall_time_ms":
                     evidence.setdefault(key, []).append(contribution.source_obs_id)
-                elif source_observation.kind == "task.heartbeat":
-                    by_source = wall_time_heartbeat_evidence.setdefault(key, {})
-                    previous = by_source.get(contribution.source_task_id)
-                    if previous is None or contribution.delta >= previous[0]:
-                        by_source[contribution.source_task_id] = (
-                            contribution.delta,
-                            contribution.source_obs_id,
-                        )
                 else:
-                    wall_time_terminal_evidence.setdefault(key, []).append(contribution.source_obs_id)
+                    wall_time_evidence_rows.setdefault(key, []).append(
+                        WallTimeEvidenceRow(
+                            source_task_id=contribution.source_task_id,
+                            source_obs_id=contribution.source_obs_id,
+                            delta=contribution.delta,
+                            from_heartbeat=source_observation.kind == "task.heartbeat",
+                        )
+                    )
         for key, source_values in wall_time_by_source.items():
             values[key] = sum(source_values.values())
-            evidence[key] = [
-                *wall_time_terminal_evidence.get(key, ()),
-                *(item[1] for _, item in sorted(wall_time_heartbeat_evidence.get(key, {}).items())),
-            ]
+            evidence[key] = list(order_wall_time_evidence(wall_time_evidence_rows.get(key, ())))
 
         heartbeat_rows = list(
             (
@@ -5165,6 +5162,67 @@ class SqlAnsichBackend:
         )
         return changed
 
+    async def _budget_usage_evidence(
+        self,
+        session: AsyncSession,
+        *,
+        aggregate_task_id: str,
+        dimension: str,
+        aggregation_scope: str,
+    ) -> tuple[str, ...]:
+        """Usage evidence for one budget row, in the order the assessor uses.
+
+        ``_assess_budget_rows`` and ``_assess_absolute_limits_at`` both write
+        ``budget_health:<dimension>:<scope>`` Belief Assertions for the same
+        Task, and the Belief resolver separates two same-authority assertions
+        on ``as_of`` then ``asserted_at``. The terminal-projection call asserts
+        at ``recorded_at`` (ingest wall clock) while the assessor asserts at
+        event time, so whichever evidence order the two paths disagree on
+        becomes a race between two clocks. They must therefore agree by
+        construction: summed dimensions keep contribution order, and
+        ``wall_time_ms`` — the one maximum-valued dimension, which retains both
+        the terminal contribution and the heartbeat high-water mark — goes
+        through ``order_wall_time_evidence``.
+        """
+
+        scope_filter = (AnsichUsageContributionRow.source_task_id == aggregate_task_id,) if aggregation_scope == "local" else ()
+        base_filters = (
+            AnsichUsageContributionRow.aggregate_task_id == aggregate_task_id,
+            AnsichUsageContributionRow.dimension == dimension,
+            *scope_filter,
+        )
+        ordering = (
+            AnsichUsageContributionRow.as_of,
+            AnsichUsageContributionRow.source_obs_id,
+        )
+        if dimension != "wall_time_ms":
+            return tuple((await session.execute(select(AnsichUsageContributionRow.source_obs_id).where(*base_filters).order_by(*ordering))).scalars())
+        wall_time_rows = (
+            await session.execute(
+                select(
+                    AnsichUsageContributionRow.source_task_id,
+                    AnsichUsageContributionRow.source_obs_id,
+                    AnsichUsageContributionRow.delta,
+                    AnsichObservationRow.kind,
+                )
+                .join(
+                    AnsichObservationRow,
+                    AnsichObservationRow.obs_id == AnsichUsageContributionRow.source_obs_id,
+                )
+                .where(*base_filters)
+                .order_by(*ordering)
+            )
+        ).all()
+        return order_wall_time_evidence(
+            WallTimeEvidenceRow(
+                source_task_id=source_task_id,
+                source_obs_id=source_obs_id,
+                delta=delta,
+                from_heartbeat=kind == "task.heartbeat",
+            )
+            for source_task_id, source_obs_id, delta, kind in wall_time_rows
+        )
+
     async def _assess_budget_rows(
         self,
         session: AsyncSession,
@@ -5207,21 +5265,11 @@ class SqlAnsichBackend:
                     as_of=_as_utc(usage_row.as_of),
                     complete_through_ingest_seq=usage_row.complete_through_ingest_seq,
                 )
-                usage_evidence = tuple(
-                    (
-                        await session.execute(
-                            select(AnsichUsageContributionRow.source_obs_id)
-                            .where(
-                                AnsichUsageContributionRow.aggregate_task_id == budget_row.task_id,
-                                AnsichUsageContributionRow.dimension == budget_row.dimension,
-                                *((AnsichUsageContributionRow.source_task_id == budget_row.task_id,) if budget_row.aggregation_scope == "local" else ()),
-                            )
-                            .order_by(
-                                AnsichUsageContributionRow.as_of,
-                                AnsichUsageContributionRow.source_obs_id,
-                            )
-                        )
-                    ).scalars()
+                usage_evidence = await self._budget_usage_evidence(
+                    session,
+                    aggregate_task_id=budget_row.task_id,
+                    dimension=budget_row.dimension,
+                    aggregation_scope=budget_row.aggregation_scope,
                 )
             belief = assess_budget_health(
                 budget,
