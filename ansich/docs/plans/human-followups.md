@@ -12,8 +12,8 @@
 | U2 | 按来源浏览块内容（raw/model-visible 对照） | ⬜ 未修复 | Phase 11 同批（依赖 raw read 强审计） | — | — |
 | U3 | 投影 Degraded 无 failed jobs 细节，无法下钻排查 | ✅ 已修复 | 可提前，建议随 Phase 9 顺带或独立小迭代 | 2026-07-21 | 5b5d03a7 |
 | U4 | Context Compression 不显示执行时机（发生时间与触发 operation） | ⬜ 未修复 | 随时可做，建议与 U3 同批随 Phase 9 顺带 | — | — |
-| D1 | 缺开发文档：概念词汇表（ContentBlock/Step/…） | ⬜ 未修复 | 立即，不依赖任何 Phase | — | — |
-| D2 | 缺使用文档：仪表盘指标含义 | ⬜ 未修复 | tooltip 随时可做；正式文档归属 Phase 12 §9 | — | — |
+| D1 | 缺开发文档：概念词汇表（ContentBlock/Step/…） | ✅ 已修复 | 立即，不依赖任何 Phase | 2026-07-21 | `152f44c2`（Phase 10 扩写 `2dedd08a`） |
+| D2 | 缺使用文档：仪表盘指标含义 | 🟡 ① 已修复 / ② 未修复 | ① 内联 tooltip 随时可做；② 正式文档归属 Phase 12 §9 | ① 2026-07-24 | ① `3425a7a1`；② — |
 | A1 | ansich 与 deerflow 采集面耦合，抽象 obs layer | ⬜ 未修复 | Phase 10 后启动设计，迁移与 Phase 11 同批 | — | — |
 
 ## U1. Context Lineage UI 重构：渐进式披露 + local graph 树状化
@@ -54,7 +54,7 @@
 
 ## D1. 开发文档：概念词汇表
 
-- 状态：⬜ 未修复。
+- 状态：✅ 已修复（2026-07-21，`152f44c2`）。`ansich/docs/concepts.md` 已落地：三层心智模型（Observation / 事实读模型 / Belief）打头，逐个定义 v0.2 词汇并标注 payload 分层、投影与重放语义、实现代码路径与所属 Phase。随后按阶段持续扩写，最近一次是 `2dedd08a`（Phase 10 的评估与语义 Belief 一节，含小节重编号与悬挂交叉引用修复）——即该文档**已随实现走到 Phase 10**，不是一次性快照。配套动作（把「新增概念同步进 concepts.md」写进 plans/README 的阶段合并规则）本次一并补上。
 - 现象：缺少开发文档；第一步应先创建一个文档介绍 ansich 中各个概念，比如 ContentBlock、Step 等。
 - 相关位置：`ansich/docs/` 现仅有设计文档、架构 UML 与阶段计划，无面向开发者的概念导览。
 - 现状：设计文档回答"为什么这么建"，阶段计划回答"怎么验收"，缺少"系统里有哪些概念、彼此什么关系"的地图；新开发者或评审者要读完 8 个阶段计划才能拼出概念全貌。
@@ -63,7 +63,9 @@
 
 ## D2. 使用文档：仪表盘指标含义
 
-- 状态：⬜ 未修复。
+- 状态：🟡 分层结算——**① 内联层已修复**（2026-07-24，`3425a7a1`）、**② 正式使用文档仍未做**（归属 Phase 12 §9，不变）。
+  - ① 已落地的范围：Operations 的 `System details` 抽屉里每个指标标签都带一个**可键盘聚焦**的 help trigger，tooltip 给出该指标的定义与诊断含义，文案已进 `en-US`/`zh-CN` 两份 locale（`systemMetricDescriptions` 共 14 项：queue/queue high-watermark/queue bytes/queue byte high-watermark、watermark、lag、failed jobs、accepted、dropped、lost、snapshot requests、snapshot items、incomplete snapshots、missing blocks），failed-job 的 help 与那个可点击下钻的数值分开以免误触；e2e 已覆盖。
+  - ② 仍缺的范围：每个指标的**正常区间、异常含义与处置动作**——tooltip 回答"这是什么"，不回答"多少算不正常、然后该做什么"。这部分连同 Alert 含义、interrupt/rollback 差异、retention/replay 命令仍是 Phase 12 §9 的发布门禁项。理由不变：Phase 11 还会新增 retention/lost-range 类指标，语义冻结后再一次写到位。
 - 现象：观测系统状态仪表盘中各个指标的意思没有说明。
 - 相关位置：Operator Lens / active-task 仪表盘（Phase 5）、projection-health 面板；Phase 12 §9 已把"运维文档：health 字段、Alert 含义、interrupt/rollback 差异、retention/replay 命令"列为发布门禁。
 - 现状：heartbeat lag、budget 消耗、usage local/inclusive、failed_jobs、watermark lag 等指标无释义，非作者无法判断什么算异常、异常后该做什么。
@@ -81,8 +83,10 @@
 
 ## 施工时机汇总（按时间线）
 
-1. **立即**：D1（概念词汇表）——独立文档任务，与代码改解耦；D2 的 tooltip 内联层可同批。
-2. **Phase 9 期间（可提前）**：U3（failed jobs 下钻）——薄诊断面，DTO 对齐 Phase 11 设计；U4（compression 执行时机）——与 U3 同属谱系诊断面补细节的小切片，同批顺带。
-3. **Phase 10 完成后**：A1 设计启动；U1 启动（谱系实体种类已稳定）。
-4. **Phase 11 同批**：U2（依赖 raw read 强审计与 retention）；A1 迁移（与 collector 加固同批）；U3 若未提前做则必须在此完成（poison job 隔离需要配套诊断面）。
-5. **Phase 12 前清零**：U1 完成 UX 收敛；D2 正式使用文档随 §9 门禁交付；本文件所有剩余项要么关闭要么显式登记为 known gap。
+现状锚点（2026-08-19，Phase 11 前加固批收尾时复核）：Phase 1–10 已落地，Phase 11 尚未开工。因此下表第 1–3 档都已到期，第 3 档的两项是**当前唯一的欠账**。
+
+1. ~~**立即**：D1（概念词汇表）；D2 的 tooltip 内联层同批。~~ **已完成**：D1 由 `152f44c2` 落地并扩写至 Phase 10（`2dedd08a`）；D2 的内联层由 `3425a7a1` 落地（D2 的正式文档仍在第 5 档）。
+2. ~~**Phase 9 期间（可提前）**：U3（failed jobs 下钻）；U4（compression 执行时机）。~~ **半完成**：U3 已由 `5b5d03a7` 落地；**U4 仍未做**，且已过其建议窗口——按它自己的归属说明，若拖到 U1 开工仍未修，就必须并入 U1（重构后的渐进式详情面板要把执行时机作为一级信息）。
+3. **Phase 10 完成后（**现已到期**）**：U1（Lineage UI 重构）与 A1（obs layer 抽象）设计**现在就该启动**——Phase 10 已完成，谱系实体种类已稳定，而 Phase 12 的验收演练是 U1 的硬期限。这两项是本文件当前的主要欠账。
+4. **Phase 11 同批**：U2（依赖 raw read 强审计与 retention）；A1 的实际迁移（与 collector/queue/lease 加固碰同一批代码，同批做只动一次）。U3 已提前完成，此档不再挂它。
+5. **Phase 12 前清零**：U1 完成 UX 收敛；D2 的正式使用文档随 §9 门禁交付；本文件所有剩余项要么关闭要么显式登记为 known gap。

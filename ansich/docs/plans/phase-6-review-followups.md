@@ -8,7 +8,7 @@
 | ---- | ---- | ---- | -------- | ------ |
 | M1 | assessor job 逐观察入队且每个 job 全量重扫历史,长任务评估成本 O(n²) | ✅ 已修复 | 2026-07-19 | `4f5ec989` |
 | L1 | 周期性 heartbeat/dwell 告警对账每秒全量加载该任务全部 episode + evidence | ✅ 已修复 | 2026-07-19 | `4f5ec989` |
-| L2 | operator action 卡在 `requested` 时同 Idempotency-Key 永久 409,无超时回收 | ✅ 已修复 | 2026-08-19 | 本次变更(待提交) |
+| L2 | operator action 卡在 `requested` 时同 Idempotency-Key 永久 409,无超时回收 | ✅ 已修复 | 2026-08-19 | `a1bcf523` |
 | L3 | 绝对预算评估中 heartbeat elapsed 无条件覆盖 wall_time 贡献和,终态边界可能低估 | ✅ 已修复 | 2026-07-19 | `b910ba82` |
 | L4 | `observability_degradation` / `projection_failure` 告警类型已声明但无生产者 | ✅ 已决策 | 2026-07-19 | `0a38a96d` |
 
@@ -30,7 +30,7 @@
 
 ## L2. operator action 卡在 `requested` 时同 key 永久 409
 
-- 状态:✅ 已于 2026-08-19 修复(本次变更,待提交),按裁决 HR3 取「保守过期 + 请求驱动接管」方向,不做启动期扫描。
+- 状态:✅ 已于 2026-08-19 修复(commit `a1bcf523`),按裁决 HR3 取「保守过期 + 请求驱动接管」方向,不做启动期扫描。
   - **过期窗口**:`sql.py` 新增模块级常量 `_STALE_REQUESTED_TAKEOVER_AFTER = timedelta(minutes=5)`,紧邻 `SqlAnsichBackend` 的 projector lease 旋钮(`projector_lease_seconds` 等)并复用其直觉:租约无人续期即可被他人接管。窗口内的 `requested` 仍按「真实在途重复请求」处理并 409,只有超窗口的孤儿才会被接管——**恢复完全由请求驱动**,没有启动期 sweep,一行孤儿只会被真正想执行该操作的 operator 判定。
   - **时间戳来源(调研结论)**:`ansich_operator_actions.created_at` 早已存在(`DateTime(timezone=True)`、NOT NULL,begin 时写入 `occurred_at`),直接作为计龄锚点;接管时把它重置为本次 `occurred_at`,新尝试因此独享完整窗口。**无需迁移**,head 仍为 `0025_ansich_assessor_watermarks`。
   - **审计契约(与 HR3 字面表述的偏差,留档)**:被放弃尝试的终态是一条 `operator.action_failed` Observation——与常规失败路径**同一 kind、同一 payload 形状**(未新增审计 kind),`result` 为 `{"outcome": "stale_requested_takeover", "requested_at", "expiry_seconds", "superseded_by_action_id"}`,末项是指向接任尝试的前向指针。审计行本身**不**保留为 `failed`,而是原地重新武装(新 `action_id`、`status=requested`、新 requested Observation)给新尝试:唯一约束是 `(task_id, action_type, idempotency_key)`,因此「陈旧行停在 failed」与「新尝试走完整 requested→terminal 生命周期」在同一把键上互斥——保留前者会让后续同 key 重试重放一条并非真实结果的 `stale_requested_takeover` 失败。取后者(重试重放的必须是**当前存活**尝试的结果),被放弃尝试的终态则留在不可变 Observation 流里——那本就是该审计的持久真相来源(`rebuild_projections()` 会清空 `ansich_operator_actions` 行表)。
@@ -73,6 +73,6 @@
 ## 计划测试矩阵缺口(随修复补齐)
 
 - M1:✅ `4f5ec989` 已补 job 合并等价性、单次最高 watermark 评估与 Step→Tool batch join 查询护栏。
-- L2:✅ 本次变更已补 begin 后崩溃的孤儿 `requested` 恢复路径(过期接管 + 未过期仍 409 + 并发单一选举 + 两个尝试各有审计终态)。
+- L2:✅ `a1bcf523` 已补 begin 后崩溃的孤儿 `requested` 恢复路径(过期接管 + 未过期仍 409 + 并发单一选举 + 两个尝试各有审计终态)。
 - L3:✅ `b910ba82` 已补最后一个心跳间隔内的 wall_time breach 在 terminal 后保留及双路 evidence 回归。
 - L4:✅ `0a38a96d` 已补“未生产类型不出现在 filter/文案”的后端路由与前端公开常量测试。

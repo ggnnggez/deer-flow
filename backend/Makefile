@@ -27,6 +27,9 @@ test-blocking-io:
 # Each test creates and drops its own uniquely-named database on that server, so
 # the tier is re-runnable. Without the env var every test self-skips (the same
 # opt-in shape as the redis tier), which is why `make test` stays SQLite-only.
+# Caveat: the `docker run` line above has not itself been executed -- the tier
+# was verified against a locally-initialised PostgreSQL 16.2 cluster on the same
+# port/URL, so treat the container recipe as untested convenience, not a proof.
 test-postgres:
 	@if [ -z "$$DEER_FLOW_TEST_POSTGRES_URL" ]; then \
 		echo "DEER_FLOW_TEST_POSTGRES_URL is not set -- the postgres tier will self-skip."; \

@@ -93,12 +93,26 @@ make stop       # Stop all services
 make install            # Install backend dependencies
 make dev                # Run Gateway API with reload (port 8001)
 make gateway            # Run Gateway API only (port 8001)
-make test               # Run all backend tests
+make test               # Run all backend tests (SQLite only)
 make test-blocking-io   # Run strict Blockbuster runtime gate on tests/blocking_io/
+make test-postgres      # Opt-in PostgreSQL tier in tests/integration/ (see below)
 make lint               # Lint with ruff
 make format             # Format code with ruff
 make migrate-rev MSG="..."  # Autogenerate a new alembic revision (see Schema Migrations section)
 ```
+
+`make test-postgres` runs `tests/integration/` — the only gate that executes the
+alembic chain against a real PostgreSQL server. It is opt-in through
+`DEER_FLOW_TEST_POSTGRES_URL` (same shape as the redis tier: every test
+self-skips when the variable is unset, which is why `make test` stays
+SQLite-only). Each test creates and drops its own uniquely-named database on
+that server, so the tier is re-runnable. It covers the migration matrix
+(empty → head, head → `0004_run_ownership` → head, a second `upgrade head` as a
+no-op), all three `bootstrap_schema` branches including the `pg_advisory_lock`
+path SQLite never takes, and one end-to-end Ansich service smoke on the migrated
+schema. It is **not** a Postgres run of the whole suite: everything outside
+`tests/integration/` still runs on SQLite only, so multi-worker behaviour
+(`SELECT … FOR UPDATE`, `skip_locked`, lost-update windows) remains unexercised.
 
 The `detect-blocking-io` target parses `app/`, `packages/harness/deerflow/`,
 and `scripts/` with AST. By default it reports only blocking IO candidates that
@@ -605,7 +619,10 @@ contributions retain `(aggregate_task_id, source_task_id, dimension,
 source_obs_id)`: local summaries include self only, inclusive summaries fan out
 through ancestry, and a late spawn backfills existing descendant contributions.
 Heartbeat wall time is cumulative per source Task (maximum elapsed evidence),
-then summed across sources. Lead assembly returns an explicit
+then summed across sources — and because it is a max-type dimension re-reported
+every tick rather than a sum-type delta, it is stored as one high-water row per
+`(aggregate, source)` instead of one row per tick (see the hardening paragraph
+below). Lead assembly returns an explicit
 `LeadAgentAssembly(graph, descriptor)` to the worker; the graph-only
 `make_lead_agent()` API and legacy custom-factory graph attribute remain
 compatibility fallbacks, not the normal descriptor transport.
@@ -852,6 +869,41 @@ the free-text comment is deliberately dropped rather than ridden into an
 Observation payload that never needs it; and the rating is part of the
 source-event id, so re-submitting the same rating is absorbed as a replay while
 changing it produces new evidence that coexists with the old assertion.
+
+**Pre-Phase-11 hardening** (one batch, 2026-08-19; details in
+`ansich/docs/plans/phase-{6,8,9,10}-review-followups.md`). `wall_time_ms` is the
+one max-type usage dimension: a `task.heartbeat` re-reports the same Task's
+cumulative elapsed time every tick, so its contribution is kept as a single
+high-water row per `(aggregate_task_id, source_task_id)` that a later tick
+replaces only when it raises the mark, rather than one durable row per tick.
+`_upsert_high_water_contribution` locks that row (`with_for_update(of=…)`)
+*before* reading it — the same lock-then-read discipline as
+`_recompute_release_quality_stats` — because it is a read-modify-write and
+sibling Tasks contend on the same ancestor row; `_backfill_spawn_usage`'s read is
+deliberately unlocked and says why in its docstring (it reads descendant self
+rows and writes only ancestor rows, disjoint sets). The `budget.consumed`
+terminal wall time keeps its own immutable row beside the mark, so both evidence
+paths survive. `_project_heartbeat` no longer writes the usage summary at all:
+`_refresh_usage_summary` is the single writer, which also means a persistently
+failing usage projector now leaves wall time `unknown` instead of being covered
+by the heartbeat writer. Migration `0024_ansich_wall_time_watermarks` collapses
+historical per-tick rows using the projector's own `(delta, as_of,
+source_obs_id)` ordering. Scope-safety assessment is incremental (see the
+Phase 6 assessor paragraph above) against the durable `ansich_assessor_watermarks`
+mark, widened inside the claim transaction. `_effect_class` reads tool arguments
+so bash can yield `filesystem_delete`/`permission_change`, always at `inferred`
+observed fidelity and always beside a retained `unknown` companion (see the
+effect paragraph above). `GET /tasks/{id}/usage?by=model` is LOCAL-only and never
+turns an unreported dimension into a zero. A stale `requested` operator action is
+taken over after five minutes by the same conflict election, with the abandoned
+attempt's terminal preserved in the observation stream. Two test-side contracts
+back this: `tests/ansich/test_settle_isolation.py` pins that the settle gate is
+attached to the method `_projector_loop` actually calls (its sufficiency is
+proven only at the load of its acceptance runs, not beyond), and
+`make test-postgres` executes the migration chain and one service smoke against a
+real server. What this batch did **not** establish: the suite outside
+`tests/integration/` still runs on SQLite, so every multi-worker claim above
+rests on code review plus the lock's presence, not on an executed concurrent test.
 
 **Workspace change review**: `packages/harness/deerflow/workspace_changes/`
 captures a pre-run and post-run snapshot of the thread-owned `workspace` and
@@ -1206,7 +1258,7 @@ DeerFlow's application tables (`runs`, `threads_meta`, `feedback`, `users`, `run
 
 The legacy branch handles pre-alembic databases that already have at least one DeerFlow-owned table. `create_all` runs first because stamping at `0001_baseline` makes alembic skip the baseline's own `create_table` DDL on the subsequent upgrade — so any baseline table introduced into `Base.metadata` after the user's DB was first provisioned (e.g. the `channel_*` tables from PR #1930 for users upgrading across multiple releases) would otherwise never be created, and the first request hitting that table would 500 with `no such table`. The backfill is **restricted to `_BASELINE_TABLE_NAMES`** so it does not also create tables that future revisions introduce — those revisions' own `op.create_table` would otherwise fail with `relation already exists`. A guard test pins `_BASELINE_TABLE_NAMES` against `0001_baseline.upgrade()`'s actual output, so editing 0001 to add or remove a table forces a matching update to the constant. Column-level shape (pre-#3658 vs post-#3658 vs manual-ALTER for `token_usage_by_model`) is answered by each `versions/*.py` revision via the idempotent helpers in `migrations/_helpers.py` (`safe_add_column` / `safe_drop_column`) which no-op when the change is already present and `logger.warning` on shape drift. **Adding a new ORM column / table only requires a new revision file — no edit to `bootstrap.py` is needed** *unless* the new revision adds a new baseline table (rare; only happens when a new model is part of the baseline rather than introduced by its own revision).
 
-The empty-DB path keeps using `create_all` because `Base.metadata` is the only authoritative schema source — `create_all` renders both SQLite (JSON, type affinity) and Postgres (JSONB, partial indexes) correctly without anyone having to keep a hand-written baseline in lockstep. `0001_baseline.upgrade()` is therefore almost never executed in practice; it exists as a stamp target + chain root.
+The empty-DB path keeps using `create_all` because `Base.metadata` is the only authoritative schema source — `create_all` renders both SQLite (JSON, type affinity) and Postgres (`json`, partial indexes, timezone-aware timestamps) correctly without anyone having to keep a hand-written baseline in lockstep. The models use generic `sa.JSON`, never `postgresql.JSONB`, so Postgres gets `json` columns — switching the chain to `jsonb` (for GIN/containment queries) would be its own migration across every JSON column, DeerFlow's and Ansich's alike, and is registered as a Phase 11 consideration in `ansich/docs/plans/phase-10-review-followups.md`. `0001_baseline.upgrade()` is therefore almost never executed in practice; it exists as a stamp target + chain root.
 
 **Concurrency safety**: Postgres uses `pg_advisory_lock` to serialise concurrent Gateway instances. SQLite uses a per-engine `asyncio.Lock` for same-process startup and is best-effort across processes via SQLite's file-level write lock + `PRAGMA busy_timeout`; multi-instance deployments should use Postgres. Column revisions in `versions/` additionally use idempotent helpers (`_helpers.py::safe_add_column`, `safe_drop_column`) so repeated post-baseline changes and retries are no-ops when the change is already present.
 

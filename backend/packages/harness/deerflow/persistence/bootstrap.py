@@ -4,9 +4,12 @@ Replaces the unconditional ``Base.metadata.create_all`` at Gateway startup.
 Combines two ideas:
 
 1. ``create_all`` stays the empty-DB fast path -- it renders ``Base.metadata``
-   faithfully across SQLite and Postgres dialects (JSON vs JSONB, server
-   defaults, index/FK names, type affinity) without anyone having to hand-keep
-   a mirror baseline in sync with the models.
+   faithfully across SQLite and Postgres dialects (server defaults, index/FK
+   names, type affinity, partial indexes, timezone-aware timestamps) without
+   anyone having to hand-keep a mirror baseline in sync with the models. Note
+   the models use generic ``sa.JSON``, never ``postgresql.JSONB``, so Postgres
+   renders ``json`` columns here; moving the chain to ``jsonb`` would be its
+   own migration across every JSON column rather than a rendering detail.
 2. **Alembic owns every change from baseline onward.** Any new ORM column /
    table / index must ship as a revision under ``migrations/versions/``.
 

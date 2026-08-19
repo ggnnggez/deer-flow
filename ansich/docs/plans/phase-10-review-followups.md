@@ -15,9 +15,9 @@
 | F10-5 | score delta 的真实分母 `score_count` 在视图边界被丢弃,门禁与展示都用 `assessed_count` | ⬜ 未修复 | — | — |
 | F10-6 | 兄弟 rollup(`_refresh_behavior_belief`、usage/budget 读模型)仍是未串行化的 read-modify-write | ⬜ 未修复 | — | — |
 | F10-7 | 缺 per-observation 持久化信号,存在「observation 丢失但回执永远 pending」的窗口 | ⬜ 未修复 | — | — |
-| F10-8 | `contracts.py` 的 scope/authorization/effect 三个 `_validate_subject` 分支缺 payload-None 守卫(既存缺陷) | ✅ 已修复 | 2026-08-18 | 本次变更待提交 |
+| F10-8 | `contracts.py` 的 scope/authorization/effect 三个 `_validate_subject` 分支缺 payload-None 守卫(既存缺陷) | ✅ 已修复 | 2026-08-19 | `d463a604` |
 | F10-9 | 同一组常量六处复制(suite-bound kinds ×3、五维度集合 ×3) | ⬜ 未修复 | — | — |
-| F10-10 | settle 时序 flaky 未隔离:在负载下轮换命中无关测试 | ✅ 已修复 | 2026-08-19 | 本次变更待提交 |
+| F10-10 | settle 时序 flaky 未隔离:在负载下轮换命中无关测试(**门禁充分性未证**,见下方留观标记) | ✅ 已修复 | 2026-08-19 | `04f7ce96` / `25168118` |
 | F10-11 | pass-rate 兜底未标注量表极性 | ⬜ 未修复 | — | — |
 | F10-12 | feedback 桥接在请求路径上 await 一次无上界的 DB 读 | ⬜ 未修复 | — | — |
 | F10-13 | `/acknowledge` 静默忽略 `semantic_override` | ⬜ 未修复 | — | — |
@@ -26,8 +26,12 @@
 | F10-16 | Recorded evaluations 列表静默截断在 100 条,无截断提示 | ⬜ 未修复 | — | — |
 | F10-17 | Agent release 头部质量徽标是硬编码字面量,后端聚合落地后会开始说谎 | ⬜ 未修复 | — | — |
 | F10-18 | 杂项(装修性/覆盖率补齐,详见该节逐条) | ⬜ 未修复 | — | — |
+| F10-19 | late spawn 边与 sum 型 contribution 并发时存在**永久**丢失窗口(wall_time 可自愈,token/step/tool 不可) | ⬜ 未修复 | — | — |
+| F10-20 | `_refresh_usage_summary` 仍是未加锁的全量重算+无条件赋值——F10-6 的同族问题,就在本批加锁那一层的上面 | ⬜ 未修复 | — | — |
+| F10-21 | 生产路径的 effect 恒 `scope_id=None`,`attempted_/realized_scope_violation` 两类结论在生产上不可达 | ⬜ 未修复 | — | — |
+| F10-22 | `sudo`/`env`/`timeout` 等包装命令下的 effect 分类未裁定,`sudo rm -rf` 目前落回 `process_execute` | ⬜ 未修复 | — | — |
 
-留观标记:F10-10 的第 4 条证据(`test_step_attempt_and_context_are_queryable_after_projection`)**未证实**——只做了排除法,没拿到原始失败文本。若它再轮换红,**先抓失败文本再修**,不要按已有的三条诊断类推。
+留观标记:F10-10 的第 4 条证据(`test_step_attempt_and_context_are_queryable_after_projection`)**未证实**——只做了排除法,没拿到原始失败文本。若它再轮换红,**先抓失败文本再修**,不要按已有的三条诊断类推。另:F10-10 的门禁只被 Task 8 的验收负载证明过(`e53cefbc` 记录了这条边界),Task 9 的更重负载下仍有 2 条已上门禁的测试翻红,详见该条的「后续观察」。
 
 ## F10-1. `alert_subject_is_not_a_task` 降级分支无测试
 
@@ -90,7 +94,7 @@
 
 ## F10-8. 三个 `_validate_subject` 分支缺 payload-None 守卫
 
-- 状态:✅ 已修复(2026-08-18,本次变更待提交)。把 `evaluation.recorded` 分支的守卫模式原样复制到 `scope.snapshotted`/`authorization.*`/`effect.*` 三个分支:subject_type 检查保持无条件,只有 payload 交叉校验挪进 `if self.payload is not None:`,payload 在手时的校验强度一字未改(`test_safety_contracts.py` 里 kind/decision、kind/phase 两条冲突拒绝用例未改动仍绿)。回归钉子:`backend/tests/ansich/test_sql_safety.py::test_externalized_scope_authorization_and_effect_payloads_read_back`——服务按 `inline_payload_max_bytes=16` 构造,让每条 payload 都走 externalize,记录 scope/authorization/effect 三条 observation 并 flush,先断言这三行在库里确实是 `payload_json IS NULL AND payload_ref_id IS NOT NULL`,再经 `service.list_timeline()` 与 `service.list_observations()` 两个公共读读回。RED 证据:读路径不是降级成空/degraded,而是直接抛 `ValidationError: Input should be a valid dictionary or instance of ScopeDescriptor [input_value=None]`(`sql.py:5574` 的 `_observation_from_row`);逐个分支补守卫时报错依次换成 `AuthorizationSnapshot`、`ToolEffect`,三个分支各自都被这一条用例钉住。附带确认:`_claim_projection_job` 同样先 `_observation_from_row` 再 hydrate payload,所以修复前这三种 kind 的 externalized observation 连投影都认领不了,job 永远 pending、`flush_task` 只能等到 `projection_settle_timeout`——"能写进去、再也读不出来"比诊断记录的还要广一层。
+- 状态:✅ 已修复(2026-08-19,`d463a604`)。把 `evaluation.recorded` 分支的守卫模式原样复制到 `scope.snapshotted`/`authorization.*`/`effect.*` 三个分支:subject_type 检查保持无条件,只有 payload 交叉校验挪进 `if self.payload is not None:`,payload 在手时的校验强度一字未改(`test_safety_contracts.py` 里 kind/decision、kind/phase 两条冲突拒绝用例未改动仍绿)。回归钉子:`backend/tests/ansich/test_sql_safety.py::test_externalized_scope_authorization_and_effect_payloads_read_back`——服务按 `inline_payload_max_bytes=16` 构造,让每条 payload 都走 externalize,记录 scope/authorization/effect 三条 observation 并 flush,先断言这三行在库里确实是 `payload_json IS NULL AND payload_ref_id IS NOT NULL`,再经 `service.list_timeline()` 与 `service.list_observations()` 两个公共读读回。RED 证据:读路径不是降级成空/degraded,而是直接抛 `ValidationError: Input should be a valid dictionary or instance of ScopeDescriptor [input_value=None]`(`sql.py:5574` 的 `_observation_from_row`);逐个分支补守卫时报错依次换成 `AuthorizationSnapshot`、`ToolEffect`,三个分支各自都被这一条用例钉住。附带确认:`_claim_projection_job` 同样先 `_observation_from_row` 再 hydrate payload,所以修复前这三种 kind 的 externalized observation 连投影都认领不了,job 永远 pending、`flush_task` 只能等到 `projection_settle_timeout`——"能写进去、再也读不出来"比诊断记录的还要广一层。
 - 原始诊断(留档):
 - 位置:`backend/packages/ansich/ansich/contracts.py` 的 `scope.snapshotted`/`authorization.*`/`effect.*` 分支(contracts.py:243-271);`evaluation.recorded` 分支(:273-283)是正确的参考写法。
 - 现状:这三个分支无条件 `model_validate((self.payload or {}).get(...))`,payload 为 `None` 时直接抛错。externalize 的 observation 在 `_observation_from_row` 里重新校验时 payload 不在手上,于是这些 kind 一旦走 externalize 路径就是"能写进去、再也读不出来"。`evaluation.recorded` 分支用 `if self.payload is not None:` 把交叉校验包起来,是本仓库里唯一正确的样板。
@@ -107,7 +111,7 @@
 
 ## F10-10. settle 时序 flaky 未隔离
 
-- 状态:✅ 已修复(2026-08-19,本次变更待提交)。四条证据指向同一个后台写者——`AnsichService._projector_loop` 的 `assess_operations()`,它永远用**墙钟** `now`,而这些测试自己驱动的评估传的是**模拟** `now`。但**同一个写者在两种测试形状里以不同频率登场,别把它们说成一件事**:
+- 状态:✅ 已修复(2026-08-19,`04f7ce96`;门禁挂载点的真 service 钉子与 flake 归类更正随 `25168118`,充分性边界随 `e53cefbc`)。四条证据指向同一个后台写者——`AnsichService._projector_loop` 的 `assess_operations()`,它永远用**墙钟** `now`,而这些测试自己驱动的评估传的是**模拟** `now`。但**同一个写者在两种测试形状里以不同频率登场,别把它们说成一件事**:
   - **默认档(9 条,`create_sql_ansich_service(...)` 没覆写 `operations_assessment_interval_ms`)**:默认值就是 1 Hz(`deerflow/ansich/__init__.py` 的 `operations_assessment_interval_ms=1_000`),所以整条测试体里后台每秒都在评估。8/8 复现的那条 budget 测试就在这一档——真正撞上来的是**这个周期**,不是「压不掉的第一轮」;把间隔调到 60s 对它其实有效,只是仍留下第一轮那一次,所以不是完整的修法。
   - **60s 档(20 条,显式 `operations_assessment_interval_ms=60_000`,如 alerts 的 coalescing 用例与 safety 的 rollback 用例)**:周期那一半已经被 `e91d9f1c` 的做法压掉了,**剩下的写者是第一轮迭代那次无条件评估**(`next_assessment = loop.time()`,循环第一次迭代必评估),它不受间隔控制,测试侧也没法把它调没。
   
@@ -127,7 +131,7 @@
 - 后续观察(Task 9 会话,2026-08-19,**不改状态、不是新诊断**):在 Task 9 的高并发负载下(与 dockerless PostgreSQL 集成层同机跑,`tests/ansich` 连跑 5 次),**29 条已上门禁的测试里有 2 条仍然翻红**。这不推翻本条的修复,但把验收的边界说清楚:**门禁只被 Task 8 那三次(外加复审后一次)背靠背验收跑证明过,没有被证明在更重的负载下充分。**
   - 翻红的两条(都已核对源码,确认带门禁):
     - `tests/ansich/test_sql_safety.py:1410::test_scope_safety_reassessment_work_does_not_grow_with_tool_call_count` —— `only_test_driven_assessments(service)` 在 :1435,三个间隔全是 `60_000`(正是本条"同型清扫"里点名的 safety 第 1435 行)。失败文本:`assert [0, 2, 3, 1, 1] == [1, 1, 1, 1, 1]`。
-    - `tests/ansich/test_sql_alerts.py:947::test_failed_assessor_jobs_degrade_health_and_can_be_retried` —— `only_test_driven_assessments(service)` 在 :966,flush 与 ops 评估间隔均为 `60_000`。**只有测试 id,没拿到失败文本**(后台 `-q` 捕获只留了 summary),证据强度与本条第 4 项的留观标记同级。
+    - `tests/ansich/test_sql_alerts.py:947::test_failed_assessor_jobs_degrade_health_and_can_be_retried` —— `only_test_driven_assessments(service)` 在 :964,flush 与 ops 评估间隔均为 `60_000`。**只有测试 id,没拿到失败文本**(后台 `-q` 捕获只留了 summary),证据强度与本条第 4 项的留观标记同级。
   - 同一批还翻红了 `tests/ansich/test_summarization_lineage.py:76::test_partial_list_content_trim_records_an_incomplete_compression_inventory`(`assert None is not None`)。它**没有**门禁、用的是 `create_sql_ansich_service(session_factory)` 的默认间隔,属于本条"只登记不修"里那 151 条的形状,不在本条的修复范围内——记在这里只是为了和上面两条区分开。
   - 复现把手:**`[0, 2, 3, 1, 1]` 这个计数**。该测试每轮先清空 `assessed_subjects`、再 `await service.assess_operations(now=...)` 一次、然后记长度;五轮总和是 7(期望 5),且第 0 轮记到 0、第 1 轮记到 2 —— 同一次运行里既有缺也有多。
   - 若它再轮换红:**先抓失败文本**,然后在两个方向里做判断,不要跳过取证直接下结论——(a) 评估是否经由门禁拦不到的路径到达了这个计数器(门禁重绑的是 `service.assess_operations`,而该计数器打在 `sql_module.assess_scope_safety` 这个领域函数上,两者不是同一个入口);(b) 或者在负载下推动这些计数器的根本不是评估,而是另一个竞争者。**本条不对这两种可能下结论**:Task 9 没有刻意复现,也没有加插桩。
@@ -208,6 +212,41 @@
 - `QualityComparisonView.resolver` 复用的是 belief resolver 的版本号,而它描述的其实是比较规则的版本——需要文档说明或独立版本号。
 - benchmark 的 `source_event_id` 用冒号拼接各组件且不转义,`run_id` 里带冒号时理论上可以碰撞;候选修法是对 suite/suite_version/case_id/run_id 加"不含冒号"的约束。
 - `not_comparable` 行与 unassessed 行目前只靠文案区分,加一个结构性标记会更利于扫读;e2e 也还没渲染过 unassessed 行、没断言过 delta 的中性配色。
+- 迁移 id 与 `alembic_version.version_num` 的 `VARCHAR(32)` 上限已**贴边**:`0024_ansich_wall_time_watermarks` 与 `0021_ansich_summary_assertion_fk` 都正好 32 字符,余量为 0。本批已在 `tests/test_persistence_bootstrap.py::test_baseline_revision_id_is_known` 补一行 `max(len(...)) <= 32` 断言把它钉住,下一条更长的 revision id 会在测试里红,而不是在用户的 Gateway 启动时红。
+- 全部 72 张表在 PostgreSQL 方言下渲染的是 `json` 而不是 `jsonb`(模型统一用泛型 `sa.JSON`,`grep JSONB` 全仓库零命中,只有 `_helpers.py` 的反射等价对与文档提到该词)。`json` 不支持 `jsonb` 的 GIN 索引与包含查询,而 Ansich 的 `*_json` 列将来若要按内容过滤就会需要它。改成 `jsonb` 是一次跨全部 JSON 列的迁移(含 Ansich 之外的 `runs`/`run_events`),**登记为 Phase 11 的待裁决项**,本批只把文档里说反的两处(`backend/AGENTS.md`、`persistence/bootstrap.py` 的 docstring)改正。
+- Task 9 的 PostgreSQL tier 文档里那条 `docker run ... postgres:16` 启动一行**本身没有被执行过**——该环境里 Docker 守护进程不可用,实际验收跑在一个由 `pgserver` wheel 自带的官方 PostgreSQL 16.2 二进制 `initdb` 出来的一次性本地 cluster 上(同一份服务端软件、同一个 5433 端口与 URL)。命令是标准写法,但"照抄即可跑通"这件事没有证据,`backend/Makefile` 的注释已就地标注。
+
+## F10-19. late spawn 与 sum 型 contribution 的永久丢失窗口
+
+- 状态:⬜ 未修复。来源:Phase 11 前加固批 Task 3 的复审(不是 Phase 10 终审)。
+- 位置:`backend/packages/harness/deerflow/ansich/persistence/sql.py::_backfill_spawn_usage`(读后代 self 行、写祖先行,刻意不加锁)与 `::_project_usage`(新贡献按当时可见的 ancestry 扇出)。
+- 现状:两条路径各自读一次 ancestry / 后代贡献集合,中间没有共同的串行化点。一条后代贡献若在 `_backfill_spawn_usage` 读完之后才提交,而它自己的 `_project_usage` 又跑在 spawn 边可见之前(此时祖先集为空),这条贡献就**再也不会**到达祖先。wall_time 不受影响——它是 max 型,下一个 tick 的扇出会把水位抬平;`total_tokens`/`steps_*`/`tool_calls_executed` 这些 sum 型维度没有这种自愈,祖先的 inclusive 值会**永久偏低**。`_backfill_spawn_usage` 的 docstring 已经点明"行锁挡不住新行插入",即这个窗口结构上不是加锁能关的。
+- 方向:需要一个把"spawn 边可见"与"该后代的贡献集合"串起来的点——例如 spawn 投影完成后按后代 Task 重新触发一次 fan-out 对账(幂等键已经保证不会双计),或把 inclusive 汇总改成读时按 ancestry join 而不是写时扇出。任选其一都要配"贡献与 spawn 边并发到达时 inclusive 不丢"的回归。
+- 归属:Phase 11(多 worker / 生产隔离),与 F10-6/F10-20 同一批。单 worker 下投影 job 串行消化,窗口不成立,因此当前不是 active bug。
+
+## F10-20. `_refresh_usage_summary` 仍是未串行化的读-改-写
+
+- 状态:⬜ 未修复。来源:同上(Task 3 复审),是 F10-6 的同族问题,登记为独立条目是因为它就在本批刚刚加锁的那一层的**上面**一层。
+- 位置:`sql.py::_refresh_usage_summary`——全量重扫该 `(aggregate, dimension)` 的 contribution,再对 `AnsichTaskUsageRow` 无条件赋值;`session.get` 之前没有 `SELECT … FOR UPDATE`,`usage is None` 分支也不是 `INSERT ON CONFLICT`。
+- 现状:Task 3 给 `_upsert_high_water_contribution` 加了 lock-before-read(参照 `_recompute_release_quality_stats` 的先例),所以 contribution 行本身在多 worker 下是安全的;但把 contribution 归约成 summary 的这一步没有跟着收口。READ COMMITTED 下两个 worker 交错——A 读到 {c1}、B 插入 c2 并读到 {c1,c2}、B 写 c1+c2、A 写 c1——summary 会丢更新,`as_of`/`complete_through_ingest_seq` 一并回退;`usage is None` 的首写者竞态则会直接撞主键。单 worker 下投影按 ingest_seq 串行消化,贡献集合单调增长,值单调不降,故当前无 active bug。
+- 方向:与 F10-6 一并处理,统一按 `_recompute_release_quality_stats` 的 lock-then-read 姿势改写(顺带用 `INSERT … ON CONFLICT` 收口首写者竞态)。
+- 归属:Phase 11(与 F10-6 合并处理)。
+
+## F10-21. 生产 effect 恒 `scope_id=None`,两类越权结论不可达
+
+- 状态:⬜ 未修复。来源:加固批 Task 5(effect class 扩充)时确认的**既存**缺口,非本批引入;phase-9-review-followups.md 的 M1 条目里已留档,在此登记为需要 owner 的独立项。
+- 位置:`backend/packages/harness/deerflow/ansich/tool_middleware.py`(记录 effect 时 `scope_id=None`,projector 原样拷贝)与 `packages/ansich/ansich/scope_safety.py`(`attempted_scope_violation`/`realized_scope_violation` 都要求 `effect.scope_id is not None`)。
+- 现状:领域逻辑与测试都覆盖了这两类结论,但生产路径上没有任何 effect 携带 `scope_id`,因此它们在真实数据上**永远不会产生**。运营者看到的 scope-safety 结论实际只有 `policy_denial` 与 `unverified_effect` 两类;Task 5 新增的 `filesystem_delete`/`permission_change` 也不例外——分类更精确了,可达性没有变。
+- 方向:给 effect 绑定 Scope 是独立议题:需要先确定"一次 tool 调用的目标资源属于哪个 Scope"的判定规则(路径前缀?sandbox 挂载点?MCP server 身份?),再在 intent 探针处解析并落到 `scope_id`。在那之前,不要把这两类结论的零命中读成"没有越权"。
+- 归属:Phase 11(与 Scope/授权主题同轨);同时应在 UI 或文档上把"不可达"说清楚,避免被读成健康信号。
+
+## F10-22. `sudo`/`env` 等包装命令下的 effect 分类未裁定
+
+- 状态:⬜ 未修复。来源:加固批 Task 5。
+- 位置:`tool_middleware.py::_leading_command_word` / `::_bash_effect_class`。
+- 现状:首命令词取的是**第一个非环境赋值 token 的 basename**,与 `rm`/`unlink`/`rmdir`、`chmod`/`chown`/`chgrp` 两个精确集合比对。因此 `sudo rm -rf /x`、`env rm x`、`timeout 5 rm x`、`xargs rm`、`command rm` 全部落回 `process_execute` + `unknown`。这个方向是**安全的**(不越权断言),但也意味着一次提权删除在 Scope Effects 面板上与一次普通命令执行长得一样。裁决 HR2 只处理了元字符闸门与 `NAME=value` 前缀,没有对"包装器"这一类给出规则。
+- 方向:需要一次独立裁决,而不是顺手加白名单——`sudo`/`env`/`nice`/`timeout`/`xargs`/`command` 各自的参数文法不同(`sudo -u user rm`、`env -i FOO=1 rm`、`timeout 5s rm`),一个"跳过 flag 及其取值"的通用规则很容易把 flag 的**取值**误当成命令词(`sudo -u rm whoami` 里的 `rm` 是用户名,不是命令)。保守可行的中间态是:只解包**无 flag** 的形式(`sudo rm …`、`env rm …`),其余仍退回 `process_execute`。任何方案都要配"包装器带 flag 时不误判"的负向用例。
+- 归属:未定,建议随下次触达 `_effect_class` 的改动一并裁决。
 
 ## 评审中确认无需跟进的点(留档)
 

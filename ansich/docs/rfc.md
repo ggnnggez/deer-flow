@@ -97,10 +97,21 @@ instrumentation 时记 `unknown`，绝不推断副作用。
 
 ## 7. 对 main 的入侵
 
-以 `upstream/main@5f0108f5` 为基准：**251 个文件变更，其中 162 个是 Ansich 独占的新增文件**
-（独立包、适配层、迁移 0005–0021、前端页面、测试）。落到主仓库既有生产代码上的是
-**45 个文件、+1903/−175 行**，另新增 5 个文件。改动形态集中在三类：中间件链上挂只读探针、
-run worker 与 task 工具的生命周期挂钩、config/deps 装配。
+基准 `upstream/main@5f0108f5` 已不在本分支历史里（本分支与 upstream 的 merge-base 是
+`cb698832`），因此下列数字按 `git diff upstream/main@5f0108f5...HEAD`（**三点**，即对
+merge-base 求差）重算，复算时间 2026-08-19：**311 个文件变更，其中 220 个是新增文件、
+198 个路径里带 `ansich`**（独立包 `backend/packages/ansich/`、适配层 `deerflow/ansich/`、
+迁移 0005–0025、Gateway 路由、前端页面、测试、`ansich/docs/`）。
+
+落到主仓库**既有后端生产代码**上的是 **45 个文件、+1940/−187 行**，另有 6 个新文件长在
+既有生产目录里（`app/gateway/routers/ansich.py`、`app/gateway/feedback_evaluation.py`、
+`deerflow/config/ansich_config.py`、`deerflow/runtime_descriptor.py`、
+`deerflow/authz/outcome.py`、`deerflow/agents/middlewares/tool_transform_meta.py`）。改动形态
+仍集中在三类：中间件链上挂只读探针、run worker 与 task 工具的生命周期挂钩、config/deps 装配。
+
+一处诚实说明：本分支现在还带着与 Ansich 无关的工作（前端 trajectory 视图），所以上面的
+**总数不能整个算到 Ansich 头上**；`frontend/src/` 里另有 7 个既有文件被修改
+（+1367/−88），其中就含该视图，故不并入上面那 45 个文件的账。
 
 依赖方向单向（`deerflow → ansich`，独立包不依赖 DeerFlow / LangGraph / FastAPI）；只写
 `ansich_*` 表；由 startup-only 的 `ansich.enabled` 全局门控，关闭即完全旁路。
@@ -112,5 +123,16 @@ run worker 与 task 工具的生命周期挂钩、config/deps 装配。
   子 Task 树与 inclusive usage、Scope/授权/副作用审计、评估输入与语义 quality Belief
   （`evaluation.recorded`、`evaluation-projector@1`、resolver `ansich-default@2`、
   cohort 可比性）。
-- **未标记最终完成**：PostgreSQL 升级矩阵、关闭 Ansich 的性能基准、生产 paper drill。
+- **Phase 11 前的加固批**（2026-08-19）：把「归属 Phase 11 前」的到期跟进项一次结清——
+  wall_time 收敛为单一写者并改成 max 型高水位通道（迁移 `0024`）、scope-safety 按 watermark
+  区间增量重估（持久表 `ansich_assessor_watermarks`，迁移 `0025`）、bash 首命令词产出
+  `filesystem_delete`/`permission_change`（observed 侧只记 `inferred`，不改变
+  `unverified_effect` 结论）、孤儿 `requested` operator action 的过期接管、externalized
+  payload 的 None 守卫、settle 时序门禁，以及补齐 `?by=model` 用量聚合。
+- **PostgreSQL 矩阵已首次执行**：opt-in 集成层（`make test-postgres`，`DEER_FLOW_TEST_POSTGRES_URL`
+  开关）在真实 PostgreSQL 16.2 上跑通整条 26 个 revision 的迁移链（空库升 head、
+  head↔`0004` 往返、二次升级幂等）、`bootstrap_schema` 三个分支（含 `pg_advisory_lock`）与
+  一次端到端服务冒烟。
+- **未标记最终完成**：后端全量套件在 PostgreSQL 上的对等运行与多 worker 并发语义（SQLite
+  单写者下根本不成立的丢更新窗口只有它能证伪）、关闭 Ansich 的性能基准、生产 paper drill。
 - **计划中**：Phase 11 生产韧性/重放/保留策略、Phase 12 验收演练。

@@ -1064,7 +1064,7 @@ class TestDecideState:
 # ---------------------------------------------------------------------------
 
 
-def test_head_revision_is_ansich_wall_time_watermarks_revision() -> None:
+def test_head_revision_is_ansich_assessor_watermarks_revision() -> None:
     assert _get_head_revision() == HEAD
 
 
@@ -1083,3 +1083,10 @@ def test_baseline_revision_id_is_known() -> None:
     script = ScriptDirectory.from_config(cfg)
     all_ids = {rev.revision for rev in script.walk_revisions()}
     assert BASELINE in all_ids, f"baseline revision id {BASELINE!r} not found in {all_ids}"
+    # Alembic's ``alembic_version.version_num`` is VARCHAR(32) and the chain is
+    # already flush against it (``0024_ansich_wall_time_watermarks`` and
+    # ``0021_ansich_summary_assertion_fk`` are exactly 32). A longer id would
+    # not fail here -- it would fail at ``alembic stamp``/``upgrade`` inside a
+    # user's Gateway startup, on Postgres, with a value-too-long error.
+    over_limit = sorted(rev for rev in all_ids if len(rev) > 32)
+    assert not over_limit, f"revision ids must fit alembic_version.version_num VARCHAR(32); too long: {over_limit}"
