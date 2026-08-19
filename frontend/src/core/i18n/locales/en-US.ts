@@ -595,6 +595,13 @@ export const enUS: Translations = {
     coverage: "Observation coverage",
     unknownEffectCoverage:
       "Effect coverage is unknown. Missing rows do not mean that no side effects occurred.",
+    environment: "Runtime environment",
+    environmentEmpty: "No environment observations were recorded for this Task.",
+    environmentProcessGroupNote:
+      "Single-command consumption snapshot, not sandbox-wide state.",
+    environmentPossiblyAffectedTitle: "Tasks running at sample time",
+    environmentMetrics: "Metrics",
+    environmentBeliefs: "Assessment",
     agentRelease: "Agent release",
     noAgentRelease: "No Agent release was resolved for this Task.",
     releaseHash: "Release hash",
@@ -689,6 +696,8 @@ export const enUS: Translations = {
       attempted_scope_violation: "Attempted scope violation",
       realized_scope_violation: "Realized scope violation",
       unverified_effect: "Unverified effect",
+      environment_pressure: "Environment pressure",
+      environment_leak_suspected: "Suspected FD leak",
     },
     alertWorkflow: {
       open: "Open",

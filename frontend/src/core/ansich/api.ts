@@ -29,6 +29,7 @@ import type {
   AnsichTaskListResponse,
   AnsichTaskLifecycleScope,
   AnsichTaskBudgetsResponse,
+  AnsichTaskEnvironmentResponse,
   AnsichTaskResponse,
   AnsichTaskUsageResponse,
   AnsichTaskAgentReleaseResponse,
@@ -436,6 +437,21 @@ export async function fetchAnsichTaskBudgets(
     await throwAnsichApiError(
       response,
       `Failed to load Ansich budgets: ${response.statusText}`,
+    );
+  }
+  return response.json();
+}
+
+export async function fetchAnsichTaskEnvironment(
+  taskId: string,
+): Promise<AnsichTaskEnvironmentResponse> {
+  const response = await fetch(
+    ansichUrl(`/tasks/${encodeURIComponent(taskId)}/environment`),
+  );
+  if (!response.ok) {
+    await throwAnsichApiError(
+      response,
+      `Failed to load Ansich task environment: ${response.statusText}`,
     );
   }
   return response.json();

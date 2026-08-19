@@ -111,6 +111,8 @@ describe("Ansich presentation", () => {
       "attempted_scope_violation",
       "realized_scope_violation",
       "unverified_effect",
+      "environment_pressure",
+      "environment_leak_suspected",
     ]);
     expect(getAlertPresentationCategory("exact_repetition")).toBe("runaway");
     expect(getAlertPresentationCategory("budget_exceeded")).toBe("runaway");
@@ -127,6 +129,12 @@ describe("Ansich presentation", () => {
       "operational",
     );
     expect(getAlertPresentationCategory("unverified_effect")).toBe(
+      "operational",
+    );
+    expect(getAlertPresentationCategory("environment_pressure")).toBe(
+      "operational",
+    );
+    expect(getAlertPresentationCategory("environment_leak_suspected")).toBe(
       "operational",
     );
   });

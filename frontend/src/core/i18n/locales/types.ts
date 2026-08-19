@@ -487,6 +487,12 @@ export interface Translations {
     effectObserved: string;
     coverage: string;
     unknownEffectCoverage: string;
+    environment: string;
+    environmentEmpty: string;
+    environmentProcessGroupNote: string;
+    environmentPossiblyAffectedTitle: string;
+    environmentMetrics: string;
+    environmentBeliefs: string;
     agentRelease: string;
     noAgentRelease: string;
     releaseHash: string;
@@ -576,6 +582,8 @@ export interface Translations {
       attempted_scope_violation: string;
       realized_scope_violation: string;
       unverified_effect: string;
+      environment_pressure: string;
+      environment_leak_suspected: string;
     };
     alertWorkflow: {
       open: string;

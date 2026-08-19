@@ -23,6 +23,8 @@ export function getAlertPresentationCategory(
     case "attempted_scope_violation":
     case "realized_scope_violation":
     case "unverified_effect":
+    case "environment_pressure":
+    case "environment_leak_suspected":
       return "operational";
     case "heartbeat_missing":
       return "liveness";
@@ -537,4 +539,101 @@ export function formatAnsichTimestamp(
     dateStyle: "medium",
     timeStyle: "medium",
   }).format(date);
+}
+
+/**
+ * Presentation tone for the environment badges below. `positive` is reserved
+ * for evidence that actively earns it (continuous coverage, an `ok`/`none`
+ * belief); an absence of instrumentation or judgement is `neutral`, never
+ * `positive` — IA §6.2/§7.3's "never green for missing evidence" rule extended
+ * to environment observability.
+ */
+export type AnsichEnvironmentBadgeTone =
+  | "positive"
+  | "neutral"
+  | "warning"
+  | "critical";
+
+export interface AnsichEnvironmentBadge {
+  label: string;
+  tone: AnsichEnvironmentBadgeTone;
+}
+
+/**
+ * Label the semantic tier of an environment sample (concepts §9.6 /
+ * environment-observability design §3.2 point 1). This distinction must never
+ * be lost between projection, assessor, API, and UI: `container` is a real
+ * sandbox-wide reading, `process_group` is one command's own snapshot (it
+ * cannot see standing state), and `host_shared` is shared with every other
+ * process on the host and must never be presented as a sandbox metric.
+ *
+ * Labels are fixed Chinese copy per the environment-observability spec's copy
+ * discipline, independent of the active UI locale — these are new,
+ * domain-specific technical marks with no established bilingual precedent yet
+ * (unlike `alertTypeLabel`, which reuses the existing i18n table).
+ */
+export function environmentScopeBadge(scope: string): AnsichEnvironmentBadge {
+  switch (scope) {
+    case "container":
+      return { label: "容器实测", tone: "positive" };
+    case "process_group":
+      return { label: "进程组快照", tone: "neutral" };
+    case "host_shared":
+      return { label: "宿主共享", tone: "neutral" };
+    default:
+      return { label: scope, tone: "neutral" };
+  }
+}
+
+/**
+ * Label how a `(Scope, environment_scope)` card was observed. `uninstrumented`
+ * renders as an explicit "未观测" — never ok/green — because no instrumentation
+ * is not evidence of a healthy environment (same discipline as
+ * `isProjectionHardFailure` refusing to read missing evidence as clean).
+ */
+export function coverageBadge(coverage: string): AnsichEnvironmentBadge {
+  switch (coverage) {
+    case "continuous":
+      return { label: "连续采样", tone: "positive" };
+    case "per_command":
+      return { label: "单命令采样", tone: "neutral" };
+    case "uninstrumented":
+      return { label: "未观测", tone: "neutral" };
+    default:
+      return { label: coverage, tone: "neutral" };
+  }
+}
+
+const ENVIRONMENT_BELIEF_BADGES: Record<string, AnsichEnvironmentBadge> = {
+  ok: { label: "正常", tone: "positive" },
+  warning: { label: "预警", tone: "warning" },
+  critical: { label: "严重", tone: "critical" },
+  none: { label: "正常", tone: "positive" },
+  suspected: { label: "严重", tone: "critical" },
+  unknown: { label: "未知", tone: "neutral" },
+};
+
+/**
+ * Label one environment Belief's categorical state. `environment_pressure:*`
+ * Beliefs use the `ok/warning/critical/unknown` family; `environment_leak:*`
+ * Beliefs use their own `none/suspected/unknown` family (assess_environment_leak
+ * never emits ok/warning/critical). Any value outside a field's own family
+ * — including a raw, unassessed synthesized Belief — renders as the neutral
+ * "未知" mark, never a blank or a borrowed positive color (concepts 第 9 条第
+ * 6 款: unknown is a first-class value, not a missing row).
+ */
+export function environmentBeliefBadge(
+  fieldName: string,
+  rawValue: string,
+): AnsichEnvironmentBadge {
+  if (fieldName.startsWith("environment_leak:")) {
+    if (rawValue === "none" || rawValue === "suspected") {
+      return ENVIRONMENT_BELIEF_BADGES[rawValue]!;
+    }
+    return ENVIRONMENT_BELIEF_BADGES.unknown!;
+  }
+  if (rawValue === "ok" || rawValue === "warning" || rawValue === "critical") {
+    return ENVIRONMENT_BELIEF_BADGES[rawValue]!;
+  }
+  return ENVIRONMENT_BELIEF_BADGES.unknown!;
 }

@@ -4,6 +4,7 @@ export { AnsichActiveTaskRow } from "./active-task-row";
 export { AnsichAgentReleasePanel } from "./agent-release-panel";
 export { AnsichReleaseQualitySection } from "./release-quality-section";
 export { AnsichBudgetPanel } from "./budget-panel";
+export { AnsichEnvironmentPanel } from "./environment-panel";
 export { AnsichEvaluationsPanel } from "./evaluations-panel";
 export { AnsichTaskTreePanel } from "./task-tree-panel";
 export { AnsichScopeEffectsPanel } from "./scope-effects-panel";

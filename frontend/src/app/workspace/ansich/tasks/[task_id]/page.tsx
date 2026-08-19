@@ -18,6 +18,7 @@ import {
   AnsichContextPanel,
   AnsichAgentReleasePanel,
   AnsichBudgetPanel,
+  AnsichEnvironmentPanel,
   AnsichEvaluationsPanel,
   AnsichEvidenceSection,
   AnsichHealthBadge,
@@ -306,6 +307,10 @@ export default function AnsichTaskDetailPage() {
 
                 <TabsContent value="resources" className="space-y-4">
                   <AnsichBudgetPanel taskId={taskId} polling={taskIsRunning} />
+                  <AnsichEnvironmentPanel
+                    taskId={taskId}
+                    polling={taskIsRunning}
+                  />
                   <AnsichScopeEffectsPanel
                     taskId={taskId}
                     polling={taskIsRunning}

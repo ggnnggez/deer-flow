@@ -24,6 +24,7 @@ import {
   fetchAnsichTaskSteps,
   fetchAnsichTaskBudgets,
   fetchAnsichTask,
+  fetchAnsichTaskEnvironment,
   fetchAnsichTaskTimeline,
   fetchAnsichTaskUsage,
   fetchAnsichTaskAgentRelease,
@@ -546,6 +547,22 @@ export function useAnsichTaskBudgets(
   return useQuery({
     queryKey: ["ansich", "tasks", taskId, "budgets"],
     queryFn: () => fetchAnsichTaskBudgets(taskId),
+    enabled: enabled && Boolean(taskId),
+    retry: false,
+    refetchInterval: () =>
+      polling && pageIsVisible() ? REFRESH_INTERVAL_MS : false,
+    refetchIntervalInBackground: false,
+  });
+}
+
+export function useAnsichTaskEnvironment(
+  taskId: string,
+  enabled = true,
+  polling = true,
+) {
+  return useQuery({
+    queryKey: ["ansich", "tasks", taskId, "environment"],
+    queryFn: () => fetchAnsichTaskEnvironment(taskId),
     enabled: enabled && Boolean(taskId),
     retry: false,
     refetchInterval: () =>

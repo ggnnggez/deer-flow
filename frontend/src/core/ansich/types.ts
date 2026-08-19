@@ -91,7 +91,8 @@ export interface AnsichObservation {
     | "context_snapshot"
     | "context_compression"
     | "agent_release"
-    | "alert";
+    | "alert"
+    | "scope";
   subject_id: string;
   fidelity_class: "hard";
   producer: AnsichProducer;
@@ -355,6 +356,8 @@ export const ANSICH_PRODUCED_ALERT_TYPES = [
   "attempted_scope_violation",
   "realized_scope_violation",
   "unverified_effect",
+  "environment_pressure",
+  "environment_leak_suspected",
 ] as const;
 
 export type AnsichAlertType = (typeof ANSICH_PRODUCED_ALERT_TYPES)[number];
@@ -805,7 +808,82 @@ export interface AnsichContextCompressionListResponse {
 
 export interface AnsichToolCallResponse {
   tool_call: AnsichToolCall;
+  // Additive: null when no per-command environment sample was recorded for
+  // this ToolCall (e.g. non-bash tools, or a provider without instrumentation).
+  environment_sample: AnsichToolEnvironmentSample | null;
   projection_status: AnsichHealth;
+}
+
+// --- Environment observability (OS-level signals: fd/io/memory/disk/pressure) ---
+
+export type AnsichEnvironmentScopeKind =
+  | "container"
+  | "process_group"
+  | "host_shared";
+
+export type AnsichEnvironmentCoverage =
+  | "continuous"
+  | "per_command"
+  | "uninstrumented";
+
+export interface AnsichEnvironmentMetric {
+  metric: string;
+  latest_value: number;
+  limit: number | null;
+  as_of: string;
+  sample_count: number;
+  window_started_at: string;
+  consecutive_growth_count: number;
+}
+
+export interface AnsichEnvironmentBelief {
+  field_name: string;
+  value: Record<string, unknown>;
+  as_of: string | null;
+  asserted_at: string | null;
+  source: AnsichNamedVersion;
+  authority_class: string;
+  fidelity_class: string;
+  evidence_obs_ids: string[];
+}
+
+export interface AnsichEnvironmentAlertSummary {
+  alert_id: string;
+  alert_type: string;
+  severity: string;
+  workflow_state: string;
+  opened_at: string;
+  resolved_at: string | null;
+}
+
+export interface AnsichEnvironmentScope {
+  scope_id: string;
+  scope_kind: string;
+  display_label: string;
+  environment_scope: string;
+  coverage: string;
+  provider: string;
+  metrics: AnsichEnvironmentMetric[];
+  beliefs: AnsichEnvironmentBelief[];
+  alerts: AnsichEnvironmentAlertSummary[];
+}
+
+export interface AnsichTaskEnvironmentResponse {
+  task_id: string;
+  scopes: AnsichEnvironmentScope[];
+}
+
+export interface AnsichToolEnvironmentSample {
+  tool_call_id: string;
+  task_id: string;
+  scope_id: string;
+  io_read_bytes: number | null;
+  io_write_bytes: number | null;
+  fd_peak: number | null;
+  sample_count: number;
+  started_at: string;
+  ended_at: string;
+  obs_id: string;
 }
 
 export interface AnsichTaskScope {

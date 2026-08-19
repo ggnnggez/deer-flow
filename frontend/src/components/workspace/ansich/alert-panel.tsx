@@ -29,7 +29,9 @@ import {
 } from "@/core/ansich/presentation";
 import type {
   AnsichAlertSummary,
+  AnsichAlertType,
   AnsichBeliefAssertion,
+  AnsichObservation,
 } from "@/core/ansich/types";
 import { useI18n } from "@/core/i18n/hooks";
 
@@ -253,16 +255,20 @@ function AlertDetailDialog({
                 </div>
               </div>
 
-              {/* 3. impact / current activity — the owning Task */}
+              {/* 3. impact / current activity — the owning Task. Environment
+                  Alerts are Scope-subject (§2.2), not Task-subject, so
+                  subject_id is never a Task id here. */}
               <div className="flex flex-wrap items-center gap-2">
-                <Button variant="outline" size="sm" asChild>
-                  <Link
-                    href={`/workspace/ansich/tasks/${encodeURIComponent(detail.alert.subject_id)}`}
-                  >
-                    {t.ansich.task}
-                    <ExternalLinkIcon />
-                  </Link>
-                </Button>
+                {!isEnvironmentAlert(detail.alert.alert_type) ? (
+                  <Button variant="outline" size="sm" asChild>
+                    <Link
+                      href={`/workspace/ansich/tasks/${encodeURIComponent(detail.alert.subject_id)}`}
+                    >
+                      {t.ansich.task}
+                      <ExternalLinkIcon />
+                    </Link>
+                  </Button>
+                ) : null}
                 {/* 4. operator actions */}
                 {detail.available_actions.map((action) => (
                   <Button
@@ -276,6 +282,12 @@ function AlertDetailDialog({
                   </Button>
                 ))}
               </div>
+
+              {isEnvironmentAlert(detail.alert.alert_type) ? (
+                <PossiblyAffectedTasksSection
+                  taskIds={possiblyAffectedTaskIds(detail.evidence)}
+                />
+              ) : null}
 
               {/* 5. why it triggered — source belief */}
               <BeliefSection
@@ -482,6 +494,55 @@ function BeliefSection({
             </pre>
           </div>
         ))
+      ) : (
+        <div className="text-muted-foreground text-sm">
+          {t.ansich.evidenceInsufficient}
+        </div>
+      )}
+    </section>
+  );
+}
+
+/**
+ * Environment Alerts (`environment_pressure`/`environment_leak_suspected`)
+ * are opened against a sandbox/host Scope, not a Task (environment-observability
+ * design §2.2) — `subject_id` is a Scope id there, never a Task id.
+ */
+function isEnvironmentAlert(alertType: AnsichAlertType): boolean {
+  return (
+    alertType === "environment_pressure" ||
+    alertType === "environment_leak_suspected"
+  );
+}
+
+/**
+ * The Tasks that were `running` when each evidence Observation was recorded
+ * (correlation, not causality — same discipline as `possible_exposure`). Each
+ * environment sample's `AnsichObservation.task_id` already names the Task its
+ * probe ran under, so this list needs no additional API surface.
+ */
+function possiblyAffectedTaskIds(evidence: AnsichObservation[]): string[] {
+  return Array.from(new Set(evidence.map((observation) => observation.task_id)));
+}
+
+function PossiblyAffectedTasksSection({ taskIds }: { taskIds: string[] }) {
+  const { t } = useI18n();
+  return (
+    <section className="space-y-3">
+      <h3 className="font-semibold">
+        {t.ansich.environmentPossiblyAffectedTitle}
+      </h3>
+      {taskIds.length ? (
+        <div className="flex flex-wrap gap-2">
+          {taskIds.map((taskId) => (
+            <Button key={taskId} variant="outline" size="sm" asChild>
+              <Link href={`/workspace/ansich/tasks/${encodeURIComponent(taskId)}`}>
+                {taskId}
+                <ExternalLinkIcon />
+              </Link>
+            </Button>
+          ))}
+        </div>
       ) : (
         <div className="text-muted-foreground text-sm">
           {t.ansich.evidenceInsufficient}
