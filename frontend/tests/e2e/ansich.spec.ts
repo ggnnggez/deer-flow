@@ -7,6 +7,7 @@ const CHILD_TASK_ID = "6a54d86c-b524-4f18-83e8-79b729c2a696";
 const HISTORY_TASK_ID = "7b43c75b-a413-4e07-92d7-68a618b1f584";
 // UI-1 downgrades UUIDs to their leading 8-char segment on list rows.
 const SHORT_TASK_ID = TASK_ID.slice(0, 8);
+const OTHER_TASK_ID = "1c7d4f52-9a3b-42e6-9a0d-5b6c7d8e9f01";
 const SHORT_HISTORY_TASK_ID = HISTORY_TASK_ID.slice(0, 8);
 const STEP_ID = "bb24aa10-f647-4c07-959a-0594087c818c";
 const BLOCK_ID = "d62dc6fd-4a91-4d32-95ae-3be8e1ddb1a9";
@@ -1512,6 +1513,90 @@ test("operations page preserves storage-unavailable detail from a 503", async ({
   await page.goto("/workspace/ansich/operations");
 
   await expect(page.getByText("Ansich storage is unavailable")).toBeVisible();
+});
+
+test("task detail scopes its projection banner to this Task's own failures", async ({
+  page,
+}) => {
+  mockLangGraphAPI(page, { threads: [] });
+  // The projection is globally degraded with seven failed jobs and a lost
+  // range belonging to a different Task. Only this Task's own trouble may
+  // reach this page.
+  const degradedHealth = {
+    ...HEALTH,
+    status: "degraded",
+    failed_jobs: 7,
+    lost_ranges: [
+      {
+        first_sequence: 40,
+        last_sequence: 41,
+        task_id: OTHER_TASK_ID,
+        producer_name: null,
+        producer_instance_id: null,
+      },
+    ],
+  };
+  await page.route(`**/api/ansich/tasks/${TASK_ID}`, (route) =>
+    route.fulfill({
+      status: 200,
+      contentType: "application/json",
+      body: JSON.stringify({ task: TASK, projection_status: degradedHealth }),
+    }),
+  );
+  await page.route(`**/api/ansich/tasks/${TASK_ID}/timeline`, (route) =>
+    route.fulfill({
+      status: 200,
+      contentType: "application/json",
+      body: JSON.stringify({
+        items: [],
+        next_cursor: null,
+        projection_status: degradedHealth,
+      }),
+    }),
+  );
+  await page.route("**/api/ansich/operations/failed-jobs?*", (route) => {
+    const requested = new URL(route.request().url()).searchParams.get("task");
+    if (requested !== TASK_ID) {
+      // A Task page that asked globally would be reporting other Tasks'
+      // failures as its own; fail loudly instead of answering.
+      return route.fulfill({
+        status: 500,
+        body: "unscoped failed-jobs request",
+      });
+    }
+    return route.fulfill({
+      status: 200,
+      contentType: "application/json",
+      body: JSON.stringify({
+        items: [
+          {
+            job_id: "3d0a5d5c-2f1a-4a5c-8f5a-2f6b1c9d4e77",
+            kind: "projection",
+            name: "task_projector",
+            version: "1",
+            task_id: TASK_ID,
+            status: "failed",
+            attempts: 2,
+            last_error: "projection worker crashed",
+            available_at: "2026-07-17T12:00:05Z",
+          },
+        ],
+        projection_status: degradedHealth,
+      }),
+    });
+  });
+
+  await page.goto(`/workspace/ansich/tasks/${TASK_ID}`);
+
+  const health = page.getByRole("status");
+  await expect(health).toContainText("This Task's data is incomplete");
+  // This Task's single failure, not the seven the system is carrying.
+  await expect(
+    health.getByRole("button", { name: "Failed jobs: 1" }),
+  ).toBeVisible();
+  await expect(health).not.toContainText("Failed jobs: 7");
+  // The lost range belongs to another Task and is never charged to this one.
+  await expect(health).not.toContainText("Lost observations");
 });
 
 test("release compare separates observed quality from the structural diff", async ({

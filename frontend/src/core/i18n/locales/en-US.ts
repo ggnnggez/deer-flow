@@ -736,7 +736,8 @@ export const enUS: Translations = {
     healthSystemLevel: "System-level",
     healthSystemLevelNote:
       "A system-level projection problem, not this Task alone: this Task's own data may be incomplete or stale.",
-    healthDismiss: "Collapse",
+    healthCountUnavailable: "Task failure count unavailable",
+    healthDismissLabel: "Collapse projection warning",
     healthBadgeLabel: (count: string) =>
       `Projection warning: ${count} items need attention, click to expand`,
     healthBadgeStatusLabel: (status: string) =>

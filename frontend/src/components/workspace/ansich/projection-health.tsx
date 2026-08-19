@@ -1,6 +1,11 @@
 "use client";
 
-import { ActivityIcon, AlertTriangleIcon, XIcon } from "lucide-react";
+import {
+  ActivityIcon,
+  AlertTriangleIcon,
+  CircleHelpIcon,
+  XIcon,
+} from "lucide-react";
 import { useCallback, useEffect, useMemo, useState } from "react";
 
 import { Button } from "@/components/ui/button";
@@ -16,8 +21,10 @@ import { useAnsichFailedJobs } from "@/core/ansich/hooks";
 import {
   resolveProjectionHealthDisplay,
   systemProjectionScope,
+  taskFailedJobCount,
   taskProjectionScope,
   type AnsichHealthSnapshot,
+  type AnsichProjectionHealthLine,
   type AnsichProjectionScope,
 } from "@/core/ansich/presentation";
 import type { AnsichHealth } from "@/core/ansich/types";
@@ -42,8 +49,8 @@ function formatLag(lagMs: number): string {
 export interface AnsichProjectionHealthState {
   /** Null until projection health has loaded for this page. */
   scope: AnsichProjectionScope | null;
-  /** The inline health line (banner or compact healthy line) is rendered. */
-  visible: boolean;
+  /** Which inline line to render; `none` while collapsed behind the badge. */
+  line: AnsichProjectionHealthLine;
   /** The banner is collapsed and its badge belongs in the page title row. */
   badgeVisible: boolean;
   dismissible: boolean;
@@ -94,13 +101,17 @@ export function useAnsichProjectionHealth({
     return subscribeAnsichHealthDismissals(sync);
   }, [dismissalKey]);
 
-  const taskFailedJobs = failedJobsQuery.data?.items.length ?? 0;
+  const taskFailedJobs = taskFailedJobCount(failedJobsQuery);
   const scope = useMemo(() => {
     if (!health) return null;
     return taskId
       ? taskProjectionScope(health, taskId, {
           count: taskFailedJobs,
-          truncated: taskFailedJobs >= TASK_FAILED_JOB_LIMIT,
+          // A scope pinned at `50+` cannot re-promote on further growth: past
+          // the page limit the count stops moving. Deliberate — the banner is
+          // already open at that size, and the drawer holds the real list.
+          truncated:
+            taskFailedJobs !== null && taskFailedJobs >= TASK_FAILED_JOB_LIMIT,
         })
       : systemProjectionScope(health);
   }, [health, taskFailedJobs, taskId]);
@@ -132,8 +143,7 @@ export function useAnsichProjectionHealth({
 
   return {
     scope,
-    visible:
-      scope !== null && (!scope.attention || Boolean(display?.showBanner)),
+    line: display?.line ?? "none",
     badgeVisible: Boolean(display?.showBadge),
     dismissible: Boolean(display?.dismissible),
     dismiss,
@@ -187,16 +197,20 @@ export function AnsichHealthBadge({
  *
  * On a Task page the numbers are that Task's own; a system-level hard failure
  * still appears, labeled as system-level, because the Task's data comes from
- * the same projection and must not be reported as clean.
+ * the same projection and must not be reported as clean. When the Task's
+ * failure count is unknown the line stays neutral rather than green: an
+ * unanswered request is not a clean bill of health.
  */
 export function AnsichProjectionHealthBanner({
   health,
   scope,
+  line,
   taskId,
   onDismiss,
 }: {
   health: AnsichHealth;
   scope: AnsichProjectionScope;
+  line: AnsichProjectionHealthLine;
   taskId?: string;
   onDismiss?: () => void;
 }) {
@@ -205,15 +219,17 @@ export function AnsichProjectionHealthBanner({
   const [failedJobsOpen, setFailedJobsOpen] = useState(false);
   const isTaskScope = scope.kind === "task";
 
+  if (line === "none") return null;
+
   return (
     <>
-      {scope.attention ? (
+      {line === "banner" ? (
         <div
           role="status"
           className="flex flex-wrap items-center gap-x-4 gap-y-2 rounded-lg border border-amber-500/40 bg-amber-500/10 p-3 text-sm"
         >
           <div className="flex items-center gap-2 font-medium text-amber-700 dark:text-amber-300">
-            <AlertTriangleIcon className="size-4" />
+            <AlertTriangleIcon className="size-4" aria-hidden />
             {scope.hardFailure && isTaskScope
               ? `${t.ansich.healthSystemLevel} · ${t.ansich.projection}: ${t.ansich.health[health.status]}`
               : isTaskScope
@@ -221,7 +237,10 @@ export function AnsichProjectionHealthBanner({
                 : `${t.ansich.projection}: ${t.ansich.health[health.status]}`}
           </div>
           <div className="text-muted-foreground flex flex-wrap items-center gap-x-3 gap-y-1 text-xs">
-            {scope.failedJobs > 0 ? (
+            {scope.failedJobs === null ? (
+              // An absent chip would read as "no failed jobs"; say so instead.
+              <span className="italic">{t.ansich.healthCountUnavailable}</span>
+            ) : scope.failedJobs > 0 ? (
               <button
                 type="button"
                 onClick={() => setFailedJobsOpen(true)}
@@ -258,8 +277,8 @@ export function AnsichProjectionHealthBanner({
                 variant="ghost"
                 size="icon"
                 className="size-8"
-                aria-label={t.ansich.healthDismiss}
-                title={t.ansich.healthDismiss}
+                aria-label={t.ansich.healthDismissLabel}
+                title={t.ansich.healthDismissLabel}
                 onClick={onDismiss}
               >
                 <XIcon />
@@ -274,9 +293,22 @@ export function AnsichProjectionHealthBanner({
         </div>
       ) : (
         <div className="text-muted-foreground flex items-center gap-2 text-sm">
-          <ActivityIcon className="size-4 text-emerald-600" />
-          <span className={cn("text-foreground font-medium")}>
-            {isTaskScope ? t.ansich.healthTaskComplete : t.ansich.dataHealthy}
+          {line === "unknown" ? (
+            <CircleHelpIcon className="size-4" aria-hidden />
+          ) : (
+            <ActivityIcon className="size-4 text-emerald-600" aria-hidden />
+          )}
+          <span
+            className={cn(
+              "font-medium",
+              line === "unknown" ? "text-muted-foreground" : "text-foreground",
+            )}
+          >
+            {line === "unknown"
+              ? t.ansich.healthCountUnavailable
+              : isTaskScope
+                ? t.ansich.healthTaskComplete
+                : t.ansich.dataHealthy}
           </span>
           <span aria-hidden>·</span>
           <span className="tabular-nums">

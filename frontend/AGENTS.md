@@ -111,7 +111,11 @@ degradation caused by other Tasks no longer interrupts a Task page. A
 system-level hard failure (`storage_available=false`, status failed/stopped) is
 the exception and still appears there, explicitly labeled system-level, because
 the Task's own numbers come from the same projection and must not be reported as
-clean. The banner is dismissible: it hides entirely and leaves an amber `⚠ N`
+clean. A Task failed-job count that has not answered — pending, or failed with
+no retry — is carried as `null`, not 0: unknown never promotes a banner or
+counts into the badge, but it does replace the green completeness line with a
+neutral "count unavailable" one, and compares as no change against a dismissal
+snapshot. The banner is dismissible: it hides entirely and leaves an amber `⚠ N`
 button in the page title row that restores it, so the warning moves rather than
 leaving the accessibility tree. The dismissed state (failed/lost counts plus
 status) is kept per scope in `sessionStorage` (`core/ansich/health-dismissal.ts`,

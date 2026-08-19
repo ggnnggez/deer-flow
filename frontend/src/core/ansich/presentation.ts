@@ -200,11 +200,29 @@ export function lostRangesForTask(
   return ranges.filter((range) => range.task_id === taskId);
 }
 
-/** The state a dismissal was taken against, and the unit of "got worse". */
+/**
+ * The state a dismissal was taken against, and the unit of "got worse".
+ *
+ * `failedJobs` is `null` when the projection could not answer how many jobs
+ * failed. That is not zero, and it is never compared as if it were.
+ */
 export interface AnsichHealthSnapshot {
-  failedJobs: number;
+  failedJobs: number | null;
   lostObservations: number;
   status: AnsichHealthStatus;
+}
+
+/**
+ * How many failed jobs a Task has, from its failed-job query result, or `null`
+ * when the request has not answered. TanStack leaves `data` undefined both
+ * while pending and after a failed request — and this query does not retry —
+ * so reading a missing `data` as 0 would turn "we do not know" into a clean
+ * bill of health for the Task (IA §5.2: never fabricate certainty).
+ */
+export function taskFailedJobCount(
+  result: { data?: { items: unknown[] } | undefined } | undefined,
+): number | null {
+  return result?.data ? result.data.items.length : null;
 }
 
 /**
@@ -238,7 +256,9 @@ function buildScope(
     attention,
     hardFailure,
     failedJobsTruncated,
-    attentionCount: snapshot.failedJobs + snapshot.lostObservations,
+    // An unknown count contributes nothing: the badge may only promise a
+    // number it can stand behind.
+    attentionCount: (snapshot.failedJobs ?? 0) + snapshot.lostObservations,
     snapshot,
   };
 }
@@ -272,13 +292,15 @@ export function systemProjectionScope(
 export function taskProjectionScope(
   health: AnsichProjectionHealthFacts,
   taskId: string,
-  failedJobs: { count: number; truncated: boolean },
+  failedJobs: { count: number | null; truncated: boolean },
 ): AnsichProjectionScope {
   const hardFailure = isProjectionHardFailure(health);
   const lostObservations = countLostObservations(
     lostRangesForTask(health.lost_ranges, taskId),
   );
-  const localAttention = failedJobs.count > 0 || lostObservations > 0;
+  // Unknown is not failing: an unanswered count must not raise a banner by
+  // itself. It only blocks the opposite claim, that the Task is complete.
+  const localAttention = (failedJobs.count ?? 0) > 0 || lostObservations > 0;
   return buildScope(
     "task",
     {
@@ -306,21 +328,37 @@ const HEALTH_STATUS_RANK: Record<AnsichHealthStatus, number> = {
 /**
  * Whether the projection got worse than the state an operator dismissed. Only
  * a rise re-promotes the banner: a steady or improving incident stays collapsed
- * behind its badge.
+ * behind its badge. An unknown failure count on either side is no evidence of a
+ * rise, so it counts as no change rather than as a jump from or to zero.
  */
 export function projectionHealthWorsened(
   dismissed: AnsichHealthSnapshot,
   current: AnsichHealthSnapshot,
 ): boolean {
+  const failedJobsRose =
+    dismissed.failedJobs !== null &&
+    current.failedJobs !== null &&
+    current.failedJobs > dismissed.failedJobs;
   return (
-    current.failedJobs > dismissed.failedJobs ||
+    failedJobsRose ||
     current.lostObservations > dismissed.lostObservations ||
     HEALTH_STATUS_RANK[current.status] > HEALTH_STATUS_RANK[dismissed.status]
   );
 }
 
+/**
+ * The inline health line this scope renders: the attention banner, the
+ * completeness claim, the neutral line for a scope whose failure count is
+ * unknown, or nothing at all while the banner is collapsed behind its badge.
+ */
+export type AnsichProjectionHealthLine =
+  | "banner"
+  | "healthy"
+  | "unknown"
+  | "none";
+
 export interface AnsichProjectionHealthDisplay {
-  showBanner: boolean;
+  line: AnsichProjectionHealthLine;
   showBadge: boolean;
   dismissible: boolean;
   /** The stored dismissal no longer describes reality and must be dropped. */
@@ -340,7 +378,8 @@ export function resolveProjectionHealthDisplay(
 ): AnsichProjectionHealthDisplay {
   if (!scope.attention) {
     return {
-      showBanner: false,
+      // A scope that cannot count its failed jobs may not claim completeness.
+      line: scope.failedJobs === null ? "unknown" : "healthy",
       showBadge: false,
       dismissible: false,
       clearDismissal: dismissed !== null,
@@ -348,7 +387,7 @@ export function resolveProjectionHealthDisplay(
   }
   if (scope.hardFailure) {
     return {
-      showBanner: true,
+      line: "banner",
       showBadge: false,
       dismissible: false,
       clearDismissal: dismissed !== null,
@@ -356,14 +395,14 @@ export function resolveProjectionHealthDisplay(
   }
   if (dismissed && !projectionHealthWorsened(dismissed, scope.snapshot)) {
     return {
-      showBanner: false,
+      line: "none",
       showBadge: true,
       dismissible: true,
       clearDismissal: false,
     };
   }
   return {
-    showBanner: true,
+    line: "banner",
     showBadge: false,
     dismissible: true,
     clearDismissal: dismissed !== null,

@@ -113,10 +113,11 @@ export default function AnsichOperationsPage() {
             <>
               {!selectedProjectionStatus ? (
                 <Skeleton className="h-18 w-full" />
-              ) : projectionHealth.visible && projectionHealth.scope ? (
+              ) : projectionHealth.scope ? (
                 <AnsichProjectionHealthBanner
                   health={selectedProjectionStatus}
                   scope={projectionHealth.scope}
+                  line={projectionHealth.line}
                   onDismiss={
                     projectionHealth.dismissible
                       ? projectionHealth.dismiss

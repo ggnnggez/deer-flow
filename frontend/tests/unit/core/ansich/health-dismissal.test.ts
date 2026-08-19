@@ -78,6 +78,18 @@ describe("Ansich health dismissal storage", () => {
     expect(readAnsichHealthDismissal(storage, key)).toBeNull();
   });
 
+  it("round-trips an unknown failure count without inventing a zero", () => {
+    const storage = new MemoryStorage();
+    const key = buildAnsichHealthDismissalKey("task-1");
+
+    writeAnsichHealthDismissal(storage, key, { ...snapshot, failedJobs: null });
+
+    expect(readAnsichHealthDismissal(storage, key)).toEqual({
+      ...snapshot,
+      failedJobs: null,
+    });
+  });
+
   it("treats a malformed or foreign record as no dismissal", () => {
     const storage = new MemoryStorage();
     const key = buildAnsichHealthDismissalKey("task-1");

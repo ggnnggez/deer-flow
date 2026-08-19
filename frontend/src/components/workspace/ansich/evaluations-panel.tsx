@@ -91,6 +91,8 @@ export function AnsichEvaluationsPanel({
   const projectionHealth = useAnsichProjectionHealth({
     health,
     taskId,
+    // Nothing to scope, and nothing rendered, until projection health arrives.
+    enabled: health !== null,
     polling,
   });
 
@@ -111,10 +113,11 @@ export function AnsichEvaluationsPanel({
 
   return (
     <div className="space-y-4">
-      {health && projectionHealth.visible && projectionHealth.scope ? (
+      {health && projectionHealth.scope ? (
         <AnsichProjectionHealthBanner
           health={health}
           scope={projectionHealth.scope}
+          line={projectionHealth.line}
           taskId={taskId}
           onDismiss={
             projectionHealth.dismissible ? projectionHealth.dismiss : undefined

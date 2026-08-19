@@ -255,10 +255,11 @@ export default function AnsichTaskDetailPage() {
                 }
               />
 
-              {health && projectionHealth.visible && projectionHealth.scope ? (
+              {health && projectionHealth.scope ? (
                 <AnsichProjectionHealthBanner
                   health={health}
                   scope={projectionHealth.scope}
+                  line={projectionHealth.line}
                   taskId={taskId}
                   onDismiss={
                     projectionHealth.dismissible

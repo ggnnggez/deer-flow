@@ -75,7 +75,8 @@ export function readAnsichHealthDismissal(
     };
     if (
       parsed.version !== HEALTH_DISMISSAL_VERSION ||
-      typeof parsed.failedJobs !== "number" ||
+      // `null` is a recorded unknown and must survive the round trip as one.
+      !(typeof parsed.failedJobs === "number" || parsed.failedJobs === null) ||
       typeof parsed.lostObservations !== "number" ||
       (parsed.status !== "healthy" &&
         parsed.status !== "degraded" &&

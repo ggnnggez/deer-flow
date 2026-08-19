@@ -11,6 +11,7 @@ import {
   isProjectionHardFailure,
   lostRangesForTask,
   projectionHealthWorsened,
+  taskFailedJobCount,
   qualityBeliefTone,
   resolveProjectionHealthDisplay,
   shortId,
@@ -462,6 +463,56 @@ describe("taskProjectionScope", () => {
     expect(scope.hardFailure).toBe(true);
     expect(scope.attentionCount).toBe(0);
   });
+
+  it("inherits the system status when the projection itself stopped", () => {
+    const scope = taskProjectionScope(
+      projectionHealth({ status: "stopped" }),
+      "task-1",
+      { count: 0, truncated: false },
+    );
+
+    expect(scope.hardFailure).toBe(true);
+    expect(scope.status).toBe("stopped");
+  });
+
+  it("carries an unknown failure count instead of reporting zero failures", () => {
+    const scope = taskProjectionScope(projectionHealth(), "task-1", {
+      count: null,
+      truncated: false,
+    });
+
+    // Unknown is not failing: it must not promote a banner or inflate the badge.
+    expect(scope.failedJobs).toBeNull();
+    expect(scope.attention).toBe(false);
+    expect(scope.attentionCount).toBe(0);
+    expect(scope.status).toBe("healthy");
+  });
+
+  it("still reports a lost range while the failure count is unknown", () => {
+    const scope = taskProjectionScope(
+      projectionHealth({ lost_ranges: [lostRange(1, 2, "task-1")] }),
+      "task-1",
+      { count: null, truncated: false },
+    );
+
+    expect(scope.attention).toBe(true);
+    expect(scope.attentionCount).toBe(2);
+  });
+});
+
+describe("taskFailedJobCount", () => {
+  it("reports an unknown count while the request has produced no answer", () => {
+    // TanStack leaves `data` undefined both while pending and after a failed
+    // request, and this hook does not retry: collapsing either into 0 would
+    // turn "we do not know" into "this Task has no failures".
+    expect(taskFailedJobCount(undefined)).toBeNull();
+    expect(taskFailedJobCount({ data: undefined })).toBeNull();
+  });
+
+  it("reports the answered count, including a genuine zero", () => {
+    expect(taskFailedJobCount({ data: { items: [] } })).toBe(0);
+    expect(taskFailedJobCount({ data: { items: [{}, {}] } })).toBe(2);
+  });
 });
 
 describe("systemProjectionScope", () => {
@@ -523,6 +574,21 @@ describe("projectionHealthWorsened", () => {
       ),
     ).toBe(false);
   });
+
+  it("treats an unknown failure count on either side as no change", () => {
+    expect(
+      projectionHealthWorsened(snapshot, { ...snapshot, failedJobs: null }),
+    ).toBe(false);
+    expect(
+      projectionHealthWorsened({ ...snapshot, failedJobs: null }, snapshot),
+    ).toBe(false);
+    expect(
+      projectionHealthWorsened(
+        { ...snapshot, failedJobs: null },
+        { ...snapshot, failedJobs: null, lostObservations: 9 },
+      ),
+    ).toBe(true);
+  });
 });
 
 describe("resolveProjectionHealthDisplay", () => {
@@ -533,7 +599,7 @@ describe("resolveProjectionHealthDisplay", () => {
 
   it("shows the banner when nothing was dismissed", () => {
     expect(resolveProjectionHealthDisplay(attentionScope, null)).toEqual({
-      showBanner: true,
+      line: "banner",
       showBadge: false,
       dismissible: true,
       clearDismissal: false,
@@ -544,7 +610,7 @@ describe("resolveProjectionHealthDisplay", () => {
     expect(
       resolveProjectionHealthDisplay(attentionScope, attentionScope.snapshot),
     ).toEqual({
-      showBanner: false,
+      line: "none",
       showBadge: true,
       dismissible: true,
       clearDismissal: false,
@@ -560,10 +626,28 @@ describe("resolveProjectionHealthDisplay", () => {
     expect(
       resolveProjectionHealthDisplay(worse, attentionScope.snapshot),
     ).toEqual({
-      showBanner: true,
+      line: "banner",
       showBadge: false,
       dismissible: true,
       clearDismissal: true,
+    });
+  });
+
+  it("keeps a dismissed Task collapsed while unrelated global health degrades", () => {
+    // The headline promise: another Task's failures are not this Task's news.
+    const globallyWorse = taskProjectionScope(
+      projectionHealth({ status: "degraded", failed_jobs: 40 }),
+      "task-1",
+      { count: 2, truncated: false },
+    );
+
+    expect(
+      resolveProjectionHealthDisplay(globallyWorse, attentionScope.snapshot),
+    ).toEqual({
+      line: "none",
+      showBadge: true,
+      dismissible: true,
+      clearDismissal: false,
     });
   });
 
@@ -575,7 +659,7 @@ describe("resolveProjectionHealthDisplay", () => {
     );
 
     expect(resolveProjectionHealthDisplay(hard, null)).toEqual({
-      showBanner: true,
+      line: "banner",
       showBadge: false,
       dismissible: false,
       clearDismissal: false,
@@ -583,7 +667,7 @@ describe("resolveProjectionHealthDisplay", () => {
     expect(
       resolveProjectionHealthDisplay(hard, attentionScope.snapshot),
     ).toEqual({
-      showBanner: true,
+      line: "banner",
       showBadge: false,
       dismissible: false,
       clearDismissal: true,
@@ -599,10 +683,37 @@ describe("resolveProjectionHealthDisplay", () => {
     expect(
       resolveProjectionHealthDisplay(clean, attentionScope.snapshot),
     ).toEqual({
-      showBanner: false,
+      // Back to the plain completeness line, and the record is gone.
+      line: "healthy",
       showBadge: false,
       dismissible: false,
       clearDismissal: true,
     });
+  });
+});
+
+describe("an unanswered failed-job request never becomes a clean bill of health", () => {
+  function lineFor(result: { data?: { items: unknown[] } } | undefined) {
+    const scope = taskProjectionScope(projectionHealth(), "task-1", {
+      count: taskFailedJobCount(result),
+      truncated: false,
+    });
+    return resolveProjectionHealthDisplay(scope, null).line;
+  }
+
+  it("renders the neutral line while the count is still pending", () => {
+    expect(lineFor(undefined)).toBe("unknown");
+  });
+
+  it("renders the neutral line after the request failed", () => {
+    expect(lineFor({ data: undefined })).toBe("unknown");
+  });
+
+  it("claims completeness only once an answered zero arrives", () => {
+    expect(lineFor({ data: { items: [] } })).toBe("healthy");
+  });
+
+  it("promotes the banner once an answered failure arrives", () => {
+    expect(lineFor({ data: { items: [{}] } })).toBe("banner");
   });
 });

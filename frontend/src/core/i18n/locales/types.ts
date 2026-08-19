@@ -622,7 +622,8 @@ export interface Translations {
     healthTaskAttention: string;
     healthSystemLevel: string;
     healthSystemLevelNote: string;
-    healthDismiss: string;
+    healthCountUnavailable: string;
+    healthDismissLabel: string;
     healthBadgeLabel: (count: string) => string;
     healthBadgeStatusLabel: (status: string) => string;
     copyTaskId: string;
