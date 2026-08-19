@@ -113,7 +113,14 @@ export interface AnsichLostRange {
 }
 
 export interface AnsichHealth {
-  status: "healthy" | "degraded" | "failed" | "stopped";
+  status:
+    | "starting"
+    | "healthy"
+    | "degraded"
+    | "recovering"
+    | "failed"
+    | "shutting_down"
+    | "stopped";
   queue_depth: number;
   queue_capacity: number;
   queue_bytes: number;

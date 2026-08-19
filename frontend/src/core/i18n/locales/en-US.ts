@@ -740,9 +740,12 @@ export const enUS: Translations = {
       interrupted: "Interrupted",
     },
     health: {
+      starting: "Starting",
       healthy: "Healthy",
       degraded: "Degraded",
+      recovering: "Recovering",
       failed: "Failed",
+      shutting_down: "Shutting down",
       stopped: "Stopped",
     },
     active: "Active",

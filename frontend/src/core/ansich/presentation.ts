@@ -1,5 +1,6 @@
 import type {
   AnsichAlertType,
+  AnsichHealth,
   AnsichLostRange,
   AnsichQualityBelief,
 } from "./types";
@@ -150,7 +151,7 @@ export function selectPrimarySignal(
  * storage unavailable. A healthy line must never hide these.
  */
 export function isProjectionAttention(health: {
-  status: "healthy" | "degraded" | "failed" | "stopped";
+  status: AnsichHealthStatus;
   failed_jobs: number;
   lost_ranges: unknown[];
   storage_available: boolean;
@@ -163,7 +164,12 @@ export function isProjectionAttention(health: {
   );
 }
 
-export type AnsichHealthStatus = "healthy" | "degraded" | "failed" | "stopped";
+/**
+ * The collector's lifecycle states, taken straight from the contract so the two
+ * cannot drift: the backend derives all seven (spec 11 §2) and the UI has to be
+ * able to name every one it can be handed.
+ */
+export type AnsichHealthStatus = AnsichHealth["status"];
 
 /** The projection-health fields the scope helpers below actually read. */
 export interface AnsichProjectionHealthFacts {
@@ -321,10 +327,18 @@ export function taskProjectionScope(
 }
 
 const HEALTH_STATUS_RANK: Record<AnsichHealthStatus, number> = {
+  // `starting` and `shutting_down` are lifecycle phases, not failures: nothing
+  // has run yet, or an orderly stop is in progress (its failure tier is
+  // `stopped`, one transition later), so neither can be worse than the state a
+  // dismissal was taken against. `recovering` sits between healthy and
+  // degraded: the incident is not over, but nothing is failing right now.
+  starting: 0,
   healthy: 0,
-  degraded: 1,
-  failed: 2,
-  stopped: 2,
+  recovering: 1,
+  degraded: 2,
+  failed: 3,
+  shutting_down: 0,
+  stopped: 3,
 };
 
 /**

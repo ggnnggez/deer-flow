@@ -716,9 +716,12 @@ export const zhCN: Translations = {
       interrupted: "已中断",
     },
     health: {
+      starting: "启动中",
       healthy: "健康",
       degraded: "降级",
+      recovering: "恢复中",
       failed: "失败",
+      shutting_down: "关停中",
       stopped: "已停止",
     },
     active: "活跃",

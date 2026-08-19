@@ -623,9 +623,12 @@ export interface Translations {
       interrupted: string;
     };
     health: {
+      starting: string;
       healthy: string;
       degraded: string;
+      recovering: string;
       failed: string;
+      shutting_down: string;
       stopped: string;
     };
     active: string;
