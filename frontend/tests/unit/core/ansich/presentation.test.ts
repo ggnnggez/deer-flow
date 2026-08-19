@@ -8,13 +8,20 @@ import {
   formatEvaluationVerdict,
   getBudgetPresentation,
   formatAnsichTimestamp,
+  isProjectionHardFailure,
+  lostRangesForTask,
+  projectionHealthWorsened,
   qualityBeliefTone,
+  resolveProjectionHealthDisplay,
   shortId,
   selectPrimarySignal,
+  systemProjectionScope,
+  taskProjectionScope,
   isProjectionAttention,
 } from "@/core/ansich/presentation";
 import {
   ANSICH_PRODUCED_ALERT_TYPES,
+  type AnsichLostRange,
   type AnsichQualityBelief,
 } from "@/core/ansich/types";
 
@@ -329,5 +336,273 @@ describe("isProjectionAttention", () => {
     expect(isProjectionAttention({ ...base, storage_available: false })).toBe(
       true,
     );
+  });
+});
+
+function lostRange(
+  first: number,
+  last: number,
+  taskId: string | null,
+): AnsichLostRange {
+  return {
+    first_sequence: first,
+    last_sequence: last,
+    task_id: taskId,
+    producer_name: null,
+    producer_instance_id: null,
+  };
+}
+
+function projectionHealth(
+  overrides: Partial<{
+    status: "healthy" | "degraded" | "failed" | "stopped";
+    failed_jobs: number;
+    lost_ranges: AnsichLostRange[];
+    storage_available: boolean;
+  }> = {},
+) {
+  return {
+    status: "healthy" as const,
+    failed_jobs: 0,
+    lost_ranges: [] as AnsichLostRange[],
+    storage_available: true,
+    ...overrides,
+  };
+}
+
+describe("isProjectionHardFailure", () => {
+  it("is true only when the projection itself cannot be trusted", () => {
+    expect(isProjectionHardFailure(projectionHealth())).toBe(false);
+    expect(
+      isProjectionHardFailure(projectionHealth({ status: "degraded" })),
+    ).toBe(false);
+    expect(
+      isProjectionHardFailure(projectionHealth({ status: "failed" })),
+    ).toBe(true);
+    expect(
+      isProjectionHardFailure(projectionHealth({ status: "stopped" })),
+    ).toBe(true);
+    expect(
+      isProjectionHardFailure(projectionHealth({ storage_available: false })),
+    ).toBe(true);
+  });
+});
+
+describe("lostRangesForTask", () => {
+  it("never attributes an unattributed loss range to a Task", () => {
+    const ranges = [
+      lostRange(1, 2, "task-1"),
+      lostRange(5, 9, null),
+      lostRange(20, 20, "task-2"),
+    ];
+
+    expect(lostRangesForTask(ranges, "task-1")).toEqual([
+      lostRange(1, 2, "task-1"),
+    ]);
+    expect(lostRangesForTask(ranges, "task-3")).toEqual([]);
+  });
+});
+
+describe("taskProjectionScope", () => {
+  it("ignores global degradation that does not touch this Task", () => {
+    const scope = taskProjectionScope(
+      projectionHealth({
+        status: "degraded",
+        failed_jobs: 7,
+        lost_ranges: [lostRange(1, 4, "other-task"), lostRange(9, 9, null)],
+      }),
+      "task-1",
+      { count: 0, truncated: false },
+    );
+
+    expect(scope.kind).toBe("task");
+    expect(scope.attention).toBe(false);
+    expect(scope.hardFailure).toBe(false);
+    expect(scope.failedJobs).toBe(0);
+    expect(scope.lostObservations).toBe(0);
+    expect(scope.attentionCount).toBe(0);
+  });
+
+  it("reports this Task's own failed jobs and lost observations only", () => {
+    const scope = taskProjectionScope(
+      projectionHealth({
+        status: "degraded",
+        failed_jobs: 7,
+        lost_ranges: [lostRange(1, 3, "task-1"), lostRange(50, 90, "other")],
+      }),
+      "task-1",
+      { count: 2, truncated: false },
+    );
+
+    expect(scope.attention).toBe(true);
+    expect(scope.failedJobs).toBe(2);
+    expect(scope.lostObservations).toBe(3);
+    expect(scope.attentionCount).toBe(5);
+    expect(scope.status).toBe("degraded");
+  });
+
+  it("marks a truncated failed-job page so the count reads as a floor", () => {
+    const scope = taskProjectionScope(projectionHealth(), "task-1", {
+      count: 50,
+      truncated: true,
+    });
+
+    expect(scope.attention).toBe(true);
+    expect(scope.failedJobsTruncated).toBe(true);
+  });
+
+  it("surfaces a system-level hard failure even when the Task looks clean", () => {
+    const scope = taskProjectionScope(
+      projectionHealth({ storage_available: false }),
+      "task-1",
+      { count: 0, truncated: false },
+    );
+
+    expect(scope.attention).toBe(true);
+    expect(scope.hardFailure).toBe(true);
+    expect(scope.attentionCount).toBe(0);
+  });
+});
+
+describe("systemProjectionScope", () => {
+  it("counts every failed job and lost observation, attributed or not", () => {
+    const scope = systemProjectionScope(
+      projectionHealth({
+        status: "degraded",
+        failed_jobs: 3,
+        lost_ranges: [lostRange(1, 2, "task-1"), lostRange(5, 5, null)],
+      }),
+    );
+
+    expect(scope.kind).toBe("system");
+    expect(scope.attention).toBe(true);
+    expect(scope.failedJobs).toBe(3);
+    expect(scope.lostObservations).toBe(3);
+    expect(scope.attentionCount).toBe(6);
+  });
+});
+
+describe("projectionHealthWorsened", () => {
+  const snapshot = {
+    failedJobs: 2,
+    lostObservations: 1,
+    status: "degraded" as const,
+  };
+
+  it("is false when nothing got worse", () => {
+    expect(projectionHealthWorsened(snapshot, snapshot)).toBe(false);
+    expect(
+      projectionHealthWorsened(snapshot, {
+        failedJobs: 1,
+        lostObservations: 0,
+        status: "healthy",
+      }),
+    ).toBe(false);
+  });
+
+  it("is true when a count rises or the status degrades further", () => {
+    expect(
+      projectionHealthWorsened(snapshot, { ...snapshot, failedJobs: 3 }),
+    ).toBe(true);
+    expect(
+      projectionHealthWorsened(snapshot, { ...snapshot, lostObservations: 2 }),
+    ).toBe(true);
+    expect(
+      projectionHealthWorsened(snapshot, { ...snapshot, status: "failed" }),
+    ).toBe(true);
+    expect(
+      projectionHealthWorsened(snapshot, { ...snapshot, status: "stopped" }),
+    ).toBe(true);
+  });
+
+  it("ranks failed and stopped as equally bad", () => {
+    expect(
+      projectionHealthWorsened(
+        { ...snapshot, status: "failed" },
+        { ...snapshot, status: "stopped" },
+      ),
+    ).toBe(false);
+  });
+});
+
+describe("resolveProjectionHealthDisplay", () => {
+  const attentionScope = taskProjectionScope(projectionHealth(), "task-1", {
+    count: 2,
+    truncated: false,
+  });
+
+  it("shows the banner when nothing was dismissed", () => {
+    expect(resolveProjectionHealthDisplay(attentionScope, null)).toEqual({
+      showBanner: true,
+      showBadge: false,
+      dismissible: true,
+      clearDismissal: false,
+    });
+  });
+
+  it("hides the banner behind the badge once dismissed at this state", () => {
+    expect(
+      resolveProjectionHealthDisplay(attentionScope, attentionScope.snapshot),
+    ).toEqual({
+      showBanner: false,
+      showBadge: true,
+      dismissible: true,
+      clearDismissal: false,
+    });
+  });
+
+  it("brings the banner back and drops the record when the state worsens", () => {
+    const worse = taskProjectionScope(projectionHealth(), "task-1", {
+      count: 3,
+      truncated: false,
+    });
+
+    expect(
+      resolveProjectionHealthDisplay(worse, attentionScope.snapshot),
+    ).toEqual({
+      showBanner: true,
+      showBadge: false,
+      dismissible: true,
+      clearDismissal: true,
+    });
+  });
+
+  it("never offers dismissal for a hard failure and drops any stale record", () => {
+    const hard = taskProjectionScope(
+      projectionHealth({ status: "stopped", storage_available: false }),
+      "task-1",
+      { count: 0, truncated: false },
+    );
+
+    expect(resolveProjectionHealthDisplay(hard, null)).toEqual({
+      showBanner: true,
+      showBadge: false,
+      dismissible: false,
+      clearDismissal: false,
+    });
+    expect(
+      resolveProjectionHealthDisplay(hard, attentionScope.snapshot),
+    ).toEqual({
+      showBanner: true,
+      showBadge: false,
+      dismissible: false,
+      clearDismissal: true,
+    });
+  });
+
+  it("clears the record on recovery so the next incident starts as a banner", () => {
+    const clean = taskProjectionScope(projectionHealth(), "task-1", {
+      count: 0,
+      truncated: false,
+    });
+
+    expect(
+      resolveProjectionHealthDisplay(clean, attentionScope.snapshot),
+    ).toEqual({
+      showBanner: false,
+      showBadge: false,
+      dismissible: false,
+      clearDismissal: true,
+    });
   });
 });

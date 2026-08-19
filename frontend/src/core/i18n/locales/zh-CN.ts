@@ -711,6 +711,16 @@ export const zhCN: Translations = {
     technicalDetails: "技术详情",
     systemDetails: "系统详情",
     dataHealthy: "数据健康",
+    healthTaskComplete: "本任务数据完整",
+    healthTaskAttention: "本任务数据不完整",
+    healthSystemLevel: "系统级",
+    healthSystemLevelNote:
+      "这是系统级投影异常，不只影响本任务：本任务自身的数据也可能不完整或已过期。",
+    healthDismiss: "收起",
+    healthBadgeLabel: (count: string) =>
+      `投影警告：${count} 项需要关注，点击展开`,
+    healthBadgeStatusLabel: (status: string) =>
+      `投影警告：${status}，点击展开`,
     copyTaskId: "复制 Task ID",
     currentActivity: "当前动作",
     whyAttention: "为何需要关注",

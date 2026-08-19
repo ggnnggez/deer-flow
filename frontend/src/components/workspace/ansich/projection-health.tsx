@@ -1,62 +1,239 @@
 "use client";
 
-import { ActivityIcon, AlertTriangleIcon } from "lucide-react";
-import { useState } from "react";
+import { ActivityIcon, AlertTriangleIcon, XIcon } from "lucide-react";
+import { useCallback, useEffect, useMemo, useState } from "react";
 
 import { Button } from "@/components/ui/button";
 import {
-  isProjectionAttention,
-  countLostObservations,
+  buildAnsichHealthDismissalKey,
+  clearAnsichHealthDismissal,
+  getSessionAnsichHealthStorage,
+  readAnsichHealthDismissal,
+  subscribeAnsichHealthDismissals,
+  writeAnsichHealthDismissal,
+} from "@/core/ansich/health-dismissal";
+import { useAnsichFailedJobs } from "@/core/ansich/hooks";
+import {
+  resolveProjectionHealthDisplay,
+  systemProjectionScope,
+  taskProjectionScope,
+  type AnsichHealthSnapshot,
+  type AnsichProjectionScope,
 } from "@/core/ansich/presentation";
 import type { AnsichHealth } from "@/core/ansich/types";
 import { useI18n } from "@/core/i18n/hooks";
 import { cn } from "@/lib/utils";
 
+import { AnsichFailedJobsDialog } from "./failed-jobs-dialog";
 import { AnsichSystemHealthDrawer } from "./system-health-drawer";
+
+/**
+ * A modest page of one Task's failed jobs — enough to size the warning without
+ * pulling the whole failure list into a polled query. A full page is reported
+ * as `50+`, never as an exact total the response cannot support.
+ */
+const TASK_FAILED_JOB_LIMIT = 50;
 
 function formatLag(lagMs: number): string {
   if (lagMs < 1000) return `${lagMs}ms`;
   return `${(lagMs / 1000).toFixed(1)}s`;
 }
 
+export interface AnsichProjectionHealthState {
+  /** Null until projection health has loaded for this page. */
+  scope: AnsichProjectionScope | null;
+  /** The inline health line (banner or compact healthy line) is rendered. */
+  visible: boolean;
+  /** The banner is collapsed and its badge belongs in the page title row. */
+  badgeVisible: boolean;
+  dismissible: boolean;
+  dismiss: () => void;
+  restore: () => void;
+}
+
 /**
- * Projection health at L0 (IA §5.2): a compact "Data healthy · lag 1.2s"
- * status line by default, promoted to a page-level banner when attention is
- * warranted. The full metric wall lives in the System details drawer and never
- * competes with task cards at page top.
+ * Own one page's health line: which scope it speaks for and whether the
+ * operator has collapsed it (IA §5.2). Pages lift this so the badge can live in
+ * their title row while the banner stays in its normal slot.
+ *
+ * Pass `taskId` for a Task-scoped line: it then reports that Task's own failed
+ * jobs and lost ranges instead of every Task's, and inherits system state only
+ * for a hard failure that makes the Task's own numbers untrustworthy.
  */
-export function AnsichProjectionHealth({
+export function useAnsichProjectionHealth({
   health,
   taskId,
+  enabled = true,
+  polling = false,
+}: {
+  health: AnsichHealth | null | undefined;
+  taskId?: string;
+  enabled?: boolean;
+  polling?: boolean;
+}): AnsichProjectionHealthState {
+  const failedJobsQuery = useAnsichFailedJobs(
+    taskId,
+    TASK_FAILED_JOB_LIMIT,
+    enabled && Boolean(taskId),
+    polling,
+  );
+  const dismissalKey = buildAnsichHealthDismissalKey(taskId);
+  const [dismissed, setDismissed] = useState<AnsichHealthSnapshot | null>(null);
+
+  // Read after mount, not during render: the same page is prerendered on the
+  // server, where sessionStorage does not exist.
+  useEffect(() => {
+    const sync = () =>
+      setDismissed(
+        readAnsichHealthDismissal(
+          getSessionAnsichHealthStorage(),
+          dismissalKey,
+        ),
+      );
+    sync();
+    return subscribeAnsichHealthDismissals(sync);
+  }, [dismissalKey]);
+
+  const taskFailedJobs = failedJobsQuery.data?.items.length ?? 0;
+  const scope = useMemo(() => {
+    if (!health) return null;
+    return taskId
+      ? taskProjectionScope(health, taskId, {
+          count: taskFailedJobs,
+          truncated: taskFailedJobs >= TASK_FAILED_JOB_LIMIT,
+        })
+      : systemProjectionScope(health);
+  }, [health, taskFailedJobs, taskId]);
+
+  const display = scope
+    ? resolveProjectionHealthDisplay(scope, dismissed)
+    : null;
+  const clearDismissal = display?.clearDismissal ?? false;
+
+  useEffect(() => {
+    if (clearDismissal) {
+      clearAnsichHealthDismissal(getSessionAnsichHealthStorage(), dismissalKey);
+    }
+  }, [clearDismissal, dismissalKey]);
+
+  const snapshot = scope?.snapshot ?? null;
+  const dismiss = useCallback(() => {
+    if (!snapshot) return;
+    writeAnsichHealthDismissal(
+      getSessionAnsichHealthStorage(),
+      dismissalKey,
+      snapshot,
+    );
+  }, [dismissalKey, snapshot]);
+
+  const restore = useCallback(() => {
+    clearAnsichHealthDismissal(getSessionAnsichHealthStorage(), dismissalKey);
+  }, [dismissalKey]);
+
+  return {
+    scope,
+    visible:
+      scope !== null && (!scope.attention || Boolean(display?.showBanner)),
+    badgeVisible: Boolean(display?.showBadge),
+    dismissible: Boolean(display?.dismissible),
+    dismiss,
+    restore,
+  };
+}
+
+/**
+ * The collapsed form of the banner: an amber count in the page title row. It
+ * carries the state in its accessible name, so collapsing the banner moves the
+ * warning rather than removing it from the page.
+ *
+ * A scope can warrant attention with nothing to count — a degraded projection
+ * that has not yet failed a job or lost a range — so the badge falls back to
+ * naming that status rather than advertising a meaningless zero.
+ */
+export function AnsichHealthBadge({
+  scope,
+  onClick,
+}: {
+  scope: AnsichProjectionScope;
+  onClick: () => void;
+}) {
+  const { t } = useI18n();
+  const counted = scope.attentionCount > 0;
+  const text = counted
+    ? scope.attentionCount.toLocaleString()
+    : t.ansich.health[scope.status];
+  return (
+    <button
+      type="button"
+      onClick={onClick}
+      aria-label={
+        counted
+          ? t.ansich.healthBadgeLabel(text)
+          : t.ansich.healthBadgeStatusLabel(text)
+      }
+      className="focus-visible:ring-ring inline-flex items-center gap-1 rounded-full border border-amber-500/40 bg-amber-500/10 px-2 py-0.5 text-xs font-medium text-amber-700 tabular-nums outline-none hover:bg-amber-500/20 focus-visible:ring-2 dark:text-amber-300"
+    >
+      <AlertTriangleIcon className="size-3.5" aria-hidden />
+      {text}
+    </button>
+  );
+}
+
+/**
+ * Projection health at L0 (IA §5.2): a compact "Data healthy · lag 1.2s" status
+ * line by default, promoted to a page-level banner when this page's own scope
+ * warrants attention. The full metric wall lives in the System details drawer
+ * and never competes with task cards at page top.
+ *
+ * On a Task page the numbers are that Task's own; a system-level hard failure
+ * still appears, labeled as system-level, because the Task's data comes from
+ * the same projection and must not be reported as clean.
+ */
+export function AnsichProjectionHealthBanner({
+  health,
+  scope,
+  taskId,
+  onDismiss,
 }: {
   health: AnsichHealth;
+  scope: AnsichProjectionScope;
   taskId?: string;
+  onDismiss?: () => void;
 }) {
   const { t } = useI18n();
   const [drawerOpen, setDrawerOpen] = useState(false);
-  const attention = isProjectionAttention(health);
-  const lostCount = countLostObservations(health.lost_ranges);
+  const [failedJobsOpen, setFailedJobsOpen] = useState(false);
+  const isTaskScope = scope.kind === "task";
 
   return (
     <>
-      {attention ? (
+      {scope.attention ? (
         <div
           role="status"
-          className="border-amber-500/40 bg-amber-500/10 flex flex-wrap items-center gap-x-4 gap-y-2 rounded-lg border p-3 text-sm"
+          className="flex flex-wrap items-center gap-x-4 gap-y-2 rounded-lg border border-amber-500/40 bg-amber-500/10 p-3 text-sm"
         >
           <div className="flex items-center gap-2 font-medium text-amber-700 dark:text-amber-300">
             <AlertTriangleIcon className="size-4" />
-            {t.ansich.projection}: {t.ansich.health[health.status]}
+            {scope.hardFailure && isTaskScope
+              ? `${t.ansich.healthSystemLevel} · ${t.ansich.projection}: ${t.ansich.health[health.status]}`
+              : isTaskScope
+                ? t.ansich.healthTaskAttention
+                : `${t.ansich.projection}: ${t.ansich.health[health.status]}`}
           </div>
           <div className="text-muted-foreground flex flex-wrap items-center gap-x-3 gap-y-1 text-xs">
-            {health.failed_jobs > 0 ? (
-              <span className="text-destructive font-medium">
-                {t.ansich.failedJobs}: {health.failed_jobs}
-              </span>
+            {scope.failedJobs > 0 ? (
+              <button
+                type="button"
+                onClick={() => setFailedJobsOpen(true)}
+                className="text-destructive font-medium underline"
+              >
+                {t.ansich.failedJobs}: {scope.failedJobs}
+                {scope.failedJobsTruncated ? "+" : ""}
+              </button>
             ) : null}
-            {lostCount > 0 ? (
+            {scope.lostObservations > 0 ? (
               <span>
-                {t.ansich.lost}: {lostCount}
+                {t.ansich.lost}: {scope.lostObservations}
               </span>
             ) : null}
             {!health.storage_available ? (
@@ -68,20 +245,38 @@ export function AnsichProjectionHealth({
               {t.ansich.lag} {formatLag(health.lag_ms)}
             </span>
           </div>
-          <Button
-            variant="outline"
-            size="sm"
-            className="ms-auto"
-            onClick={() => setDrawerOpen(true)}
-          >
-            {t.ansich.systemDetails}
-          </Button>
+          <div className="ms-auto flex items-center gap-1">
+            <Button
+              variant="outline"
+              size="sm"
+              onClick={() => setDrawerOpen(true)}
+            >
+              {t.ansich.systemDetails}
+            </Button>
+            {onDismiss ? (
+              <Button
+                variant="ghost"
+                size="icon"
+                className="size-8"
+                aria-label={t.ansich.healthDismiss}
+                title={t.ansich.healthDismiss}
+                onClick={onDismiss}
+              >
+                <XIcon />
+              </Button>
+            ) : null}
+          </div>
+          {scope.hardFailure && isTaskScope ? (
+            <p className="text-muted-foreground basis-full text-xs">
+              {t.ansich.healthSystemLevelNote}
+            </p>
+          ) : null}
         </div>
       ) : (
         <div className="text-muted-foreground flex items-center gap-2 text-sm">
           <ActivityIcon className="size-4 text-emerald-600" />
           <span className={cn("text-foreground font-medium")}>
-            {t.ansich.dataHealthy}
+            {isTaskScope ? t.ansich.healthTaskComplete : t.ansich.dataHealthy}
           </span>
           <span aria-hidden>·</span>
           <span className="tabular-nums">
@@ -102,6 +297,11 @@ export function AnsichProjectionHealth({
         taskId={taskId}
         open={drawerOpen}
         onOpenChange={setDrawerOpen}
+      />
+      <AnsichFailedJobsDialog
+        open={failedJobsOpen}
+        onOpenChange={setFailedJobsOpen}
+        taskId={taskId}
       />
     </>
   );

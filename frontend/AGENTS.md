@@ -101,9 +101,24 @@ question-oriented entry points with URL view state (`?view=summary|decision|reso
 Summary (diagnostic strip + Task tree), Decision trace (logical Steps), Resources &
 safety (Budgets + Scopes & effects), and Evidence (timeline + context & lineage +
 Agent release, all lazy/no-store). Projection health renders as a compact
-`Data healthy · lag` line promoted to a page-level banner on
-degraded/failed/lost-range/storage-unavailable; the full metric wall lives in the
-`System details` drawer. Every metric label in that drawer has a keyboard-focusable
+`Data healthy · lag` line promoted to a page-level banner when the page's own
+scope warrants it; the full metric wall lives in the `System details` drawer.
+That scope is tiered: Operations keeps the global counts, while Task detail
+counts only that Task's own failed jobs (a bounded `failed-jobs?task=` page,
+rendered as `50+` when full) and its own lost ranges — an unattributed range
+(`task_id: null`) stays system-scoped and is never charged to a Task — so global
+degradation caused by other Tasks no longer interrupts a Task page. A
+system-level hard failure (`storage_available=false`, status failed/stopped) is
+the exception and still appears there, explicitly labeled system-level, because
+the Task's own numbers come from the same projection and must not be reported as
+clean. The banner is dismissible: it hides entirely and leaves an amber `⚠ N`
+button in the page title row that restores it, so the warning moves rather than
+leaving the accessibility tree. The dismissed state (failed/lost counts plus
+status) is kept per scope in `sessionStorage` (`core/ansich/health-dismissal.ts`,
+system and each Task independent); a rising count or a worsening status
+(healthy < degraded < failed/stopped) drops the record and re-promotes the
+banner, recovery clears it so the next incident opens as a banner again, and a
+hard failure renders no dismiss button at all. Every metric label in that drawer has a keyboard-focusable
 help trigger whose localized tooltip explains the metric's definition and diagnostic
 meaning; failed-job help stays separate from the clickable failed-job value. UUIDs on
 list rows and the hero downgrade to their leading

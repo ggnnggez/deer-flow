@@ -158,10 +158,18 @@ export function useAnsichAlertWorkflow() {
   });
 }
 
+/**
+ * Failed projection/assessor jobs, globally or for one Task.
+ *
+ * `polling` is appended after `enabled` so the existing dialog call shape keeps
+ * working: the dialog opens on demand and fetches once, while the Task health
+ * line asks for the same cadence as the rest of a running Task's read models.
+ */
 export function useAnsichFailedJobs(
   taskId: string | undefined,
   limit = 100,
   enabled = true,
+  polling = false,
 ) {
   return useQuery({
     queryKey: [
@@ -174,6 +182,9 @@ export function useAnsichFailedJobs(
     queryFn: () => fetchAnsichFailedJobs(taskId, limit),
     enabled,
     retry: false,
+    refetchInterval: () =>
+      polling && pageIsVisible() ? REFRESH_INTERVAL_MS : false,
+    refetchIntervalInBackground: false,
   });
 }
 

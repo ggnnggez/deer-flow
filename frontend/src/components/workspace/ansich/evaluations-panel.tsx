@@ -24,7 +24,10 @@ import type {
 import { useI18n } from "@/core/i18n/hooks";
 import { cn } from "@/lib/utils";
 
-import { AnsichProjectionHealth } from "./projection-health";
+import {
+  AnsichProjectionHealthBanner,
+  useAnsichProjectionHealth,
+} from "./projection-health";
 import { AnsichShortId } from "./short-id";
 import { AnsichTechnicalEvidence } from "./technical-evidence";
 
@@ -84,6 +87,12 @@ export function AnsichEvaluationsPanel({
 }) {
   const { t } = useI18n();
   const query = useAnsichTaskEvaluations(taskId, true, polling);
+  const health = query.data?.projection_status ?? null;
+  const projectionHealth = useAnsichProjectionHealth({
+    health,
+    taskId,
+    polling,
+  });
 
   if (query.isPending) {
     return <Skeleton className="h-64 w-full" />;
@@ -99,12 +108,18 @@ export function AnsichEvaluationsPanel({
 
   const beliefs = query.data?.quality_beliefs ?? [];
   const evaluations = query.data?.evaluations ?? [];
-  const health = query.data?.projection_status ?? null;
 
   return (
     <div className="space-y-4">
-      {health ? (
-        <AnsichProjectionHealth health={health} taskId={taskId} />
+      {health && projectionHealth.visible && projectionHealth.scope ? (
+        <AnsichProjectionHealthBanner
+          health={health}
+          scope={projectionHealth.scope}
+          taskId={taskId}
+          onDismiss={
+            projectionHealth.dismissible ? projectionHealth.dismiss : undefined
+          }
+        />
       ) : null}
 
       <Card>

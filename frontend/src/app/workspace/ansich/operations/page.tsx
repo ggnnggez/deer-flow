@@ -9,9 +9,11 @@ import { Skeleton } from "@/components/ui/skeleton";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import {
   AnsichAlertPanel,
-  AnsichProjectionHealth,
+  AnsichHealthBadge,
+  AnsichProjectionHealthBanner,
   AnsichActiveTaskRow,
   AnsichTaskRow,
+  useAnsichProjectionHealth,
 } from "@/components/workspace/ansich";
 import {
   WorkspaceBody,
@@ -61,6 +63,10 @@ export default function AnsichOperationsPage() {
       : selectedView === "history"
         ? historyTasksQuery.error
         : alertsQuery.error;
+  const projectionHealth = useAnsichProjectionHealth({
+    health: selectedProjectionStatus,
+    enabled: isAdmin,
+  });
 
   useEffect(() => {
     document.title = `${t.ansich.title} - ${t.pages.appName}`;
@@ -74,9 +80,17 @@ export default function AnsichOperationsPage() {
           <header className="space-y-1">
             <div className="flex flex-wrap items-baseline justify-between gap-2">
               <h1 className="text-2xl font-semibold">{t.ansich.title}</h1>
-              <span className="text-muted-foreground text-xs">
-                {t.ansich.autoRefresh}
-              </span>
+              <div className="flex items-center gap-2">
+                <span className="text-muted-foreground text-xs">
+                  {t.ansich.autoRefresh}
+                </span>
+                {projectionHealth.badgeVisible && projectionHealth.scope ? (
+                  <AnsichHealthBadge
+                    scope={projectionHealth.scope}
+                    onClick={projectionHealth.restore}
+                  />
+                ) : null}
+              </div>
             </div>
             <p className="text-muted-foreground text-sm">
               {t.ansich.description}
@@ -97,11 +111,19 @@ export default function AnsichOperationsPage() {
             </Alert>
           ) : (
             <>
-              {selectedProjectionStatus ? (
-                <AnsichProjectionHealth health={selectedProjectionStatus} />
-              ) : (
+              {!selectedProjectionStatus ? (
                 <Skeleton className="h-18 w-full" />
-              )}
+              ) : projectionHealth.visible && projectionHealth.scope ? (
+                <AnsichProjectionHealthBanner
+                  health={selectedProjectionStatus}
+                  scope={projectionHealth.scope}
+                  onDismiss={
+                    projectionHealth.dismissible
+                      ? projectionHealth.dismiss
+                      : undefined
+                  }
+                />
+              ) : null}
 
               <Tabs
                 value={selectedView}

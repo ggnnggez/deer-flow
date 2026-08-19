@@ -731,6 +731,16 @@ export const enUS: Translations = {
     technicalDetails: "Technical details",
     systemDetails: "System details",
     dataHealthy: "Data healthy",
+    healthTaskComplete: "Task data complete",
+    healthTaskAttention: "This Task's data is incomplete",
+    healthSystemLevel: "System-level",
+    healthSystemLevelNote:
+      "A system-level projection problem, not this Task alone: this Task's own data may be incomplete or stale.",
+    healthDismiss: "Collapse",
+    healthBadgeLabel: (count: string) =>
+      `Projection warning: ${count} items need attention, click to expand`,
+    healthBadgeStatusLabel: (status: string) =>
+      `Projection warning: ${status}, click to expand`,
     copyTaskId: "Copy Task ID",
     currentActivity: "Current activity",
     whyAttention: "Why attention is needed",

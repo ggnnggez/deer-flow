@@ -120,6 +120,14 @@ Data healthy · lag 1.2s
 
 当 health 为 degraded/failed、failed jobs 大于零、存在 lost range 或 storage unavailable 时，状态提升为页面级横幅。完整 queue、水位、snapshot 与失败 job 信息进入 `System details` Drawer。
 
+横幅的口径按页面分层，避免与本页无关的告警反复打断操作：
+
+- Operations 页保持全局口径：全部 failed jobs、全部 lost range 与 projection status。
+- Task 详情页只统计本 Task 自己的 failed jobs（按 `task` 过滤的有界列表，取满一页时显示为 `50+`）与本 Task 自己的 lost range；`task_id` 为 null 的未归属丢失只属于系统口径，不计入任何 Task。其它 Task 造成的全局 degraded 不再在此提升为横幅。
+- 例外是系统级硬故障（`storage_available=false`，或 status 为 failed/stopped）：此时 Task 页自身的数据同样来自这份投影，不可信，必须显示一条明确标注为「系统级」的横幅，而不能声称本任务数据完整（永不虚构确定性）。横幅中的失败作业数可点击，直接打开已按本 Task 过滤的失败 Job 列表。
+
+横幅可被操作者收起：收起后横幅整体隐藏，页面标题行右侧出现一个琥珀色 `⚠ N` 徽标（真实 `button`，`aria-label` 携带当前状态），点击即可恢复横幅——信息只是被折叠，不会从无障碍树中消失。收起状态按口径分别保存在 sessionStorage（system 与 `task:<id>` 互不影响），记录的是收起当时的 failed jobs / lost 数量与 status 快照。当失败数或丢失数上升、或 status 恶化（healthy < degraded < failed/stopped）时，记录作废、横幅自动重新展开；恢复到无需关注时同样清除记录，使下一次异常仍以完整横幅开始。系统级硬故障不提供收起按钮。
+
 ### 5.3 Attention Queue
 
 Operations 的默认主区域是 Attention Queue，而不是所有 Running Task。

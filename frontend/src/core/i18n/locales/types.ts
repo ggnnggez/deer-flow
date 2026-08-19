@@ -618,6 +618,13 @@ export interface Translations {
     technicalDetails: string;
     systemDetails: string;
     dataHealthy: string;
+    healthTaskComplete: string;
+    healthTaskAttention: string;
+    healthSystemLevel: string;
+    healthSystemLevelNote: string;
+    healthDismiss: string;
+    healthBadgeLabel: (count: string) => string;
+    healthBadgeStatusLabel: (status: string) => string;
     copyTaskId: string;
     currentActivity: string;
     whyAttention: string;

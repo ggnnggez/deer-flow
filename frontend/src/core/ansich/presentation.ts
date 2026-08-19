@@ -161,6 +161,215 @@ export function isProjectionAttention(health: {
   );
 }
 
+export type AnsichHealthStatus = "healthy" | "degraded" | "failed" | "stopped";
+
+/** The projection-health fields the scope helpers below actually read. */
+export interface AnsichProjectionHealthFacts {
+  status: AnsichHealthStatus;
+  failed_jobs: number;
+  lost_ranges: AnsichLostRange[];
+  storage_available: boolean;
+}
+
+/**
+ * A projection failure no page can see past: storage is unavailable, or the
+ * projector itself failed/stopped. A Task-scoped view must surface this even
+ * when the Task's own numbers look clean, because those numbers come from the
+ * same projection — claiming the Task is fine would be fabricating certainty.
+ */
+export function isProjectionHardFailure(health: {
+  status: AnsichHealthStatus;
+  storage_available: boolean;
+}): boolean {
+  return (
+    !health.storage_available ||
+    health.status === "failed" ||
+    health.status === "stopped"
+  );
+}
+
+/**
+ * The lost ranges attributable to one Task. A range with `task_id: null` is
+ * unattributed loss and belongs to the system scope only: counting it against a
+ * Task would invent an attribution the projection never recorded.
+ */
+export function lostRangesForTask(
+  ranges: AnsichLostRange[],
+  taskId: string,
+): AnsichLostRange[] {
+  return ranges.filter((range) => range.task_id === taskId);
+}
+
+/** The state a dismissal was taken against, and the unit of "got worse". */
+export interface AnsichHealthSnapshot {
+  failedJobs: number;
+  lostObservations: number;
+  status: AnsichHealthStatus;
+}
+
+/**
+ * What one page's health line reports, at that page's scope (IA §5.2). The
+ * Operations page speaks for the whole projection; a Task page speaks only for
+ * its own Task, plus any system-level hard failure that invalidates it.
+ */
+export interface AnsichProjectionScope extends AnsichHealthSnapshot {
+  kind: "system" | "task";
+  /** Warrants a banner rather than the compact healthy line. */
+  attention: boolean;
+  /** Rule ③: untrustworthy projection, never dismissible. */
+  hardFailure: boolean;
+  /** The failed-job page filled its limit, so the count is a floor. */
+  failedJobsTruncated: boolean;
+  /** Failed jobs plus lost Observations — what the collapsed badge counts. */
+  attentionCount: number;
+  snapshot: AnsichHealthSnapshot;
+}
+
+function buildScope(
+  kind: "system" | "task",
+  snapshot: AnsichHealthSnapshot,
+  attention: boolean,
+  hardFailure: boolean,
+  failedJobsTruncated: boolean,
+): AnsichProjectionScope {
+  return {
+    ...snapshot,
+    kind,
+    attention,
+    hardFailure,
+    failedJobsTruncated,
+    attentionCount: snapshot.failedJobs + snapshot.lostObservations,
+    snapshot,
+  };
+}
+
+/** Projection health for the whole system (Operations page). */
+export function systemProjectionScope(
+  health: AnsichProjectionHealthFacts,
+): AnsichProjectionScope {
+  return buildScope(
+    "system",
+    {
+      failedJobs: health.failed_jobs,
+      lostObservations: countLostObservations(health.lost_ranges),
+      status: health.status,
+    },
+    isProjectionAttention(health),
+    isProjectionHardFailure(health),
+    false,
+  );
+}
+
+/**
+ * Projection health for one Task. Global degradation caused by *other* Tasks is
+ * deliberately out of scope — that noise is what drove operators to ignore the
+ * banner. The system status is inherited only when it is a hard failure, so a
+ * dismissed Task banner is never re-promoted by an unrelated incident.
+ *
+ * `failedJobs.count` comes from a bounded page of this Task's failed jobs, so
+ * `truncated` marks the count as a floor rather than a total.
+ */
+export function taskProjectionScope(
+  health: AnsichProjectionHealthFacts,
+  taskId: string,
+  failedJobs: { count: number; truncated: boolean },
+): AnsichProjectionScope {
+  const hardFailure = isProjectionHardFailure(health);
+  const lostObservations = countLostObservations(
+    lostRangesForTask(health.lost_ranges, taskId),
+  );
+  const localAttention = failedJobs.count > 0 || lostObservations > 0;
+  return buildScope(
+    "task",
+    {
+      failedJobs: failedJobs.count,
+      lostObservations,
+      status: hardFailure
+        ? health.status
+        : localAttention
+          ? "degraded"
+          : "healthy",
+    },
+    hardFailure || localAttention,
+    hardFailure,
+    failedJobs.truncated,
+  );
+}
+
+const HEALTH_STATUS_RANK: Record<AnsichHealthStatus, number> = {
+  healthy: 0,
+  degraded: 1,
+  failed: 2,
+  stopped: 2,
+};
+
+/**
+ * Whether the projection got worse than the state an operator dismissed. Only
+ * a rise re-promotes the banner: a steady or improving incident stays collapsed
+ * behind its badge.
+ */
+export function projectionHealthWorsened(
+  dismissed: AnsichHealthSnapshot,
+  current: AnsichHealthSnapshot,
+): boolean {
+  return (
+    current.failedJobs > dismissed.failedJobs ||
+    current.lostObservations > dismissed.lostObservations ||
+    HEALTH_STATUS_RANK[current.status] > HEALTH_STATUS_RANK[dismissed.status]
+  );
+}
+
+export interface AnsichProjectionHealthDisplay {
+  showBanner: boolean;
+  showBadge: boolean;
+  dismissible: boolean;
+  /** The stored dismissal no longer describes reality and must be dropped. */
+  clearDismissal: boolean;
+}
+
+/**
+ * Decide what one scope's health line shows given the dismissal an operator
+ * took against it. Dismissal hides the banner behind a header badge — it never
+ * removes the information from the page — and it is refused outright for a hard
+ * failure. A worsening state or a full recovery drops the record, so the next
+ * incident opens as a banner again rather than silently as a badge.
+ */
+export function resolveProjectionHealthDisplay(
+  scope: AnsichProjectionScope,
+  dismissed: AnsichHealthSnapshot | null,
+): AnsichProjectionHealthDisplay {
+  if (!scope.attention) {
+    return {
+      showBanner: false,
+      showBadge: false,
+      dismissible: false,
+      clearDismissal: dismissed !== null,
+    };
+  }
+  if (scope.hardFailure) {
+    return {
+      showBanner: true,
+      showBadge: false,
+      dismissible: false,
+      clearDismissal: dismissed !== null,
+    };
+  }
+  if (dismissed && !projectionHealthWorsened(dismissed, scope.snapshot)) {
+    return {
+      showBanner: false,
+      showBadge: true,
+      dismissible: true,
+      clearDismissal: false,
+    };
+  }
+  return {
+    showBanner: true,
+    showBadge: false,
+    dismissible: true,
+    clearDismissal: dismissed !== null,
+  };
+}
+
 export function formatDuration(milliseconds: number | null): string {
   if (milliseconds === null) return "—";
   const seconds = Math.floor(milliseconds / 1_000);

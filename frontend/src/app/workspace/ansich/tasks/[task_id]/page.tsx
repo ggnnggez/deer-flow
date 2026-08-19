@@ -2,7 +2,12 @@
 
 import { AlertCircleIcon, ArrowLeftIcon } from "lucide-react";
 import Link from "next/link";
-import { useParams, usePathname, useRouter, useSearchParams } from "next/navigation";
+import {
+  useParams,
+  usePathname,
+  useRouter,
+  useSearchParams,
+} from "next/navigation";
 import { useCallback, useEffect } from "react";
 
 import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert";
@@ -15,13 +20,15 @@ import {
   AnsichBudgetPanel,
   AnsichEvaluationsPanel,
   AnsichEvidenceSection,
+  AnsichHealthBadge,
   AnsichObservationTimeline,
-  AnsichProjectionHealth,
+  AnsichProjectionHealthBanner,
   AnsichStepsPanel,
   AnsichTaskDiagnosticStrip,
   AnsichTaskHero,
   AnsichTaskTreePanel,
   AnsichScopeEffectsPanel,
+  useAnsichProjectionHealth,
 } from "@/components/workspace/ansich";
 import {
   WorkspaceBody,
@@ -82,7 +89,8 @@ function extractBehaviorState(
       "") as string,
   ).toLowerCase();
   if (raw.includes("runaway")) return "runaway";
-  if (raw === "normal" || raw === "nominal" || raw === "within") return "normal";
+  if (raw === "normal" || raw === "nominal" || raw === "within")
+    return "normal";
   return "unknown";
 }
 
@@ -114,7 +122,12 @@ export default function AnsichTaskDetailPage() {
   const task = taskQuery.data?.task;
   const behavior = taskQuery.data?.behavior;
   const taskIsRunning = task?.control.value === "running";
-  const usageQuery = useAnsichTaskUsage(taskId, isAdmin, taskIsRunning, "local");
+  const usageQuery = useAnsichTaskUsage(
+    taskId,
+    isAdmin,
+    taskIsRunning,
+    "local",
+  );
   const budgetsQuery = useAnsichTaskBudgets(taskId, isAdmin, taskIsRunning);
   const stepsQuery = useAnsichTaskSteps(taskId, isAdmin, taskIsRunning);
   const timelineQuery = useAnsichTaskTimeline(taskId, isAdmin, taskIsRunning);
@@ -129,6 +142,12 @@ export default function AnsichTaskDetailPage() {
     taskQuery.data?.projection_status ??
     null;
   const queryError = taskQuery.error ?? timelineQuery.error;
+  const projectionHealth = useAnsichProjectionHealth({
+    health,
+    taskId,
+    enabled: isAdmin,
+    polling: taskIsRunning,
+  });
   const compressionIds = Array.from(
     new Set(
       (compressionsQuery.data?.pages ?? []).flatMap((page) =>
@@ -209,6 +228,14 @@ export default function AnsichTaskDetailPage() {
                 durationMs={durationMs}
                 childCount={childCount}
                 primarySignal={primarySignal}
+                actions={
+                  projectionHealth.badgeVisible && projectionHealth.scope ? (
+                    <AnsichHealthBadge
+                      scope={projectionHealth.scope}
+                      onClick={projectionHealth.restore}
+                    />
+                  ) : null
+                }
                 technicalDetails={
                   <dl className="grid gap-x-6 gap-y-2 text-xs sm:grid-cols-2">
                     <TechRow label={t.ansich.task} value={task.task_id} />
@@ -228,15 +255,20 @@ export default function AnsichTaskDetailPage() {
                 }
               />
 
-              {health && (
-                <AnsichProjectionHealth health={health} taskId={taskId} />
-              )}
+              {health && projectionHealth.visible && projectionHealth.scope ? (
+                <AnsichProjectionHealthBanner
+                  health={health}
+                  scope={projectionHealth.scope}
+                  taskId={taskId}
+                  onDismiss={
+                    projectionHealth.dismissible
+                      ? projectionHealth.dismiss
+                      : undefined
+                  }
+                />
+              ) : null}
 
-              <Tabs
-                value={view}
-                onValueChange={setView}
-                className="space-y-4"
-              >
+              <Tabs value={view} onValueChange={setView} className="space-y-4">
                 <TabsList variant="line">
                   <TabsTrigger value="summary">
                     {t.ansich.viewSummary}
@@ -280,10 +312,7 @@ export default function AnsichTaskDetailPage() {
                 </TabsContent>
 
                 <TabsContent value="evidence" className="space-y-3">
-                  <AnsichEvidenceSection
-                    title={t.ansich.timeline}
-                    defaultOpen
-                  >
+                  <AnsichEvidenceSection title={t.ansich.timeline} defaultOpen>
                     {timelineQuery.isPending ? (
                       <Skeleton className="h-48 w-full" />
                     ) : (
