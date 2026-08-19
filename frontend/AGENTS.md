@@ -124,7 +124,9 @@ leaving the accessibility tree. The dismissed state (failed/lost counts plus
 status) is kept per scope in `sessionStorage` (`core/ansich/health-dismissal.ts`,
 system and each Task independent); a rising count or a worsening status
 (healthy < degraded < failed/stopped) drops the record and re-promotes the
-banner, recovery clears it so the next incident opens as a banner again, and a
+banner, a recovery a real count can vouch for clears it so the next incident
+opens as a banner again (an unknown count clears nothing — otherwise the pending
+window after a reload would discard the record), and a
 hard failure renders no dismiss button at all. Every metric label in that drawer has a keyboard-focusable
 help trigger whose localized tooltip explains the metric's definition and diagnostic
 meaning; failed-job help stays separate from the clickable failed-job value. UUIDs on

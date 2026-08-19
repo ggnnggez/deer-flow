@@ -693,6 +693,58 @@ describe("resolveProjectionHealthDisplay", () => {
     });
   });
 
+  it("keeps the record while the count is unknown: unknown is not recovery", () => {
+    // The reload case: sessionStorage survives, the query cache does not, so
+    // health arrives before the count. Clearing here would downgrade a stored
+    // dismissal to an in-memory one, decided by a request race.
+    const unknownClean = taskProjectionScope(projectionHealth(), "task-1", {
+      count: null,
+      truncated: false,
+    });
+
+    expect(
+      resolveProjectionHealthDisplay(unknownClean, attentionScope.snapshot),
+    ).toEqual({
+      line: "unknown",
+      showBadge: false,
+      dismissible: false,
+      clearDismissal: false,
+    });
+
+    // …and once the count lands unchanged, the badge is back, not the banner.
+    expect(
+      resolveProjectionHealthDisplay(attentionScope, attentionScope.snapshot),
+    ).toEqual({
+      line: "none",
+      showBadge: true,
+      dismissible: true,
+      clearDismissal: false,
+    });
+  });
+
+  it("stays collapsed when a dismissed scope's count goes unknown", () => {
+    // Attention persists through the lost range, so this exercises the
+    // dismissed branch rather than the recovery branch.
+    const unknownWithLoss = taskProjectionScope(
+      projectionHealth({ lost_ranges: [lostRange(1, 2, "task-1")] }),
+      "task-1",
+      { count: null, truncated: false },
+    );
+
+    expect(
+      resolveProjectionHealthDisplay(unknownWithLoss, {
+        failedJobs: 1,
+        lostObservations: 2,
+        status: "degraded",
+      }),
+    ).toEqual({
+      line: "none",
+      showBadge: true,
+      dismissible: true,
+      clearDismissal: false,
+    });
+  });
+
   it("clears the record on recovery so the next incident starts as a banner", () => {
     const clean = taskProjectionScope(projectionHealth(), "task-1", {
       count: 0,

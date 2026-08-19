@@ -378,19 +378,26 @@ export interface AnsichProjectionHealthDisplay {
  * took against it. Dismissal hides the banner behind a header badge — it never
  * removes the information from the page — and it is refused outright for a hard
  * failure. A worsening state or a full recovery drops the record, so the next
- * incident opens as a banner again rather than silently as a badge.
+ * incident opens as a banner again rather than silently as a badge — but only a
+ * recovery a real count can vouch for: unknown is not a rise, not completeness,
+ * and not recovery either.
  */
 export function resolveProjectionHealthDisplay(
   scope: AnsichProjectionScope,
   dismissed: AnsichHealthSnapshot | null,
 ): AnsichProjectionHealthDisplay {
   if (!scope.attention) {
+    const unknown = scope.failedJobs === null;
     return {
       // A scope that cannot count its failed jobs may not claim completeness.
-      line: scope.failedJobs === null ? "unknown" : "healthy",
+      line: unknown ? "unknown" : "healthy",
       showBadge: false,
       dismissible: false,
-      clearDismissal: dismissed !== null,
+      // Nor is unknown a recovery: keep the record until a real count says so.
+      // Clearing here would let the pending window after a reload — where
+      // sessionStorage survives but the query cache does not — discard a
+      // dismissal, making its lifetime a request race.
+      clearDismissal: !unknown && dismissed !== null,
     };
   }
   if (scope.hardFailure) {
