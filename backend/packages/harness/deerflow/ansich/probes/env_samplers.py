@@ -86,15 +86,19 @@ def sample_aio_container(cgroup_dir: Path, *, proc_root: Path = Path("/proc")) -
     try:
         read_total = 0
         write_total = 0
+        saw_io = False
         for line in (cgroup_dir / "io.stat").read_text().splitlines():
             for field in line.split()[1:]:
                 if field.startswith("rbytes="):
                     read_total += int(field.removeprefix("rbytes="))
+                    saw_io = True
                 elif field.startswith("wbytes="):
                     write_total += int(field.removeprefix("wbytes="))
-        metrics["io_read_bytes"] = {"value": read_total, "limit": None}
-        metrics["io_write_bytes"] = {"value": write_total, "limit": None}
-    except OSError:
+                    saw_io = True
+        if saw_io:
+            metrics["io_read_bytes"] = {"value": read_total, "limit": None}
+            metrics["io_write_bytes"] = {"value": write_total, "limit": None}
+    except (OSError, ValueError):
         pass
     try:
         metrics["rss_bytes"] = {"value": int((cgroup_dir / "memory.current").read_text().strip()), "limit": None}

@@ -64,6 +64,44 @@ def test_sample_aio_container_missing_cgroup_files_omit_metrics(tmp_path):
     assert reading is None  # 什么都没读到 → 不发样本,不猜
 
 
+def test_sample_aio_container_malformed_io_stat_does_not_discard_other_metrics(tmp_path):
+    # Review finding 1: a malformed numeric field (rbytes=abc) must not raise
+    # out of the whole function — that would discard the already-collected
+    # fd_open metric and skip the still-readable rss_bytes below it. The
+    # io.stat block's own except must widen to (OSError, ValueError).
+    cgroup = tmp_path / "cg"
+    proc = tmp_path / "proc"
+    _write(cgroup / "cgroup.procs", "101\n")
+    _write(cgroup / "io.stat", "8:0 rbytes=abc wbytes=2000 rios=1 wios=2\n")
+    _write(cgroup / "memory.current", "4096\n")
+    (proc / "101" / "fd").mkdir(parents=True)
+    (proc / "101" / "fd" / "0").write_text("")
+    _write(proc / "101" / "limits", "Max open files            1024                 4096                 files\n")
+    reading = sample_aio_container(cgroup, proc_root=proc)
+    assert reading is not None
+    assert reading.metrics["fd_open"] == {"value": 1, "limit": 1024}
+    assert reading.metrics["rss_bytes"]["value"] == 4096
+    assert "io_read_bytes" not in reading.metrics
+    assert "io_write_bytes" not in reading.metrics
+
+
+def test_sample_aio_container_io_stat_without_byte_tokens_omits_io_metrics(tmp_path):
+    # Review finding 2: lines with no rbytes=/wbytes= tokens must not report a
+    # "confirmed zero" — that would violate the never-zero-filled discipline
+    # for something that was actually unparseable/absent.
+    cgroup = tmp_path / "cg"
+    _write(cgroup / "cgroup.procs", "")
+    _write(cgroup / "io.stat", "8:0 rios=1 wios=2\n")
+    reading = sample_aio_container(cgroup, proc_root=tmp_path / "proc")
+    assert reading is None
+    _write(cgroup / "memory.current", "4096\n")
+    reading = sample_aio_container(cgroup, proc_root=tmp_path / "proc")
+    assert reading is not None
+    assert "io_read_bytes" not in reading.metrics
+    assert "io_write_bytes" not in reading.metrics
+    assert reading.metrics["rss_bytes"]["value"] == 4096
+
+
 def test_local_provider_peek():
     # NOTE (deviation from brief's literal example): the real
     # ``LocalSandboxProvider.__init__`` takes only ``max_cached_threads`` (no

@@ -723,3 +723,30 @@ def test_create_sandbox_evicts_oldest_warm_replica_via_shared_lifecycle(tmp_path
     assert "warm-oldest" not in provider._warm_pool
     assert provider._warm_pool == {"warm-newest": (newest_info, 20.0)}
     assert provider._sandbox_infos["created"] is created_info
+
+
+# ── peek_thread_sandbox (Task 4 review fix) ──────────────────────────────────
+
+
+def test_peek_thread_sandbox_hit_returns_tracked_sandbox(tmp_path):
+    """A tracked (user, thread) must resolve to its AioSandbox via in-memory maps only."""
+    aio_mod = importlib.import_module("deerflow.community.aio_sandbox.aio_sandbox_provider")
+    provider = _make_provider(tmp_path)
+    provider._lock = aio_mod.threading.Lock()
+    provider._thread_sandboxes = {("user-1", "thread-1"): "sb-1"}
+    tracked = MagicMock()
+    provider._sandboxes = {"sb-1": tracked}
+
+    assert provider.peek_thread_sandbox("user-1", "thread-1") is tracked
+
+
+def test_peek_thread_sandbox_miss_returns_none(tmp_path):
+    """An untracked thread must return None without touching backend/ownership."""
+    aio_mod = importlib.import_module("deerflow.community.aio_sandbox.aio_sandbox_provider")
+    provider = _make_provider(tmp_path)
+    provider._lock = aio_mod.threading.Lock()
+    provider._thread_sandboxes = {("user-1", "thread-1"): "sb-1"}
+    provider._sandboxes = {"sb-1": MagicMock()}
+
+    assert provider.peek_thread_sandbox("user-1", "thread-unknown") is None
+    assert provider.peek_thread_sandbox("user-2", "thread-1") is None
