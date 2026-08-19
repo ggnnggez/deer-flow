@@ -31,6 +31,7 @@
 | F10-21 | 生产路径的 effect 恒 `scope_id=None`,`attempted_/realized_scope_violation` 两类结论在生产上不可达 | ⬜ 未修复 | — | — |
 | F10-22 | `sudo`/`env`/`timeout` 等包装命令下的 effect 分类未裁定,`sudo rm -rf` 目前落回 `process_execute` | ⬜ 未修复 | — | — |
 | F10-23 | `_assess_scope_safety_at` 直接校验原始行的 `payload_json`、不 hydrate externalized payload,externalized 的 `authorization.*`/`effect.*` 证据会把 assessor job 打成 durable failed(F10-8 同一危害类的 assessor 侧兄弟,既存) | ⬜ 未修复 | — | — |
+| F10-24 | `budget_health:*` 有两个生产写者,`asserted_at` 决胜在模拟事件钟与真实 ingest 墙钟之间比较——证据序已由 `order_wall_time_evidence` 收敛(`ae731b18`),但**断言结构形状**(`as_of_known` vs `enforcement`/`shadow`)仍随决胜漂移 | ⬜ 未修复(证据序半已修) | — | `ae731b18` |
 
 留观标记:F10-10 的第 4 条证据(`test_step_attempt_and_context_are_queryable_after_projection`)**未证实**——只做了排除法,没拿到原始失败文本。若它再轮换红,**先抓失败文本再修**,不要按已有的三条诊断类推。另:F10-10 的门禁只被 Task 8 的验收负载证明过(`e53cefbc` 记录了这条边界),Task 9 的更重负载下仍有 2 条已上门禁的测试翻红,详见该条的「后续观察」。
 
@@ -277,3 +278,12 @@
 ## 计划作者层面的系统性教训(留档)
 
 本阶段五个 Important 级的**计划**缺陷共享同一个形状:计划规定了结构,却没有规定这些结构必须保持的不变量。对每一个读模型、每一个对外发布的数字,计划都应当写出它的不变量、在哪里被执行、在哪里被测试,而不是只列出列。文档任务的文件清单应当从上一阶段的 docs commit 推导,而不是凭记忆罗列(Task 11 的文件清单漏掉 `phase-N-review-followups.md` 这个惯例,正是 F10-1–F10-3 之外还要额外补一份本文件的原因)。
+
+## F10-24. `budget_health:*` 双写者的 `asserted_at` 跨钟决胜
+
+- 状态:⬜ 未修复(证据序的一半已由 HOTFIX-0 `ae731b18` 收敛)。来源:P11-A 批 HOTFIX-0 的根因分析(`.superpowers/sdd/2026-08-19-ansich-p11a-write-resilience/hotfix-0-report.md`)。
+- 位置:`backend/packages/harness/deerflow/ansich/persistence/sql.py::_assess_absolute_limits_at`(评估器写者,`asserted_at`=模拟事件时间)与 `::_assess_budget_rows`(终端投影写者,`asserted_at`=真实 ingest 墙钟);`resolve_current_belief` 对两条同 `as_of`、同 `configured_rule` 权威的断言按 `asserted_at` 决胜。
+- 现状:证据**顺序**已通过共享纯函数 `ansich.budget.order_wall_time_evidence` + `SqlAnsichBackend._budget_usage_evidence` 在两个写者间收敛(时钟无关性已用 2026/2099 双 fixture 证明)。但两个写者的 `value_json` **结构形状不同**:终端投影写者带 `as_of_known`,评估器写者带 `enforcement`/`shadow`——读者拿到哪个形状取决于同一次跨钟决胜。`get_task_budget_health` 今天用 `.get()` 容忍两种形状,但任何依赖 `enforcement`/`shadow` 字段存在性的消费者会踩中。
+- 教训(测试作者规则,已在本条挂账):fixture 时间戳写「当天」会造出定时炸弹——真实时钟越过 fixture 时刻的一瞬,决胜翻转、断言由绿转红且永久。2026-08-20 的全量绿(所有 8/18-19 时间戳已成过去)证明当前无其他潜伏实例;新测试不得让 resolver 决胜落在模拟钟与真实钟之间。
+- 方向:二选一——(a) 收敛两个写者的 `value_json` 形状(终端写者补齐 `enforcement`/`shadow` 或评估器改为最小共同形状);(b) 给终端写者的断言一个 resolver 可确定性排序的权威/`config_hash` 维度,使决胜不再依赖钟。任选其一都要配「两个写者交错时读者拿到的形状稳定」的回归。
+- 归属:P11-B(与评估器债 F10-6/假说 (c) 同批同轨)。
