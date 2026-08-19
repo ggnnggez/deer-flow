@@ -1289,7 +1289,9 @@ git add backend/packages/harness/deerflow/ansich/persistence/models.py backend/p
 git commit -m "feat(ansich): environment read-model tables and migration 0026"
 ```
 
----### Task 8: `environment-projector@1`
+---
+
+### Task 8: `environment-projector@1`
 
 **Files:**
 - Modify: `backend/packages/harness/deerflow/ansich/persistence/sql.py`
