@@ -191,6 +191,8 @@ from deerflow.ansich.persistence.models import (
     AnsichContextWindowRow,
     AnsichCurrentBeliefRow,
     AnsichEntityRow,
+    AnsichEnvironmentCoverageRow,
+    AnsichEnvironmentStateRow,
     AnsichEvaluationIndexRow,
     AnsichLlmAttemptRow,
     AnsichObservationRow,
@@ -217,6 +219,7 @@ from deerflow.ansich.persistence.models import (
     AnsichToolCallResultRow,
     AnsichToolCallRow,
     AnsichToolEffectRow,
+    AnsichToolEnvSampleRow,
     AnsichTransitionRow,
     AnsichUsageContributionRow,
 )
@@ -289,6 +292,10 @@ _PROJECTORS = (
     ("task-budget", "1"),
     ("task-heartbeat", "1"),
     ("task-safety", "1"),
+    # Registration order is execution priority for one Observation, and the
+    # environment projection hangs off the Scope entity that ``task-safety``
+    # creates from ``scope.snapshotted`` — so it must follow it.
+    ("environment-projector", "1"),
     # Registered last on purpose: evaluations point at subjects (Task, Step,
     # ToolCall, ContentBlock, AgentRelease) that the projectors above create.
     ("evaluation-projector", "1"),
@@ -301,6 +308,7 @@ _PROJECTOR_KINDS = {
     "task-budget": frozenset({"budget.configured"}),
     "task-heartbeat": frozenset({"task.heartbeat"}),
     "task-safety": _SAFETY_PROJECTION_KINDS,
+    "environment-projector": frozenset({"environment.sampled"}),
     "evaluation-projector": frozenset({EVALUATION_OBSERVATION_KIND}),
 }
 _ASSESSOR_VERSIONS = {
@@ -909,6 +917,8 @@ class SqlAnsichBackend:
                         await self._project_heartbeat(session, observation)
                     elif projector_name == "task-safety":
                         await self._project_safety(session, observation)
+                    elif projector_name == "environment-projector":
+                        await self._project_environment(session, observation)
                     elif projector_name == "evaluation-projector":
                         await self._project_evaluation(session, observation)
                     else:
@@ -1064,6 +1074,12 @@ class SqlAnsichBackend:
                 AnsichTaskAgentReleaseRow,
                 AnsichAgentReleaseComponentRow,
                 AnsichAgentReleaseRow,
+                # Coverage and state carry an FK onto the Scope entity they
+                # describe, so they are deleted before AnsichEntityRow; the
+                # per-tool-call samples are FK-free but rebuild alongside them.
+                AnsichEnvironmentStateRow,
+                AnsichEnvironmentCoverageRow,
+                AnsichToolEnvSampleRow,
                 AnsichScopeRow,
                 AnsichTaskRow,
                 AnsichEntityRow,
@@ -7971,6 +7987,125 @@ class SqlAnsichBackend:
                         ordinal=0,
                     )
                 )
+
+    #: Metrics whose monotonic growth is worth tracking as a leak signal. Only
+    #: these drive ``consecutive_growth_count`` / ``growth_started_at``; every
+    #: other metric keeps its latest value and window minimum without a trend.
+    _GROWTH_TRACKED_METRICS = frozenset({"fd_open"})
+
+    async def _project_environment(
+        self,
+        session: AsyncSession,
+        observation: ObservationEnvelope,
+    ) -> None:
+        """Materialize one ``environment.sampled`` Observation.
+
+        Writes at most three rows: the ``(Scope, environment_scope)`` coverage
+        declaration, one current-state row per metric for continuous coverage,
+        and one per-tool-call row for ``per_command`` coverage. Every write is
+        replay-safe — a same-obs redelivery and a late sample are both no-ops,
+        so ``rebuild_projections()`` reconstructs identical rows.
+        """
+
+        from ansich.environment import EnvironmentSamplePayload
+
+        # strict=False: producers serialize the window datetimes as ISO strings.
+        payload = EnvironmentSamplePayload.model_validate(observation.payload, strict=False)
+        scope_id = observation.subject_id
+        if await session.get(AnsichEntityRow, scope_id) is None:
+            raise _ProjectionDependencyPending(f"environment sample {observation.obs_id} is waiting for Scope {scope_id}")
+
+        coverage = await session.get(AnsichEnvironmentCoverageRow, (scope_id, payload.environment_scope), with_for_update=True)
+        if coverage is None:
+            session.add(
+                AnsichEnvironmentCoverageRow(
+                    scope_id=scope_id,
+                    environment_scope=payload.environment_scope,
+                    coverage=payload.coverage,
+                    provider=payload.provider,
+                    as_of=observation.occurred_at,
+                    last_obs_id=observation.obs_id,
+                    updated_at=observation.recorded_at,
+                )
+            )
+        elif coverage.last_obs_id != observation.obs_id and observation.occurred_at >= _as_utc(coverage.as_of):
+            coverage.coverage = payload.coverage
+            coverage.provider = payload.provider
+            coverage.as_of = observation.occurred_at
+            coverage.last_obs_id = observation.obs_id
+            coverage.updated_at = observation.recorded_at
+
+        if payload.coverage == "per_command":
+            existing = await session.get(AnsichToolEnvSampleRow, payload.tool_call_id)
+            if existing is None:
+                metrics = payload.metrics
+                session.add(
+                    AnsichToolEnvSampleRow(
+                        tool_call_id=payload.tool_call_id,
+                        task_id=observation.task_id,
+                        scope_id=scope_id,
+                        io_read_bytes=(metrics["io_read_bytes"].value if "io_read_bytes" in metrics else None),
+                        io_write_bytes=(metrics["io_write_bytes"].value if "io_write_bytes" in metrics else None),
+                        fd_peak=(metrics["fd_open"].value if "fd_open" in metrics else None),
+                        sample_count=payload.window.sample_count,
+                        started_at=payload.window.started_at,
+                        ended_at=payload.window.ended_at,
+                        obs_id=observation.obs_id,
+                    )
+                )
+            # A per-command sample describes one tool call's own window, not the
+            # Scope's continuous trend, so it never moves the state row.
+            return
+
+        if payload.coverage == "uninstrumented":
+            return
+
+        for metric, value in payload.metrics.items():
+            # Lock the row BEFORE reading it: sibling projections of the same
+            # Scope can land on this row concurrently and every branch below is
+            # a read-modify-write, so an unlocked read would lose an update
+            # under Postgres READ COMMITTED. Same discipline as
+            # _upsert_high_water_contribution; FOR UPDATE is a no-op on SQLite.
+            row = await session.get(AnsichEnvironmentStateRow, (scope_id, payload.environment_scope, metric), with_for_update=True)
+            if row is None:
+                session.add(
+                    AnsichEnvironmentStateRow(
+                        scope_id=scope_id,
+                        environment_scope=payload.environment_scope,
+                        metric=metric,
+                        latest_value=value.value,
+                        limit_value=value.limit,
+                        as_of=observation.occurred_at,
+                        window_started_at=payload.window.started_at,
+                        window_min_value=value.value,
+                        sample_count=payload.window.sample_count,
+                        consecutive_growth_count=0,
+                        growth_started_at=None,
+                        last_obs_id=observation.obs_id,
+                        provider=payload.provider,
+                        updated_at=observation.recorded_at,
+                    )
+                )
+                continue
+            if row.last_obs_id == observation.obs_id or observation.occurred_at < _as_utc(row.as_of):
+                # Same-obs redelivery, or a sample older than what the row
+                # already reflects: no-op, so a replay is deterministic.
+                continue
+            if metric in self._GROWTH_TRACKED_METRICS and value.value > row.latest_value:
+                if row.consecutive_growth_count == 0:
+                    row.growth_started_at = observation.occurred_at
+                row.consecutive_growth_count += 1
+            else:
+                row.consecutive_growth_count = 0
+                row.growth_started_at = None
+            row.window_min_value = min(row.window_min_value, value.value)
+            row.latest_value = value.value
+            row.limit_value = value.limit
+            row.as_of = observation.occurred_at
+            row.sample_count += payload.window.sample_count
+            row.last_obs_id = observation.obs_id
+            row.provider = payload.provider
+            row.updated_at = observation.recorded_at
 
     async def _project_safety(
         self,
