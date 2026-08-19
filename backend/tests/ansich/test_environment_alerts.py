@@ -210,6 +210,7 @@ async def _alerts(session_factory: async_sessionmaker[AsyncSession]) -> list[Ans
                     .where(AnsichAlertRow.subject_id == _SCOPE_ID)
                     .order_by(
                         AnsichAlertRow.alert_type,
+                        AnsichAlertRow.stable_condition_key,
                         AnsichAlertRow.episode,
                     )
                 )
@@ -532,6 +533,162 @@ async def test_uninstrumented_declaration_asserts_unknown_without_state_rows(tmp
     # No state row exists, so the leak rule never runs for this Scope.
     assert leak_value is None
     assert alerts == []
+
+
+@pytest.mark.anyio
+async def test_resolving_after_the_task_ended_keeps_the_affected_task_ids(tmp_path) -> None:
+    """The closing write must not erase the operator's only attribution.
+
+    When the episode resolves, the Scope is usually a candidate through the
+    unresolved episode alone — no Task is running, so the freshly observed list
+    is empty. Writing that empty list over the stored ids would blank the read
+    model exactly when someone goes looking at the closed Alert.
+    """
+
+    task_id = new_id()
+    run_id = "env-affected"
+    async with _environment_service(tmp_path, "ansich-env-affected.db") as (
+        service,
+        session_factory,
+    ):
+        await _bootstrap(service, task_id, run_id)
+        await _record_sample(
+            service,
+            task_id,
+            run_id,
+            tick=1,
+            occurred_at=_STARTED_AT + timedelta(seconds=10),
+            metrics=_fd(990),
+        )
+        await service.assess_operations(now=_STARTED_AT + timedelta(seconds=11))
+        opened = await _alerts(session_factory)
+        assert [row.workflow_state for row in opened] == ["open"]
+        async with session_factory() as session:
+            at_open = await session.get(AnsichAlertReadModelRow, opened[0].entity_id)
+        assert at_open is not None
+        assert at_open.possibly_affected_task_ids == [task_id]
+
+        service.record(_task_completed(task_id, run_id, _STARTED_AT + timedelta(seconds=15)))
+        await service.flush_task(task_id)
+        # No running Task remains; the Scope stays a candidate only because the
+        # episode is still open. Samples stopped, so the state goes unknown and
+        # the episode resolves on one of these ticks.
+        for offset in (20, 41, 42):
+            await service.assess_operations(now=_STARTED_AT + timedelta(seconds=offset))
+        resolved = await _alerts(session_factory)
+        async with session_factory() as session:
+            at_resolve = await session.get(AnsichAlertReadModelRow, resolved[0].entity_id)
+        value = await _current_value(session_factory, _FD_FIELD)
+
+    assert [row.workflow_state for row in resolved] == ["resolved"]
+    assert value == "unknown"
+    assert at_resolve is not None
+    assert at_resolve.possibly_affected_task_ids == [task_id]
+
+
+@pytest.mark.anyio
+async def test_two_pressure_metrics_on_one_scope_do_not_resolve_each_other(tmp_path) -> None:
+    """One Scope, two stable keys under the same rule and Alert type.
+
+    ``reconcile_alert_conditions`` resolves any unreported key in an evaluated
+    ``(subject, rule, alert_type)`` scope, so the whole Scope must be reconciled
+    in one call. Reconciling metric by metric would make each metric close the
+    other's episode on every tick; this pins that it does not.
+    """
+
+    task_id = new_id()
+    run_id = "env-two-metrics"
+    metrics: dict[str, dict[str, int | None]] = {
+        "fd_open": {"value": 990, "limit": 1024},
+        "disk_free_bytes": {"value": 8, "limit": 100},
+    }
+    async with _environment_service(tmp_path, "ansich-env-two-metrics.db") as (
+        service,
+        session_factory,
+    ):
+        await _bootstrap(service, task_id, run_id)
+        await _record_sample(
+            service,
+            task_id,
+            run_id,
+            tick=1,
+            occurred_at=_STARTED_AT + timedelta(seconds=10),
+            metrics=metrics,
+        )
+        await service.assess_operations(now=_STARTED_AT + timedelta(seconds=11))
+        after_first = await _alerts(session_factory)
+        # Two further ticks with both conditions still breaching: any
+        # per-assessment reconcile would have closed one of them by now.
+        for offset in (15, 20):
+            await service.assess_operations(now=_STARTED_AT + timedelta(seconds=offset))
+        after_repeats = await _alerts(session_factory)
+        disk_value = await _current_value(session_factory, "environment_pressure:disk_free_bytes")
+        fd_value = await _current_value(session_factory, _FD_FIELD)
+
+    assert [row.stable_condition_key for row in after_first] == [
+        "env:disk_free_bytes",
+        "env:fd_open",
+    ]
+    assert [row.stable_condition_key for row in after_repeats] == [
+        "env:disk_free_bytes",
+        "env:fd_open",
+    ]
+    assert [row.workflow_state for row in after_repeats] == ["open", "open"]
+    assert [row.resolved_at for row in after_repeats] == [None, None]
+    assert [row.episode for row in after_repeats] == [1, 1]
+    assert [row.severity for row in after_repeats] == ["warning", "critical"]
+    assert [row.entity_id for row in after_first] == [row.entity_id for row in after_repeats]
+    assert disk_value == "warning"
+    assert fd_value == "critical"
+
+
+@pytest.mark.anyio
+async def test_severity_escalation_updates_the_open_episode_in_place(tmp_path) -> None:
+    """warning → critical is a confirm, not a new episode."""
+
+    task_id = new_id()
+    run_id = "env-escalation"
+    async with _environment_service(tmp_path, "ansich-env-escalation.db") as (
+        service,
+        session_factory,
+    ):
+        await _bootstrap(service, task_id, run_id)
+        await _record_sample(
+            service,
+            task_id,
+            run_id,
+            tick=1,
+            occurred_at=_STARTED_AT + timedelta(seconds=10),
+            metrics=_fd(850),
+        )
+        await service.assess_operations(now=_STARTED_AT + timedelta(seconds=11))
+        warned = await _alerts(session_factory)
+
+        await _record_sample(
+            service,
+            task_id,
+            run_id,
+            tick=2,
+            occurred_at=_STARTED_AT + timedelta(seconds=20),
+            metrics=_fd(990),
+        )
+        await service.assess_operations(now=_STARTED_AT + timedelta(seconds=21))
+        escalated = await _alerts(session_factory)
+        value = await _current_value(session_factory, _FD_FIELD)
+        async with session_factory() as session:
+            read_model = await session.get(AnsichAlertReadModelRow, escalated[0].entity_id)
+
+    assert [row.severity for row in warned] == ["warning"]
+    assert [row.workflow_state for row in warned] == ["open"]
+    assert len(escalated) == 1
+    assert escalated[0].entity_id == warned[0].entity_id
+    assert escalated[0].episode == warned[0].episode == 1
+    assert escalated[0].severity == "critical"
+    assert escalated[0].workflow_state == "open"
+    assert escalated[0].resolved_at is None
+    assert value == "critical"
+    assert read_model is not None
+    assert read_model.severity == "critical"
 
 
 @pytest.mark.anyio

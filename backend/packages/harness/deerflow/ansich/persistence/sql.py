@@ -2788,7 +2788,7 @@ class SqlAnsichBackend:
                     resolved_at=alert.resolved_at,
                     summary_json=summary_json,
                     evidence_count=len(alert.evidence),
-                    possibly_affected_task_ids=possibly_affected_task_ids,
+                    possibly_affected_task_ids=(possibly_affected_task_ids or None),
                 )
             )
         else:
@@ -2801,7 +2801,16 @@ class SqlAnsichBackend:
             read_model.resolved_at = alert.resolved_at
             read_model.summary_json = summary_json
             read_model.evidence_count = len(alert.evidence)
-            if possibly_affected_task_ids is not None:
+            if possibly_affected_task_ids:
+                # Overwrite only with a non-empty observation. The field means
+                # "Tasks running when this Alert was last sampled", and the
+                # sample that closes an episode is usually the one where the
+                # Task has already ended — the candidate Scope survives on its
+                # unresolved episode alone, so the list is empty exactly then.
+                # Writing that empty list would erase the operator's only
+                # attribution at the moment they most need it. Keeping the last
+                # non-empty observation is honest; unioning across time would
+                # not be, so it is deliberately not done.
                 read_model.possibly_affected_task_ids = possibly_affected_task_ids
 
     async def _resolve_terminal_alerts(
