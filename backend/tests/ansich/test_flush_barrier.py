@@ -673,6 +673,46 @@ async def test_a_refused_loss_report_is_offered_again_rather_than_skipped() -> N
 
 
 @pytest.mark.anyio
+async def test_a_loss_contiguous_with_a_reported_range_gets_its_own_report() -> None:
+    """The third way the cursor could lie: coalescing across the boundary.
+
+    ``_record_loss`` merges a loss into the last range when it continues it —
+    same Task, same producer, next sequence — which is what keeps an outage from
+    filing one range per row. But a range that has *already been written* into
+    the Observation stream is finished: extending it in place hides the
+    extension below the reporting cursor, where the pass can never see it again,
+    and the ranges the pass did write claim less loss than the collector
+    charged. Under-reporting loss is the one direction that is never allowed.
+
+    So coalescing stops at the boundary: a loss that continues a reported range
+    opens a new one, which is reported in its own right on the next pass.
+
+    Driven at the rule's own level. Reaching it end to end needs a successful
+    write — the only thing that runs the reporting pass — to land *between* two
+    losses that are contiguous in the collector sequence and share a producer,
+    and the incident shapes that charge contiguous rows charge them without an
+    intervening write. The two seams are called here in exactly the order the
+    service calls them in.
+    """
+
+    task_id = new_id()
+    backend = _RecordingBackend()
+    service = AnsichService(backend, flush_interval_ms=60_000)
+
+    with service._lock:
+        service._record_loss(1, task_id, producer_name="probe", producer_instance_id="local")
+    await service._report_degradation_if_storage_recovered()
+    with service._lock:
+        service._record_loss(2, task_id, producer_name="probe", producer_instance_id="local")
+    await service._report_degradation_if_storage_recovered()
+
+    assert [(report.payload["first_sequence"], report.payload["last_sequence"]) for report in backend.degradation_reports] == [(1, 1), (2, 2)]
+    # Two ranges, not one extended one: the second is what carries the second
+    # report, and health shows the same two the stream was told about.
+    assert [(lost.first_sequence, lost.last_sequence) for lost in service.get_health().lost_ranges] == [(1, 1), (2, 2)]
+
+
+@pytest.mark.anyio
 async def test_a_barrier_on_a_task_with_nothing_queued_reports_the_known_watermark() -> None:
     """Old-field clamp: an empty selection is still a successful flush."""
 

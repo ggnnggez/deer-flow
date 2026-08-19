@@ -55,6 +55,13 @@ from ansich.usage import AggregationScope, TaskUsageBreakdownView, TaskUsageByMo
 logger = logging.getLogger(__name__)
 _DROP_WARNING_INTERVAL_SECONDS = 60.0
 _PRODUCER_ACCOUNT_LIMIT = 256
+# How many charged Observation ids the receipt path can still name. Loss is
+# already accounted permanently in `dropped_count` and `_lost_ranges`; this set
+# only answers "was *this* Observation one of them", which is a question that
+# stops being asked shortly after the intake that provoked it. Losing the oldest
+# entries costs no honesty — an id nothing remembers is also in no queue and in
+# no database, so it is presumed lost rather than reported pending (RA6).
+_LOST_OBSERVATION_ID_LIMIT = 4096
 
 
 def _serialized_observation_size(observation: ObservationEnvelope) -> int:
@@ -146,6 +153,10 @@ class AnsichService:
         self._lock = Lock()
         self._running = False
         self._started = False
+        # Raised for the whole of `start()`, including its awaits, so `stop()`
+        # can refuse to drain loops that do not exist yet. Deliberately not a
+        # lifecycle input: `starting` is already derived from the flags below.
+        self._starting = False
         self._stopping = False
         self._stopped = False
         self._backend = backend
@@ -201,6 +212,12 @@ class AnsichService:
         # Lowest sequence ever charged as lost. A lost sequence is a permanent
         # hole: the contiguous persistence watermark can never pass it.
         self._lowest_lost_sequence: int | None = None
+        # The Observation ids charged as lost, newest last, bounded at
+        # `_LOST_OBSERVATION_ID_LIMIT`. An `OrderedDict` used as a FIFO set:
+        # every loss path that carries an envelope registers here, and the
+        # receipt path (RA6) reads it to tell a row something refused from a row
+        # that is merely still on its way.
+        self._lost_observation_ids: OrderedDict[str, None] = OrderedDict()
         self._last_drop_warning_at: float | None = None
         self._suppressed_drop_warning_count = 0
         self._loop: asyncio.AbstractEventLoop | None = None
@@ -247,8 +264,22 @@ class AnsichService:
         )
 
     async def start(self) -> None:
+        """Bring the collector up: bootstrap storage, then the writer and projector.
+
+        Raises ``RuntimeError`` if a ``stop()`` is in progress. The two calls
+        exclude each other because a start landing inside a drain re-arms the
+        flags that drain is still using: health would walk ``shutting_down ->
+        healthy``, which is not a legal transition, and the drain would go on
+        charging rows behind a service reporting itself up. No ordering of the
+        flag writes below makes that safe, so it is refused instead. Starting an
+        already-running service stays a no-op.
+        """
+
+        if self._stopping:
+            raise RuntimeError("cannot start an Ansich service while it is stopping")
         if self._running:
             return
+        self._starting = True
         # Re-arm the lifecycle flags before the first await, `_started` first:
         # a restart must be observed as stopped -> starting -> healthy, and
         # clearing `_stopped` first would let a reader see the service back in
@@ -282,6 +313,8 @@ class AnsichService:
             # claim a collector is on its way up when nothing is coming.
             self._stopped = True
             raise
+        finally:
+            self._starting = False
 
     def record(self, observation: ObservationEnvelope) -> RecordReceipt:
         return self.record_batch((observation,))[0]
@@ -672,6 +705,28 @@ class AnsichService:
         state after one bounded settle attempt rather than blocking until every
         projector finishes. A replayed intake never records a second
         Observation — it reports the stored one and the status it has now.
+
+        **What the status is resolved from** (RA6). ``pending`` is a promise: it
+        says a projection job exists and polling will eventually answer. So the
+        receipt is read off the state the Observation is actually in, not off
+        the boolean of the write that was attempted for it —
+
+        1. queued, or in a writer's hands: ``pending``. It is on its way.
+        2. charged as lost: ``failed``. Something refused it.
+        3. durable: whatever its projection jobs say.
+        4. none of the above: ``failed``, presumed lost. An accepted ``obs_id``
+           that is in no queue, no writer's hands and no database — the shape a
+           restart leaves — has nothing left to poll.
+
+        This makes the answer **precise rather than conservative**. Reading
+        ``flush_task(...).persisted`` was neither: under RA5② a terminal budget
+        closing is not a refusal, so it returned the row to the queue for the
+        writer, and the receipt called a live Observation ``failed``. It also
+        had nothing to say about (4), where the previous rule's ``pending``
+        promised a job that no longer exists.
+
+        A rejected *intake* still short-circuits: it was never queued, so it has
+        nothing to flush, and rung 2 would reach the same answer anyway.
         """
 
         # The envelope resolves the replay identity: a benchmark evaluation
@@ -688,47 +743,84 @@ class AnsichService:
         if existing_obs_id is not None:
             return EvaluationRecordReceipt(
                 observation_id=existing_obs_id,
-                projection_status=await self._evaluation_projection_status(existing_obs_id),
+                projection_status=await self._resolve_evaluation_receipt_status(existing_obs_id),
                 idempotent_replay=True,
             )
         if not self.record(observation).accepted:
             # A rejected intake (storage unavailable, stopped service, queue
             # overflow) was never made durable, so its projection can never
-            # land; the loss is already accounted as a lost range.
+            # land; the loss is already accounted as a lost range, and the
+            # resolution below would reach the same answer through rung 2.
             return EvaluationRecordReceipt(
                 observation_id=observation.obs_id,
                 projection_status="failed",
                 idempotent_replay=False,
             )
-        if not (await self.flush_task(record.task_id)).persisted:
-            # The same reasoning one branch up, for the write rather than the
-            # intake: nothing was persisted, so no projection job exists and
-            # reporting "pending" would leave the caller waiting on one that
-            # cannot arrive. A storage failure charged the Observation as lost;
-            # a terminal-flush timeout returned it to the queue for the writer
-            # (RA5②), which makes this answer conservative rather than final —
-            # the row may still land. A settle timeout AFTER a successful write
-            # keeps ``persisted=True`` and correctly falls through to the real
-            # job status below.
-            return EvaluationRecordReceipt(
-                observation_id=observation.obs_id,
-                projection_status="failed",
-                idempotent_replay=False,
-            )
+        # The barrier's own verdict is deliberately not read: it says whether
+        # *this call* placed the row, and RA5② made that a different question
+        # from whether the row is still alive. What it is still wanted for is
+        # its effect — it is the bounded attempt to make the answer `applied`
+        # rather than `pending` before the caller ever sees it.
+        await self.flush_task(record.task_id)
         return EvaluationRecordReceipt(
             observation_id=observation.obs_id,
-            projection_status=await self._evaluation_projection_status(observation.obs_id),
+            projection_status=await self._resolve_evaluation_receipt_status(observation.obs_id),
             idempotent_replay=False,
         )
 
+    async def _resolve_evaluation_receipt_status(self, obs_id: str) -> EvaluationProjectionStatus:
+        """Answer where one accepted Observation stands, in RA6's order.
+
+        The order is the whole of it, because more than one rung can hold an
+        opinion about the same id and only the first is entitled to it: an
+        outstanding row is in no database yet, and a charged row is in no
+        database ever. See ``record_evaluation`` for what each rung means.
+        """
+
+        with self._lock:
+            if self._observation_outstanding(obs_id):
+                return "pending"
+            charged = obs_id in self._lost_observation_ids
+        if charged:
+            return "failed"
+        return await self._evaluation_projection_status(obs_id)
+
+    def _observation_outstanding(self, obs_id: str) -> bool:
+        """True while this Observation is queued or in a writer's hands.
+
+        Bounded by ``queue_capacity`` and only ever walked from the receipt
+        path, which is one HTTP request rather than the record hot path; the
+        terminal barrier already scans the same queue under the same lock.
+        Callers must already hold ``self._lock``.
+        """
+
+        for _, observation, _ in self._queue:
+            if observation.obs_id == obs_id:
+                return True
+        for batch in self._in_flight.values():
+            for _, observation in batch:
+                if observation.obs_id == obs_id:
+                    return True
+        return False
+
     async def _evaluation_projection_status(self, obs_id: str) -> EvaluationProjectionStatus:
+        """RA6's last two rungs: what storage says about this Observation's jobs.
+
+        No job for an Observation the caller was told was accepted is not a job
+        that has yet to appear — jobs are committed with the Observation they
+        belong to — so it reads as ``failed`` rather than as a ``pending`` that
+        nothing will ever settle. A backend that cannot answer at all is the one
+        exception: absence of a *reader* says nothing about the Observation, so
+        the unknown keeps the pre-RA6 ``pending``.
+        """
+
         if not self.get_health().storage_available:
             return "failed"
         read_status = getattr(self._backend, "get_observation_projection_status", None)
         if not callable(read_status):
             return "pending"
         status = await read_status(obs_id)
-        return "pending" if status is None else status
+        return "failed" if status is None else status
 
     async def get_evaluation_subject(self, subject_id: str) -> str | None:
         """Return the Entity type an evaluation subject id resolves to."""
@@ -1384,6 +1476,26 @@ class AnsichService:
         return await get_detail(job_id=job_id, kind=kind)
 
     async def stop(self) -> None:
+        """Drain what the writer still holds on a budget, then join the loops.
+
+        Raises ``RuntimeError`` if a ``start()`` is in progress: until it
+        returns there are no loops to drain, and a stop that found none would
+        return immediately and leave the half-built service coming up behind it.
+        Stopping an already-stopped service stays a no-op.
+
+        RA7. ``stop_drain_timeout_ms`` is the whole of the writer's remaining
+        work, and it bounds the **attempt**, not the number of attempts: the
+        writer can be inside a ``persist_and_project`` that never answers, which
+        no count of retries can shorten, so the budget has to be able to take
+        the attempt away. What the drain could not place by then is charged and
+        reported once — see ``_drain_writer``.
+
+        The projector keeps joining unconditionally: it holds no rows of its
+        own, so a slow projection delays shutdown without risking data.
+        """
+
+        if self._starting:
+            raise RuntimeError("cannot stop an Ansich service while it is starting")
         if not self._running:
             return
         # The drain is its own lifecycle phase: a backlog and write retries are
@@ -1401,7 +1513,7 @@ class AnsichService:
                 self._wake_event.set()
             writer_task = self._writer_task
             if writer_task is not None:
-                await writer_task
+                await self._drain_writer(writer_task)
             self._writer_task = None
             if self._projector_wake_event is not None:
                 self._projector_wake_event.set()
@@ -1414,6 +1526,58 @@ class AnsichService:
             # stopped service instead of one that reports shutting down forever.
             self._stopped = True
             self._stopping = False
+
+    async def _drain_writer(self, writer_task: asyncio.Task[None]) -> None:
+        """Give the writer ``stop_drain_timeout_ms`` to finish, then take the loss.
+
+        RA7. The drain is not a separate writer: ``_writer_loop`` keeps running
+        with ``_running`` already false, which is what turns its retry paths
+        into single direct attempts (a refusal is charged rather than retried,
+        and the stop event cuts any wait it is already inside short). So the
+        budget's job is not to stop it retrying — it is to bound the one thing
+        retry logic cannot: an attempt that never returns. ``wait_for`` cancels
+        the task and waits for the cancellation to land, so a wedged backend
+        costs the budget rather than the process.
+
+        What the cancellation leaves behind is charged in two halves, and
+        neither can charge the other's rows twice. The batch the writer had in
+        its hands is released and charged by ``_flush_batch``'s own
+        ``BaseException`` handler, from the in-flight entry rather than from the
+        list that entered it, so rows that already landed are not invented as
+        loss. Everything still queued is charged here, and leaves the queue with
+        the same locked write — a row counted lost while still reported as
+        queued would be reported twice.
+
+        The WARNING is emitted once, from here, and is deliberately **not**
+        rate-limited: a drain happens once per process, and a shutdown that lost
+        rows must not be swallowed by an unrelated drop sixty seconds earlier.
+        It reports everything charged while the drain ran — both halves above,
+        plus anything the accept path rejected in the meantime, which is loss
+        this shutdown caused just the same.
+        """
+
+        with self._lock:
+            charged_before = self._dropped_count
+            opened_ranges_from = len(self._lost_ranges)
+        try:
+            await asyncio.wait_for(writer_task, timeout=self._stop_drain_timeout_seconds)
+            return
+        except TimeoutError:
+            pass
+        with self._lock:
+            remaining = [(sequence, observation) for sequence, observation, _ in self._queue]
+            self._queue = deque()
+            self._queue_bytes = 0
+            for sequence, observation in remaining:
+                self._record_observation_loss(sequence, observation)
+            # A range charged before the drain and merely *extended* by it stays
+            # out of this slice; the count above is the exact figure either way.
+            self._emit_drop_warning(
+                reason="stop_drain_timeout",
+                observation_count=self._dropped_count - charged_before,
+                lost_ranges=tuple(self._lost_ranges[opened_ranges_from:]),
+                suppressed_warning_count=self._suppressed_drop_warning_count,
+            )
 
     def _producer_account(self, producer_name: str, producer_instance_id: str) -> _ProducerAccount:
         """Return one producer instance's account, creating it on first sighting.
@@ -1476,7 +1640,15 @@ class AnsichService:
         # number rather than rescanned out of `_lost_ranges`, which coalesces.
         if self._lowest_lost_sequence is None or sequence < self._lowest_lost_sequence:
             self._lowest_lost_sequence = sequence
-        if self._lost_ranges:
+        # Coalescing stops at the reporting boundary. A range the degradation
+        # pass has already written is finished: extending it in place would hide
+        # the extension below `_lost_range_report_cursor`, where the pass can
+        # never offer it again, and the ranges the stream was told about would
+        # claim less loss than the collector charged. A loss that continues a
+        # reported range therefore opens a new one, which is reported in its own
+        # right — the cursor is what makes "already reported" a fact rather than
+        # a guess, so the check is against it and not against a flag per range.
+        if len(self._lost_ranges) > self._lost_range_report_cursor:
             previous = self._lost_ranges[-1]
             if previous.task_id == task_id and previous.producer_name == producer_name and previous.producer_instance_id == producer_instance_id and previous.last_sequence + 1 == sequence:
                 extended = previous.model_copy(update={"last_sequence": sequence})
@@ -1510,6 +1682,11 @@ class AnsichService:
                 task_id = observation.task_id
                 producer_name = observation.producer.name
                 producer_instance_id = observation.producer.instance_id
+                # The reject path is the other loss funnel that holds envelopes,
+                # so the receipt tracking is registered here as well as in
+                # `_record_observation_loss` (RA6). `_record_loss` itself sees
+                # only sequences, which is why neither of them can hook it.
+                self._track_lost_observation(observation.obs_id)
                 self._record_loss(
                     sequence,
                     task_id,
@@ -1544,13 +1721,47 @@ class AnsichService:
         observation_count: int,
         lost_ranges: tuple[LostRange, ...],
     ) -> None:
+        """Say a batch was dropped, at most once per ``_DROP_WARNING_INTERVAL_SECONDS``.
+
+        The window is shared by every recurring drop reason — overflow, poison —
+        because those arrive in floods and one log line per row is how a real
+        incident becomes unreadable. What it suppresses is counted, so the next
+        warning inside the window says how much it stands for.
+        """
+
         warning_at = time.monotonic()
         if self._last_drop_warning_at is not None and warning_at - self._last_drop_warning_at < _DROP_WARNING_INTERVAL_SECONDS:
             self._suppressed_drop_warning_count += 1
             return
+        if not self._emit_drop_warning(
+            reason=reason,
+            observation_count=observation_count,
+            lost_ranges=lost_ranges,
+            suppressed_warning_count=self._suppressed_drop_warning_count,
+        ):
+            return
+        self._last_drop_warning_at = warning_at
+        self._suppressed_drop_warning_count = 0
+
+    def _emit_drop_warning(
+        self,
+        *,
+        reason: str,
+        observation_count: int,
+        lost_ranges: tuple[LostRange, ...],
+        suppressed_warning_count: int,
+    ) -> bool:
+        """Write one structured drop WARNING. ``False`` if logging itself failed.
+
+        Split out of ``_warn_batch_loss`` for the one caller that must not be
+        rate-limited: the stop drain reports at most once per process, and a
+        shutdown that lost rows may not be swallowed by an unrelated drop a
+        minute earlier. Collection stays fail-open — a handler that raises costs
+        the message, never the caller.
+        """
+
         detected_at = datetime.now(UTC).isoformat()
         serialized_ranges = tuple(item.model_dump(mode="json") for item in lost_ranges)
-        suppressed_warning_count = self._suppressed_drop_warning_count
         try:
             logger.warning(
                 "Ansich collector dropped %d observation(s): reason=%s detected_at=%s lost_ranges=%s suppressed_drop_warnings=%d",
@@ -1573,9 +1784,28 @@ class AnsichService:
                 },
             )
         except Exception:
-            return
-        self._last_drop_warning_at = warning_at
-        self._suppressed_drop_warning_count = 0
+            return False
+        return True
+
+    def _track_lost_observation(self, obs_id: str) -> None:
+        """Remember that this Observation was charged, within a bounded window.
+
+        RA6's second rung. The receipt path has to separate a row something
+        refused from a row that is merely still on its way, and neither
+        ``dropped_count`` nor a ``LostRange`` can answer that about one
+        ``obs_id`` — the ranges are numbered in collector sequences, which a
+        caller holding a receipt never saw.
+
+        Bounded FIFO rather than a growing set: the question is only ever asked
+        shortly after the intake that provoked it, and an id that has aged out is
+        not *forgotten* — it is in no queue and in no database either, which the
+        resolution's last rung reads as lost. Callers must already hold
+        ``self._lock``.
+        """
+
+        self._lost_observation_ids[obs_id] = None
+        while len(self._lost_observation_ids) > _LOST_OBSERVATION_ID_LIMIT:
+            self._lost_observation_ids.popitem(last=False)
 
     def _record_observation_loss(self, sequence: int, observation: ObservationEnvelope) -> None:
         """Charge one observation at the **collector** sequence it was accepted under.
@@ -1590,9 +1820,14 @@ class AnsichService:
         needed to change to fix it — every caller already carries the collector
         sequence beside the observation in its `(sequence, observation)` tuple.
 
+        This is also where every *writer-side* loss registers its ``obs_id`` for
+        the receipt path (RA6): the charged batch, the poison verdict and the
+        stop drain all reach the ledger through here.
+
         Callers must already hold ``self._lock``.
         """
 
+        self._track_lost_observation(observation.obs_id)
         self._record_loss(
             sequence,
             observation.task_id,
@@ -2174,14 +2409,19 @@ class AnsichService:
         as lost and still reported as held would report the same observations
         twice to whoever is reading health at that moment.
 
-        ``only_if_parked`` is the cancellation path's guard, and it decides two
-        things at once. A batch that already landed and was released has nothing
-        to charge, and charging it anyway would invent a loss that never
-        happened. And what a still-parked batch may be charged is **what the
-        buffer says it holds**, not the list that entered: per-item isolation
-        shrinks that entry as rows resolve, so `selected` there names rows that
-        are already durable and rows already charged as poison. Reading the
-        released tuple keeps the charge exactly as wide as the remainder.
+        **What a parked batch may be charged is what the buffer says it holds**,
+        not the list that entered. Per-item isolation shrinks that entry as rows
+        resolve, so `selected` can name rows that are already durable and rows
+        already charged as poison; the released tuple keeps the charge exactly
+        as wide as the remainder. That is true of every caller, not only the
+        cancellation path — the two agree today, and the buffer is the one that
+        cannot go stale — so the released tuple wins whenever there is one.
+
+        ``only_if_parked`` decides the other question: what to do when there is
+        *no* entry left. For the cancellation path that means the batch already
+        landed and was released, so charging it would invent a loss that never
+        happened; for the paths that charge a refusal they just received, the
+        list they hold is the whole of what was refused.
         """
 
         charged: tuple[tuple[int, ObservationEnvelope], ...] | list[tuple[int, ObservationEnvelope]] = selected
@@ -2189,10 +2429,10 @@ class AnsichService:
             if in_flight_token is not None:
                 released = self._in_flight.get(in_flight_token)
                 self._discard_in_flight(in_flight_token)
-                if only_if_parked:
-                    if released is None:
-                        return False
+                if released is not None:
                     charged = released
+                elif only_if_parked:
+                    return False
             for sequence, observation in charged:
                 self._record_observation_loss(sequence, observation)
             self._writer_backoff_until = None

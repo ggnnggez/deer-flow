@@ -514,16 +514,18 @@ class _StalledStorageBackend:
 
 
 @pytest.mark.anyio
-async def test_record_evaluation_receipt_is_failed_when_the_flush_does_not_persist() -> None:
-    """The intake's own write did not land, so the receipt may not say `pending`.
+async def test_record_evaluation_receipt_is_pending_when_the_flush_leaves_the_row_alive() -> None:
+    """The terminal window closed with the write in flight — which is not a refusal.
 
-    A `pending` receipt is a promise that a projection job exists to poll, and
-    nothing was written here — that part is F10-7's subject and is unchanged.
-    What changed under RA5② is the fate of the Observation: the terminal window
-    closing is not a refusal, so the row goes back on the queue for the writer
-    instead of being charged as lost. The receipt is therefore *conservative*
-    rather than final — the row may still land — which is the direction Task 7
-    revisits when receipt terminality gets its own rules.
+    F10-7's rule is unchanged: a `pending` receipt promises a projection job
+    exists to poll, so an Observation that was never written may not claim it.
+    What changed is which Observations those are. Under RA5② a closing terminal
+    window returns the selection to the head of the queue instead of charging
+    it, and RA6 resolves the receipt from that state rather than from
+    `flush_task(...).persisted`: a row that is queued or in a writer's hands is
+    still on its way to storage, and calling it `failed` reported an incident
+    that had not happened. The full ladder is
+    `tests/ansich/test_receipt_terminality.py`'s subject.
     """
 
     task_id = new_id()
@@ -548,7 +550,7 @@ async def test_record_evaluation_receipt_is_failed_when_the_flush_does_not_persi
         await service.stop()
 
     assert backend.persist_calls >= 1
-    assert receipt.projection_status == "failed"
+    assert receipt.projection_status == "pending"
     assert receipt.idempotent_replay is False
     # Nothing refused the write, so nothing is charged: the Observation is in
     # the queue or in the writer's hands, never nowhere.

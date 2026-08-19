@@ -59,6 +59,14 @@ LIFECYCLE_PHASES: dict[str, dict[str, bool]] = {
 # order their flag writes: ``stop()`` marks stopping before it clears running
 # and writes stopped before it clears stopping, and ``start()`` re-arms
 # ``started`` first, so neither leaves a gap phase a reader could observe.
+#
+# The table's precondition is that the two calls never overlap, and that is
+# enforced rather than assumed: ``start()`` raises while ``_stopping`` is up and
+# ``stop()`` raises while ``_starting`` is (the re-entrancy guard, pinned by
+# ``test_bounded_stop.py``'s two refusal tests). Without it a start landing
+# inside a drain would re-arm the flags mid-``stopping``, producing the
+# ``stopping -> running`` step that is missing here on purpose — and with it the
+# ``shutting_down -> healthy`` transition the clamp below calls illegal.
 PHASE_STEPS: tuple[tuple[str, str], ...] = (
     ("pre_start", "pre_start"),  # not started yet
     ("pre_start", "running"),  # start() finished
