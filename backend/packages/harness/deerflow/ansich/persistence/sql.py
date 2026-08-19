@@ -8602,10 +8602,23 @@ class SqlAnsichBackend:
                 if row.consecutive_growth_count == 0:
                     row.growth_started_at = observation.occurred_at
                 row.consecutive_growth_count += 1
+                # A continuing run keeps its running minimum, which — because
+                # every sample in the run is strictly larger than the previous
+                # one — is exactly the value the run started from.
+                row.window_min_value = min(row.window_min_value, value.value)
             else:
                 row.consecutive_growth_count = 0
                 row.growth_started_at = None
-            row.window_min_value = min(row.window_min_value, value.value)
+                # The streak broke, so re-anchor the baseline to this sample.
+                # Keeping a lifetime minimum here (fd=50 at container start,
+                # steady working set 400) would make the leak rule's
+                # ``latest - window_min`` compare against a dip nobody is
+                # growing away from any more, and any later six-sample wobble
+                # would read as suspected. Semantics after this reset:
+                # "minimum since the current growth run began", derived only
+                # from this row's own ordered inputs, so a replay is
+                # deterministic.
+                row.window_min_value = value.value
             row.latest_value = value.value
             row.limit_value = value.limit
             row.as_of = observation.occurred_at

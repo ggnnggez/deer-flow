@@ -1618,6 +1618,12 @@ class AnsichEnvironmentStateRow(Base):
     (``window_started_at`` / ``window_min_value`` / ``consecutive_growth_count``
     / ``growth_started_at``) so an assessor can detect sustained monotonic
     growth (e.g. a leaking fd count) without rescanning raw observations.
+
+    ``window_min_value`` is the minimum since the *current* growth run began,
+    not a lifetime minimum: the projector re-anchors it to the incoming sample
+    whenever the growth streak resets, so the leak rule's
+    ``latest - window_min`` measures the current run's net growth instead of a
+    distance from some long-past dip.
     """
 
     __tablename__ = "ansich_environment_state"

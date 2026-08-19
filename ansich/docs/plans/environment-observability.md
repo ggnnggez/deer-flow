@@ -2,7 +2,7 @@
 
 ## 实现状态（2026-08-19）
 
-已形成可运行的纵向切片：新增 `environment.sampled` Observation（subject 为 sandbox/host Scope），由两条采集路径产生——`AnsichEnvironmentProbe`（仿 `AnsichTaskHeartbeat`，AIO 容器读 cgroup、local 读宿主磁盘/PSI 并声明 host+sandbox 两个 Scope、其余 provider 只发一条 `uninstrumented` 声明）与 local bash 的按命令 `ProcessGroupSampler`（`deerflow/sandbox/telemetry.py`，ansich 无关，经 `asyncio.to_thread` 边界的显式 `Context` 回传，由既有 Ansich tool probe 链发射）。`environment-projector@1` 注册在 `task-safety` 之后，产出三张读模型（migration `0026_ansich_environment`：`ansich_environment_coverage`、`ansich_environment_state`、`ansich_tool_env_samples`）。`environment-pressure@1` 挂进现有周期 operations 评估循环，产出 `environment_pressure:<metric>` 与 `environment_leak:fd_open` 两类 transition-only Assertion，以及 `environment_pressure`/`environment_leak_suspected` 两个新 `AlertType`，Alert evidence 附 `possibly_affected_task_ids`（时间相关，非因果）。`GET /api/ansich/tasks/{task_id}/environment` 与 ToolCall 详情的 additive `environment_sample` 字段是读侧接口；前端 Task 详情“运行环境”面板落地。
+已形成可运行的纵向切片：新增 `environment.sampled` Observation（subject 为 sandbox/host Scope），由两条采集路径产生——`AnsichEnvironmentProbe`（仿 `AnsichTaskHeartbeat`，AIO 容器读 cgroup、local 读宿主磁盘/PSI 并声明 host+sandbox 两个 Scope、其余 provider 只发一条 `uninstrumented` 声明）与 local bash 的按命令 `ProcessGroupSampler`（`deerflow/sandbox/telemetry.py`，ansich 无关，经 `asyncio.to_thread` 边界的显式 `Context` 回传，由既有 Ansich tool probe 链发射）。`environment-projector@1` 注册在 `task-safety` 之后，产出三张读模型（migration `0026_ansich_environment`：`ansich_environment_coverage`、`ansich_environment_state`、`ansich_tool_env_samples`）。`environment-pressure@1` 挂进现有周期 operations 评估循环，产出 `environment_pressure:<metric>` 与 `environment_leak:fd_open` 两类 transition-only Assertion，以及 `environment_pressure`/`environment_leak_suspected` 两个新 `AlertType`，**Alert 读模型行**附 `possibly_affected_task_ids`（非空覆盖语义；时间相关，非因果），evidence 仍是贡献样本的 obs 引用。`GET /api/ansich/tasks/{task_id}/environment` 与 ToolCall 详情的 additive `environment_sample` 字段是读侧接口；前端 Task 详情“运行环境”面板落地。
 
 本地验收覆盖 SQLite 迁移/重放、后端 Ansich 回归与前端 lint/typecheck/单元测试；真实 PostgreSQL 升级矩阵、关闭 Ansich 的性能基准和生产 paper drill 仍是与其余 Phase 共同的最终生产就绪门禁（见 [README.md](README.md) 的 PostgreSQL 门禁进度条目）。
 
@@ -46,3 +46,13 @@ Phase 11（生产韧性、重放与保留策略）尚未开始实现。本切片
 - per_command 数据产生 Alert：v1 严格只读侧展示，不接入 episode 状态机（spec §5.3）。
 
 详见 spec §4.5、§5.3。
+
+## 5. 与 spec 的实现级偏差（有意，已声明）
+
+前两条随实施计划一同论证（见 [实施计划「与 spec 的两处实现级偏差」](../../../docs/superpowers/plans/2026-08-19-ansich-environment-observability.md)），第三条在终审时补记：
+
+1. **`possibly_affected_task_ids` 不进 assertion value，也不作为 alert evidence obs**：它随运行中 Task 集合变化，放进 `value_json` 会破坏「仅跃迁追加」去重。落点改为 **Alert 读模型行**的附加 JSON 列（reconcile 变更时按非空覆盖语义刷新），evidence 仍是贡献样本的 obs 引用。语义不变（「采样时正在运行」），存储位置从 evidence 挪到读模型。
+2. **local 的连续 tick 同时声明两个 Scope**：host Scope（承载 host_shared 读数）与 sandbox Scope（`local:{thread_id}`，per_command 样本的 subject）。因为 per_command 观测需要 sandbox Scope 实体存在，而 local 的连续读数挂在 host Scope 上。
+3. **spec §6.2 的「ToolCall 行有样本时显示 io/fd 小字」v1 未实现**：additive 的 `environment_sample` 字段已由 `GET /api/ansich/tasks/{task_id}/tool-calls/...` 详情返回，并在 `frontend/src/core/ansich/types.ts` 中有对应 TS 类型，但前端 ToolCall 行没有任何消费它的渲染。这是有意推迟：读侧接口与类型先落地，UI 呈现待 UI-2 的 ToolCall 行信息密度一并裁定，不在本切片内实现。
+
+

@@ -1008,10 +1008,13 @@ coverage is not `continuous` (a `process_group` snapshot cannot prove
 standing growth, and `host_shared` mixes in every other process on the box),
 so per-command evidence structurally cannot feed it. Two new `AlertType`
 values (`environment_pressure`, `environment_leak_suspected`) join the
-public filter and reuse the existing episode state machine unchanged; their
-evidence carries `possibly_affected_task_ids` — the Tasks the assessor found
-`running` in that Scope at sample time — which is correlation, not
-causality, the same discipline as `possible_exposure`. Per-command data
+public filter and reuse the existing episode state machine unchanged. The
+Alert **read-model row** carries `possibly_affected_task_ids` — the Tasks the
+assessor found `running` in that Scope at sample time, written with
+non-empty-overwrite semantics on every reconcile that creates or updates the
+row — which is correlation, not causality, the same discipline as
+`possible_exposure`; the episode's evidence itself remains what it always was,
+references to the contributing `environment.sampled` Observations. Per-command data
 deliberately produces zero Alerts in v1: it is read-side only
 (`GET /tasks/{id}/environment`, the additive `environment_sample` field on
 ToolCall detail, and the frontend's coverage-badged "运行环境" panel), because

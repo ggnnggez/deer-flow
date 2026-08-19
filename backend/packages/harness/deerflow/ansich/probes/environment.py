@@ -152,15 +152,24 @@ class AnsichEnvironmentProbe:
             self._task = None
 
     async def _run(self) -> None:
+        # Tick immediately, then wait out the interval. Waiting first would
+        # leave the sandbox Scope undeclared for a whole interval, and an early
+        # `bash` emitting `tool:{id}:env` inside that gap would strand its
+        # per_command observation on a dependency wait that a short run never
+        # satisfies — a timed-out failed job and degraded Ansich health for a
+        # run that did nothing wrong.
+        first = True
         while not self._stop_event.is_set():
-            try:
-                await asyncio.wait_for(
-                    self._stop_event.wait(),
-                    timeout=self._interval_seconds,
-                )
-                return
-            except TimeoutError:
-                pass
+            if not first:
+                try:
+                    await asyncio.wait_for(
+                        self._stop_event.wait(),
+                        timeout=self._interval_seconds,
+                    )
+                    return
+                except TimeoutError:
+                    pass
+            first = False
 
             if not self._is_owner():
                 logger.info(
@@ -321,7 +330,23 @@ def _resolve_aio(*, user_id: str, thread_id: str) -> ProbeResolution:
     if sandbox is None:
         # Sandbox not acquired yet this tick — skip without declaring anything.
         return ProbeResolution(scopes=(), coverage="continuous", provider="aio", reading_scope=None, reading=None)
-    sandbox_decl = ScopeDecl("sandbox", f"aio:{thread_id}", "sandbox_boundary")
+    # Use the provider's own sandbox id as the Scope's external ref. Phase 9's
+    # task-structural projector derives a Task's `within_scope` sandbox Scope
+    # from `task.created`'s `sandbox_ref`, which is that same provider sandbox
+    # id (AIO: sha256(f"{user_id}:{thread_id}")[:8]). Declaring anything else
+    # here (e.g. "aio:{thread_id}") would mint a *second* Scope entity for one
+    # container, so AIO child Tasks could not join back to the environment
+    # evidence and an environment Alert's `possibly_affected_task_ids` would
+    # omit the subagents sharing the container.
+    #
+    # The `aio:{thread_id}` fallback below is only reached when the peeked
+    # sandbox carries no id at all: no better identity exists at that moment,
+    # so an honest thread-derived ref beats declaring nothing. If a later tick
+    # peeks a sandbox that does have an id, declaring the real Scope then is
+    # correct and this earlier declaration simply remains its own separate,
+    # honest record of what was observable at the time.
+    sandbox_ref = str(getattr(sandbox, "id", "") or "") or f"aio:{thread_id}"
+    sandbox_decl = ScopeDecl("sandbox", sandbox_ref, "sandbox_boundary")
     container_id = _aio_container_id(provider, sandbox)
     cgroup_dir = resolve_container_cgroup_dir(container_id) if container_id else None
     if cgroup_dir is None:

@@ -267,7 +267,7 @@ local sandbox 还有按命令采样：`LocalSandbox` 在命令运行期间用 an
 
 `environment-projector@1` 注册在 `task-safety` 之后（挂在其建立的 Scope 实体上），产出三张读模型（migration `0026_ansich_environment`）：`ansich_environment_coverage`（per-Scope 覆盖态）、`ansich_environment_state`（每 `(scope_id, environment_scope, metric)` 一行的现状行，先锁后读，含 `consecutive_growth_count` 趋势字段）、`ansich_tool_env_samples`（每 `tool_call_id` 至多一行，供 ToolCall 详情读；无外键，不参与依赖等待投影）。
 
-`environment-pressure@1` assessor 挂进现有周期 operations 评估循环，产出两类结论：`environment_pressure:<metric>`（fd/disk/PSI 越阈，authority=`configured_rule`）与 `environment_leak:fd_open`（container + continuous 下 fd 连续增长的“suspected”判断）。Alert evidence 附采样时刻该 Scope 内 `running` 的 Task 列表，字段名 `possibly_affected_task_ids`——**硬规则二：这是时间相关性，不是因果**，措辞与建模都不得声称因果，同 `possible_exposure` 的纪律。
+`environment-pressure@1` assessor 挂进现有周期 operations 评估循环，产出两类结论：`environment_pressure:<metric>`（fd/disk/PSI 越阈，authority=`configured_rule`）与 `environment_leak:fd_open`（container + continuous 下 fd 连续增长的“suspected”判断）。采样时刻该 Scope 内 `running` 的 Task 列表落在 **Alert 读模型行**的 `possibly_affected_task_ids` 字段上（非空覆盖语义：每次 reconcile 只在观测到非空列表时覆写，空列表不擦除上一次的归属），evidence 仍是贡献样本的 obs 引用——**硬规则二：这是时间相关性，不是因果**，措辞与建模都不得声称因果，同 `possible_exposure` 的纪律。
 
 **硬规则三：缺数据永远是 unknown，不是 ok。** run 活跃但超过 3× 采样间隔无样本，或 `coverage = uninstrumented`，assessor 一律降级为 `unknown`；环境评估绝不写 Task 控制状态。
 

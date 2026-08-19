@@ -3,9 +3,16 @@ import threading
 import time
 
 import pytest
+from ansich.safety import scope_entity_id, scope_reference_hash
 
 from deerflow.ansich.probes.env_samplers import EnvironmentReading
-from deerflow.ansich.probes.environment import AnsichEnvironmentProbe, ProbeResolution, ScopeDecl
+from deerflow.ansich.probes.environment import (
+    AnsichEnvironmentProbe,
+    ProbeResolution,
+    ScopeDecl,
+    _resolve_aio,
+    _resolve_local,
+)
 
 
 class FakeService:
@@ -204,3 +211,112 @@ async def test_probe_skips_tick_when_reading_has_empty_metrics():
     assert len(samples) >= 1
     for sample in samples:
         assert sample.payload["metrics"] == {"disk_free_bytes": {"value": 1, "limit": 2}}
+
+
+@pytest.mark.asyncio
+async def test_probe_ticks_immediately_without_waiting_a_full_interval():
+    """The first tick must not be gated behind a full interval.
+
+    The local sandbox Scope has to exist before an early ``bash`` emits its
+    ``tool:{id}:env`` per-command sample; otherwise that observation waits on a
+    Scope a short run never declares, and the dependency wait eventually
+    becomes a failed job plus degraded Ansich health.
+    """
+
+    service = FakeService()
+    probe = AnsichEnvironmentProbe(
+        service,
+        task_id="6f000000-0000-4000-8000-000000000005",
+        run_id="run-first-tick",
+        interval_seconds=10.0,  # far longer than the sleep below
+        is_owner=lambda: True,
+        resolve=lambda: _container_resolution(),
+    )
+    probe.start()
+    await asyncio.sleep(0.1)
+    await probe.stop()
+
+    scope_obs = [o for o in service.recorded if o.kind == "scope.snapshotted"]
+    samples = [o for o in service.recorded if o.kind == "environment.sampled"]
+    assert len(scope_obs) == 1
+    assert len(samples) == 1
+
+
+@pytest.mark.asyncio
+async def test_probe_does_not_tick_when_ownership_is_lost_before_the_first_tick():
+    """The immediate first tick still runs the ownership check first."""
+
+    service = FakeService()
+    probe = AnsichEnvironmentProbe(
+        service,
+        task_id="6f000000-0000-4000-8000-000000000006",
+        run_id="run-first-tick-not-owner",
+        interval_seconds=10.0,
+        is_owner=lambda: False,
+        resolve=lambda: _container_resolution(),
+    )
+    probe.start()
+    await asyncio.sleep(0.1)
+    await probe.stop()
+
+    assert service.recorded == []
+
+
+class _FakeSandbox:
+    def __init__(self, sandbox_id):
+        self.id = sandbox_id
+
+
+class _FakeAioProvider:
+    def __init__(self, sandbox):
+        self._sandbox = sandbox
+
+    def peek_thread_sandbox(self, user_id, thread_id):
+        return self._sandbox
+
+
+def _projected_sandbox_scope_id(sandbox_ref: str) -> str:
+    """Mirror how the task-structural projector derives a sandbox Scope id.
+
+    ``_project_scopes`` (and ``ansich.memory``'s in-memory twin) resolve a
+    Task's ``within_scope`` sandbox Scope from ``task.created``'s
+    ``sandbox_ref`` as ``scope_entity_id("sandbox", scope_reference_hash(
+    "sandbox", sandbox_ref))``, with no extra normalization of its own.
+    """
+
+    return scope_entity_id("sandbox", scope_reference_hash("sandbox", sandbox_ref))
+
+
+def test_aio_resolver_declares_the_provider_sandbox_id_as_its_scope(monkeypatch):
+    """The AIO probe Scope must be the same entity Tasks attach to.
+
+    ``task.created``'s ``sandbox_ref`` is the provider sandbox id (AIO:
+    ``sha256(f"{user_id}:{thread_id}")[:8]``). Declaring a different ref here
+    would mint a second Scope entity for one container, so AIO child Tasks
+    could not join back and an environment Alert's
+    ``possibly_affected_task_ids`` would omit the subagents sharing it.
+    """
+
+    sandbox_id = "a1b2c3d4"
+    monkeypatch.setattr(
+        "deerflow.ansich.probes.environment.get_sandbox_provider",
+        lambda: _FakeAioProvider(_FakeSandbox(sandbox_id)),
+    )
+    # No container id is reachable on the fake, so this lands on the
+    # uninstrumented declaration branch — which declares the same ScopeDecl the
+    # instrumented branch does.
+    resolution = _resolve_aio(user_id="user-1", thread_id="thread-1")
+
+    (decl,) = resolution.scopes
+    assert decl.scope_kind == "sandbox"
+    assert decl.external_ref == sandbox_id
+    declared_scope_id = scope_entity_id(decl.scope_kind, scope_reference_hash(decl.scope_kind, decl.external_ref))
+    assert declared_scope_id == _projected_sandbox_scope_id(sandbox_id)
+
+
+def test_local_resolver_sandbox_scope_matches_the_local_sandbox_id(monkeypatch):
+    """``LocalSandboxProvider`` ids per-thread sandboxes exactly ``local:{thread_id}``."""
+
+    resolution = _resolve_local(user_id="user-1", thread_id="thread-1")
+    sandbox_decls = [decl for decl in resolution.scopes if decl.scope_kind == "sandbox"]
+    assert [decl.external_ref for decl in sandbox_decls] == ["local:thread-1"]

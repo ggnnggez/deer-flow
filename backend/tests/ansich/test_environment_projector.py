@@ -396,6 +396,61 @@ async def test_consecutive_growth_accumulates_then_resets_on_a_drop(tmp_path) ->
 
 
 @pytest.mark.anyio
+async def test_window_min_reanchors_to_the_dip_when_the_growth_streak_breaks(tmp_path) -> None:
+    """``window_min_value`` is the minimum since the current run began.
+
+    A lifetime minimum would leave the leak rule comparing ``latest`` against a
+    dip nobody is growing away from any more (fd=50 at container start, steady
+    working set 400), so any later wobble would read as suspected. The dip here
+    (115) is deliberately *above* the historical minimum (100): only a
+    re-anchoring projector records it.
+    """
+
+    task_id, run_id = new_id(), "env-reanchor-run"
+    samples = tuple(
+        _environment_sampled(
+            task_id,
+            run_id,
+            tick=tick,
+            occurred_at=_OCCURRED_AT + timedelta(seconds=10 * tick),
+            metrics=_fd(value),
+        )
+        # grow 100 -> 110 -> 120, dip to 115 (streak resets), then grow again.
+        for tick, value in ((1, 100), (2, 110), (3, 120), (4, 115), (5, 118), (6, 121))
+    )
+
+    async with _environment_service(tmp_path, "ansich-env-reanchor.db") as (
+        service,
+        session_factory,
+    ):
+        service.record_batch((_task_created(task_id, run_id), _scope_snapshotted(task_id, run_id), *samples[:4]))
+        await service.flush_task(task_id)
+
+        async with session_factory() as session:
+            dipped = await session.get(AnsichEnvironmentStateRow, (_SCOPE_ID, "container", "fd_open"))
+            dipped_snapshot = (dipped.latest_value, dipped.window_min_value, dipped.consecutive_growth_count)
+
+        service.record_batch(samples[4:])
+        await service.flush_task(task_id)
+
+        async with session_factory() as session:
+            regrown = await session.get(AnsichEnvironmentStateRow, (_SCOPE_ID, "container", "fd_open"))
+            regrown_snapshot = (
+                regrown.latest_value,
+                regrown.window_min_value,
+                regrown.consecutive_growth_count,
+                _utc(regrown.growth_started_at),
+            )
+            errors = await session.scalar(select(func.count()).select_from(AnsichProjectionErrorRow))
+
+    # The dip itself becomes the new baseline, not the run's historical 100.
+    assert dipped_snapshot == (115, 115, 0)
+    # The new run keeps tracking its own starting baseline (the dip value).
+    assert regrown_snapshot == (121, 115, 2, _OCCURRED_AT + timedelta(seconds=50))
+    assert errors == 0
+
+
+@pytest.mark.anyio
 async def test_same_observation_redelivery_leaves_the_state_row_unchanged(tmp_path) -> None:
     task_id, run_id = new_id(), "env-redelivery-run"
     samples = tuple(

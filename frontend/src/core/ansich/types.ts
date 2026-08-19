@@ -900,7 +900,8 @@ export interface AnsichTaskScope {
     | "workspace"
     | "sandbox"
     | "authorization"
-    | "external_origin";
+    | "external_origin"
+    | "host";
   external_ref_hash: string;
   display_label: string;
   parent_scope_id: string | null;

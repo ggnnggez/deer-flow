@@ -282,6 +282,22 @@ def test_leak_below_min_growth_is_none() -> None:
     assert assessment.value["value"] == "none"
 
 
+def test_leak_uses_the_current_runs_baseline_not_a_lifetime_dip() -> None:
+    """A run-scoped baseline keeps an old dip from manufacturing a suspicion.
+
+    Shaped like the container that starts at fd=50 and settles at a working set
+    of 400: six growing samples spanning 70s that add only +7 in total. With
+    the projector's post-fix ``window_min_value`` (the current run's own
+    starting value, 400) this is net growth of 7 against a
+    ``leak_min_growth`` of 50, so the rule must say "none". A lifetime minimum
+    of 50 would have made the same inputs read as 357 of growth.
+    """
+
+    assessment = _leak(window_min_value=400, latest_value=407)
+    assert assessment is not None
+    assert assessment.value["value"] == "none"
+
+
 def test_leak_below_window_span_is_none() -> None:
     assessment = _leak(growth_started_at=_NOW - timedelta(seconds=59))
     assert assessment is not None
