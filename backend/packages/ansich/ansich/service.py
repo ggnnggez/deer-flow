@@ -6,7 +6,7 @@ import time
 from collections import OrderedDict, deque
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from threading import Lock
 from weakref import ReferenceType, WeakMethod, ref
 
@@ -15,7 +15,7 @@ from ansich.backend import AnsichBackend
 from ansich.budget import BudgetHealthBelief, TaskBudgetsView
 from ansich.compression import ContextCompressionSummaryView, ContextCompressionView
 from ansich.context_state import ContextStateView
-from ansich.contracts import AnsichHealth, ControlValue, FlushResult, LostRange, ObservationEnvelope, Producer, ProducerHealth, RecordReceipt, TaskLifecycleScope, TaskView
+from ansich.contracts import AnsichHealth, ControlValue, FlushResult, LostRange, ObservationEnvelope, Producer, ProducerHealth, RecordReceipt, TaskLifecycleScope, TaskView, WriterHealth
 from ansich.environment import (
     EnvironmentHistoryView,
     TaskEnvironmentView,
@@ -95,6 +95,11 @@ class AnsichService:
         terminal_flush_timeout_ms: int = 2_000,
         projector_poll_interval_ms: int = 250,
         operations_assessment_interval_ms: int = 1_000,
+        writer_retry_max_attempts: int = 5,
+        writer_backoff_initial_ms: int = 100,
+        writer_backoff_max_ms: int = 5_000,
+        writer_item_max_attempts: int = 2,
+        stop_drain_timeout_ms: int = 10_000,
         unavailable_reason: str | None = None,
     ) -> None:
         if queue_capacity < 1:
@@ -111,6 +116,16 @@ class AnsichService:
             raise ValueError("projector_poll_interval_ms must be positive")
         if operations_assessment_interval_ms < 1:
             raise ValueError("operations_assessment_interval_ms must be positive")
+        if writer_retry_max_attempts < 1:
+            raise ValueError("writer_retry_max_attempts must be positive")
+        if writer_backoff_initial_ms < 1:
+            raise ValueError("writer_backoff_initial_ms must be positive")
+        if writer_backoff_max_ms < 1:
+            raise ValueError("writer_backoff_max_ms must be positive")
+        if writer_item_max_attempts < 1:
+            raise ValueError("writer_item_max_attempts must be positive")
+        if stop_drain_timeout_ms < 1:
+            raise ValueError("stop_drain_timeout_ms must be positive")
         self._capacity = queue_capacity
         self._byte_capacity = queue_byte_capacity
         self._batch_size = batch_size
@@ -118,6 +133,14 @@ class AnsichService:
         self._terminal_flush_timeout_seconds = terminal_flush_timeout_ms / 1000
         self._projector_poll_interval_seconds = projector_poll_interval_ms / 1000
         self._operations_assessment_interval_seconds = operations_assessment_interval_ms / 1000
+        self._writer_retry_max_attempts = writer_retry_max_attempts
+        self._writer_backoff_initial_ms = writer_backoff_initial_ms
+        self._writer_backoff_max_ms = writer_backoff_max_ms
+        # Held for the tasks that consume them: per-item isolation (Task 5) and
+        # the bounded stop drain (Task 7). Threaded now so the config path is
+        # wired once rather than three times.
+        self._writer_item_max_attempts = writer_item_max_attempts
+        self._stop_drain_timeout_seconds = stop_drain_timeout_ms / 1000
         self._queue: deque[tuple[int, ObservationEnvelope, int]] = deque()
         self._queue_bytes = 0
         self._lock = Lock()
@@ -133,6 +156,19 @@ class AnsichService:
         # LRU-ordered, bounded at `_PRODUCER_ACCOUNT_LIMIT`; see `_producer_account`.
         self._producer_accounts: OrderedDict[tuple[str, str], _ProducerAccount] = OrderedDict()
         self._evicted_producer_count = 0
+        self._writer_consecutive_failures = 0
+        self._writer_backoff_until: datetime | None = None
+        # The batches the writer has taken off the queue and not yet placed.
+        # Keyed by an opaque token so a batch can be released exactly once from
+        # either the success path or the caller's `finally`, and kept whole so
+        # the flush barrier (Task 6) and the stop drain (Task 7) can read both
+        # its size and its collector-sequence span.
+        self._in_flight: dict[int, tuple[tuple[int, ObservationEnvelope], ...]] = {}
+        self._in_flight_token = 0
+        # PA6's recovery evidence: raised by a write failure, lowered only once
+        # the writer has caught up again. `recovering` may be derived from this
+        # and never from a bare queue backlog — see `ansich.lifecycle`.
+        self._writer_retry_backlog = False
         self._queue_high_watermark = 0
         self._queue_byte_high_watermark = 0
         self._snapshot_request_count = 0
@@ -144,6 +180,7 @@ class AnsichService:
         self._suppressed_drop_warning_count = 0
         self._loop: asyncio.AbstractEventLoop | None = None
         self._wake_event: asyncio.Event | None = None
+        self._stop_event: asyncio.Event | None = None
         self._projector_wake_event: asyncio.Event | None = None
         self._persist_lock: asyncio.Lock | None = None
         self._projection_lock: asyncio.Lock | None = None
@@ -192,6 +229,10 @@ class AnsichService:
                 await initialize_metrics()
             self._loop = asyncio.get_running_loop()
             self._wake_event = asyncio.Event()
+            # A separate signal from `_wake_event` on purpose: new work must
+            # never cut a backoff short (that would hammer a storage backend
+            # that just refused a write), while shutdown always must.
+            self._stop_event = asyncio.Event()
             self._projector_wake_event = asyncio.Event()
             self._persist_lock = asyncio.Lock()
             self._projection_lock = asyncio.Lock()
@@ -329,12 +370,10 @@ class AnsichService:
                     stopping=self._stopping,
                     stopped=self._stopped,
                     unavailable_reason=self._unavailable_reason,
-                    # Placeholders until the rest of the write-resilience batch
-                    # lands: Task 4 wires the BatchWriter's retry state here
-                    # (``WriterHealth.consecutive_failures``) and Task 6 wires
-                    # the unreported *global* lost ranges.
-                    consecutive_write_failures=0,
+                    consecutive_write_failures=self._writer_consecutive_failures,
+                    # Task 6 wires the unreported *global* lost ranges here.
                     unreported_loss_pending=False,
+                    writer_retry_backlog=self._writer_retry_backlog,
                     dropped_count=self._dropped_count,
                     failed_jobs=failed_jobs,
                     queue_depth=len(self._queue),
@@ -380,6 +419,15 @@ class AnsichService:
                         last_successful_flush_at=account.last_successful_flush_at,
                     )
                     for (producer_name, producer_instance_id), account in sorted(self._producer_accounts.items(), key=lambda item: item[0])
+                ),
+                writer=WriterHealth(
+                    consecutive_failures=self._writer_consecutive_failures,
+                    backoff_until=self._writer_backoff_until,
+                    # Items the writer holds are out of `queue_depth` — they no
+                    # longer consume queue capacity — so this is the only place
+                    # they are visible. `poison_observation_count` keeps its
+                    # default until Task 5 isolates poison items.
+                    in_flight_count=self._in_flight_observation_count(),
                 ),
                 evicted_producer_count=self._evicted_producer_count,
             )
@@ -1202,6 +1250,8 @@ class AnsichService:
         self._stopping = True
         self._running = False
         try:
+            if self._stop_event is not None:
+                self._stop_event.set()
             if self._wake_event is not None:
                 self._wake_event.set()
             writer_task = self._writer_task
@@ -1443,31 +1493,218 @@ class AnsichService:
             pass
 
     async def _flush_batch(self) -> FlushResult:
+        """Place one queued batch, retrying a refused write on a bounded backoff.
+
+        This is the writer loop's path, and the only one allowed to wait: spec
+        §2 keeps backoff inside the writer coroutine so it can never sit on an
+        Agent call stack. A refused batch leaves the queue but is *not* charged
+        as loss — it is parked in flight and retried until storage takes it, the
+        batch-level attempts run out (Task 5's isolation seam), or the service
+        starts draining.
+        """
+
         with self._lock:
             queued = [self._queue.popleft() for _ in range(min(len(self._queue), self._batch_size))]
             self._queue_bytes -= sum(item[2] for item in queued)
             selected = [(sequence, observation) for sequence, observation, _ in queued]
-        return await self._persist_items(selected)
-
-    async def _persist_items(self, selected: list[tuple[int, ObservationEnvelope]]) -> FlushResult:
         if not selected:
             return FlushResult(persisted=True, processed_count=0)
+        token = self._enter_in_flight(selected)
+        try:
+            attempt = 0
+            while True:
+                attempt += 1
+                result = await self._attempt_persist(selected, in_flight_token=token)
+                if result is not None:
+                    return result
+                if not self._running:
+                    # Draining. Retrying here would hold `stop()` open for as
+                    # long as storage stays down, so the drain keeps today's
+                    # semantics — one attempt, then the range is charged and
+                    # reported. Task 7 gives that drain its own time budget.
+                    return self._charge_batch_loss(selected, in_flight_token=token)
+                if attempt >= self._writer_retry_max_attempts:
+                    return await self._isolate_poison_batch(selected, in_flight_token=token)
+                await self._wait_before_retry(self._backoff_delay_seconds(attempt))
+        finally:
+            self._exit_in_flight(token)
+
+    async def _isolate_poison_batch(
+        self,
+        selected: list[tuple[int, ObservationEnvelope]],
+        *,
+        in_flight_token: int,
+    ) -> FlushResult:
+        """Seam for per-item poison isolation once batch retries are exhausted.
+
+        TODO(Task 5): persist the batch item by item, retry each item up to
+        ``writer_item_max_attempts``, and charge only the item storage keeps
+        refusing as a ``poison_observation`` loss so its neighbours still land.
+
+        Interim behaviour, until that lands: **nothing is dropped**. The batch
+        stays parked in the in-flight buffer and is retried at the capped
+        backoff interval, so a long outage costs latency rather than data. The
+        one exit is shutdown: a batch the drain still cannot place is charged as
+        loss instead of holding `stop()` open forever.
+        """
+
+        while True:
+            await self._wait_before_retry(self._backoff_delay_seconds(None))
+            if not self._running:
+                return self._charge_batch_loss(selected, in_flight_token=in_flight_token)
+            result = await self._attempt_persist(selected, in_flight_token=in_flight_token)
+            if result is not None:
+                return result
+
+    async def _persist_items(self, selected: list[tuple[int, ObservationEnvelope]]) -> FlushResult:
+        """Place a batch with a single attempt; a refusal is charged as loss.
+
+        The terminal flush barrier runs here, on the Agent's own call stack and
+        inside its own timeout budget, which is exactly where spec §2 forbids a
+        backoff wait. Retries therefore belong to `_flush_batch`; what a failure
+        means for this caller is unchanged.
+        """
+
+        if not selected:
+            return FlushResult(persisted=True, processed_count=0)
+        result = await self._attempt_persist(selected)
+        if result is not None:
+            return result
+        return self._charge_batch_loss(selected)
+
+    async def _attempt_persist(
+        self,
+        selected: list[tuple[int, ObservationEnvelope]],
+        *,
+        in_flight_token: int | None = None,
+    ) -> FlushResult | None:
+        """One write attempt. ``None`` means storage refused this batch.
+
+        Returning rather than raising is what lets the caller decide between
+        retrying and charging the loss; the accounting either outcome needs is
+        already done by the time it answers.
+        """
+
         try:
             processed = await self._backend.persist_and_project([observation for _, observation in selected])
         except Exception:
-            with self._lock:
-                for _, observation in selected:
-                    self._record_observation_loss(observation)
-            return FlushResult(persisted=False, processed_count=0, reason="storage_failure")
-        # Task 4 rewrites this method (retry/backoff + in-flight buffer) and must
-        # keep calling this on whatever its success path becomes: it is the only
-        # writer of `ProducerHealth.last_successful_flush_at`.
+            self._record_write_failure()
+            return None
+        self._record_write_success(in_flight_token=in_flight_token)
+        # The only writer of `ProducerHealth.last_successful_flush_at`: every
+        # success path has to keep coming through here.
         self._record_successful_flush(observation for _, observation in selected)
         self._notify_persisted(selected)
         if self._projector_wake_event is not None:
             self._projector_wake_event.set()
         await self._report_degradation_if_storage_recovered()
         return FlushResult(persisted=True, processed_count=processed)
+
+    def _record_write_failure(self) -> None:
+        with self._lock:
+            self._writer_consecutive_failures += 1
+            # PA6's incident evidence, raised in the same locked section as the
+            # failure count so no reader can see the residue without its cause —
+            # which is what makes `healthy -> recovering` unreachable rather
+            # than merely unlisted.
+            self._writer_retry_backlog = True
+
+    def _record_write_success(self, *, in_flight_token: int | None = None) -> None:
+        with self._lock:
+            self._writer_consecutive_failures = 0
+            self._writer_backoff_until = None
+            if in_flight_token is not None:
+                self._in_flight.pop(in_flight_token, None)
+            # Caught up: nothing held, and no more than the one batch the next
+            # flush empties. Until then the collector is still `recovering`.
+            if not self._in_flight and len(self._queue) <= self._batch_size:
+                self._writer_retry_backlog = False
+
+    def _charge_batch_loss(
+        self,
+        selected: list[tuple[int, ObservationEnvelope]],
+        *,
+        in_flight_token: int | None = None,
+    ) -> FlushResult:
+        # Charged and released in one locked section: a batch that is both
+        # counted as lost and still reported as held would report the same
+        # observations twice to whoever is reading health at that moment.
+        with self._lock:
+            for _, observation in selected:
+                self._record_observation_loss(observation)
+            if in_flight_token is not None:
+                self._in_flight.pop(in_flight_token, None)
+            self._writer_backoff_until = None
+        return FlushResult(persisted=False, processed_count=0, reason="storage_failure")
+
+    def _enter_in_flight(self, selected: list[tuple[int, ObservationEnvelope]]) -> int:
+        with self._lock:
+            self._in_flight_token += 1
+            token = self._in_flight_token
+            self._in_flight[token] = tuple(selected)
+            return token
+
+    def _exit_in_flight(self, token: int) -> None:
+        with self._lock:
+            self._in_flight.pop(token, None)
+
+    def _in_flight_observation_count(self) -> int:
+        """Observations the writer holds. Callers must already hold ``_lock``."""
+
+        return sum(len(batch) for batch in self._in_flight.values())
+
+    def _in_flight_sequence_bounds(self) -> tuple[int, int] | None:
+        """Lowest and highest collector sequence held, or ``None`` if nothing is.
+
+        The flush barrier (Task 6) and the stop drain (Task 7) both need to know
+        which sequences are in the writer's hands rather than in the queue, so
+        the buffer answers that here instead of each of them reaching into it.
+        Callers must already hold ``_lock``.
+        """
+
+        sequences = [sequence for batch in self._in_flight.values() for sequence, _ in batch]
+        if not sequences:
+            return None
+        return min(sequences), max(sequences)
+
+    def _backoff_delay_seconds(self, attempt: int | None) -> float:
+        """Exponential from the initial delay, capped. ``None`` asks for the cap."""
+
+        if attempt is None:
+            return self._writer_backoff_max_ms / 1000
+        # Bounded exponent: the multiplier is capped anyway, and an unbounded
+        # shift on a long-lived retry would build a pointlessly huge integer.
+        delay_ms = self._writer_backoff_initial_ms * (2 ** min(attempt - 1, 32))
+        return min(delay_ms, self._writer_backoff_max_ms) / 1000
+
+    async def _wait_before_retry(self, delay_seconds: float) -> None:
+        """Back off before the next attempt, publishing the deadline in health."""
+
+        with self._lock:
+            self._writer_backoff_until = datetime.now(UTC) + timedelta(seconds=delay_seconds)
+        try:
+            await self._sleep_before_retry(delay_seconds)
+        finally:
+            with self._lock:
+                self._writer_backoff_until = None
+
+    async def _sleep_before_retry(self, delay_seconds: float) -> None:
+        """The single sleeping point of the retry path, cut short by ``stop()``.
+
+        Kept alone in its own method for two reasons: the interruption is the
+        whole mechanism (a shutdown must never wait out a 5s backoff), and a
+        test can drive the schedule through it without spending real time.
+        """
+
+        stop_event = self._stop_event
+        if stop_event is None:
+            await asyncio.sleep(delay_seconds)
+            return
+        waiter = asyncio.ensure_future(stop_event.wait())
+        try:
+            await asyncio.wait({waiter}, timeout=delay_seconds)
+        finally:
+            waiter.cancel()
 
     def _notify_persisted(self, selected: list[tuple[int, ObservationEnvelope]]) -> None:
         observation_ids_by_task: dict[str, list[str]] = {}

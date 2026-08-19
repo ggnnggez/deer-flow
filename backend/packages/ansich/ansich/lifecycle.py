@@ -74,10 +74,10 @@ one state is not a transition and is therefore not listed; a consumer clamping a
 sequence compares only the pairs where the state changed.
 
 The closure is computed for the *post-PA6* derivation, where ``recovering``
-comes from the recovery residue (``unreported_loss_pending``, and from Task 4
-the writer's retry backlog) rather than from a bare queue backlog. Task 4
-removes that backlog clause and re-verifies this set against the real writer
-state.
+comes from the recovery residue (``unreported_loss_pending`` or the writer's
+retry backlog) rather than from a bare queue backlog. That clause is now gone
+and the set has been re-verified against it, both by enumeration and against
+the real writer state driving ``AnsichService.get_health()``.
 """
 
 
@@ -89,6 +89,13 @@ class LifecycleInputs(BaseModel):
     collector instead of an unknown one. ``extra="forbid"`` closes the other
     half of that mis-wire: a misspelled signal is an error, not a value the
     derivation silently ignores.
+
+    ``queue_depth``/``batch_size`` are the exception to "everything here is
+    read": PA6 removed the bare backlog clause, so the derivation deliberately
+    does *not* key on them any more. They stay inputs because the negative —
+    a deep queue on its own is not an incident — is only expressible if the
+    signal is present, and because a future rule that wants the backlog must
+    then say so at this boundary rather than inventing a new one.
     """
 
     model_config = ConfigDict(frozen=True, extra="forbid")
@@ -103,6 +110,7 @@ class LifecycleInputs(BaseModel):
     queue_depth: int
     batch_size: int
     unreported_loss_pending: bool
+    writer_retry_backlog: bool
 
 
 def derive_status(inputs: LifecycleInputs) -> str:
@@ -129,9 +137,17 @@ def derive_status(inputs: LifecycleInputs) -> str:
         un-lost. Spec §2's ``recovering`` covers the write-failure recovery
         path only.
     ``recovering``
-        No active failure, but the collector is still catching up: the queue
-        holds more than one batch, or a known lost range has not been reported
-        into the Observation stream yet.
+        No active failure, but an incident left residue the collector is still
+        working through: a known lost range that has not been reported into the
+        Observation stream yet, or a writer still catching up on the backlog a
+        write failure left behind (``writer_retry_backlog``).
+
+        PA6: a deep queue on its own is *not* residue. Keying on it would mark
+        a healthy collector under an ordinary load burst as recovering, and it
+        would manufacture a ``healthy -> recovering`` transition that spec §2's
+        graph does not contain. Both residue signals can only be raised by a
+        failure this function already reports as ``degraded``, which is what
+        keeps that edge unreachable rather than merely unlisted.
     ``healthy``
         Everything above is quiet.
     """
@@ -146,6 +162,6 @@ def derive_status(inputs: LifecycleInputs) -> str:
         return "failed"
     if inputs.consecutive_write_failures > 0 or inputs.dropped_count > 0 or inputs.failed_jobs > 0:
         return "degraded"
-    if inputs.queue_depth > inputs.batch_size or inputs.unreported_loss_pending:
+    if inputs.unreported_loss_pending or inputs.writer_retry_backlog:
         return "recovering"
     return "healthy"

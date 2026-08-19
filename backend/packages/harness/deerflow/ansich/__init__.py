@@ -91,6 +91,11 @@ def create_sql_ansich_service(
     terminal_flush_timeout_ms: int = 10_000,
     projector_poll_interval_ms: int = 250,
     operations_assessment_interval_ms: int = 1_000,
+    writer_retry_max_attempts: int = 5,
+    writer_backoff_initial_ms: int = 100,
+    writer_backoff_max_ms: int = 5_000,
+    writer_item_max_attempts: int = 2,
+    stop_drain_timeout_ms: int = 10_000,
     projector_lease_seconds: int = 30,
     projector_max_attempts: int = 5,
     projector_dependency_timeout_seconds: int = 300,
@@ -125,6 +130,11 @@ def create_sql_ansich_service(
         terminal_flush_timeout_ms=terminal_flush_timeout_ms,
         projector_poll_interval_ms=projector_poll_interval_ms,
         operations_assessment_interval_ms=operations_assessment_interval_ms,
+        writer_retry_max_attempts=writer_retry_max_attempts,
+        writer_backoff_initial_ms=writer_backoff_initial_ms,
+        writer_backoff_max_ms=writer_backoff_max_ms,
+        writer_item_max_attempts=writer_item_max_attempts,
+        stop_drain_timeout_ms=stop_drain_timeout_ms,
     )
 
 
@@ -159,6 +169,11 @@ def create_embedded_ansich_service(config, session_factory):
             queue_byte_capacity=config.queue_byte_capacity,
             batch_size=config.batch_size,
             flush_interval_ms=config.flush_interval_ms,
+            writer_retry_max_attempts=config.writer_retry_max_attempts,
+            writer_backoff_initial_ms=config.writer_backoff_initial_ms,
+            writer_backoff_max_ms=config.writer_backoff_max_ms,
+            writer_item_max_attempts=config.writer_item_max_attempts,
+            stop_drain_timeout_ms=config.stop_drain_timeout_ms,
             unavailable_reason="storage_unavailable",
         )
     return create_sql_ansich_service(
@@ -169,6 +184,11 @@ def create_embedded_ansich_service(config, session_factory):
         flush_interval_ms=config.flush_interval_ms,
         terminal_flush_timeout_ms=config.terminal_flush_timeout_ms,
         projector_poll_interval_ms=config.projector_poll_interval_ms,
+        writer_retry_max_attempts=config.writer_retry_max_attempts,
+        writer_backoff_initial_ms=config.writer_backoff_initial_ms,
+        writer_backoff_max_ms=config.writer_backoff_max_ms,
+        writer_item_max_attempts=config.writer_item_max_attempts,
+        stop_drain_timeout_ms=config.stop_drain_timeout_ms,
         projector_lease_seconds=config.projector_lease_seconds,
         projector_max_attempts=config.projector_max_attempts,
         projector_dependency_timeout_seconds=config.projector_dependency_timeout_seconds,

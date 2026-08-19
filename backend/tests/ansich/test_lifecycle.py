@@ -86,6 +86,7 @@ def _inputs(**overrides: object) -> LifecycleInputs:
         "queue_depth": 0,
         "batch_size": 100,
         "unreported_loss_pending": False,
+        "writer_retry_backlog": False,
     }
     base.update(overrides)
     return LifecycleInputs(**base)  # type: ignore[arg-type]
@@ -100,26 +101,28 @@ def _reachable_status_pairs() -> dict[tuple[str, str], str]:
 
     * ``dropped_count`` only ever grows — the service never forgets a drop.
     * A recovery residue cannot precede its cause: ``unreported_loss_pending``
-      (and, from Task 4, the writer's retry backlog) is what a failure *leaves
-      behind*, so it may only be set in a step whose predecessor already showed
-      an active write failure or the residue itself.
+      and ``writer_retry_backlog`` are what a failure *leaves behind*, so
+      either may only be set in a step whose predecessor already showed an
+      active write failure or a residue itself. That is not a modelling
+      convenience: both signals are raised by the service inside the same
+      locked section that raises ``consecutive_write_failures``, so no reader
+      can see the residue without having seen its cause.
 
-    ``queue_depth`` is held below ``batch_size`` on purpose: PA6 removes the
-    bare backlog clause from the derivation in Task 4, so this closure is
-    computed for the post-PA6 rule where ``recovering`` comes only from the
-    residue signal. Task 4's own negative sequences re-verify it against the
-    real writer state.
+    ``queue_depth`` is held below ``batch_size`` on purpose: PA6 removed the
+    bare backlog clause from the derivation, so a deep queue is evidence the
+    derivation deliberately does not key on. ``test_a_deep_queue_alone_...``
+    pins that directly.
     """
 
-    signal_space = tuple(itertools.product((0, 1), (0, 1), (0, 1), (False, True)))
+    signal_space = tuple(itertools.product((0, 1), (0, 1), (0, 1), (False, True), (False, True)))
     found: dict[tuple[str, str], str] = {}
     for before_phase, after_phase in PHASE_STEPS:
         for unavailable in (None, "storage_unavailable"):  # fixed at construction
-            for drops_a, jobs_a, failures_a, residue_a in signal_space:
-                for drops_b, jobs_b, failures_b, residue_b in signal_space:
+            for drops_a, jobs_a, failures_a, residue_a, backlog_a in signal_space:
+                for drops_b, jobs_b, failures_b, residue_b, backlog_b in signal_space:
                     if drops_b < drops_a:
                         continue
-                    if residue_b and not (failures_a or residue_a):
+                    if (residue_b or backlog_b) and not (failures_a or residue_a or backlog_a):
                         continue
                     before = derive_status(
                         _inputs(
@@ -129,6 +132,7 @@ def _reachable_status_pairs() -> dict[tuple[str, str], str]:
                             failed_jobs=jobs_a,
                             consecutive_write_failures=failures_a,
                             unreported_loss_pending=residue_a,
+                            writer_retry_backlog=backlog_a,
                         )
                     )
                     after = derive_status(
@@ -139,13 +143,14 @@ def _reachable_status_pairs() -> dict[tuple[str, str], str]:
                             failed_jobs=jobs_b,
                             consecutive_write_failures=failures_b,
                             unreported_loss_pending=residue_b,
+                            writer_retry_backlog=backlog_b,
                         )
                     )
                     if before == after:
                         continue
                     found.setdefault(
                         (before, after),
-                        f"{before_phase}->{after_phase}, unavailable={unavailable}, (drops,jobs,failures,residue) {(drops_a, jobs_a, failures_a, residue_a)} -> {(drops_b, jobs_b, failures_b, residue_b)}",
+                        f"{before_phase}->{after_phase}, unavailable={unavailable}, (drops,jobs,failures,residue,backlog) {(drops_a, jobs_a, failures_a, residue_a, backlog_a)} -> {(drops_b, jobs_b, failures_b, residue_b, backlog_b)}",
                     )
     return found
 
@@ -173,6 +178,35 @@ class _GatedBackend(InMemoryAnsichBackend):
         self.entered.set()
         await self.release.wait()
         return await super().persist_and_project(observations)
+
+
+class _RetryBacklogBackend(InMemoryAnsichBackend):
+    """Refuses one write, then holds the next so the catch-up stays observable.
+
+    The refusal is what raises the writer's retry backlog; holding the write
+    that follows freezes the service in the state between "the outage ended"
+    and "the queue it caused is drained".
+    """
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.refused = False
+        self.landed = asyncio.Event()
+        self.holding = asyncio.Event()
+        self.release = asyncio.Event()
+        self._held = False
+
+    async def persist_and_project(self, observations: list[ObservationEnvelope]) -> int:
+        if not self.refused:
+            self.refused = True
+            raise OSError("storage refused the batch")
+        if self.landed.is_set() and not self._held:
+            self._held = True
+            self.holding.set()
+            await self.release.wait()
+        count = await super().persist_and_project(observations)
+        self.landed.set()
+        return count
 
 
 class _GatedInitBackend(InMemoryAnsichBackend):
@@ -257,17 +291,30 @@ def test_an_active_failure_outranks_the_recovery_residue() -> None:
     # and `recovering` are mutually legal transitions, so no pair-level clamp
     # can catch this ordering — only asserting the state itself does.
     assert derive_status(_inputs(consecutive_write_failures=1, unreported_loss_pending=True)) == "degraded"
+    assert derive_status(_inputs(consecutive_write_failures=1, writer_retry_backlog=True)) == "degraded"
     assert derive_status(_inputs(failed_jobs=1, unreported_loss_pending=True)) == "degraded"
 
 
-def test_recovering_reports_a_backlog_with_no_active_failure() -> None:
-    assert derive_status(_inputs(queue_depth=101, batch_size=100)) == "recovering"
+def test_recovering_reports_incident_residue_with_no_active_failure() -> None:
+    # PA6: `recovering` needs incident evidence. Both signals are residue a
+    # write failure left behind — one on the reporting side, one on the
+    # writer's own retry path.
     assert derive_status(_inputs(unreported_loss_pending=True)) == "recovering"
+    assert derive_status(_inputs(writer_retry_backlog=True)) == "recovering"
 
 
-def test_healthy_is_the_quiet_answer_and_one_batch_is_not_a_backlog() -> None:
+def test_a_deep_queue_alone_is_not_recovery_evidence() -> None:
+    # PA6 removed the bare `queue_depth > batch_size` clause. A load burst is
+    # not an incident: reporting it as `recovering` would both mislabel a
+    # healthy collector and manufacture a `healthy -> recovering` edge that is
+    # nowhere in the spec's graph. `queue_depth` stays an *input* so this
+    # negative can be stated at all.
+    assert derive_status(_inputs(queue_depth=10_000, batch_size=100)) == "healthy"
+    assert derive_status(_inputs(queue_depth=101, batch_size=100)) == "healthy"
+
+
+def test_healthy_is_the_quiet_answer() -> None:
     assert derive_status(_inputs()) == "healthy"
-    # A queue the next flush empties in one batch is not a backlog.
     assert derive_status(_inputs(queue_depth=100, batch_size=100)) == "healthy"
 
 
@@ -299,8 +346,10 @@ def test_nominal_sequences_walk_exactly_the_spec_arc() -> None:
         _inputs(started=False),
         _inputs(),
         _inputs(consecutive_write_failures=1),
-        _inputs(consecutive_write_failures=3, queue_depth=250),
-        _inputs(queue_depth=250),
+        _inputs(consecutive_write_failures=3, queue_depth=250, writer_retry_backlog=True),
+        # The write landed: failures are cleared, but the writer is still
+        # working through the backlog the outage left behind.
+        _inputs(queue_depth=250, writer_retry_backlog=True),
         _inputs(queue_depth=100),
         _inputs(stopping=True),
         _inputs(stopped=True),
@@ -381,7 +430,7 @@ def test_every_derived_status_is_a_contract_lifecycle_state() -> None:
         derive_status(_inputs(started=False)),
         derive_status(_inputs()),
         derive_status(_inputs(dropped_count=1)),
-        derive_status(_inputs(queue_depth=101)),
+        derive_status(_inputs(writer_retry_backlog=True)),
         derive_status(_inputs(unavailable_reason="storage_unavailable")),
         derive_status(_inputs(stopping=True)),
         derive_status(_inputs(stopped=True)),
@@ -446,17 +495,26 @@ async def test_health_reports_degraded_after_a_dropped_batch() -> None:
 
 @pytest.mark.anyio
 async def test_health_reports_recovering_while_a_backlog_waits_behind_the_writer() -> None:
-    backend = _GatedBackend()
-    service = AnsichService(backend, batch_size=1, flush_interval_ms=1)
+    # PA6 moved what this pin drives, not what it pins: it used to reach
+    # `recovering` through the bare `queue_depth > batch_size` clause, which is
+    # gone because an ordinary load burst is not an incident. The residue it
+    # drives instead is the writer's retry backlog — the only production path
+    # that can put `recovering` on `AnsichHealth.status`, which is why this test
+    # is kept rather than deleted.
+    backend = _RetryBacklogBackend()
+    service = AnsichService(backend, batch_size=1, flush_interval_ms=1, writer_backoff_initial_ms=1)
     await service.start()
     try:
-        service.record(_observation("run-backlog-0"))
-        await asyncio.wait_for(backend.entered.wait(), timeout=5)
-        for index in range(1, 4):
+        for index in range(4):
             service.record(_observation(f"run-backlog-{index}"))
+        await asyncio.wait_for(backend.holding.wait(), timeout=5)
 
         health = service.get_health()
-        assert health.queue_depth == 3
+        # One batch already recovered, one held in the writer's hands, and the
+        # rest still queued behind it.
+        assert health.writer.consecutive_failures == 0
+        assert health.writer.in_flight_count == 1
+        assert health.queue_depth == 2
         assert health.status == "recovering"
     finally:
         backend.release.set()

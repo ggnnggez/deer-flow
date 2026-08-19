@@ -33,6 +33,52 @@ def test_ansich_is_disabled_by_default_with_bounded_runtime_settings():
     assert config.assessors.tool_frequency_threshold == 30
 
 
+def test_writer_resilience_defaults_are_bounded():
+    config = AnsichConfig()
+
+    assert config.writer_retry_max_attempts == 5
+    assert config.writer_backoff_initial_ms == 100
+    assert config.writer_backoff_max_ms == 5_000
+    assert config.writer_item_max_attempts == 2
+    assert config.stop_drain_timeout_ms == 10_000
+    for field in (
+        "writer_retry_max_attempts",
+        "writer_backoff_initial_ms",
+        "writer_backoff_max_ms",
+        "writer_item_max_attempts",
+        "stop_drain_timeout_ms",
+    ):
+        # Every one of these is a count or a duration: zero would mean "never
+        # retry"/"no budget" spelled as a bound rather than as a switch.
+        with pytest.raises(ValidationError):
+            AnsichConfig.model_validate({field: 0})
+        assert AnsichConfig.model_fields[field].description.startswith("startup-only:")
+
+
+def test_writer_resilience_settings_reach_the_service_on_both_assembly_paths():
+    configured = AnsichConfig(
+        enabled=True,
+        writer_retry_max_attempts=3,
+        writer_backoff_initial_ms=25,
+        writer_backoff_max_ms=250,
+        writer_item_max_attempts=4,
+        stop_drain_timeout_ms=7_500,
+    )
+
+    sql_backed = create_embedded_ansich_service(configured, MagicMock())
+    # The no-storage service still writes nothing, but it must not be assembled
+    # with a different writer policy than the one the operator configured.
+    without_storage = create_embedded_ansich_service(configured, None)
+
+    for service in (sql_backed, without_storage):
+        assert service is not None
+        assert service._writer_retry_max_attempts == 3
+        assert service._writer_backoff_initial_ms == 25
+        assert service._writer_backoff_max_ms == 250
+        assert service._writer_item_max_attempts == 4
+        assert service._stop_drain_timeout_seconds == 7.5
+
+
 def test_evaluation_thresholds_are_overridable_and_bounded():
     config = AnsichConfig.model_validate(
         {

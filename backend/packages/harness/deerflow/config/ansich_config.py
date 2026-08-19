@@ -56,6 +56,31 @@ class AnsichConfig(BaseModel):
         ge=1,
         description="Largest canonical JSON Observation payload stored inline before using ansich_payloads.",
     )
+    writer_retry_max_attempts: int = Field(
+        default=5,
+        ge=1,
+        description="startup-only: attempts the writer makes on one refused batch before isolating it item by item.",
+    )
+    writer_backoff_initial_ms: int = Field(
+        default=100,
+        ge=1,
+        description="startup-only: first delay the writer waits after a refused batch; doubles per attempt.",
+    )
+    writer_backoff_max_ms: int = Field(
+        default=5_000,
+        ge=1,
+        description="startup-only: ceiling for the writer's doubling retry delay.",
+    )
+    writer_item_max_attempts: int = Field(
+        default=2,
+        ge=1,
+        description="startup-only: attempts one Observation gets during item-by-item isolation before it is judged poison.",
+    )
+    stop_drain_timeout_ms: int = Field(
+        default=10_000,
+        ge=1,
+        description="startup-only: total budget for persisting whatever is still queued when the collector stops.",
+    )
     heartbeat_interval_seconds: int = Field(
         default=10,
         ge=1,
