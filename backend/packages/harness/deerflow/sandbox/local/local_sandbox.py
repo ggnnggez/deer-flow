@@ -13,6 +13,7 @@ from pathlib import Path
 from typing import NamedTuple
 
 from deerflow.config.paths import VIRTUAL_PATH_PREFIX
+from deerflow.sandbox import telemetry
 from deerflow.sandbox.env_policy import build_sandbox_env
 from deerflow.sandbox.local.list_dir import list_dir
 from deerflow.sandbox.path_patterns import build_output_mask_pattern
@@ -595,6 +596,14 @@ class LocalSandbox(Sandbox):
         except OSError:
             process_group_id = None
 
+        resource_sampler = None
+        if process_group_id is not None and telemetry.per_command_sampling_enabled():
+            try:
+                resource_sampler = telemetry.ProcessGroupSampler(process_group_id)
+                resource_sampler.start()
+            except Exception:
+                resource_sampler = None
+
         try:
             try:
                 process.wait(timeout=timeout)
@@ -608,6 +617,11 @@ class LocalSandbox(Sandbox):
                 thread.join(timeout=join_timeout)
                 if thread.is_alive():
                     logger.debug("Subprocess output drain thread still active after command returned")
+            if resource_sampler is not None:
+                try:
+                    telemetry.publish_command_sample(resource_sampler.stop())
+                except Exception:
+                    logger.debug("command resource sample publish failed", exc_info=True)
 
         stdout = stdout_capture.read()
         stderr = stderr_capture.read()
