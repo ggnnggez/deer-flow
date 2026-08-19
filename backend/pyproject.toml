@@ -48,6 +48,11 @@ dev = [
     # dev group so the stream-bridge tests can always import/exercise the redis
     # bridge without forcing it onto production installs.
     "redis>=5.0.0",
+    # asyncpg is the async driver half of the optional runtime extra
+    # (deerflow-harness[postgres]); pin it in the dev group so the opt-in
+    # postgres tier (tests/integration/, DEER_FLOW_TEST_POSTGRES_URL) can build
+    # an engine without forcing the whole postgres extra onto every install.
+    "asyncpg>=0.29",
     # TUI runtime dep (also declared as the deerflow-harness[tui] extra); kept in
     # the dev group so the terminal workbench can be run and tested locally / in CI.
     "textual>=0.80",

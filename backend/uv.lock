@@ -828,6 +828,7 @@ redis = [
 
 [package.dev-dependencies]
 dev = [
+    { name = "asyncpg" },
     { name = "blockbuster" },
     { name = "hypothesis" },
     { name = "jsonschema" },
@@ -870,6 +871,7 @@ provides-extras = ["postgres", "redis", "discord", "monocle", "browser"]
 
 [package.metadata.requires-dev]
 dev = [
+    { name = "asyncpg", specifier = ">=0.29" },
     { name = "blockbuster", specifier = ">=1.5.26,<1.6" },
     { name = "hypothesis", specifier = ">=6.100,<7" },
     { name = "jsonschema", specifier = ">=4.26.0" },
