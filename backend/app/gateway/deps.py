@@ -339,12 +339,27 @@ async def langgraph_runtime(app: FastAPI, startup_config: AppConfig) -> AsyncGen
                 app.state.ansich_service = create_embedded_ansich_service(ansich_config, sf)
                 if app.state.ansich_service is not None:
                     await app.state.ansich_service.start()
+
+                # Per-command sandbox telemetry has no consumer without an assembled
+                # Ansich service, so only flip it on when one actually started; the
+                # import+setter live inside this same fail-open try so a telemetry
+                # import failure cannot abort Gateway startup.
+                from deerflow.sandbox import telemetry as sandbox_telemetry
+
+                sandbox_telemetry.set_per_command_sampling_enabled(app.state.ansich_service is not None and ansich_config.enabled and ansich_config.environment_probe_enabled and ansich_config.environment_per_command_sampling)
             except Exception:
                 logger.exception("Ansich startup failed; continuing without collection")
 
-        from deerflow.sandbox import telemetry as sandbox_telemetry
+        if app.state.ansich_service is None:
+            # Covers: ansich disabled entirely, or the block above failed before
+            # (or while) setting the switch — explicitly disable rather than
+            # leaving per-command sampling on with no consumer.
+            try:
+                from deerflow.sandbox import telemetry as sandbox_telemetry
 
-        sandbox_telemetry.set_per_command_sampling_enabled(bool(ansich_config is not None and ansich_config.enabled and ansich_config.environment_probe_enabled and ansich_config.environment_per_command_sampling))
+                sandbox_telemetry.set_per_command_sampling_enabled(False)
+            except Exception:
+                logger.exception("Could not disable per-command environment sampling telemetry")
 
         from deerflow.persistence.thread_meta import make_thread_store
 

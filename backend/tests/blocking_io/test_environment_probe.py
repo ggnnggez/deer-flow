@@ -37,9 +37,12 @@ async def test_probe_tick_offloads_resolver_blocking_io(tmp_path: Path) -> None:
         read_target = tmp_path / "fake-stat"
         read_target.write_text("13195 (fake) S 1 0 0", encoding="utf-8")
 
+    calls = {"n": 0}
+
     def resolve():
         # Real synchronous filesystem IO — must run off the event loop.
         read_target.read_text()
+        calls["n"] += 1
         return None
 
     service = _FakeService()
@@ -54,3 +57,8 @@ async def test_probe_tick_offloads_resolver_blocking_io(tmp_path: Path) -> None:
     probe.start()
     await asyncio.sleep(0.12)
     await probe.stop()
+
+    # Witness: at least one tick must actually have run the resolver, so a
+    # passing test proves the blocking read was offloaded — not merely that
+    # no tick ever fired.
+    assert calls["n"] >= 1

@@ -92,6 +92,7 @@ class AnsichEnvironmentProbe:
         interval_seconds: float,
         is_owner: Callable[[], bool],
         resolve: Callable[[], ProbeResolution | None],
+        stop_timeout_seconds: float = 2.0,
     ) -> None:
         if interval_seconds <= 0:
             raise ValueError("interval_seconds must be positive")
@@ -101,6 +102,7 @@ class AnsichEnvironmentProbe:
         self._interval_seconds = interval_seconds
         self._is_owner = is_owner
         self._resolve = resolve
+        self._stop_timeout_seconds = stop_timeout_seconds
         self._started_at = datetime.now(UTC)
         self._last_tick_at: datetime | None = None
         self._tick = 0
@@ -123,7 +125,21 @@ class AnsichEnvironmentProbe:
         if task is None:
             return
         try:
-            await task
+            # asyncio.to_thread's underlying executor job is not cancellable once
+            # running, so a plain ``await task`` inherits the resolver's
+            # worst-case duration (cold provider construction, AIO provider lock
+            # contention, a wedged /proc or mount) — unacceptable ahead of the
+            # worker's terminal reconciliation/Task-terminal sequence. Bound the
+            # join instead; ``shield`` keeps the timeout from cancelling the
+            # underlying task, so a still-running resolver simply finishes on
+            # its own in the background after this method returns.
+            await asyncio.wait_for(asyncio.shield(task), timeout=self._stop_timeout_seconds)
+        except TimeoutError:
+            logger.warning(
+                "Ansich environment probe shutdown exceeded %.1fs for run %s; abandoning in-flight tick (resolver may still be running in a worker thread)",
+                self._stop_timeout_seconds,
+                self._run_id,
+            )
         except asyncio.CancelledError:
             pass
         except Exception:
@@ -190,8 +206,11 @@ class AnsichEnvironmentProbe:
                     self._declaration_sent = True
                 self._stop_event.set()  # 声明一次后循环无事可做
                 return
-            if resolution.reading is None:
-                return  # 沙箱尚未就绪:显式覆盖空洞,不猜
+            if resolution.reading is None or not resolution.reading.metrics:
+                # 沙箱尚未就绪,或本 tick 未能读到任何指标(如工作区目录尚未创建、
+                # PSI 不可用):显式跳过,不发出会被 EnvironmentSamplePayload 拒绝的
+                # 空 metrics 样本,也不永久降级为 uninstrumented——下一 tick 可能恢复。
+                return
             self._tick += 1
             self._emit_sample(resolution, now, sample_count=1, metrics=resolution.reading.metrics)
             self._last_tick_at = now
