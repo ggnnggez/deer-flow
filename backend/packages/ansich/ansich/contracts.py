@@ -640,6 +640,9 @@ class FlushResult(BaseModel):
     persisted: bool
     processed_count: int
     reason: str | None = None
+    persisted_through: int | None = None
+    lost_ranges: tuple[LostRange, ...] = ()
+    timed_out: bool = False
 
 
 class LostRange(BaseModel):
@@ -652,10 +655,31 @@ class LostRange(BaseModel):
     producer_instance_id: str | None = None
 
 
+class ProducerHealth(BaseModel):
+    model_config = ConfigDict(frozen=True)
+
+    producer_name: str
+    producer_instance_id: str
+    accepted_count: int
+    dropped_count: int
+    last_accepted_sequence: int | None
+    serialization_failures: int
+    last_successful_flush_at: datetime | None
+
+
+class WriterHealth(BaseModel):
+    model_config = ConfigDict(frozen=True)
+
+    consecutive_failures: int = 0
+    backoff_until: datetime | None = None
+    in_flight_count: int = 0
+    poison_observation_count: int = 0
+
+
 class AnsichHealth(BaseModel):
     model_config = ConfigDict(frozen=True)
 
-    status: Literal["healthy", "degraded", "failed", "stopped"]
+    status: Literal["starting", "healthy", "degraded", "recovering", "failed", "shutting_down", "stopped"]
     queue_depth: int
     queue_capacity: int
     queue_bytes: int = 0
@@ -679,6 +703,10 @@ class AnsichHealth(BaseModel):
     snapshot_visible_bytes: int = 0
     incomplete_snapshot_count: int = 0
     missing_content_block_count: int = 0
+    producers: tuple[ProducerHealth, ...] = ()
+    writer: WriterHealth = WriterHealth()
+    evicted_producer_count: int = 0
+    unreported_global_lost_range_count: int = 0
 
 
 class ControlBelief(BaseModel):
