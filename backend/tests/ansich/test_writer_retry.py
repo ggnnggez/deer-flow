@@ -17,6 +17,7 @@ that the wait is cut short.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 from collections.abc import Callable
 from datetime import UTC, datetime
 
@@ -27,10 +28,10 @@ from ansich.lifecycle import LEGAL_TRANSITIONS
 from ansich.memory import InMemoryAnsichBackend
 
 
-def _observation(source_id: str) -> ObservationEnvelope:
+def _observation(source_id: str, *, task_id: str | None = None) -> ObservationEnvelope:
     return ObservationEnvelope.task_lifecycle(
         kind="task.created",
-        task_id=new_id(),
+        task_id=task_id or new_id(),
         source_kind="deerflow_run",
         source_id=source_id,
         occurred_at=datetime(2026, 8, 19, 12, 0, tzinfo=UTC),
@@ -83,6 +84,29 @@ class _OutageThenBacklogBackend(_RefusingBackend):
         return count
 
 
+class _PoisonTaskBackend(InMemoryAnsichBackend):
+    """Healthy storage that permanently refuses one Task's rows.
+
+    This is the shape a constraint violation takes: the outage is not the
+    storage, it is one row, so every other write must keep working while the
+    writer is stuck on it.
+    """
+
+    def __init__(self, poison_task_id: str) -> None:
+        super().__init__()
+        self.poison_task_id = poison_task_id
+        self.refusals = 0
+        self.persisted: list[ObservationEnvelope] = []
+
+    async def persist_and_project(self, observations: list[ObservationEnvelope]) -> int:
+        if any(observation.task_id == self.poison_task_id for observation in observations):
+            self.refusals += 1
+            raise ValueError("constraint violation on this row")
+        count = await super().persist_and_project(observations)
+        self.persisted.extend(observations)
+        return count
+
+
 class _DeadBackend:
     """Never accepts a write; every read is duck-typed and safely absent."""
 
@@ -125,6 +149,24 @@ async def _wait_until(predicate: Callable[[], bool], *, timeout: float = 5.0) ->
     while not predicate():
         assert loop.time() < deadline, "condition was not reached in time"
         await asyncio.sleep(0.01)
+
+
+def test_in_memory_accepts_the_same_writer_policy_as_the_real_constructor() -> None:
+    # The convenience constructor is what tests and embedded callers reach for;
+    # a writer policy it cannot express is a policy they cannot exercise.
+    service = AnsichService.in_memory(
+        writer_retry_max_attempts=2,
+        writer_backoff_initial_ms=7,
+        writer_backoff_max_ms=11,
+        writer_item_max_attempts=3,
+        stop_drain_timeout_ms=1_500,
+    )
+
+    assert service._writer_retry_max_attempts == 2
+    assert service._writer_backoff_initial_ms == 7
+    assert service._writer_backoff_max_ms == 11
+    assert service._writer_item_max_attempts == 3
+    assert service._stop_drain_timeout_seconds == 1.5
 
 
 @pytest.mark.anyio
@@ -334,6 +376,136 @@ async def test_an_exhausted_batch_is_kept_in_flight_instead_of_being_dropped() -
     assert health.dropped_count == 0
     assert health.lost_ranges == ()
     assert len(backend.persisted) == 1
+
+
+@pytest.mark.anyio
+async def test_a_parked_poison_batch_does_not_block_the_terminal_barrier() -> None:
+    """One unwritable row must not stop every other Task from being persisted.
+
+    The writer parks that row and retries it forever (Task 5 replaces the
+    parking with per-item isolation). If it held ``persist_lock`` across those
+    waits, every terminal barrier after it would spend its whole budget waiting
+    for a lock, never reach storage, and charge its own rows as lost — a single
+    constraint violation would take the collector's write path down with it.
+    """
+
+    poison_task = new_id()
+    healthy_task = new_id()
+    backend = _PoisonTaskBackend(poison_task)
+    service = AnsichService(
+        backend,
+        batch_size=1,
+        flush_interval_ms=1,
+        terminal_flush_timeout_ms=200,
+        writer_retry_max_attempts=3,
+        writer_backoff_initial_ms=1,
+        writer_backoff_max_ms=1_000,
+    )
+    await service.start()
+    try:
+        service.record(_observation("poison", task_id=poison_task))
+        # Batch attempts exhausted and the batch parked in the isolation seam,
+        # which is where the writer now spends its (capped) waits.
+        await _wait_until(lambda: service.get_health().writer.consecutive_failures >= 3 and service.get_health().writer.in_flight_count == 1)
+        before = service.get_health()
+
+        service.record(_observation("healthy", task_id=healthy_task))
+        result = await service.flush_task(healthy_task)
+        after = service.get_health()
+    finally:
+        await service.stop()
+
+    assert result.persisted is True
+    assert result.reason is None
+    assert [observation.task_id for observation in backend.persisted] == [healthy_task]
+    assert before.dropped_count == 0
+    assert after.dropped_count == 0
+    assert after.lost_ranges == ()
+    # And the barrier did not "unblock" itself by discarding the parked batch.
+    assert after.writer.in_flight_count == 1
+
+
+@pytest.mark.anyio
+async def test_the_barrier_writes_while_the_writer_sleeps_out_its_backoff() -> None:
+    """Storage recovered; the writer is still asleep. The barrier must not wait.
+
+    The backoff here is 5s against a 200ms terminal budget, so a barrier that
+    had to wait for the writer's clock could only ever time out. It succeeds
+    because the writer holds the persist lock for its attempts, never for its
+    waits.
+    """
+
+    backend = _RefusingBackend(failures=1)
+    terminal_task = new_id()
+    service = AnsichService(
+        backend,
+        batch_size=1,
+        flush_interval_ms=1,
+        terminal_flush_timeout_ms=200,
+        writer_backoff_initial_ms=5_000,
+        writer_backoff_max_ms=5_000,
+    )
+    await service.start()
+    try:
+        service.record(_observation("outage"))
+        await _wait_until(lambda: service.get_health().writer.backoff_until is not None)
+        attempts_before = backend.attempts
+
+        service.record(_observation("terminal", task_id=terminal_task))
+        result = await service.flush_task(terminal_task)
+        # Captured before the drain: `stop()` interrupts the writer's wait, and
+        # its own next attempt would otherwise be counted here too.
+        attempts_after = backend.attempts
+        persisted_after = [observation.task_id for observation in backend.persisted]
+        health = service.get_health()
+    finally:
+        await service.stop()
+
+    assert result.persisted is True
+    assert result.reason is None
+    # A real storage attempt, not a timeout dressed up as one.
+    assert attempts_after == attempts_before + 1
+    assert persisted_after == [terminal_task]
+    assert health.dropped_count == 0
+
+
+@pytest.mark.anyio
+async def test_a_cancelled_writer_charges_its_parked_batch_instead_of_dropping_it() -> None:
+    """A batch the writer is holding must never vanish without being accounted.
+
+    Cancellation is how an event loop shuts a writer down, and the parked batch
+    is out of the queue by then — nothing else would ever report it. Full
+    shutdown semantics (a drain budget) remain Task 7's; this is the guarantee
+    that the in-flight buffer cannot swallow work in the meantime.
+    """
+
+    service = AnsichService(
+        _DeadBackend(),
+        batch_size=1,
+        flush_interval_ms=1,
+        writer_backoff_initial_ms=5_000,
+    )
+    await service.start()
+    try:
+        service.record(_observation("cancelled"))
+        await _wait_until(lambda: service.get_health().writer.in_flight_count == 1)
+
+        writer_task = service._writer_task
+        assert writer_task is not None
+        writer_task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await writer_task
+
+        health = service.get_health()
+    finally:
+        # `stop()` awaits the writer task again, which re-raises the cancellation.
+        with contextlib.suppress(asyncio.CancelledError):
+            await service.stop()
+
+    assert health.dropped_count == 1
+    assert len(health.lost_ranges) == 1
+    assert health.lost_ranges[0].first_sequence == 1
+    assert health.writer.in_flight_count == 0
 
 
 @pytest.mark.anyio

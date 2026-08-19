@@ -145,9 +145,16 @@ def derive_status(inputs: LifecycleInputs) -> str:
         PA6: a deep queue on its own is *not* residue. Keying on it would mark
         a healthy collector under an ordinary load burst as recovering, and it
         would manufacture a ``healthy -> recovering`` transition that spec §2's
-        graph does not contain. Both residue signals can only be raised by a
-        failure this function already reports as ``degraded``, which is what
-        keeps that edge unreachable rather than merely unlisted.
+        graph does not contain.
+
+        Removing the clause does not by itself make that transition impossible —
+        this function cannot see who set its inputs. It is a modelling rule
+        about the caller, and what justifies it is that ``AnsichService`` raises
+        either residue signal in the same locked section that raises
+        ``consecutive_write_failures``, so a reader cannot observe residue
+        without having observed its cause as ``degraded`` first. A different
+        caller that set the residue on its own would break the rule, which is
+        why the service's co-write is pinned by its own test.
     ``healthy``
         Everything above is quiet.
     """

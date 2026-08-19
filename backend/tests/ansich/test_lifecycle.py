@@ -103,10 +103,11 @@ def _reachable_status_pairs() -> dict[tuple[str, str], str]:
     * A recovery residue cannot precede its cause: ``unreported_loss_pending``
       and ``writer_retry_backlog`` are what a failure *leaves behind*, so
       either may only be set in a step whose predecessor already showed an
-      active write failure or a residue itself. That is not a modelling
-      convenience: both signals are raised by the service inside the same
-      locked section that raises ``consecutive_write_failures``, so no reader
-      can see the residue without having seen its cause.
+      active write failure or a residue itself. This is a modelling rule about
+      the caller rather than a property of the derivation, and what justifies
+      it is that the service raises both signals inside the same locked section
+      that raises ``consecutive_write_failures`` — so no reader can see the
+      residue without having seen its cause.
 
     ``queue_depth`` is held below ``batch_size`` on purpose: PA6 removed the
     bare backlog clause from the derivation, so a deep queue is evidence the
