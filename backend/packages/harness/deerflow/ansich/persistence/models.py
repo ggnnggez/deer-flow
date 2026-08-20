@@ -91,11 +91,28 @@ class AnsichProjectionJobRow(Base):
     dependency_pending_since: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     lease_owner: Mapped[str | None] = mapped_column(String(128))
     lease_expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    # Monotonic per-job claim counter, to be raised by every claim. It exists
+    # because ``lease_owner`` alone cannot make a compare-and-set sound: the
+    # owner id is one ``uuid4`` minted per service instance
+    # (``sql.py::_lease_owner``) and stable for the whole process lifetime, so a
+    # worker whose lease expired while it was still working can claim the *same*
+    # job again and read its own id back out of ``lease_owner``. That is an ABA
+    # -- the field returned to a value it already held, through a state the
+    # stale writer must not write into -- so an owner-only
+    # ``WHERE lease_owner = :me`` would let the stale attempt commit over the
+    # fresh claim. The generation tells the two claims apart, so a CAS has to
+    # compare ``(lease_owner, lease_generation)`` together. Nothing raises it
+    # yet: the claim/complete paths adopt it separately from this column.
+    lease_generation: Mapped[int] = mapped_column(BigInteger, nullable=False, server_default="0")
     last_error: Mapped[str | None] = mapped_column(Text)
 
     __table_args__ = (
         UniqueConstraint("obs_id", "projector_name", "projector_version", name="uq_ansich_projection_job_version"),
         Index("ix_ansich_projection_jobs_claim", "status", "available_at", "lease_expires_at"),
+        # Per-projector status-split counts for the health merge: a health read
+        # groups this table by ``(projector_name, status)``, which without this
+        # index is a full scan of every job row ever written.
+        Index("ix_ansich_projection_jobs_projector_status", "projector_name", "status"),
     )
 
 
@@ -143,6 +160,13 @@ class AnsichAssessorJobRow(Base):
     )
     lease_owner: Mapped[str | None] = mapped_column(String(128))
     lease_expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    # Same ABA hazard as ``AnsichProjectionJobRow.lease_generation``: the owner
+    # id is one process-lifetime ``uuid4``, so an expired-lease worker can
+    # re-claim its own job and read its own id back out of ``lease_owner``. A
+    # CAS therefore has to compare ``(lease_owner, lease_generation)``, never
+    # the owner alone. Nothing raises it yet: the claim/complete paths adopt it
+    # separately from this column.
+    lease_generation: Mapped[int] = mapped_column(BigInteger, nullable=False, server_default="0")
     last_error: Mapped[str | None] = mapped_column(Text)
     dependency_pending_since: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
 

@@ -42,7 +42,7 @@ from deerflow.persistence.base import Base
 
 # The two migration tests below upgrade to ``head``, so this pin tracks the
 # current head revision rather than the evaluation revision itself.
-HEAD_REVISION = "0026_ansich_environment"
+HEAD_REVISION = "0027_ansich_lease_generation"
 PREVIOUS_REVISION = "0022_ansich_assessor_deadline"
 EVALUATION_TABLES = {"ansich_evaluation_index", "ansich_release_quality_stats"}
 

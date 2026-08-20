@@ -1597,6 +1597,7 @@ This invokes `alembic revision --autogenerate` against the live ORM models. Revi
 - `migrations/versions/0023_ansich_evaluations.py` — Phase 10 rebuildable evaluation query index and `(release, cohort, dimension)` release quality statistics
 - `migrations/versions/0024_ansich_wall_time_watermarks.py` — data-only collapse of historical per-tick `wall_time_ms` usage contributions into one high-water row per `(aggregate, source)`
 - `migrations/versions/0025_ansich_assessor_watermarks.py` — durable per-`(subject, assessor, version)` mark of the highest evidence watermark an assessor has successfully settled, so scope-safety can re-judge only the ToolCalls a new watermark window names
+- `migrations/versions/0027_ansich_lease_generation.py` — `lease_generation` on both job tables (a per-job claim counter, because the process-lifetime `lease_owner` uuid makes an owner-only CAS an ABA) plus `ix_ansich_projection_jobs_projector_status` for the health merge's per-projector status-split counts
 - `persistence/bootstrap.py` — `bootstrap_schema(engine, backend=...)`, the three-branch decision + locking
 - Tests: `tests/test_persistence_bootstrap.py` (branches), `tests/test_persistence_bootstrap_concurrency.py` (concurrency), `tests/test_persistence_bootstrap_regression.py` (issue #3682), `tests/test_persistence_migrations_env.py` (filter), `tests/blocking_io/test_persistence_bootstrap.py` (asyncio.to_thread anchor)
 

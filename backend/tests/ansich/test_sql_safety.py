@@ -206,7 +206,7 @@ def test_phase9_safety_migration_upgrades_sqlite(tmp_path) -> None:
     finally:
         engine.dispose()
 
-    assert revision == "0026_ansich_environment"
+    assert revision == "0027_ansich_lease_generation"
     assert {
         "ansich_authorization_snapshots",
         "ansich_authorization_scopes",

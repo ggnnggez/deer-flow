@@ -935,7 +935,7 @@ def test_projection_dependency_deadline_migration_upgrades_sqlite(tmp_path) -> N
         engine.dispose()
 
     assert "dependency_pending_since" in column_names
-    assert revision == "0026_ansich_environment"
+    assert revision == "0027_ansich_lease_generation"
     assert len(revision) <= 32
 
 
@@ -959,8 +959,181 @@ def test_assessor_dependency_deadline_migration_upgrades_sqlite(tmp_path) -> Non
         engine.dispose()
 
     assert "dependency_pending_since" in column_names
-    assert revision == "0026_ansich_environment"
+    assert revision == "0027_ansich_lease_generation"
     assert len(revision) <= 32
+
+
+LEASE_GENERATION_REVISION = "0027_ansich_lease_generation"
+PRE_LEASE_GENERATION_REVISION = "0026_ansich_environment"
+PROJECTOR_STATUS_INDEX = "ix_ansich_projection_jobs_projector_status"
+
+
+def _lease_generation_alembic_config(database_path: Path) -> AlembicConfig:
+    backend_root = Path(__file__).resolve().parents[2]
+    config = AlembicConfig(str(backend_root / "packages" / "harness" / "deerflow" / "persistence" / "migrations" / "alembic.ini"))
+    config.set_main_option("sqlalchemy.url", f"sqlite+aiosqlite:///{database_path}")
+    # The Alembic env only applies process-wide logging.fileConfig when this
+    # remains set; the integration test must not disable loggers used later.
+    config.config_file_name = None
+    return config
+
+
+def _job_table_shape(database_path: Path) -> tuple[dict[str, dict], dict[str, dict], dict[str, list[str]], str]:
+    engine = create_engine(f"sqlite:///{database_path}")
+    try:
+        database_inspector = inspect(engine)
+        projection_columns = {column["name"]: column for column in database_inspector.get_columns("ansich_projection_jobs")}
+        assessor_columns = {column["name"]: column for column in database_inspector.get_columns("ansich_assessor_jobs")}
+        projection_indexes = {index["name"]: list(index["column_names"]) for index in database_inspector.get_indexes("ansich_projection_jobs")}
+        with engine.connect() as connection:
+            revision = connection.scalar(text("SELECT version_num FROM alembic_version"))
+    finally:
+        engine.dispose()
+    return projection_columns, assessor_columns, projection_indexes, revision
+
+
+def _seed_pre_lease_generation_jobs(database_path: Path) -> None:
+    """Write one job row into each table while the column does not exist yet."""
+    engine = create_engine(f"sqlite:///{database_path}")
+    try:
+        with engine.begin() as connection:
+            connection.execute(
+                text(
+                    """
+                    INSERT INTO ansich_projection_jobs (
+                        job_id, obs_id, projector_name, projector_version,
+                        status, attempts, available_at
+                    ) VALUES (
+                        'job-projection', 'obs-projection', 'task-structural', '1',
+                        'pending', 0, '2026-08-20 00:00:00'
+                    )
+                    """
+                )
+            )
+            connection.execute(
+                text(
+                    """
+                    INSERT INTO ansich_assessor_jobs (
+                        job_id, subject_id, assessor_name, assessor_version,
+                        evidence_watermark, status, attempts, available_at
+                    ) VALUES (
+                        'job-assessor', 'task-subject', 'scope-safety', '1.0.0',
+                        7, 'pending', 0, '2026-08-20 00:00:00'
+                    )
+                    """
+                )
+            )
+    finally:
+        engine.dispose()
+
+
+def _seeded_job_ids(database_path: Path) -> tuple[str | None, str | None]:
+    engine = create_engine(f"sqlite:///{database_path}")
+    try:
+        with engine.connect() as connection:
+            projection = connection.scalar(text("SELECT job_id FROM ansich_projection_jobs WHERE job_id = 'job-projection'"))
+            assessor = connection.scalar(text("SELECT job_id FROM ansich_assessor_jobs WHERE job_id = 'job-assessor'"))
+    finally:
+        engine.dispose()
+    return projection, assessor
+
+
+def _seeded_lease_generations(database_path: Path) -> tuple[int | None, int | None]:
+    engine = create_engine(f"sqlite:///{database_path}")
+    try:
+        with engine.connect() as connection:
+            projection = connection.scalar(text("SELECT lease_generation FROM ansich_projection_jobs WHERE job_id = 'job-projection'"))
+            assessor = connection.scalar(text("SELECT lease_generation FROM ansich_assessor_jobs WHERE job_id = 'job-assessor'"))
+    finally:
+        engine.dispose()
+    return projection, assessor
+
+
+def test_lease_generation_migration_roundtrips_sqlite(tmp_path) -> None:
+    """``0027`` must upgrade, reverse, and upgrade again over existing job rows.
+
+    Rows seeded at ``0026`` are the case the ``NOT NULL DEFAULT 0`` exists for:
+    a column added without one cannot be made ``NOT NULL`` over rows that
+    predate it. The second upgrade proves the revision is genuinely re-runnable
+    after a reversal rather than merely reversible once.
+    """
+
+    database_path = tmp_path / "ansich-lease-generation-roundtrip.db"
+    config = _lease_generation_alembic_config(database_path)
+    alembic_command.upgrade(config, PRE_LEASE_GENERATION_REVISION)
+    _seed_pre_lease_generation_jobs(database_path)
+
+    alembic_command.upgrade(config, "head")
+
+    projection_columns, assessor_columns, projection_indexes, revision = _job_table_shape(database_path)
+    assert revision == LEASE_GENERATION_REVISION
+    assert len(revision) <= 32
+    assert projection_columns["lease_generation"]["nullable"] is False
+    assert assessor_columns["lease_generation"]["nullable"] is False
+    assert str(projection_columns["lease_generation"]["default"]).strip("'") == "0"
+    assert str(assessor_columns["lease_generation"]["default"]).strip("'") == "0"
+    # Column order is load-bearing: the health merge groups by projector first,
+    # so a ``(status, projector_name)`` index would not serve the same read.
+    assert projection_indexes[PROJECTOR_STATUS_INDEX] == ["projector_name", "status"]
+    # Rows that predate the column start at generation zero rather than NULL.
+    assert _seeded_lease_generations(database_path) == (0, 0)
+
+    alembic_command.downgrade(config, PRE_LEASE_GENERATION_REVISION)
+
+    projection_columns, assessor_columns, projection_indexes, revision = _job_table_shape(database_path)
+    assert revision == PRE_LEASE_GENERATION_REVISION
+    assert "lease_generation" not in projection_columns
+    assert "lease_generation" not in assessor_columns
+    assert PROJECTOR_STATUS_INDEX not in projection_indexes
+    # The downgrade drops columns, never job rows.
+    assert _seeded_job_ids(database_path) == ("job-projection", "job-assessor")
+
+    alembic_command.upgrade(config, "head")
+
+    projection_columns, assessor_columns, projection_indexes, revision = _job_table_shape(database_path)
+    assert revision == LEASE_GENERATION_REVISION
+    assert "lease_generation" in projection_columns
+    assert "lease_generation" in assessor_columns
+    assert projection_indexes[PROJECTOR_STATUS_INDEX] == ["projector_name", "status"]
+    assert _seeded_lease_generations(database_path) == (0, 0)
+
+
+def test_lease_generation_migration_is_idempotent_on_existing_schema(tmp_path) -> None:
+    """A database that already carries the columns and index still upgrades.
+
+    This is the legacy ``create_all`` shape plus the manual-``ALTER`` case the
+    idempotent helpers exist for: re-running the revision must be a no-op, not
+    a duplicate column or a ``index already exists`` crash.
+    """
+
+    database_path = tmp_path / "ansich-lease-generation-existing.db"
+    config = _lease_generation_alembic_config(database_path)
+    alembic_command.upgrade(config, PRE_LEASE_GENERATION_REVISION)
+
+    engine = create_engine(f"sqlite:///{database_path}")
+    try:
+        with engine.begin() as connection:
+            connection.execute(text("ALTER TABLE ansich_projection_jobs ADD COLUMN lease_generation BIGINT DEFAULT '0' NOT NULL"))
+            connection.execute(text("ALTER TABLE ansich_assessor_jobs ADD COLUMN lease_generation BIGINT DEFAULT '0' NOT NULL"))
+            connection.execute(text(f"CREATE INDEX {PROJECTOR_STATUS_INDEX} ON ansich_projection_jobs (projector_name, status)"))
+    finally:
+        engine.dispose()
+
+    alembic_command.upgrade(config, "head")
+
+    engine = create_engine(f"sqlite:///{database_path}")
+    try:
+        # A list, not a set, so a duplicated column would be visible.
+        projection_column_names = [column["name"] for column in inspect(engine).get_columns("ansich_projection_jobs")]
+        assessor_column_names = [column["name"] for column in inspect(engine).get_columns("ansich_assessor_jobs")]
+    finally:
+        engine.dispose()
+
+    _projection_columns, _assessor_columns, projection_indexes, revision = _job_table_shape(database_path)
+    assert revision == LEASE_GENERATION_REVISION
+    assert projection_column_names.count("lease_generation") == 1
+    assert assessor_column_names.count("lease_generation") == 1
+    assert projection_indexes[PROJECTOR_STATUS_INDEX] == ["projector_name", "status"]
 
 
 @pytest.mark.anyio
