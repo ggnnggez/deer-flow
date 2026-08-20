@@ -388,10 +388,13 @@ _TOOL_TERMINAL_PRECEDENCE = {
 #: ``processing`` row only becomes claimable once its lease has expired.
 _CLAIMABLE_JOB_STATUSES = ("pending", "retry")
 #: Stable advisory-lock key for the Ansich single-operator maintenance
-#: operations (``rebuild_projections`` / ``retry_failed_projections``). Two
-#: random 32-bit halves picked once, deliberately distinct from the schema
-#: bootstrap key (``persistence/bootstrap.py::_PG_LOCK_KEY``) so a rebuild and a
-#: startup migration never queue behind each other. Changing it effectively
+#: operations (``rebuild_projections`` / ``retry_failed_projections``). The
+#: value is mnemonic rather than random -- ``0DEE`` marks it as DeerFlow's,
+#: ``A115``/``C4A5`` read as "ansich"/"CAS", and ``0027`` is the revision that
+#: added the column this work guards -- and it is deliberately distinct from the
+#: schema bootstrap key (``persistence/bootstrap.py::_PG_LOCK_KEY``) so a
+#: rebuild and a startup migration never queue behind each other. It stays under
+#: 2**63 so it is a valid signed bigint lock id. Changing it effectively
 #: releases the prior lock, so do not change it without coordinating.
 _PG_MAINTENANCE_LOCK_KEY = 0x0DEE_A115_C4A5_0027
 
@@ -804,36 +807,51 @@ class SqlAnsichBackend:
         safer of the two: a rejected rebuild leaves the caller to decide whether
         the work happened, while a queued one always ends with the replay
         actually done -- and these are rare, deliberate operator actions, not a
-        hot path where the wait would cost throughput. The wait is unbounded at
-        the database, but a deployment-level ``database.command_timeout`` (30s
-        by default) bounds it in practice: past it asyncpg cancels the pending
-        lock request and the call fails loudly instead of queueing forever. That
-        is the same exposure the schema bootstrap's advisory lock already
-        carries on the same engine, and it fails in the safe direction -- no
-        lock is taken, so nothing is left held.
+        hot path where the wait would cost throughput. That wait is not free for
+        the worker doing it: ``AnsichService`` holds its process-local
+        ``_projection_lock`` around this call, so a queued operator also stalls
+        its own projector loop -- and any terminal barrier waiting behind it --
+        for as long as it waits.
+
+        The wait is unbounded at the database, but a deployment-level
+        ``database.command_timeout`` (30s by default) bounds it in practice:
+        past it asyncpg cancels the pending lock request and the call fails
+        loudly instead of queueing forever. That is the same exposure the schema
+        bootstrap's advisory lock already carries on the same engine. A
+        cancelled acquire is *not* proof that no lock was taken -- the grant can
+        land server-side while the reply is still in flight -- so the unlock is
+        inside the guarded region and runs on that path too; a
+        ``pg_advisory_unlock`` for a lock this session never held returns false
+        and is otherwise harmless, which is the cheap side of that trade.
 
         On PostgreSQL the guard is a session-scoped ``pg_advisory_lock`` held on
         one pinned connection for the whole operation (the bootstrap precedent,
         ``persistence/bootstrap.py``), including the disable of
         ``idle_in_transaction_session_timeout`` that otherwise lets a managed
-        server kill the holder and silently release the lock. Everywhere else --
-        SQLite in practice -- it is a documented no-op: SQLite is single-writer
-        and single-node by deployment, so the only concurrency it has is inside
-        one process, which ``AnsichService`` already serialises with its own
-        ``_projection_lock``.
+        server kill the holder and silently release the lock; it is issued
+        *before* the acquire because a slow acquire is itself time spent idle in
+        transaction. Everywhere else -- SQLite in practice -- it is a documented
+        no-op: SQLite is single-writer and single-node by deployment, so the only
+        concurrency it has is inside one process, which ``AnsichService`` already
+        serialises with that same ``_projection_lock``. A dialect that cannot be
+        resolved at all raises instead of degrading to the no-op: a lock is a
+        safety device, and one that fails open would let two operators replay the
+        same Observations with nothing in the logs to say so.
         """
 
         async with self._session_factory() as session:
-            dialect_name = session.bind.dialect.name if session.bind is not None else ""
-            if dialect_name != "postgresql":
+            bind = session.bind
+            if bind is None:
+                raise RuntimeError("Ansich maintenance lock cannot resolve the session's dialect; refusing to run an unguarded rebuild/retry")
+            if bind.dialect.name != "postgresql":
                 yield
                 return
             await session.execute(text("SET LOCAL idle_in_transaction_session_timeout = 0"))
-            await session.execute(
-                text("SELECT pg_advisory_lock(:key)"),
-                {"key": _PG_MAINTENANCE_LOCK_KEY},
-            )
             try:
+                await session.execute(
+                    text("SELECT pg_advisory_lock(:key)"),
+                    {"key": _PG_MAINTENANCE_LOCK_KEY},
+                )
                 yield
             finally:
                 try:
@@ -1077,13 +1095,18 @@ class SqlAnsichBackend:
                         job_id=job_id,
                         lease_generation=lease_generation,
                     )
+                if context_metrics_changed:
+                    # Unconditional, including on a dropped write: this is a
+                    # recount of whole tables, not a report of our progress, and
+                    # the rows it counts were committed by the projection above
+                    # whoever ends up owning the job. Skipping it would leave the
+                    # counts stale until some unrelated projection refreshed them.
+                    await self._refresh_context_metrics()
                 if not settled:
                     # The job belongs to another worker now, so its progress is
                     # not ours to report: neither the watermark nor the
                     # processed count may advance on a dropped write.
                     continue
-                if context_metrics_changed:
-                    await self._refresh_context_metrics()
                 processed += 1
                 self._watermark = ingest_seq if self._watermark is None else max(self._watermark, ingest_seq)
                 if self._latest_projected_at is None or observation.recorded_at > self._latest_projected_at:

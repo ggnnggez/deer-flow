@@ -1210,16 +1210,23 @@ untouched.
 **P11-B lease compare-and-set, `retry`, single-operator maintenance** (the
 lease slice of Phase 11; spec §3). The `lease_generation` column migration
 `0027` added is now live. Every claim raises it by one and remembers what it
-claimed; every later write for that job — completion, error re-arm, and the
-assessor group's sibling absorption — carries
-`WHERE job_id = :id AND lease_generation = :claimed`. Rowcount zero means the
-row was taken over (the lease expired and someone re-claimed it, or a rebuild
-re-pended it) and the write is **dropped silently**, never raised: the new owner
-owns the outcome, and an exception there would only re-arm the row under its
-feet. Whatever the losing worker already projected stays committed — projector
-idempotency is the backstop that makes the drop safe, and the new owner
-converges on the same read model. Drops are counted in a process-local debug
-counter (`SqlAnsichBackend.stale_completion_count`), deliberately **not** a
+claimed; every later write for that job — completion and error re-arm alike —
+carries `WHERE job_id = :id AND lease_generation = :claimed`. Assessor sibling
+absorption sits on the other side of that contract: it is a takeover, so it
+*raises* the absorbed rows' generation inside the claim transaction, which is
+what makes the previous owner's late completion or error write fail its CAS.
+Rowcount zero means the row was taken over (the lease expired and someone
+re-claimed it, a rebuild re-pended it, or a claim absorbed it) and the write is
+**dropped silently**, never raised: the new owner owns the outcome, and an
+exception there would only re-arm the row under its feet. Whatever the losing
+worker already projected stays committed — projector idempotency is the backstop
+that makes the drop safe, and the new owner converges on the same read model.
+That backstop covers the **projection** path only: an assessor evaluation also
+advances `ansich_assessor_watermarks`, which a dropped completion must not leave
+committed (it can raise the mark over a band the new owner has not judged), so
+the assessor path's transaction rollback is owned by the hypothesis-(c) work
+rather than settled here. Drops are counted in a process-local debug counter
+(`SqlAnsichBackend.stale_completion_count`), deliberately **not** a
 health field. Why a generation rather than `lease_owner`: that id is one
 `uuid4` per process, so a worker whose lease expired mid-work re-claims the same
 job and reads its own id back out — an ABA an owner-only CAS cannot see.
@@ -1237,10 +1244,16 @@ maintenance operations. On Postgres each holds a `pg_advisory_lock`
 key) for its whole duration and a second operator **blocks** rather than being
 rejected — unbounded at the database, but bounded in practice by
 `database.command_timeout` (30s), past which asyncpg cancels the pending lock
-request and the call fails loudly with nothing held, the same exposure the
-schema bootstrap's advisory lock already carries. On single-writer SQLite that
-lock is a documented no-op and `AnsichService._projection_lock` remains the
-in-process half of the guard.
+request and the call fails loudly, the same exposure the schema bootstrap's
+advisory lock already carries. A cancelled acquire is not proof that no lock was
+taken (the grant can land while the reply is in flight), so the unlock runs on
+that path too. **The wait is not free for the waiting worker:**
+`AnsichService` holds its process-local `_projection_lock` around the backend
+call, so a queued operator stalls its own projector loop and any terminal
+barrier behind it for the whole wait. On single-writer SQLite the DB lock is a
+documented no-op — a dialect that cannot be resolved at all raises rather than
+degrading to that no-op — and `_projection_lock` remains the in-process half of
+the guard.
 
 `rebuild`'s re-pend raises every generation, because the lock does not stop a
 worker that claimed a job *before* the rebuild started: without the bump its

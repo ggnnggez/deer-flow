@@ -35,11 +35,15 @@ from deerflow.ansich.persistence.models import (
     AnsichProjectionErrorRow,
     AnsichProjectionJobRow,
 )
-from deerflow.ansich.persistence.sql import SqlAnsichBackend
+from deerflow.ansich.persistence.sql import _PG_MAINTENANCE_LOCK_KEY, SqlAnsichBackend
 from deerflow.persistence.base import Base
+from deerflow.persistence.bootstrap import _PG_LOCK_KEY as _PG_BOOTSTRAP_LOCK_KEY
 
 # Past-dated fixture timestamps (see the module docstring's clock discipline).
-_OCCURRED_AT = datetime(2026, 8, 19, 12, 0, tzinfo=UTC)
+# Comfortably past, not merely yesterday: a one-day margin is close enough to
+# the real clock that a slow machine, a timezone slip, or a suite that runs
+# overnight could put a "past" fixture in the future.
+_OCCURRED_AT = datetime(2026, 7, 1, 12, 0, tzinfo=UTC)
 _EXPIRED_AT = datetime(2026, 1, 1, tzinfo=UTC)
 
 
@@ -260,6 +264,107 @@ async def test_error_write_after_takeover_cannot_re_arm_the_new_owner_s_job(tmp_
 
 
 @pytest.mark.anyio
+async def test_dependency_wait_re_arm_after_takeover_is_dropped(tmp_path):
+    """The third error branch: a dependency wait re-arming a job it lost.
+
+    It writes different values than a hard error — it keeps ``pending``, hands
+    its attempt back, and stamps ``dependency_pending_since`` — so a guard that
+    covered only the hard branch would still let this one re-open a row the new
+    owner is working on, and reset the attempt count it is working under.
+    """
+
+    async with _two_workers(tmp_path) as workers:
+        task_id = new_id()
+        step_id = new_id()
+        # A Step whose Task was never projected: the projection raises the
+        # replay-safe dependency wait rather than a hard error.
+        await workers.a.persist_and_project(
+            [
+                ObservationEnvelope(
+                    kind="step.started",
+                    occurred_at=_OCCURRED_AT,
+                    task_id=task_id,
+                    step_id=step_id,
+                    subject_type="step",
+                    subject_id=step_id,
+                    producer=Producer(name="lease-cas-dependency-takeover", version="1", instance_id="test"),
+                    producer_seq=1,
+                    source_event_id="lease-cas:dependency-takeover:step:started",
+                    correlation_id=task_id,
+                    payload={"step_seq": 1, "actor_kind": "lead_agent"},
+                )
+            ]
+        )
+        record: dict[str, object] = {}
+        _take_over_between_claim_and_completion(workers, record)
+
+        await workers.a.project_pending(limit=1)
+
+        b_claim = record["b"]
+        assert b_claim is not None
+        after_stale_wait = await _projection_job(workers.a_sessions, b_claim[0])
+        assert after_stale_wait.status == "processing"
+        assert after_stale_wait.lease_owner == workers.b._lease_owner
+        assert after_stale_wait.lease_generation == b_claim[-1]
+        # The two fields only this branch writes.
+        assert after_stale_wait.dependency_pending_since is None
+        assert after_stale_wait.attempts == b_claim[-2]
+        assert workers.a.stale_completion_count == 1
+
+
+@pytest.mark.anyio
+async def test_dropped_completion_still_refreshes_the_global_context_metrics(tmp_path):
+    """A dropped write costs this worker the job, not the database-wide counts.
+
+    ``_refresh_context_metrics`` is a recount of whole tables, not a report of
+    this worker's progress: the rows it counts were committed by the projection
+    that just ran regardless of who ends up owning the job row.
+    """
+
+    async with _two_workers(tmp_path) as workers:
+        task_id = new_id()
+        step_id = new_id()
+        await workers.a.persist_and_project(
+            [
+                ObservationEnvelope(
+                    kind="step.started",
+                    occurred_at=_OCCURRED_AT,
+                    task_id=task_id,
+                    step_id=step_id,
+                    subject_type="step",
+                    subject_id=step_id,
+                    producer=Producer(name="lease-cas-metrics", version="1", instance_id="test"),
+                    producer_seq=1,
+                    source_event_id="lease-cas:metrics:step:started",
+                    correlation_id=task_id,
+                    payload={"step_seq": 1, "actor_kind": "lead_agent"},
+                )
+            ]
+        )
+
+        async def project_step_touching_context(*_args, **_kwargs) -> bool:
+            return True
+
+        workers.a._project_step = project_step_touching_context  # type: ignore[method-assign]
+        refreshes: list[int] = []
+        original_refresh = workers.a._refresh_context_metrics
+
+        async def counting_refresh() -> None:
+            refreshes.append(1)
+            await original_refresh()
+
+        workers.a._refresh_context_metrics = counting_refresh  # type: ignore[method-assign]
+        record: dict[str, object] = {}
+        _take_over_between_claim_and_completion(workers, record)
+
+        await workers.a.project_pending(limit=1)
+
+        assert record["b"] is not None
+        assert workers.a.stale_completion_count == 1
+        assert refreshes == [1]
+
+
+@pytest.mark.anyio
 async def test_absorbed_sibling_cannot_be_re_armed_by_the_previous_owner(tmp_path):
     """Assessor absorption is a takeover too, so it must move the generation.
 
@@ -471,8 +576,8 @@ async def test_retry_reports_the_rows_it_re_armed_and_leaves_an_in_flight_job_al
 class _RecordingSession:
     """Minimal session stand-in that records the SQL a maintenance lock emits."""
 
-    def __init__(self, dialect_name: str, statements: list[str]) -> None:
-        self.bind = SimpleNamespace(dialect=SimpleNamespace(name=dialect_name))
+    def __init__(self, dialect_name: str | None, statements: list[tuple[str, object]]) -> None:
+        self.bind = None if dialect_name is None else SimpleNamespace(dialect=SimpleNamespace(name=dialect_name))
         self._statements = statements
 
     async def __aenter__(self) -> _RecordingSession:
@@ -481,25 +586,64 @@ class _RecordingSession:
     async def __aexit__(self, *_exc_info: object) -> None:
         return None
 
-    async def execute(self, statement: object, _parameters: object = None) -> None:
-        self._statements.append(" ".join(str(statement).split()))
+    async def execute(self, statement: object, parameters: object = None) -> None:
+        self._statements.append((" ".join(str(statement).split()), parameters))
 
     async def rollback(self) -> None:
-        self._statements.append("ROLLBACK")
+        self._statements.append(("ROLLBACK", None))
+
+
+def _statement_index(statements: list[tuple[str, object]], needle: str) -> int:
+    for index, (sql, _parameters) in enumerate(statements):
+        if needle in sql:
+            return index
+    raise AssertionError(f"no statement containing {needle!r} in {[sql for sql, _ in statements]}")
 
 
 @pytest.mark.anyio
 @pytest.mark.parametrize("dialect_name", ["postgresql", "sqlite"])
 async def test_maintenance_lock_serialises_on_postgres_and_no_ops_elsewhere(dialect_name):
-    statements: list[str] = []
+    statements: list[tuple[str, object]] = []
     backend = SqlAnsichBackend(lambda: _RecordingSession(dialect_name, statements))  # type: ignore[arg-type]
 
     async with backend._maintenance_lock():
         inside = list(statements)
 
-    if dialect_name == "postgresql":
-        assert any("pg_advisory_lock" in statement for statement in inside)
-        assert not any("pg_advisory_unlock" in statement for statement in inside)
-        assert any("pg_advisory_unlock" in statement for statement in statements)
-    else:
+    if dialect_name == "sqlite":
         assert statements == []
+        return
+
+    lock_index = _statement_index(inside, "pg_advisory_lock")
+    # The kill-switch must precede the acquire, not merely accompany it: a slow
+    # acquire on a contended cluster is itself time spent idle in transaction,
+    # which is what the timeout would kill (bootstrap.py says the same).
+    assert _statement_index(inside, "idle_in_transaction_session_timeout") < lock_index
+    # The lock is a documented contract, not an implementation detail: the key
+    # value identifies this lock across processes and releases, and it must not
+    # collide with the schema bootstrap's, or a rebuild would queue behind a
+    # startup migration (and vice versa).
+    assert inside[lock_index][1] == {"key": _PG_MAINTENANCE_LOCK_KEY}
+    assert _PG_MAINTENANCE_LOCK_KEY == 0x0DEE_A115_C4A5_0027
+    assert _PG_MAINTENANCE_LOCK_KEY != _PG_BOOTSTRAP_LOCK_KEY
+    assert not any("pg_advisory_unlock" in sql for sql, _ in inside)
+    unlock_index = _statement_index(statements, "pg_advisory_unlock")
+    assert statements[unlock_index][1] == {"key": _PG_MAINTENANCE_LOCK_KEY}
+
+
+@pytest.mark.anyio
+async def test_maintenance_lock_refuses_to_run_when_the_dialect_is_unresolvable():
+    """A lock that cannot tell which backend it is on must fail closed.
+
+    Unreachable through the ordinary session factory, and that is exactly why
+    it is pinned: a safety lock silently degrading to a no-op would let two
+    operators replay the same Observations while every log stayed quiet.
+    """
+
+    statements: list[tuple[str, object]] = []
+    backend = SqlAnsichBackend(lambda: _RecordingSession(None, statements))  # type: ignore[arg-type]
+
+    with pytest.raises(RuntimeError, match="dialect"):
+        async with backend._maintenance_lock():
+            pass
+
+    assert statements == []
