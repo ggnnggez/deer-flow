@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import hashlib
 import json
-from collections.abc import Sequence
+import logging
+from collections.abc import AsyncIterator, Sequence
+from contextlib import asynccontextmanager
 from datetime import UTC, datetime, timedelta
 from typing import Literal, cast
 from uuid import uuid4
@@ -172,7 +174,7 @@ from ansich.usage import (
     child_task_contribution_for_tool_started,
     usage_contributions_for_observation,
 )
-from sqlalchemy import and_, case, delete, func, or_, select, update
+from sqlalchemy import and_, case, delete, func, or_, select, text, update
 from sqlalchemy.dialects.postgresql import insert as postgresql_insert
 from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
@@ -380,6 +382,20 @@ _TOOL_TERMINAL_PRECEDENCE = {
     "failed": 4,
     "returned": 5,
 }
+#: Job statuses a claim may take over. ``retry`` is a re-armed job that already
+#: spent an attempt; ``pending`` stays reserved for work nothing has tried yet
+#: (including a replay-safe dependency wait, which consumes no attempt), and a
+#: ``processing`` row only becomes claimable once its lease has expired.
+_CLAIMABLE_JOB_STATUSES = ("pending", "retry")
+#: Stable advisory-lock key for the Ansich single-operator maintenance
+#: operations (``rebuild_projections`` / ``retry_failed_projections``). Two
+#: random 32-bit halves picked once, deliberately distinct from the schema
+#: bootstrap key (``persistence/bootstrap.py::_PG_LOCK_KEY``) so a rebuild and a
+#: startup migration never queue behind each other. Changing it effectively
+#: releases the prior lock, so do not change it without coordinating.
+_PG_MAINTENANCE_LOCK_KEY = 0x0DEE_A115_C4A5_0027
+
+logger = logging.getLogger(__name__)
 
 
 class _ProjectionDependencyPending(RuntimeError):
@@ -754,6 +770,11 @@ class SqlAnsichBackend:
         self._lease_owner = str(uuid4())
         self._watermark: int | None = None
         self._failed_jobs = 0
+        # Debug counter, deliberately not a health field: how many of this
+        # worker's writes were dropped because the job had already been taken
+        # over (its ``lease_generation`` moved). It is process-local and resets
+        # on restart; exposing it as durable health is Task 10's call.
+        self._stale_completion_count = 0
         self._latest_recorded_at: datetime | None = None
         self._latest_projected_at: datetime | None = None
         self._context_metrics = {
@@ -763,6 +784,69 @@ class SqlAnsichBackend:
             "incomplete_snapshot_count": 0,
             "missing_content_block_count": 0,
         }
+
+    @property
+    def stale_completion_count(self) -> int:
+        """Writes this worker dropped because the job had been taken over."""
+
+        return self._stale_completion_count
+
+    @asynccontextmanager
+    async def _maintenance_lock(self) -> AsyncIterator[None]:
+        """Serialise the operator maintenance operations across workers.
+
+        ``rebuild_projections`` and ``retry_failed_projections`` are
+        single-operator operations: both re-arm durable jobs wholesale, so two
+        of them (or one of them plus another instance of itself) running at once
+        would replay the same Observations twice.
+
+        A second operator **blocks** rather than being rejected. Waiting is the
+        safer of the two: a rejected rebuild leaves the caller to decide whether
+        the work happened, while a queued one always ends with the replay
+        actually done -- and these are rare, deliberate operator actions, not a
+        hot path where the wait would cost throughput. The wait is unbounded at
+        the database, but a deployment-level ``database.command_timeout`` (30s
+        by default) bounds it in practice: past it asyncpg cancels the pending
+        lock request and the call fails loudly instead of queueing forever. That
+        is the same exposure the schema bootstrap's advisory lock already
+        carries on the same engine, and it fails in the safe direction -- no
+        lock is taken, so nothing is left held.
+
+        On PostgreSQL the guard is a session-scoped ``pg_advisory_lock`` held on
+        one pinned connection for the whole operation (the bootstrap precedent,
+        ``persistence/bootstrap.py``), including the disable of
+        ``idle_in_transaction_session_timeout`` that otherwise lets a managed
+        server kill the holder and silently release the lock. Everywhere else --
+        SQLite in practice -- it is a documented no-op: SQLite is single-writer
+        and single-node by deployment, so the only concurrency it has is inside
+        one process, which ``AnsichService`` already serialises with its own
+        ``_projection_lock``.
+        """
+
+        async with self._session_factory() as session:
+            dialect_name = session.bind.dialect.name if session.bind is not None else ""
+            if dialect_name != "postgresql":
+                yield
+                return
+            await session.execute(text("SET LOCAL idle_in_transaction_session_timeout = 0"))
+            await session.execute(
+                text("SELECT pg_advisory_lock(:key)"),
+                {"key": _PG_MAINTENANCE_LOCK_KEY},
+            )
+            try:
+                yield
+            finally:
+                try:
+                    await session.execute(
+                        text("SELECT pg_advisory_unlock(:key)"),
+                        {"key": _PG_MAINTENANCE_LOCK_KEY},
+                    )
+                except Exception:  # noqa: BLE001
+                    logger.warning(
+                        "ansich maintenance: pg_advisory_unlock raised; the session close will release it",
+                        exc_info=True,
+                    )
+                await session.rollback()
 
     async def initialize_metrics(self) -> None:
         await self._refresh_failed_job_count()
@@ -940,9 +1024,10 @@ class SqlAnsichBackend:
             claim = await self._claim_projection_job()
             if claim is None:
                 break
-            job_id, projector_name, observation, ingest_seq, attempt = claim
+            job_id, projector_name, observation, ingest_seq, attempt, lease_generation = claim
             try:
                 context_metrics_changed = False
+                settled = False
                 async with self._session_factory() as session, session.begin():
                     if projector_name == "task-structural":
                         await self._project_structural(session, observation)
@@ -987,14 +1072,16 @@ class SqlAnsichBackend:
                                     status="pending",
                                 )
                             )
-                    job = await session.get(AnsichProjectionJobRow, job_id)
-                    if job is None:
-                        raise RuntimeError("claimed Ansich projection job disappeared")
-                    job.status = "completed"
-                    job.dependency_pending_since = None
-                    job.lease_owner = None
-                    job.lease_expires_at = None
-                    job.last_error = None
+                    settled = await self._complete_projection_job(
+                        session,
+                        job_id=job_id,
+                        lease_generation=lease_generation,
+                    )
+                if not settled:
+                    # The job belongs to another worker now, so its progress is
+                    # not ours to report: neither the watermark nor the
+                    # processed count may advance on a dropped write.
+                    continue
                 if context_metrics_changed:
                     await self._refresh_context_metrics()
                 processed += 1
@@ -1002,7 +1089,12 @@ class SqlAnsichBackend:
                 if self._latest_projected_at is None or observation.recorded_at > self._latest_projected_at:
                     self._latest_projected_at = observation.recorded_at
             except Exception as exc:
-                await self._record_projection_error(job_id, attempt, exc)
+                await self._record_projection_error(
+                    job_id,
+                    attempt,
+                    exc,
+                    lease_generation=lease_generation,
+                )
         return processed
 
     def get_projection_metrics(self) -> dict[str, int | None]:
@@ -1046,18 +1138,35 @@ class SqlAnsichBackend:
                 .join(AnsichObservationRow, AnsichObservationRow.obs_id == AnsichProjectionJobRow.obs_id)
                 .where(
                     AnsichObservationRow.task_id == task_id,
-                    or_(
-                        AnsichProjectionJobRow.status == "pending",
-                        AnsichProjectionJobRow.status == "processing",
-                    ),
+                    # ``retry`` is unsettled work like the other two: it has
+                    # spent an attempt but is still queued to be claimed.
+                    AnsichProjectionJobRow.status.in_((*_CLAIMABLE_JOB_STATUSES, "processing")),
                 )
                 .limit(1)
             )
         return pending is not None
 
     async def rebuild_projections(self) -> int:
-        """Delete rebuildable Phase 1 state and replay every durable job."""
+        """Delete rebuildable Phase 1 state and replay every durable job.
 
+        A single-operator maintenance operation: the whole delete-re-pend-replay
+        sequence runs under ``_maintenance_lock``, so a second operator (or a
+        concurrent retry) waits instead of replaying the same Observations
+        alongside it. See that method for the block-rather-than-reject choice
+        and the SQLite no-op.
+
+        The re-pend raises every job's ``lease_generation``. A worker holding a
+        claim when the rebuild starts is *not* stopped by the lock -- it never
+        took it -- so its late completion would otherwise match the re-pended
+        row and mark the job settled before the replay ever claimed it, quietly
+        dropping that Observation from the rebuilt read model. Raising the
+        generation makes that write fail its compare-and-set instead.
+        """
+
+        async with self._maintenance_lock():
+            return await self._rebuild_projections_locked()
+
+    async def _rebuild_projections_locked(self) -> int:
         async with self._session_factory() as session, session.begin():
             for model in (
                 AnsichAlertReadModelRow,
@@ -1136,6 +1245,10 @@ class SqlAnsichBackend:
                     lease_owner=None,
                     lease_expires_at=None,
                     last_error=None,
+                    # Invalidate any lease this re-pend just took away (see the
+                    # docstring). The counter is monotonic and is never reset:
+                    # that is exactly what makes it ABA-proof.
+                    lease_generation=AnsichProjectionJobRow.lease_generation + 1,
                 )
             )
         self._watermark = None
@@ -1151,8 +1264,34 @@ class SqlAnsichBackend:
                 return replayed
 
     async def retry_failed_projections(self, *, task_id: str | None = None) -> int:
-        """Requeue failed durable jobs and settle them without deleting projections."""
+        """Requeue failed durable jobs and settle them without deleting projections.
 
+        A single-operator maintenance operation like ``rebuild_projections``, and
+        held under the same ``_maintenance_lock`` for the same reason: the
+        re-arm plus its replay must not interleave with a second operator's.
+
+        Only ``failed`` rows are touched, and that scope is the safety property
+        rather than an optimisation: a failed job carries no live lease (both
+        error paths clear it before writing the status), while a ``processing``
+        row belongs to a worker that is still entitled to finish it. Re-arming
+        one of those would hand the same Observation to two workers at once.
+
+        ``lease_generation`` is deliberately **not** reset here. It is monotonic
+        for the lifetime of the row -- resetting it would recreate exactly the
+        ABA the column exists to prevent, letting an older claim's number match
+        again -- and it needs no bump either, because a failed row has no
+        in-flight writer to invalidate.
+
+        The return value is the number of rows the re-arm actually changed, so
+        it can never over-report work that a concurrent state change had already
+        taken off the failed list.
+        """
+
+        async with self._maintenance_lock():
+            return await self._retry_failed_projections_locked(task_id=task_id)
+
+    async def _retry_failed_projections_locked(self, *, task_id: str | None) -> int:
+        re_armed = 0
         async with self._session_factory() as session, session.begin():
             failed_job_ids = select(AnsichProjectionJobRow.job_id).where(AnsichProjectionJobRow.status == "failed")
             if task_id is not None:
@@ -1166,9 +1305,14 @@ class SqlAnsichBackend:
                 failed_assessor_job_ids = failed_assessor_job_ids.where(AnsichAssessorJobRow.subject_id == task_id)
             assessor_job_ids = tuple((await session.execute(failed_assessor_job_ids)).scalars())
             if job_ids:
-                await session.execute(
+                projection_result = await session.execute(
                     update(AnsichProjectionJobRow)
-                    .where(AnsichProjectionJobRow.job_id.in_(job_ids))
+                    .where(
+                        AnsichProjectionJobRow.job_id.in_(job_ids),
+                        # Re-asserted at write time, so the count reports rows
+                        # this call really re-armed rather than rows it selected.
+                        AnsichProjectionJobRow.status == "failed",
+                    )
                     .values(
                         status="pending",
                         attempts=0,
@@ -1179,10 +1323,14 @@ class SqlAnsichBackend:
                         last_error=None,
                     )
                 )
+                re_armed += int(projection_result.rowcount or 0)
             if assessor_job_ids:
-                await session.execute(
+                assessor_result = await session.execute(
                     update(AnsichAssessorJobRow)
-                    .where(AnsichAssessorJobRow.job_id.in_(assessor_job_ids))
+                    .where(
+                        AnsichAssessorJobRow.job_id.in_(assessor_job_ids),
+                        AnsichAssessorJobRow.status == "failed",
+                    )
                     .values(
                         status="pending",
                         attempts=0,
@@ -1193,7 +1341,8 @@ class SqlAnsichBackend:
                         last_error=None,
                     )
                 )
-        if not job_ids and not assessor_job_ids:
+                re_armed += int(assessor_result.rowcount or 0)
+        if re_armed == 0:
             return 0
 
         while await self.project_pending(limit=200):
@@ -1201,7 +1350,7 @@ class SqlAnsichBackend:
         await self.assess_operations()
         await self._refresh_failed_job_count()
         await self._refresh_context_metrics()
-        return len(job_ids) + len(assessor_job_ids)
+        return re_armed
 
     async def list_failed_jobs(
         self,
@@ -1316,7 +1465,14 @@ class SqlAnsichBackend:
 
     async def _claim_projection_job(
         self,
-    ) -> tuple[str, str, ObservationEnvelope, int, int] | None:
+    ) -> tuple[str, str, ObservationEnvelope, int, int, int] | None:
+        """Take one claimable job, raising its ``lease_generation`` by one.
+
+        The returned generation is what the claim owns; every later write for
+        this job carries it as a compare-and-set and is dropped if the row has
+        moved on (see ``_complete_projection_job``).
+        """
+
         now = datetime.now(UTC)
         async with self._session_factory() as session, session.begin():
             row = (
@@ -1326,7 +1482,7 @@ class SqlAnsichBackend:
                     .where(
                         AnsichProjectionJobRow.available_at <= now,
                         or_(
-                            AnsichProjectionJobRow.status == "pending",
+                            AnsichProjectionJobRow.status.in_(_CLAIMABLE_JOB_STATUSES),
                             (AnsichProjectionJobRow.status == "processing") & (AnsichProjectionJobRow.lease_expires_at <= now),
                         ),
                     )
@@ -1346,6 +1502,8 @@ class SqlAnsichBackend:
             job.attempts += 1
             job.lease_owner = self._lease_owner
             job.lease_expires_at = now + timedelta(seconds=self._projector_lease_seconds)
+            job.lease_generation = (job.lease_generation or 0) + 1
+            claimed_generation = job.lease_generation
             observation = self._observation_from_row(observation_row)
             if observation.payload is None and observation.payload_ref_id is not None:
                 payload = await session.get(AnsichPayloadRow, observation.payload_ref_id)
@@ -1355,46 +1513,130 @@ class SqlAnsichBackend:
                 if not isinstance(decoded, dict):
                     raise ValueError("Ansich projection payload must decode to an object")
                 observation = observation.model_copy(update={"payload": decoded, "payload_ref_id": None})
-            return job.job_id, job.projector_name, observation, observation_row.ingest_seq, job.attempts
+            return (
+                job.job_id,
+                job.projector_name,
+                observation,
+                observation_row.ingest_seq,
+                job.attempts,
+                claimed_generation,
+            )
 
-    async def _record_projection_error(self, job_id: str, attempt: int, exc: Exception) -> None:
+    async def _complete_projection_job(
+        self,
+        session: AsyncSession,
+        *,
+        job_id: str,
+        lease_generation: int,
+    ) -> bool:
+        """Settle a claimed projection job, unless the claim has been taken over.
+
+        The guard is ``WHERE job_id = :id AND lease_generation = :claimed``. A
+        rowcount of zero means this worker no longer owns the outcome -- its
+        lease expired and someone else claimed the row, or a rebuild re-pended
+        it -- and the write is dropped **silently**: the new owner is
+        responsible for the job, and raising here would only convert a
+        harmless loss of a race into an error path that re-arms the row under
+        the new owner's feet. A row that vanished entirely (an Observation
+        deleted with its jobs) takes the same path for the same reason.
+
+        The projection writes themselves stay committed. They are idempotent by
+        construction, which is precisely the backstop this drop relies on: the
+        new owner redoes the work and converges on the same read model.
+        """
+
+        result = await session.execute(
+            update(AnsichProjectionJobRow)
+            .where(
+                AnsichProjectionJobRow.job_id == job_id,
+                AnsichProjectionJobRow.lease_generation == lease_generation,
+            )
+            .values(
+                status="completed",
+                dependency_pending_since=None,
+                lease_owner=None,
+                lease_expires_at=None,
+                last_error=None,
+            )
+        )
+        if result.rowcount:
+            return True
+        self._stale_completion_count += 1
+        logger.debug(
+            "ansich projection job %s was taken over before generation %s could complete it",
+            job_id,
+            lease_generation,
+        )
+        return False
+
+    async def _record_projection_error(
+        self,
+        job_id: str,
+        attempt: int,
+        exc: Exception,
+        *,
+        lease_generation: int,
+    ) -> None:
+        """Re-arm or fail a claimed job, unless the claim has been taken over.
+
+        Carries the same generation compare-and-set as the completion path, and
+        for a sharper reason: a stale error write does not merely duplicate a
+        settlement, it *un-settles* a row that now belongs to someone else --
+        re-arming it for a third claim while the current owner is still working,
+        and charging a failed job against health for an attempt nobody owns.
+        When the guard rejects the write, the durable error row and the
+        degradation mark are dropped with it.
+
+        A hard error re-arms to ``retry`` rather than ``pending``: the attempt
+        was spent, and ``pending`` has to keep meaning "never attempted" for a
+        health read to tell a queue from a retry loop. A dependency wait is the
+        deliberate exception -- it gives its attempt back, so it is not a retry
+        and stays ``pending``.
+        """
+
         async with self._session_factory() as session, session.begin():
             job = await session.get(AnsichProjectionJobRow, job_id)
             if job is None:
                 return
+            obs_id = job.obs_id
             message = str(exc)[:4_000]
+            now = datetime.now(UTC)
             if isinstance(exc, _ProjectionDependencyPending):
-                now = datetime.now(UTC)
                 pending_since = now if job.dependency_pending_since is None else _as_utc(job.dependency_pending_since)
-                job.dependency_pending_since = pending_since
-                job.status = "failed" if now - pending_since >= self._projector_dependency_timeout else "pending"
-                job.attempts = max(0, job.attempts - 1)
-                job.available_at = now + timedelta(milliseconds=250)
-                job.lease_owner = None
-                job.lease_expires_at = None
-                job.last_error = message
-                if job.status == "failed":
-                    self._failed_jobs += 1
-                    await self._mark_projection_task_degraded(session, job.obs_id)
-                    session.add(
-                        AnsichProjectionErrorRow(
-                            error_id=new_id(),
-                            job_id=job_id,
-                            attempt=attempt,
-                            error_type=type(exc).__name__,
-                            message=message,
-                        )
-                    )
+                timed_out = now - pending_since >= self._projector_dependency_timeout
+                values = {
+                    "dependency_pending_since": pending_since,
+                    "status": "failed" if timed_out else "pending",
+                    "attempts": max(0, job.attempts - 1),
+                    "available_at": now + timedelta(milliseconds=250),
+                    "lease_owner": None,
+                    "lease_expires_at": None,
+                    "last_error": message,
+                }
+                durable_failure = timed_out
+            else:
+                values = {
+                    "dependency_pending_since": None,
+                    "status": "failed" if attempt >= self._projector_max_attempts else "retry",
+                    "available_at": now + timedelta(milliseconds=250),
+                    "lease_owner": None,
+                    "lease_expires_at": None,
+                    "last_error": message,
+                }
+                durable_failure = True
+            if not await self._apply_job_error(
+                session,
+                model=AnsichProjectionJobRow,
+                job_id=job_id,
+                lease_generation=lease_generation,
+                values=values,
+            ):
                 return
-            job.dependency_pending_since = None
-            job.status = "failed" if attempt >= self._projector_max_attempts else "pending"
-            if job.status == "failed":
+            if values["status"] == "failed":
                 self._failed_jobs += 1
-                await self._mark_projection_task_degraded(session, job.obs_id)
-            job.available_at = datetime.now(UTC) + timedelta(milliseconds=250)
-            job.lease_owner = None
-            job.lease_expires_at = None
-            job.last_error = message
+                await self._mark_projection_task_degraded(session, obs_id)
+            if not durable_failure:
+                return
             session.add(
                 AnsichProjectionErrorRow(
                     error_id=new_id(),
@@ -1404,6 +1646,35 @@ class SqlAnsichBackend:
                     message=message,
                 )
             )
+
+    async def _apply_job_error(
+        self,
+        session: AsyncSession,
+        *,
+        model: type[AnsichProjectionJobRow] | type[AnsichAssessorJobRow],
+        job_id: str,
+        lease_generation: int,
+        values: dict[str, object],
+    ) -> bool:
+        """Write one guarded error re-arm; ``False`` means the claim was taken over."""
+
+        result = await session.execute(
+            update(model)
+            .where(
+                model.job_id == job_id,
+                model.lease_generation == lease_generation,
+            )
+            .values(**values)
+        )
+        if result.rowcount:
+            return True
+        self._stale_completion_count += 1
+        logger.debug(
+            "ansich job %s was taken over before generation %s could record its error",
+            job_id,
+            lease_generation,
+        )
+        return False
 
     @staticmethod
     async def _mark_projection_task_degraded(
@@ -1419,7 +1690,7 @@ class SqlAnsichBackend:
 
     async def _claim_assessor_job(
         self,
-    ) -> tuple[str, str, str, int, int] | None:
+    ) -> tuple[str, str, str, int, int, int] | None:
         """Claim one assessor job, absorbing its currently claimable siblings.
 
         Absorption flips the group's lower jobs to ``completed`` here, in the
@@ -1428,12 +1699,18 @@ class SqlAnsichBackend:
         therefore also widens the durable evidence mark down to just below the
         group's lowest watermark (see ``_widen_assessor_watermark``), making the
         widening exactly as durable as the absorption that requires it.
+
+        Absorption is a takeover as much as the claim itself is: an absorbed
+        sibling may have been leased by a worker whose lease has since expired
+        and which is still evaluating it. Its ``lease_generation`` therefore
+        rises too, so that worker's late completion or error write fails its
+        compare-and-set instead of re-arming a job this group already settled.
         """
 
         now = datetime.now(UTC)
         async with self._session_factory() as session, session.begin():
             claimable = or_(
-                AnsichAssessorJobRow.status == "pending",
+                AnsichAssessorJobRow.status.in_(_CLAIMABLE_JOB_STATUSES),
                 and_(
                     AnsichAssessorJobRow.status == "processing",
                     AnsichAssessorJobRow.lease_expires_at <= now,
@@ -1482,10 +1759,13 @@ class SqlAnsichBackend:
                 absorbed.lease_owner = None
                 absorbed.lease_expires_at = None
                 absorbed.last_error = None
+                absorbed.lease_generation = (absorbed.lease_generation or 0) + 1
             job.status = "processing"
             job.attempts += 1
             job.lease_owner = self._lease_owner
             job.lease_expires_at = now + timedelta(seconds=self._projector_lease_seconds)
+            job.lease_generation = (job.lease_generation or 0) + 1
+            claimed_generation = job.lease_generation
             await self._widen_assessor_watermark(
                 session,
                 subject_id=job.subject_id,
@@ -1499,47 +1779,101 @@ class SqlAnsichBackend:
                 job.assessor_name,
                 job.evidence_watermark,
                 job.attempts,
+                claimed_generation,
             )
+
+    async def _complete_assessor_job(
+        self,
+        session: AsyncSession,
+        *,
+        job_id: str,
+        lease_generation: int,
+    ) -> bool:
+        """Settle a claimed assessor job under the same guard as a projection job.
+
+        See ``_complete_projection_job``: rowcount zero means the row moved on
+        (a later claim absorbed or re-claimed it) and the write is dropped
+        without an exception, leaving the outcome to whoever holds it now.
+        """
+
+        result = await session.execute(
+            update(AnsichAssessorJobRow)
+            .where(
+                AnsichAssessorJobRow.job_id == job_id,
+                AnsichAssessorJobRow.lease_generation == lease_generation,
+            )
+            .values(
+                status="completed",
+                dependency_pending_since=None,
+                lease_owner=None,
+                lease_expires_at=None,
+                last_error=None,
+            )
+        )
+        if result.rowcount:
+            return True
+        self._stale_completion_count += 1
+        logger.debug(
+            "ansich assessor job %s was taken over before generation %s could complete it",
+            job_id,
+            lease_generation,
+        )
+        return False
 
     async def _record_assessor_error(
         self,
         job_id: str,
         attempt: int,
         exc: Exception,
+        *,
+        lease_generation: int,
     ) -> None:
+        """Guarded assessor re-arm; mirrors ``_record_projection_error``.
+
+        The absorbed-sibling case is what makes the guard load-bearing here: the
+        group's lower jobs are already ``completed`` by the time an earlier
+        owner's evaluation fails, and an unguarded write would put one of them
+        back in the queue with an error row against it.
+        """
+
         async with self._session_factory() as session, session.begin():
             job = await session.get(AnsichAssessorJobRow, job_id)
             if job is None:
                 return
             message = str(exc)[:4_000]
+            now = datetime.now(UTC)
             if isinstance(exc, _ProjectionDependencyPending):
-                now = datetime.now(UTC)
                 pending_since = now if job.dependency_pending_since is None else _as_utc(job.dependency_pending_since)
-                job.dependency_pending_since = pending_since
-                job.status = "failed" if now - pending_since >= self._projector_dependency_timeout else "pending"
-                job.attempts = max(0, job.attempts - 1)
-                job.available_at = now + timedelta(milliseconds=250)
-                job.lease_owner = None
-                job.lease_expires_at = None
-                job.last_error = message
-                if job.status != "failed":
-                    return
-                session.add(
-                    AnsichAssessorErrorRow(
-                        error_id=new_id(),
-                        job_id=job_id,
-                        attempt=attempt,
-                        error_type=type(exc).__name__,
-                        message=message,
-                    )
-                )
+                timed_out = now - pending_since >= self._projector_dependency_timeout
+                values = {
+                    "dependency_pending_since": pending_since,
+                    "status": "failed" if timed_out else "pending",
+                    "attempts": max(0, job.attempts - 1),
+                    "available_at": now + timedelta(milliseconds=250),
+                    "lease_owner": None,
+                    "lease_expires_at": None,
+                    "last_error": message,
+                }
+                durable_failure = timed_out
             else:
-                job.dependency_pending_since = None
-                job.status = "failed" if attempt >= self._projector_max_attempts else "pending"
-                job.available_at = datetime.now(UTC) + timedelta(milliseconds=250)
-                job.lease_owner = None
-                job.lease_expires_at = None
-                job.last_error = message
+                values = {
+                    "dependency_pending_since": None,
+                    "status": "failed" if attempt >= self._projector_max_attempts else "retry",
+                    "available_at": now + timedelta(milliseconds=250),
+                    "lease_owner": None,
+                    "lease_expires_at": None,
+                    "last_error": message,
+                }
+                durable_failure = True
+            if not await self._apply_job_error(
+                session,
+                model=AnsichAssessorJobRow,
+                job_id=job_id,
+                lease_generation=lease_generation,
+                values=values,
+            ):
+                return
+            if durable_failure:
                 session.add(
                     AnsichAssessorErrorRow(
                         error_id=new_id(),
@@ -1570,7 +1904,7 @@ class SqlAnsichBackend:
             claim = await self._claim_assessor_job()
             if claim is None:
                 break
-            job_id, task_id, assessor_name, evidence_watermark, attempt = claim
+            job_id, task_id, assessor_name, evidence_watermark, attempt, lease_generation = claim
             try:
                 async with self._session_factory() as session, session.begin():
                     if assessor_name == ACTION_REPETITION_ASSESSOR.name:
@@ -1719,16 +2053,18 @@ class SqlAnsichBackend:
                             task_id=task_id,
                             now=now,
                         )
-                    job = await session.get(AnsichAssessorJobRow, job_id)
-                    if job is None:
-                        raise RuntimeError("claimed Ansich assessor job disappeared")
-                    job.status = "completed"
-                    job.dependency_pending_since = None
-                    job.lease_owner = None
-                    job.lease_expires_at = None
-                    job.last_error = None
+                    await self._complete_assessor_job(
+                        session,
+                        job_id=job_id,
+                        lease_generation=lease_generation,
+                    )
             except Exception as exc:
-                await self._record_assessor_error(job_id, attempt, exc)
+                await self._record_assessor_error(
+                    job_id,
+                    attempt,
+                    exc,
+                    lease_generation=lease_generation,
+                )
         return changed
 
     async def _scope_safety_window_start(
@@ -3078,7 +3414,9 @@ class SqlAnsichBackend:
 
         A failed job dominates: it is durable evidence that the read model will
         not converge without operator retry. Anything still claimable — pending,
-        leased, or dependency-waiting — reads as ``pending``.
+        ``retry`` (re-armed after a spent attempt), leased, or
+        dependency-waiting — reads as ``pending``: the caller is being told the
+        Observation has not landed yet, not why.
         """
 
         async with self._session_factory() as session:

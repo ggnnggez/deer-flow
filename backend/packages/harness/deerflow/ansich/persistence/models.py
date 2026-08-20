@@ -100,9 +100,14 @@ class AnsichProjectionJobRow(Base):
     # -- the field returned to a value it already held, through a state the
     # stale writer must not write into -- so an owner-only
     # ``WHERE lease_owner = :me`` would let the stale attempt commit over the
-    # fresh claim. The generation tells the two claims apart, so a CAS has to
-    # compare ``(lease_owner, lease_generation)`` together. Nothing raises it
-    # yet: the claim/complete paths adopt it separately from this column.
+    # fresh claim. The generation tells the two claims apart, so the CAS keys on
+    # it. Raised by every claim and by ``rebuild``'s re-pend
+    # (``sql.py::_claim_projection_job`` / ``_rebuild_projections_locked``);
+    # completion and error writes guard on it
+    # (``_complete_projection_job`` / ``_record_projection_error``). It is
+    # monotonic for the row's lifetime and is never reset -- an operator retry
+    # deliberately leaves it alone, because resetting it would recreate the very
+    # ABA it exists to prevent.
     lease_generation: Mapped[int] = mapped_column(BigInteger, nullable=False, server_default="0")
     last_error: Mapped[str | None] = mapped_column(Text)
 
@@ -163,9 +168,10 @@ class AnsichAssessorJobRow(Base):
     # Same ABA hazard as ``AnsichProjectionJobRow.lease_generation``: the owner
     # id is one process-lifetime ``uuid4``, so an expired-lease worker can
     # re-claim its own job and read its own id back out of ``lease_owner``. A
-    # CAS therefore has to compare ``(lease_owner, lease_generation)``, never
-    # the owner alone. Nothing raises it yet: the claim/complete paths adopt it
-    # separately from this column.
+    # CAS therefore has to key on the generation, never the owner alone. Raised
+    # by every claim *and* by sibling absorption (``sql.py::_claim_assessor_job``
+    # completes the group's lower jobs, which is a takeover of whoever had one
+    # leased); completion and error writes guard on it.
     lease_generation: Mapped[int] = mapped_column(BigInteger, nullable=False, server_default="0")
     last_error: Mapped[str | None] = mapped_column(Text)
     dependency_pending_since: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))

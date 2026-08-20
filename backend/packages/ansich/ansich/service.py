@@ -1457,8 +1457,12 @@ class AnsichService:
             rebuilt = int(await rebuild())
             await self._assess_operations_unlocked()
             return rebuilt
-        # The reset-and-replay must never interleave with the background
-        # projector loop claiming the same jobs (SQLite has no SKIP LOCKED).
+        # This lock is the *in-process* half of the guard: it keeps the
+        # reset-and-replay from interleaving with this service's own projector
+        # loop. It says nothing about other processes -- a SQL backend takes a
+        # cross-worker lock of its own for the whole operation
+        # (``sql.py::_maintenance_lock``: a Postgres advisory lock, and a
+        # documented no-op on single-writer SQLite).
         async with projection_lock:
             rebuilt = int(await rebuild())
             await self._assess_operations_unlocked()

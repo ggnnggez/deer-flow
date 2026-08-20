@@ -41,6 +41,7 @@ from deerflow.ansich.persistence.models import (
 from deerflow.ansich.persistence.sql import SqlAnsichBackend, _list_task_views_statement
 from deerflow.ansich.tool_middleware import AnsichRawToolMiddleware, AnsichVisibleToolMiddleware
 from deerflow.persistence.base import Base
+from deerflow.persistence.migrations._helpers import _normalize_default
 
 
 class _ObservedFinalModel(BaseChatModel):
@@ -966,6 +967,7 @@ def test_assessor_dependency_deadline_migration_upgrades_sqlite(tmp_path) -> Non
 LEASE_GENERATION_REVISION = "0027_ansich_lease_generation"
 PRE_LEASE_GENERATION_REVISION = "0026_ansich_environment"
 PROJECTOR_STATUS_INDEX = "ix_ansich_projection_jobs_projector_status"
+CLAIM_INDEX = "ix_ansich_projection_jobs_claim"
 
 
 def _lease_generation_alembic_config(database_path: Path) -> AlembicConfig:
@@ -1070,8 +1072,14 @@ def test_lease_generation_migration_roundtrips_sqlite(tmp_path) -> None:
     assert len(revision) <= 32
     assert projection_columns["lease_generation"]["nullable"] is False
     assert assessor_columns["lease_generation"]["nullable"] is False
-    assert str(projection_columns["lease_generation"]["default"]).strip("'") == "0"
-    assert str(assessor_columns["lease_generation"]["default"]).strip("'") == "0"
+    # Read through the migration layer's own comparator rather than a
+    # hand-rolled strip: each dialect renders a reflected default differently
+    # (outer parens, a Postgres ``::bigint`` cast), and ``_normalize_default``
+    # is exactly what ``safe_add_column`` uses to decide whether a reflected
+    # default matches the model's. It keeps the literal's quotes -- both
+    # dialects quote it -- so unquoting is the last step to the value itself.
+    assert _normalize_default(projection_columns["lease_generation"]["default"]).strip("'") == "0"
+    assert _normalize_default(assessor_columns["lease_generation"]["default"]).strip("'") == "0"
     # Column order is load-bearing: the health merge groups by projector first,
     # so a ``(status, projector_name)`` index would not serve the same read.
     assert projection_indexes[PROJECTOR_STATUS_INDEX] == ["projector_name", "status"]
@@ -1085,6 +1093,10 @@ def test_lease_generation_migration_roundtrips_sqlite(tmp_path) -> None:
     assert "lease_generation" not in projection_columns
     assert "lease_generation" not in assessor_columns
     assert PROJECTOR_STATUS_INDEX not in projection_indexes
+    # SQLite has no DROP COLUMN for this shape, so alembic's batch mode
+    # recreates the table: the pre-existing claim index must survive that
+    # round trip, not just the column it was asked to drop.
+    assert CLAIM_INDEX in projection_indexes
     # The downgrade drops columns, never job rows.
     assert _seeded_job_ids(database_path) == ("job-projection", "job-assessor")
 

@@ -1207,6 +1207,56 @@ for the writer only — the projector join stays unbounded until batch C rewrite
 the §8 ordering. Replay, retention, raw-read audit and the acceptance drills are
 untouched.
 
+**P11-B lease compare-and-set, `retry`, single-operator maintenance** (the
+lease slice of Phase 11; spec §3). The `lease_generation` column migration
+`0027` added is now live. Every claim raises it by one and remembers what it
+claimed; every later write for that job — completion, error re-arm, and the
+assessor group's sibling absorption — carries
+`WHERE job_id = :id AND lease_generation = :claimed`. Rowcount zero means the
+row was taken over (the lease expired and someone re-claimed it, or a rebuild
+re-pended it) and the write is **dropped silently**, never raised: the new owner
+owns the outcome, and an exception there would only re-arm the row under its
+feet. Whatever the losing worker already projected stays committed — projector
+idempotency is the backstop that makes the drop safe, and the new owner
+converges on the same read model. Drops are counted in a process-local debug
+counter (`SqlAnsichBackend.stale_completion_count`), deliberately **not** a
+health field. Why a generation rather than `lease_owner`: that id is one
+`uuid4` per process, so a worker whose lease expired mid-work re-claims the same
+job and reads its own id back out — an ABA an owner-only CAS cannot see.
+
+A new job status `retry` separates re-armed work from never-attempted work: a
+hard error re-arms to `retry` because the attempt was spent, while a replay-safe
+dependency wait stays `pending` because it hands its attempt back and was never
+a retry. Both claim predicates and `has_pending_for_task` accept it, `processing`
+is deliberately not renamed, and the evaluation receipt keeps reporting every
+still-claimable status as `pending`.
+
+`rebuild_projections` and `retry_failed_projections` are single-operator
+maintenance operations. On Postgres each holds a `pg_advisory_lock`
+(`sql.py::_PG_MAINTENANCE_LOCK_KEY`, deliberately distinct from the bootstrap
+key) for its whole duration and a second operator **blocks** rather than being
+rejected — unbounded at the database, but bounded in practice by
+`database.command_timeout` (30s), past which asyncpg cancels the pending lock
+request and the call fails loudly with nothing held, the same exposure the
+schema bootstrap's advisory lock already carries. On single-writer SQLite that
+lock is a documented no-op and `AnsichService._projection_lock` remains the
+in-process half of the guard.
+
+`rebuild`'s re-pend raises every generation, because the lock does not stop a
+worker that claimed a job *before* the rebuild started: without the bump its
+late completion would mark the job settled between the re-pend and the replay,
+silently dropping that Observation from the rebuilt read model. `retry` touches
+only `failed` rows — a leased row belongs to a worker still entitled to finish
+it — returns the rowcount it actually re-armed, and never resets the
+generation, which stays monotonic for the row's lifetime precisely so an older
+claim's number can never match again.
+
+`tests/ansich/test_lease_cas.py` proves these as explicit interleaving scripts
+(two engines and two backends over one SQLite file, lease expiry injected as a
+past-dated timestamp rather than by moving a clock). What that substrate cannot
+prove stays unproven: SQLite renders `skip_locked` empty, so claim-side
+exclusion and READ COMMITTED lost updates still need the opt-in Postgres tier.
+
 **Workspace change review**: `packages/harness/deerflow/workspace_changes/`
 captures a pre-run and post-run snapshot of the thread-owned `workspace` and
 `outputs` directories. `runtime/runs/worker.py` performs the filesystem scan via
