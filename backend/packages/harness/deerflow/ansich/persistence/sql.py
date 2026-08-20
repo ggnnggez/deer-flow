@@ -311,6 +311,12 @@ _SAFETY_PROJECTION_KINDS = frozenset(
         "effect.observed",
     }
 )
+#: The follow-up job a committed spawn edge leaves behind (F10-19). It is
+#: deliberately absent from ``_PROJECTOR_KINDS``: intake never creates one, so
+#: an ordinary root ``task.created`` costs nothing. ``_project_task_spawn``
+#: enqueues it, in the same transaction as the edge, only when an edge is
+#: actually established.
+_SPAWN_RECONCILE_PROJECTOR = ("task-spawn-reconcile", "1")
 _PROJECTORS = (
     ("task-structural", "1"),
     ("task-control", "1"),
@@ -326,6 +332,11 @@ _PROJECTORS = (
     # Registered last on purpose: evaluations point at subjects (Task, Step,
     # ToolCall, ContentBlock, AgentRelease) that the projectors above create.
     ("evaluation-projector", "1"),
+    # Last of all: it re-reads the ancestry closure ``task-structural`` writes
+    # for the same Observation, so on a rebuild replay -- where both jobs are
+    # pending at once and priority is the only thing separating them -- the
+    # edge must already be back.
+    _SPAWN_RECONCILE_PROJECTOR,
 )
 _PROJECTOR_KINDS = {
     "task-structural": frozenset((*_CONTROL_BY_KIND, "agent_release.resolved")),
@@ -663,7 +674,7 @@ async def _lock_rollup_targets(session: AsyncSession, statement) -> list:
       an existing row's writers, not the membership of a set. That is the
       structural reason F10-19 (a late spawn edge racing a sum-type usage
       contribution) is **not** closed by any of this — it needs the re-fanout
-      reconciliation, not a lock. See ``_backfill_spawn_usage``'s docstring.
+      reconciliation, not a lock. See ``_reconcile_spawn_usage``.
 
     The lost update this discipline prevents is proven red on a real
     PostgreSQL server by the two-worker tier in
@@ -1200,6 +1211,8 @@ class SqlAnsichBackend:
                         await self._project_environment(session, observation)
                     elif projector_name == "evaluation-projector":
                         await self._project_evaluation(session, observation)
+                    elif projector_name == _SPAWN_RECONCILE_PROJECTOR[0]:
+                        await self._reconcile_spawn_usage(session, observation)
                     else:
                         raise ValueError(f"unknown Ansich projector: {projector_name}")
                     for assessor_name, assessor_version in _assessors_after_projection(
@@ -7558,6 +7571,12 @@ class SqlAnsichBackend:
             )
             if identity != (parent_task_id, step_id, tool_call_id):
                 raise ValueError("child Task already has a different parent")
+            # No reconciliation is enqueued here on purpose: this edge was
+            # established by an earlier run of this projection, which left one
+            # behind in the same transaction. The one case that leaves an edge
+            # without one is a row written before F10-19's fix existed, and
+            # those spawns are long settled; a `rebuild_projections()` replays
+            # this projection and mints one for them if it is ever wanted.
             return
 
         if (
@@ -7606,6 +7625,146 @@ class SqlAnsichBackend:
             descendant_task_ids=tuple(item[0] for item in descendant_depths),
             updated_at=observation.recorded_at,
         )
+        # The backfill above can only carry what is durable *now*, and its read
+        # has no serialising point against a concurrent `_project_usage` (F10-19).
+        # Leave a reconciliation job behind so the same fan-out runs once more
+        # from a transaction that starts after this edge is visible. Enqueued
+        # here rather than at the end of `_backfill_spawn_usage` because it is
+        # not part of that fan-out: it is the promise that the fan-out will be
+        # repeated, and it has to be made even when this pass copied nothing.
+        await self._enqueue_spawn_usage_reconcile(session, observation.obs_id)
+
+    @staticmethod
+    async def _enqueue_spawn_usage_reconcile(session: AsyncSession, obs_id: str) -> None:
+        """Promise one post-commit re-fan of this spawn's descendants (F10-19).
+
+        **Why a follow-up job and not this transaction's tail.** A tail would be
+        a second read with the *same* visibility as the edge write, which is
+        what ``_backfill_spawn_usage`` already is — it would re-read exactly the
+        rows the first read saw and close nothing. The window is defined by a
+        contribution that commits *after* that read, so the only trigger point
+        that can see it is one whose transaction starts after this one commits.
+        A job is that trigger, and being a row committed atomically with the
+        edge it also survives a crash in between: an edge can never become
+        durable without its reconciliation being durable too. The cost is one
+        extra job per established spawn edge (not per ``task.created``), which
+        rides the existing lease/CAS/attempt/failed-job machinery rather than
+        adding any of its own.
+
+        Idempotent on ``(obs_id, projector_name, projector_version)``: a replay
+        of this projection — a re-claim after a lease expiry, or ``rebuild``'s
+        re-pend — finds the row it already left and adds nothing.
+        """
+
+        projector_name, projector_version = _SPAWN_RECONCILE_PROJECTOR
+        await _insert_ignoring_conflict(
+            session,
+            AnsichProjectorVersionRow,
+            {
+                "projector_name": projector_name,
+                "projector_version": projector_version,
+            },
+            index_elements=["projector_name", "projector_version"],
+            returning=AnsichProjectorVersionRow.projector_name,
+        )
+        await _insert_ignoring_conflict(
+            session,
+            AnsichProjectionJobRow,
+            {
+                "job_id": new_id(),
+                "obs_id": obs_id,
+                "projector_name": projector_name,
+                "projector_version": projector_version,
+                "status": "pending",
+            },
+            index_elements=["obs_id", "projector_name", "projector_version"],
+            returning=AnsichProjectionJobRow.job_id,
+        )
+
+    async def _reconcile_spawn_usage(
+        self,
+        session: AsyncSession,
+        observation: ObservationEnvelope,
+    ) -> None:
+        """Re-fan a spawned Task's own contributions to its complete ancestry.
+
+        Closes F10-19. ``_backfill_spawn_usage`` reads the descendants' self
+        rows and ``_project_usage`` fans a new contribution out over the
+        ancestry visible at *its* time; nothing orders the two. A contribution
+        that commits after the backfill's read, whose own fan-out ran before the
+        edge was visible, reaches no ancestor — ever. ``wall_time_ms`` self-heals
+        because it is max-type and every tick re-fans the whole mark, but the
+        sum-type dimensions (``total_tokens``, ``steps*``, ``tool_calls_*``)
+        have no such repair, so the ancestor's inclusive value stays permanently
+        low.
+
+        This pass runs in its own transaction, strictly after the edge
+        committed, and simply repeats the fan-out. It relies entirely on
+        ``_store_usage_contribution``'s existing idempotency — ``ON CONFLICT DO
+        NOTHING`` keyed by ``(aggregate, source, dimension, source_obs_id)`` for
+        sum types, a high-water compare-and-set for ``wall_time_ms`` — so every
+        contribution the first backfill already delivered is a no-op that never
+        reaches ``changed`` and therefore never touches a summary. Only the
+        window's lost rows actually land, which is what makes re-running this
+        (a retry, a second spawn under the same ancestor, ``rebuild``) free.
+
+        The ordering discipline is inherited rather than re-implemented: the
+        traversal is ``_backfill_spawn_usage``'s own, which sorts its ancestors
+        before taking the high-water contribution locks and sorts ``changed``
+        before taking the summary locks. The two reads below are ordered for the
+        same reason, so the tuple handed down is a function of the ids and not
+        of storage order.
+        """
+
+        child_task_id = observation.task_id
+        if await session.get(AnsichTaskSpawnRow, child_task_id) is None:
+            # No edge to reconcile. Reachable only while a rebuild is replaying
+            # (the re-pended job outlives the rows it describes) or after the
+            # Observation's own projection failed durably. Returning is right
+            # for both: whatever re-establishes the edge runs its own backfill
+            # and leaves its own reconciliation behind.
+            return
+        ancestor_task_ids = tuple((await session.execute(select(AnsichTaskAncestryRow.ancestor_task_id).where(AnsichTaskAncestryRow.descendant_task_id == child_task_id).order_by(AnsichTaskAncestryRow.ancestor_task_id))).scalars())
+        if not ancestor_task_ids:
+            return
+        descendant_task_ids = (
+            child_task_id,
+            *(await session.execute(select(AnsichTaskAncestryRow.descendant_task_id).where(AnsichTaskAncestryRow.ancestor_task_id == child_task_id).order_by(AnsichTaskAncestryRow.descendant_task_id))).scalars(),
+        )
+        # A `_project_usage` that is *still running* would defeat this pass the
+        # same way it defeated the backfill: its fan-out already read the
+        # pre-edge ancestry and its contribution is not committed yet, so the
+        # read below cannot see it. Its job says so — a claim commits
+        # ``processing`` in its own transaction before the work starts, and the
+        # completion commits with the projection — so waiting for the live
+        # claims to clear is what turns this from a narrower window into none.
+        # Only a *live* lease is waited on: an expired one is re-claimable, and
+        # the re-claim redoes the fan-out against the now-visible edge, which
+        # delivers the ancestor rows without this pass. The wait gives its
+        # attempt back and is bounded by ``projector_dependency_timeout_seconds``
+        # like every other replay-safe dependency.
+        in_flight = await session.scalar(
+            select(AnsichProjectionJobRow.job_id)
+            .join(
+                AnsichObservationRow,
+                AnsichObservationRow.obs_id == AnsichProjectionJobRow.obs_id,
+            )
+            .where(
+                AnsichProjectionJobRow.projector_name == "task-usage",
+                AnsichProjectionJobRow.status == "processing",
+                AnsichProjectionJobRow.lease_expires_at > datetime.now(UTC),
+                AnsichObservationRow.task_id.in_(descendant_task_ids),
+            )
+            .limit(1)
+        )
+        if in_flight is not None:
+            raise _ProjectionDependencyPending(f"spawn usage reconciliation for Task {child_task_id} is waiting for an in-flight usage projection")
+        await self._backfill_spawn_usage(
+            session,
+            ancestor_task_ids=ancestor_task_ids,
+            descendant_task_ids=descendant_task_ids,
+            updated_at=observation.recorded_at,
+        )
 
     async def _backfill_spawn_usage(
         self,
@@ -7629,6 +7788,14 @@ class SqlAnsichBackend:
         never lower an ancestor's mark or over-report. A lock here would also
         not help the sum-type rows: row locks do not block inserts of new rows,
         which is the only way that set changes.
+
+        What this read genuinely cannot see is a contribution that commits after
+        it — F10-19. That is not closed here and is not closable here, because
+        this read has the same visibility as the edge being written beside it.
+        It is closed by running this whole fan-out a second time from a later
+        transaction: ``_project_task_spawn`` leaves a
+        ``task-spawn-reconcile`` job behind, and ``_reconcile_spawn_usage``
+        calls back into this function once the edge is durable.
         """
 
         local_rows = list(
@@ -8389,7 +8556,8 @@ class SqlAnsichBackend:
             # `as_of` and `complete_through_ingest_seq` down with it. See
             # `_lock_rollup_targets`. Note the lock does not (and cannot) stop
             # a peer from inserting a new contribution row -- that set-
-            # membership race is F10-19's, closed by re-fanout, not here.
+            # membership race is F10-19's, closed by `_reconcile_spawn_usage`'s
+            # re-fanout, not here.
             # Lost-update proof on a real PostgreSQL server: T9's two-worker
             # tier, tests/integration/test_postgres_multiworker.py.
             usage = next(iter(await _lock_rollup_targets(session, summary_statement)), None)
