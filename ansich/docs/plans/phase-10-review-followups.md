@@ -36,6 +36,8 @@
 | F10-26 | rebuild 完整性:`rebuild_projections()` 可能在依赖延迟的 job 尚未结算时就以「首轮空扫」宣告完成(本批四次目击) | ⬜ 未修复 | — | — |
 | F10-27 | 装配不对称:`create_embedded_ansich_service` 的无存储分支漏传三个 knob;`operations_assessment_interval_ms` 至今没有 `AnsichConfig` 字段,生产恒为 1000ms | ⬜ 未修复 | — | — |
 | F10-28 | 健康线的两处 UI 级留观:中性线态(phase/unknown)的**渲染层**零覆盖(图标三元式曾在本批被反转过);task 作用域在系统 phase 期间仍称「本任务数据完整」 | ⬜ 未修复 | — | — |
+| F10-29 | 环境外部化载荷类:externalized 的 `environment.sampled` 读不回(契约分支无守卫直接抛)、认领不了(先 envelope 后 hydrate 的顺序使投影作业 durable failed)、history 读者守卫跳过(其"从不外部化"注释已撤回)——同一危害类三实例 | ⬜ 未修复 | — | — |
+| F10-30 | settle-budget flake 家族(与 F10-10 分开记):三条 `terminal_flush_timeout_ms=100` 构造的测试在 24-hog 争用下 3/3 全红且两侧一致——flush 预算输给负载,行退回队列/作业未建;F10-10 的节奏门禁管不了 flush 预算 | ⬜ 未修复(测试侧) | — | — |
 
 留观标记:F10-10 的第 4 条证据(`test_step_attempt_and_context_are_queryable_after_projection`)**未证实**——只做了排除法,没拿到原始失败文本。若它再轮换红,**先抓失败文本再修**,不要按已有的三条诊断类推。另:F10-10 的门禁只被 Task 8 的验收负载证明过(`e53cefbc` 记录了这条边界),Task 9 的更重负载下仍有 2 条已上门禁的测试翻红,详见该条的「后续观察」。
 
@@ -375,3 +377,24 @@
 - 验收准则(评审已给定,照此写用例):**翡翠 `ActivityIcon` 只属于 `healthy`;phase 与 unknown 两种线态都必须是哑光 help 图标**。落法:一组「中性线态」e2e 用例(`starting` 夹具 + `unknown`(计数不可用)夹具),与既有 ansich e2e 同套路(路由桩)。仓库没有组件级 DOM 测试设施,e2e 是唯一载体。
 - 第二处——task 作用域在系统 phase 期间的诚实性:`taskProjectionScope` 在无硬故障、无本任务 attention 时把 status 合成为 `"healthy"`,于是系统 `starting`/`shutting_down` 期间任务页仍渲染绿色「本任务数据完整」——PA15 刚在系统作用域移除的那句话,在下一层原样存在。与既定规则(任务只继承硬故障)一致,且两个 phase 在 HTTP 上近乎不可观测(lifespan 先启服务后放流量、关停先排空请求),故为 minor;但它与第一处是同一个诚实性问题,修第一处时应一并裁定(方向:phase 期间任务页也用 phase 线态,或在文档里明确接受)。
 - 归属:下一次触达该组件的 UI 批(或 P11-B 若其健康面板工作触达此处)。
+
+## F10-29. 环境外部化载荷类(F10-8/F10-23 的第三面)
+
+- 状态:⬜ 未修复。来源:P11-B 批 Task 4 的清扫发现(评审升级了严重度)。
+- 三个实例,同一危害类(externalized payload 的读者不 hydrate):
+  1. `packages/ansich/ansich/contracts.py` 的 `environment.sampled` 校验分支对 `payload is None` **无守卫直接抛**(F10-8 修的三个分支有守卫,这个没有)——externalized 环境样本经任何公共读(`list_timeline`/`list_observations`/告警证据)都读不回;
+  2. `_claim_projection_job` 先 `_observation_from_row` 后 hydrate 的顺序使这类行**认领即失败**——`environment-projector@1` 的作业 durable failed("写得进、读不出、作业永不落地",F10-8 当年"比诊断记录的还要广一层"的同款形状);
+  3. `sql.py` 环境 history 读者对 payload-ref 行守卫跳过——其"环境载荷从不外部化"的注释已在 `0d9aa3cb` 撤回(它们**可以**外部化,默认 65536 字节阈值下概率低)。
+- 概率:低(环境样本 payload 小);方向:契约分支补 F10-8 同款守卫 + history 读者走 hydrate;每实例配回归。
+- 归属:下一次触达环境观测的改动,或 P11-C。
+
+## F10-30. settle-budget flake 家族(与 F10-10 明确分开)
+
+- 状态:⬜ 未修复(测试侧;生产行为是 fail-open 预算语义,非 bug)。来源:P11-B 批 T2-T4 的争用复测逐步识别,T4 修复轮定名。
+- 成员(全部 `terminal_flush_timeout_ms=100` 构造、24-hog 争用下 3/3 全红、修改前后两侧一致):
+  1. `test_externalized_scope_authorization_and_effect_payloads_read_back`(:1195,`stored_payload_state == {}`——flush 预算内没写完);
+  2. `test_scope_safety_dependency_wait_crosses_deadline_into_failed_job_and_retry`(:514,`NoneType.job_id`——作业未建);
+  3. `test_scope_safety_waits_for_subject_entity_then_self_heals`(同型)。
+- 为什么不是 F10-10:其中两条**已上** `only_test_driven_assessments` 门禁——该门禁管评估**节奏**,管不了 **flush 预算**输给负载;P11-A 的屏障语义(超时退回队首)使测试在重排队中读到空态。两族必须分开记,否则会把「加大门禁」的错误结论套到这一族上。
+- 方向:这三条测试的读断言前补一个对 flush/重排队路径的确定性 settle 等待(或争用级运行放宽终端预算);普通负载下极少翻红,合并门禁仍以安静机全绿为准。
+- 归属:下一次测试卫生波;F10-10 留观的兄弟条目。
