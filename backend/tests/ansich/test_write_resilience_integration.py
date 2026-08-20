@@ -121,6 +121,17 @@ class _StorageFault:
       only shape in which the receipt ladder's rung 2 is *decisive* — the row
       is durable, so rung 3 has a real and different answer available.
 
+      **The mechanism is synthetic; the state it produces is not.** The error
+      is injected at the connection's ``__aexit__``, after the real session's
+      own ``__aexit__`` has already returned — not a sequence ``aiosqlite``
+      produces on its own. What it reproduces is the *state* the collector is
+      documented to reach honestly by other routes: a write cancelled between
+      storage committing and the call returning (``_drain_writer``'s
+      cancellation window), or an acknowledgement lost on the way back. Those
+      are hard to script and this is not, so the fault stands in for them —
+      the rows are genuinely committed to real SQLite either way, which is the
+      part the receipt ladder is being asked about.
+
     Everything downstream of the switch is production. A healed collector opens
     the real session, runs the real statements, and commits real rows.
     """
@@ -438,16 +449,29 @@ async def _collector(tmp_path, name: str, **overrides) -> AsyncIterator[tuple[An
     service = create_sql_ansich_service(fault, **settings)  # type: ignore[arg-type]
     only_test_driven_assessments(service)
     await service.start()
+    body_failed = False
     try:
         yield service, fault
+    except BaseException:
+        body_failed = True
+        raise
     finally:
         # Always healed before the drain: a stalled backend would spend the
         # whole stop budget and charge loss the test never asked for, turning
         # every teardown into a second, silent scenario.
         fault.heal()
-        with contextlib.suppress(Exception):
+        try:
             await service.stop()
-        await engine.dispose()
+        except Exception:
+            # A stop that raises against a healed backend is a finding about
+            # the drain, not teardown noise, so it is re-raised. The one case
+            # it is swallowed in is a test body that already failed: there the
+            # stop failure is a consequence, and letting it replace the real
+            # diagnosis would hide the thing worth reading.
+            if not body_failed:
+                raise
+        finally:
+            await engine.dispose()
 
 
 @pytest.mark.anyio
@@ -707,11 +731,18 @@ async def test_barrier_timeout_under_a_stalled_backend_returns_rows_instead_of_l
     which time it already holds ``persist_lock`` and has taken the rows. The
     writer therefore finds the lock held and waits, which is precisely the
     contention this test wants.
+
+    The long ``flush_interval_ms`` is part of that: at the collector default
+    the writer also wakes on its **own** timer, and a writer that took the
+    batch first would leave the barrier merely waiting on a lock — taking
+    nothing, returning nothing, and passing every assertion below for the wrong
+    reason. The strict queue-depth assertion after the timeout is what pins
+    which of the two actually held the rows.
     """
 
     task_id = new_id()
     observations = _workload(task_id, 12)
-    async with _collector(tmp_path, "barrier-stall") as (service, fault):
+    async with _collector(tmp_path, "barrier-stall", flush_interval_ms=30_000) as (service, fault):
         await _wait_for("the collector to reach its first idle", lambda: service.get_health().status == "healthy")
 
         fault.stall()
@@ -731,11 +762,15 @@ async def test_barrier_timeout_under_a_stalled_backend_returns_rows_instead_of_l
         # watermark to name.
         assert timed_out.persisted_through is None
         assert health_at_timeout.dropped_count == 0
-        # The rows are back in the queue rather than in anybody's hands. The
-        # writer may already have taken a batch of them off the head, so the
-        # honest invariant is that queue plus outstanding accounts for all of
-        # them.
-        assert health_at_timeout.queue_depth + health_at_timeout.writer.in_flight_count == len(observations)
+        # Every row is back in the queue and nothing is outstanding. Strict, and
+        # deliberately so: this is what says the *barrier* took the rows and
+        # gave them back. A writer that had taken a batch first would leave the
+        # barrier holding only the remainder, and the two numbers would split.
+        # The read is deterministic — releasing `persist_lock` only *schedules*
+        # the waiting writer, and `flush_task` returns to this task without
+        # yielding to the loop in between.
+        assert health_at_timeout.queue_depth == len(observations)
+        assert health_at_timeout.writer.in_flight_count == 0
         assert fault.stall_count > 0
 
         fault.heal()
@@ -759,31 +794,75 @@ async def test_barrier_timeout_under_a_stalled_backend_returns_rows_instead_of_l
 
 
 @pytest.mark.anyio
-async def test_a_stalled_barrier_does_not_stop_the_writer_placing_the_rows_after_the_heal(tmp_path) -> None:
-    """The other half of RA5②: the returned rows keep their collector order.
+async def test_a_stalled_barrier_returns_its_rows_to_the_queue_head_not_the_tail(tmp_path) -> None:
+    """The other half of RA5②: the returned rows go back *where they came from*.
 
-    A barrier that gave rows back at the head of the queue and a writer that
-    then placed them must leave the stream in the order the accept path
-    allocated. Read back through the real backend, ``producer_seq`` and the
-    stored order are the check on that — a return that appended instead of
-    prepending would show up here as a reordered replay rather than as a lost
-    row.
+    A spent budget puts the barrier's selection back at the **head** of the
+    queue, below everything recorded while it was holding them. That is what
+    keeps the collector sequence authoritative after an incident — and it only
+    means anything if there is something in the queue for the rows to be below.
+    Rows recorded *after* the return sort above them whether the return
+    prepends or appends, so a test that records them afterwards is green
+    against both and pins nothing. (An earlier version of this test did exactly
+    that, and stayed green under a deliberate append-to-tail mutant.)
+
+    The trailing rows therefore arrive **during the hold**. ``record_batch`` is
+    a synchronous, thread-safe call by design, so the test schedules it on the
+    loop with ``call_soon`` and then awaits the barrier inline: the barrier
+    reaches its stall without ever yielding, so the callback can only run once
+    the rows are already taken and ``persist_lock`` is already held. Nothing
+    here depends on the writer's state — it can take nothing while the barrier
+    holds the lock — which is what makes the setup deterministic rather than a
+    race against loop startup. The state captured inside that callback is
+    asserted below, so a hold that did not happen fails loudly instead of
+    quietly making the ordering claim vacuous again.
+
+    Read back through the real backend, ``list_observations`` is ordered by
+    ``ingest_seq`` — the order storage accepted the rows in — so a return that
+    appended shows up as a reordered replay rather than as a lost row.
     """
 
     task_id = new_id()
     observations = _workload(task_id, 9)
-    async with _collector(tmp_path, "barrier-order") as (service, fault):
-        await _wait_for("the collector to reach its first idle", lambda: service.get_health().status == "healthy")
+    held, trailing = observations[:6], observations[6:]
+    # The long interval only keeps the writer quiet during the hold; it is not
+    # load-bearing here, because the barrier takes the queue before the writer
+    # can run at all.
+    async with _collector(tmp_path, "barrier-order", flush_interval_ms=30_000) as (service, fault):
+        during_hold: list[tuple[bool, AnsichHealth]] = []
+
+        def record_trailing_rows() -> None:
+            receipts = service.record_batch(tuple(trailing))
+            # Captured rather than asserted: this runs as a loop callback, so a
+            # failure here would be swallowed by the loop's exception handler
+            # instead of failing the test.
+            during_hold.append((all(receipt.accepted for receipt in receipts), service.get_health()))
 
         fault.stall()
-        service.record_batch(tuple(observations[:6]))
-        with _terminal_budget(service, 150):
+        service.record_batch(tuple(held))
+        asyncio.get_running_loop().call_soon(record_trailing_rows)
+        with _terminal_budget(service, 250):
             timed_out = await service.flush_task(task_id)
-        assert timed_out.timed_out is True
 
-        # Recorded *after* the barrier gave its rows back: these must sort
-        # above them, which is only true if the return went to the head.
-        service.record_batch(tuple(observations[6:]))
+        assert timed_out.timed_out is True
+        assert timed_out.lost_ranges == ()
+        # The precondition the ordering claim rests on: while the barrier held
+        # its selection, the trailing rows were the whole of the queue — so the
+        # return had something it could be placed either above or below.
+        assert len(during_hold) == 1
+        accepted, held_state = during_hold[0]
+        assert accepted
+        assert held_state.queue_depth == len(trailing)
+        assert held_state.writer.in_flight_count == len(held)
+
+        returned = service.get_health()
+        assert returned.dropped_count == 0
+        # Everything back in the queue, nothing outstanding: the barrier gave
+        # back exactly what it took. Which *end* it gave them back to is what
+        # the stored order below answers.
+        assert returned.queue_depth == len(observations)
+        assert returned.writer.in_flight_count == 0
+
         fault.heal()
         await _wait_for(
             "the whole workload to reach storage",
@@ -795,9 +874,9 @@ async def test_a_stalled_barrier_does_not_stop_the_writer_placing_the_rows_after
 
     assert health.dropped_count == 0
     assert settled.persisted_through == len(observations)
-    assert {observation.obs_id for observation in stored} == {observation.obs_id for observation in observations}
-    consumptions = [observation for observation in stored if observation.kind == "budget.consumed"]
-    assert [observation.producer_seq for observation in consumptions] == sorted(observation.producer_seq for observation in consumptions)
+    # Storage accepted them in the order the accept path allocated: the six the
+    # barrier gave back first, then the three recorded while it held them.
+    assert [observation.obs_id for observation in stored] == [observation.obs_id for observation in observations]
 
 
 @pytest.mark.anyio
@@ -810,6 +889,28 @@ async def test_writer_resilience_config_reaches_the_service_and_the_backend(tmp_
     and pre-existing knobs on both sides of the assembly — service and backend —
     ride along as controls, so a factory that dropped its ``**config`` on the
     floor fails here rather than in whichever scenario happened to depend on it.
+
+    **What this adds over
+    ``test_ansich_config.py::test_writer_resilience_settings_reach_the_service_on_both_assembly_paths``**,
+    which is not superseded and should not be deleted for this one: that test
+    owns the five writer knobs across *both* embedded branches, including the
+    ``session_factory is None`` one this file never builds. This test owns the
+    three things it does not — the twelve pre-existing control knobs, the
+    **backend** half of the assembly (nothing over there is asserted anywhere
+    else), and the derived backoff schedule, which is what catches a threading
+    bug that swapped the initial/max pair while both field reads still passed.
+
+    One asymmetry worth naming while looking straight at it, and deliberately
+    not fixed here: the ``session_factory is None`` branch of
+    ``create_embedded_ansich_service`` constructs ``AnsichService`` directly and
+    passes the five writer knobs but **not** ``terminal_flush_timeout_ms``,
+    ``projector_poll_interval_ms``, or ``operations_assessment_interval_ms``, so
+    a service with no storage silently runs those three at their constructor
+    defaults rather than at the operator's values. It is inert today — that
+    service refuses every record with ``storage_unavailable`` and has no
+    projector to poll — but it is a real gap between the two branches, and it
+    belongs to whoever next touches that constructor (T10 / P11-B), not to a
+    test-only task.
     """
 
     engine = create_async_engine(f"sqlite+aiosqlite:///{tmp_path / 'config-threading'}.db")
