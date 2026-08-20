@@ -2132,6 +2132,12 @@ class SqlAnsichBackend:
                         # The cost is one bounded, evidence-complete re-judge of
                         # the band per late job -- strictly better than an
                         # unbounded series of them, and than a permanent lie.
+                        # After a PB4 rollback this guarantee degrades to
+                        # transient: the pre-claim mark died with the rolled-back
+                        # transaction, so the retrying claim settles at its own
+                        # watermark (one truncated evaluation) -- safe direction,
+                        # because the low mark re-opens the band and the next
+                        # trigger repairs the Belief.
                         effective_watermark = evidence_watermark if claim.pre_claim_watermark is None else max(evidence_watermark, claim.pre_claim_watermark)
                         results = await self._assess_scope_safety_at(
                             session,

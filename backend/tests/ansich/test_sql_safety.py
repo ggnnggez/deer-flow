@@ -1952,13 +1952,16 @@ def _scope_snapshot_observation(
 ) -> ObservationEnvelope:
     """A ``scope.snapshotted`` that names no ToolCall and no ``within_scope``.
 
-    Two properties make it the only usable carrier for the "late job below the
+    Two properties make it a convenient carrier for the "late job below the
     mark" shape. It is scope-safety evidence, so projecting it mints a
     scope-safety assessor job at its own ``ingest_seq``; and it names no
     ToolCall, so while it sits unprojected it does *not* poison the evidence
-    windows that span it -- an unprojected ``authorization.*``/``effect.*`` row
-    would, because its ToolCall Entity is what ``_persist_assessment`` waits
-    for, and every evaluation over that window would roll back instead.
+    windows that span it. It is NOT the only carrier: an ``authorization.*``/
+    ``effect.*`` row deferred on its *Scope* (its ToolCall Entity present)
+    commits in every spanning evaluation just the same -- see
+    ``_scope_deferred_authorization`` below, the PB5 test's fixture, and the
+    corrected F10-10 addendum. Only a row deferred on its *ToolCall* rolls
+    spanning evaluations back.
     """
 
     scope = ScopeDescriptor(
