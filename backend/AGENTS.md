@@ -680,13 +680,22 @@ ToolCalls named by evidence in the new watermark window and leaves converged
 conclusions unwritten (they are stamped with the assessment time, so a rewrite
 would append an assertion every trigger rather than dedupe). Keeping that true
 takes one more step, because claiming lowers the mark below the group's lowest
-watermark: the claim carries the mark it found *before* widening it, and the
-evaluation settles at `max(its own watermark, that pre-claim mark)`. Without
-that restore a dependency-deferred job landing under an already-advanced mark
-leaves the mark a whole band low, and the next trigger re-judges every converged
-ToolCall in it — F10-10 hypothesis (c), fixed in P11-B. Restoring cannot skip
-evidence: the pre-claim mark is itself a value some earlier evaluation reached
-by judging everything below it. The window's lower
+watermark. The claim carries the mark it found *before* widening it, and the
+evaluation then uses `max(its own watermark, that pre-claim mark)` **twice**:
+as the bound of the evidence it reads, and as the mark it settles. Without the
+settle half a dependency-deferred job landing under an already-advanced mark
+leaves the mark a whole band low, and every later trigger re-judges every
+converged ToolCall in it (F10-10 hypothesis (c)). Without the *read* half that
+job judges its own subject on a truncated prefix — the `effect.observed` that
+cleared a ToolCall sits above its low watermark, so it concludes
+`unverified_effect: present`, and because `as_of` is the assessment time the
+resolver selects that stale verdict. Before the settle half existed the dragged
+mark repaired that by accident on the next trigger; closing the band makes the
+repair have to be deliberate, which is what the read half is (controller ruling
+PB5). The cost is one bounded, evidence-complete re-judge of the band per late
+job, replacing an unbounded series of them and a permanently wrong Belief.
+Neither half can skip evidence: the pre-claim mark is itself a value some
+earlier evaluation reached by judging everything below it. The window's lower
 bound is `ansich_assessor_watermarks`, written inside the evaluation's own
 transaction and deleted by `rebuild_projections()` with the conclusions it
 describes — an assessor job's `completed` status cannot serve as that bound
@@ -1231,8 +1240,14 @@ completion costs the **whole evaluation**: `_complete_assessor_job` returning
 false raises `_StaleAssessorClaim` inside the evaluation's transaction, and the
 assessments, alert episodes and the mark roll back with the job status
 (controller ruling PB4). It is not charged as a failure — no durable error row,
-no re-arm — because it is a change of owner, not a fault, and the new owner
-redoes the work in full. Drops are counted in a process-local debug counter
+no re-arm; the claim-time `attempts` increment stands, but nothing further is
+charged — because it is a change of owner, not a fault, and the new owner redoes
+the work in full. The sharp case is absorption: the new owner completes the
+group's lower jobs in its own claim transaction and widens the mark below them,
+so its evaluation is the only thing that will ever cover their evidence. A stale
+advance back over that band leaves the new owner an empty window, the absorbed
+job `completed`, and the mark claiming coverage — evidence judged by nobody,
+permanently. Drops are counted in a process-local debug counter
 (`SqlAnsichBackend.stale_completion_count`), deliberately **not** a
 health field. Why a generation rather than `lease_owner`: that id is one
 `uuid4` per process, so a worker whose lease expired mid-work re-claims the same

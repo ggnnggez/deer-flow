@@ -2115,10 +2115,28 @@ class SqlAnsichBackend:
                             session,
                             task_id=task_id,
                         )
+                        # Controller ruling PB5. A job claimed below an
+                        # already-advanced mark must be judged against
+                        # everything that mark already claims to cover, not
+                        # against its own low watermark. Reading only up to its
+                        # own watermark truncates the evidence -- the later
+                        # `effect.observed` that cleared a ToolCall is simply
+                        # invisible -- and the conclusion it derives is stamped
+                        # with the assessment time, so it wins the resolver and
+                        # replaces a correct Belief with a wrong one. Before the
+                        # pre-claim restore that wrong conclusion was repaired by
+                        # accident: the dragged mark re-opened the band and the
+                        # next trigger re-judged it with full evidence. The
+                        # restore closes the band, so the repair has to become
+                        # deliberate and happen here, in the same evaluation.
+                        # The cost is one bounded, evidence-complete re-judge of
+                        # the band per late job -- strictly better than an
+                        # unbounded series of them, and than a permanent lie.
+                        effective_watermark = evidence_watermark if claim.pre_claim_watermark is None else max(evidence_watermark, claim.pre_claim_watermark)
                         results = await self._assess_scope_safety_at(
                             session,
                             task_id=task_id,
-                            evidence_watermark=evidence_watermark,
+                            evidence_watermark=effective_watermark,
                             window_start_exclusive=window_start_exclusive,
                             now=now,
                         )
@@ -2154,7 +2172,7 @@ class SqlAnsichBackend:
                             session,
                             task_id=task_id,
                             assessor=SCOPE_SAFETY_ASSESSOR,
-                            evidence_watermark=evidence_watermark,
+                            evidence_watermark=effective_watermark,
                             pre_claim_watermark=claim.pre_claim_watermark,
                         )
                     else:
@@ -2279,6 +2297,13 @@ class SqlAnsichBackend:
         anything: it is itself a value some earlier evaluation reached by
         judging everything below it, and this evaluation judged the window the
         widening opened.
+
+        On the scope-safety path the caller already raises its *evaluation*
+        watermark to the same maximum (PB5), so the restore here is redundant
+        for it by construction. It stays because the invariant belongs to the
+        mark's own writer, not to one caller's arithmetic: whatever watermark
+        arrives, the mark may not come out below what an earlier evaluation
+        settled.
         """
 
         target = evidence_watermark if pre_claim_watermark is None else max(evidence_watermark, pre_claim_watermark)

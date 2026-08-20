@@ -661,6 +661,13 @@ class RebuildOutcome(BaseModel):
     than reading a complete-looking count off an incomplete rebuild. ``failed``
     rows are deliberately not counted: they are settled, badly, and already
     surfaced through the failed-job count and its operator retry path.
+
+    It is counted at the end of the *backend's* pass, which is before
+    ``AnsichService.rebuild_projections`` runs its own final assessment sweep;
+    that sweep can settle assessor jobs this number still counts, and can mint
+    new ones it does not. So it is a lower bound on completeness taken at a
+    known point, not a live gauge -- re-running the rebuild is what confirms an
+    empty backlog.
     """
 
     model_config = ConfigDict(frozen=True)
