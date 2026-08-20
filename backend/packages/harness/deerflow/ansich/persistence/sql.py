@@ -635,6 +635,73 @@ def _read_model_values_equal(current: object, candidate: object) -> bool:
     return current == candidate
 
 
+async def _lock_rollup_targets(session: AsyncSession, statement) -> list:
+    """Lock a rollup's target rows BEFORE its inputs are read.
+
+    Every read-modify-write rollup in this module shares one hazard: sibling
+    jobs that separate leased workers claim concurrently
+    (``_claim_projection_job`` / ``_claim_assessor_job`` use ``skip_locked``)
+    all read-modify-write the same aggregate row. Under Postgres READ COMMITTED
+    an unlocked reader can load the inputs before a peer commits its own and
+    then overwrite the aggregate with a value that excludes it — a lost update
+    that a single-loop replay would not reproduce. Taking the lock first makes
+    the second worker block until the first commits, and READ COMMITTED then
+    gives its later statements the committed inputs. Locking *after* the read
+    would leave exactly the same window open, which is why this helper exists
+    as a call the reading code has to make first rather than as a flag on the
+    read itself. ``FOR UPDATE`` is a no-op on SQLite, which has a single writer
+    anyway. Reference implementation and precedent:
+    ``_recompute_release_quality_stats``.
+
+    Two things this lock deliberately does NOT do:
+
+    * It cannot lock a row that does not exist yet, so two concurrent first
+      writers both fall through to the insert. Each call site closes that with
+      ``INSERT … ON CONFLICT DO NOTHING`` followed by a re-read under the lock
+      (see ``_insert_ignoring_conflict``).
+    * It cannot stop a peer from INSERTING a *new input* row. Row locks bound
+      an existing row's writers, not the membership of a set. That is the
+      structural reason F10-19 (a late spawn edge racing a sum-type usage
+      contribution) is **not** closed by any of this — it needs the re-fanout
+      reconciliation, not a lock. See ``_backfill_spawn_usage``'s docstring.
+
+    The lost update this discipline prevents is proven red on a real
+    PostgreSQL server by the two-worker tier in
+    ``tests/integration/test_postgres_multiworker.py``; SQLite can only pin the
+    statement order, which ``tests/ansich/test_rollup_serialization.py`` does.
+    """
+
+    return list((await session.execute(statement.with_for_update())).scalars())
+
+
+async def _insert_ignoring_conflict(
+    session: AsyncSession,
+    model: type,
+    values: dict[str, object],
+    *,
+    index_elements: Sequence[str],
+    returning,
+) -> bool:
+    """``INSERT … ON CONFLICT DO NOTHING``; report whether this caller won.
+
+    The first-writer half of the lock-then-read discipline: ``FOR UPDATE``
+    cannot lock a row that does not exist, so two workers can both decide to
+    create the aggregate. ``ON CONFLICT DO NOTHING`` makes the loser a no-op
+    instead of an ``IntegrityError``, and it returns ``False`` so the caller
+    can re-read the winner's row — now lockable — and converge on it.
+    """
+
+    dialect_name = session.bind.dialect.name if session.bind is not None else ""
+    if dialect_name == "postgresql":
+        statement = postgresql_insert(model).values(**values)
+    elif dialect_name == "sqlite":
+        statement = sqlite_insert(model).values(**values)
+    else:
+        raise ValueError(f"unsupported Ansich SQL dialect: {dialect_name}")
+    inserted = (await session.execute(statement.on_conflict_do_nothing(index_elements=list(index_elements)).returning(returning))).scalar_one_or_none()
+    return inserted is not None
+
+
 def _list_task_views_statement(
     *,
     limit: int,
@@ -3036,6 +3103,28 @@ class SqlAnsichBackend:
         task_id: str,
         now: datetime,
     ) -> int:
+        # Lock the aggregate BEFORE reading its inputs (F10-6). The `behavior`
+        # Belief is a rollup over this Task's `behavior_signal:*` siblings, and
+        # each sibling is written by a *different* assessor job -- separate
+        # leased workers claim action-repetition and absolute-limit for one
+        # Task concurrently, and both then recompute this single row. See
+        # `_lock_rollup_targets` for why the lock has to precede the read and
+        # for what it deliberately does not cover; the residual here is the
+        # reference implementation's own: a `behavior` current-Belief row that
+        # does not exist yet cannot be locked, so two concurrent first writers
+        # both reach `_resolve_current_assessment`'s insert and one loses on the
+        # composite primary key. That IntegrityError is an ordinary assessor
+        # error (`_record_assessor_error` re-arms the job to `retry`), so the
+        # race costs one attempt rather than correctness.
+        # Lost-update proof on a real PostgreSQL server: T9's two-worker tier,
+        # tests/integration/test_postgres_multiworker.py.
+        await _lock_rollup_targets(
+            session,
+            select(AnsichCurrentBeliefRow).where(
+                AnsichCurrentBeliefRow.subject_id == task_id,
+                AnsichCurrentBeliefRow.field_name == "behavior",
+            ),
+        )
         signal_rows = list(
             (
                 await session.execute(
@@ -6070,6 +6159,9 @@ class SqlAnsichBackend:
             running_task_ids = tuple((await session.execute(select(AnsichTaskSummaryRow.task_id).where(AnsichTaskSummaryRow.control_value == "running"))).scalars())
 
         views: list[ActiveTaskView] = []
+        # T10 (RB8) replaces this process-local metrics stamping with DB-derived
+        # numbers; the two `metrics.get(...)` reads below belong to that task,
+        # not to this one, which changes only the row-locking discipline.
         metrics = self.get_projection_metrics()
         for task_id in running_task_ids:
             task = await self.get_task(task_id)
@@ -6194,6 +6286,32 @@ class SqlAnsichBackend:
             )
 
         async with self._session_factory() as session, session.begin():
+            # Lock every target row BEFORE this transaction reads any of them
+            # (F10-6). Two workers each run their own operations tick and both
+            # read-modify-write the same per-Task read-model rows; the compare
+            # below ("has anything changed?") is what an interleaved peer can
+            # invalidate, leaving `updated_at` describing a value the row no
+            # longer holds. Locking first is what makes the compare-and-write
+            # of each row atomic. Ordered by `task_id` so two ticks holding
+            # overlapping row sets take them in the same order and cannot
+            # deadlock.
+            #
+            # Honest residual, deliberately not fixed here: every input above
+            # was read in *earlier, already-committed* sessions, so this lock
+            # serializes the writers, not the compute. A tick whose inputs are
+            # staler can still publish after a fresher one; ordering those
+            # needs a monotonic guard, not a row lock, and adding one would be
+            # a behaviour change rather than the locking discipline this task
+            # is scoped to.
+            # Lost-update proof on a real PostgreSQL server: T9's two-worker
+            # tier, tests/integration/test_postgres_multiworker.py.
+            locked_read_models = {
+                row.task_id: row
+                for row in await _lock_rollup_targets(
+                    session,
+                    select(AnsichActiveTaskReadModelRow).where(AnsichActiveTaskReadModelRow.task_id.in_([view.task_id for view in views])).order_by(AnsichActiveTaskReadModelRow.task_id),
+                )
+            }
             if running_task_ids:
                 await session.execute(delete(AnsichActiveTaskReadModelRow).where(AnsichActiveTaskReadModelRow.task_id.not_in(running_task_ids)))
             else:
@@ -6230,19 +6348,27 @@ class SqlAnsichBackend:
                     "lost_ranges_json": [item.model_dump(mode="json") for item in view.lost_ranges],
                     "last_evidence_at": view.last_evidence_at,
                 }
-                row = await session.get(
-                    AnsichActiveTaskReadModelRow,
-                    view.task_id,
-                )
+                row = locked_read_models.get(view.task_id)
                 if row is None:
-                    session.add(
-                        AnsichActiveTaskReadModelRow(
-                            task_id=view.task_id,
-                            updated_at=view.updated_at,
+                    if await _insert_ignoring_conflict(
+                        session,
+                        AnsichActiveTaskReadModelRow,
+                        {
+                            "task_id": view.task_id,
+                            "updated_at": view.updated_at,
                             **values,
-                        )
-                    )
-                elif any(not _read_model_values_equal(getattr(row, key), value) for key, value in values.items()):
+                        },
+                        index_elements=["task_id"],
+                        returning=AnsichActiveTaskReadModelRow.task_id,
+                    ):
+                        continue
+                    # A peer created this Task's row between the lock above
+                    # (which had nothing to lock) and this insert. Re-read it
+                    # under the lock and fall through to the ordinary compare.
+                    row = await session.scalar(select(AnsichActiveTaskReadModelRow).where(AnsichActiveTaskReadModelRow.task_id == view.task_id).with_for_update())
+                    if row is None:
+                        raise RuntimeError("Ansich active-task read model upsert did not produce a row")
+                if any(not _read_model_values_equal(getattr(row, key), value) for key, value in values.items()):
                     for key, value in values.items():
                         setattr(row, key, value)
                     row.updated_at = view.updated_at
@@ -7872,34 +7998,65 @@ class SqlAnsichBackend:
     ) -> None:
         if observation.payload is None:
             raise ValueError("budget.configured requires inline projection payload")
+        # Lock the target budget row BEFORE reading the inputs that decide
+        # whether to write it (F10-6). One `budget.configured` Observation can
+        # legitimately be projected twice at once: a lease that expires
+        # mid-work lets a second worker claim the same job while the first is
+        # still inside this transaction, and the completion-side CAS drops only
+        # the *completion*, not the work. Both would then read "no budget row"
+        # and both insert on the same primary key. See `_lock_rollup_targets`.
+        # Lost-update proof on a real PostgreSQL server: T9's two-worker tier,
+        # tests/integration/test_postgres_multiworker.py.
+        existing_budget = next(
+            iter(
+                await _lock_rollup_targets(
+                    session,
+                    select(AnsichTaskBudgetRow).where(AnsichTaskBudgetRow.entity_id == observation.obs_id),
+                )
+            ),
+            None,
+        )
         if await session.get(AnsichTaskRow, observation.task_id) is None:
             raise _ProjectionDependencyPending(f"budget observation {observation.obs_id} is waiting for Task {observation.task_id}")
         if await session.get(AnsichEntityRow, observation.obs_id) is None:
-            session.add(
-                AnsichEntityRow(
-                    entity_id=observation.obs_id,
-                    entity_type="task_budget",
-                    discovered_obs_id=observation.obs_id,
-                )
+            # ON CONFLICT rather than a bare insert for the same reason: the
+            # row this lock could not take does not exist yet, so the peer's
+            # Entity insert can land between the check above and this write.
+            await _insert_ignoring_conflict(
+                session,
+                AnsichEntityRow,
+                {
+                    "entity_id": observation.obs_id,
+                    "entity_type": "task_budget",
+                    "discovered_obs_id": observation.obs_id,
+                },
+                index_elements=["entity_id"],
+                returning=AnsichEntityRow.entity_id,
             )
-            await session.flush()
-        if await session.get(AnsichTaskBudgetRow, observation.obs_id) is not None:
+        if existing_budget is not None:
             return
         payload = observation.payload
-        session.add(
-            AnsichTaskBudgetRow(
-                entity_id=observation.obs_id,
-                task_id=observation.task_id,
-                dimension=str(payload["dimension"]),
-                aggregation_scope=str(payload["aggregation_scope"]),
-                warning_limit=(int(payload["warning_limit"]) if isinstance(payload.get("warning_limit"), int) else None),
-                hard_limit=(int(payload["hard_limit"]) if isinstance(payload.get("hard_limit"), int) else None),
-                enforcement=payload.get("enforcement") is True,
-                source_kind=str(payload["source_kind"]),
-                requested_value=(int(payload["requested_value"]) if isinstance(payload.get("requested_value"), int) else None),
-                effective_value=int(payload["effective_value"]),
-                configured_obs_id=observation.obs_id,
-            )
+        # A lost first-write race needs no re-read: the losing writer is
+        # projecting the same immutable Observation, so the winner's row is
+        # byte-for-byte what this one would have written.
+        await _insert_ignoring_conflict(
+            session,
+            AnsichTaskBudgetRow,
+            {
+                "entity_id": observation.obs_id,
+                "task_id": observation.task_id,
+                "dimension": str(payload["dimension"]),
+                "aggregation_scope": str(payload["aggregation_scope"]),
+                "warning_limit": (int(payload["warning_limit"]) if isinstance(payload.get("warning_limit"), int) else None),
+                "hard_limit": (int(payload["hard_limit"]) if isinstance(payload.get("hard_limit"), int) else None),
+                "enforcement": payload.get("enforcement") is True,
+                "source_kind": str(payload["source_kind"]),
+                "requested_value": (int(payload["requested_value"]) if isinstance(payload.get("requested_value"), int) else None),
+                "effective_value": int(payload["effective_value"]),
+                "configured_obs_id": observation.obs_id,
+            },
+            index_elements=["entity_id"],
+            returning=AnsichTaskBudgetRow.entity_id,
         )
 
     async def _project_usage(
@@ -8145,6 +8302,11 @@ class SqlAnsichBackend:
         aggregation_scope: AggregationScope,
         updated_at: datetime,
     ) -> None:
+        summary_statement = select(AnsichTaskUsageRow).where(
+            AnsichTaskUsageRow.task_id == task_id,
+            AnsichTaskUsageRow.dimension == dimension,
+            AnsichTaskUsageRow.aggregation_scope == aggregation_scope,
+        )
         statement = (
             select(AnsichUsageContributionRow, AnsichObservationRow.ingest_seq)
             .join(
@@ -8158,42 +8320,64 @@ class SqlAnsichBackend:
         )
         if aggregation_scope == "local":
             statement = statement.where(AnsichUsageContributionRow.source_task_id == task_id)
-        rows = list((await session.execute(statement)).all())
-        if not rows:
-            return
-        if dimension == "wall_time_ms":
-            latest_by_source: dict[str, int] = {}
-            for contribution, _ in rows:
-                latest_by_source[contribution.source_task_id] = max(
-                    latest_by_source.get(contribution.source_task_id, 0),
-                    contribution.delta,
-                )
-            value = sum(latest_by_source.values())
-        else:
-            value = sum(contribution.delta for contribution, _ in rows)
-        as_of = max(_as_utc(contribution.as_of) for contribution, _ in rows)
-        watermark = max(ingest_seq for _, ingest_seq in rows)
-        usage = await session.get(
-            AnsichTaskUsageRow,
-            (task_id, dimension, aggregation_scope),
-        )
-        if usage is None:
-            session.add(
-                AnsichTaskUsageRow(
-                    task_id=task_id,
-                    dimension=dimension,
-                    aggregation_scope=aggregation_scope,
-                    value=value,
-                    as_of=as_of,
-                    complete_through_ingest_seq=watermark,
-                    updated_at=updated_at,
-                )
-            )
-            return
-        usage.value = value
-        usage.as_of = as_of
-        usage.complete_through_ingest_seq = watermark
-        usage.updated_at = updated_at
+        # At most two passes: the second only runs when this worker lost the
+        # first-write race, and by then the row exists, so its lock is real.
+        for _attempt in range(2):
+            # Lock the summary BEFORE rescanning its contributions (F10-20).
+            # This is a full rescan plus an unconditional assignment, one layer
+            # above the contribution rows T3 already locked: under READ
+            # COMMITTED, A reading {c1} while B inserts c2 and writes c1+c2
+            # leaves A's later write reducing the summary back to c1, taking
+            # `as_of` and `complete_through_ingest_seq` down with it. See
+            # `_lock_rollup_targets`. Note the lock does not (and cannot) stop
+            # a peer from inserting a new contribution row -- that set-
+            # membership race is F10-19's, closed by re-fanout, not here.
+            # Lost-update proof on a real PostgreSQL server: T9's two-worker
+            # tier, tests/integration/test_postgres_multiworker.py.
+            usage = next(iter(await _lock_rollup_targets(session, summary_statement)), None)
+            rows = list((await session.execute(statement)).all())
+            if not rows:
+                return
+            if dimension == "wall_time_ms":
+                latest_by_source: dict[str, int] = {}
+                for contribution, _ in rows:
+                    latest_by_source[contribution.source_task_id] = max(
+                        latest_by_source.get(contribution.source_task_id, 0),
+                        contribution.delta,
+                    )
+                value = sum(latest_by_source.values())
+            else:
+                value = sum(contribution.delta for contribution, _ in rows)
+            as_of = max(_as_utc(contribution.as_of) for contribution, _ in rows)
+            watermark = max(ingest_seq for _, ingest_seq in rows)
+            if usage is not None:
+                usage.value = value
+                usage.as_of = as_of
+                usage.complete_through_ingest_seq = watermark
+                usage.updated_at = updated_at
+                return
+            if await _insert_ignoring_conflict(
+                session,
+                AnsichTaskUsageRow,
+                {
+                    "task_id": task_id,
+                    "dimension": dimension,
+                    "aggregation_scope": aggregation_scope,
+                    "value": value,
+                    "as_of": as_of,
+                    "complete_through_ingest_seq": watermark,
+                    "updated_at": updated_at,
+                },
+                index_elements=["task_id", "dimension", "aggregation_scope"],
+                returning=AnsichTaskUsageRow.task_id,
+            ):
+                return
+            # A peer won the first write. Loop once more rather than writing
+            # the value computed above: that value was reduced from inputs read
+            # before the winner committed, so assigning it now would be the
+            # very lost update the lock exists to prevent. The second pass
+            # locks the committed row first and re-reduces under it.
+        raise RuntimeError("Ansich task usage summary upsert did not converge")
 
     async def _project_step(self, session: AsyncSession, observation: ObservationEnvelope) -> bool:
         """Project logical decisions, physical LLM attempts, and request context.
