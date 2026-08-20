@@ -206,7 +206,7 @@ async def test_tool_call_projection_survives_restart_and_rebuild_without_usage_d
     await restarted.start()
     try:
         restarted_tool_call = await restarted.get_tool_call(tool_call_id)
-        assert await restarted.rebuild_projections() > 0
+        assert (await restarted.rebuild_projections()).replayed > 0
         rebuilt_task = await restarted.get_task(task_id)
         rebuilt_tool_call = await restarted.get_tool_call(tool_call_id)
     finally:
@@ -386,7 +386,7 @@ async def test_tool_projection_repairs_raw_and_visible_observations_that_arrive_
         await service.flush_task(task_id)
         step = await service.get_step(step_id)
         task = await service.get_task(task_id)
-        assert await service.rebuild_projections() > 0
+        assert (await service.rebuild_projections()).replayed > 0
         rebuilt_step = await service.get_step(step_id)
         rebuilt_task = await service.get_task(task_id)
     finally:
@@ -549,7 +549,7 @@ async def test_conflicting_tool_terminal_evidence_is_preserved_and_degrades_task
                     )
                 ).scalars()
             )
-        assert await service.rebuild_projections() > 0
+        assert (await service.rebuild_projections()).replayed > 0
         rebuilt_task = await service.get_task(task_id)
         rebuilt_tool_call = await service.get_tool_call(tool_call_id)
     finally:
@@ -1316,7 +1316,7 @@ async def test_projection_tables_can_be_rebuilt_from_durable_observations(tmp_pa
 
         # Rebuild must go through the service so it cannot race the
         # background projector loop over the same reset jobs (F7).
-        assert await service.rebuild_projections() > 0
+        assert (await service.rebuild_projections()).replayed > 0
 
         after = await service.get_task(task_id)
         observations = await service.list_observations(task_id)
@@ -1409,7 +1409,7 @@ async def test_step_attempt_and_context_are_queryable_after_projection(tmp_path)
         await service.flush_task(task_id)
         steps = await service.list_steps(task_id)
         context = await service.get_step_context(steps[0].step_id)
-        assert await service.rebuild_projections() > 0
+        assert (await service.rebuild_projections()).replayed > 0
         rebuilt_steps = await service.list_steps(task_id)
         rebuilt_context = await service.get_step_context(steps[0].step_id)
     finally:
@@ -1756,7 +1756,7 @@ async def test_append_only_context_persists_one_state_delta_instead_of_full_snap
             await service.flush_task(task_id)
         steps = await service.list_steps(task_id)
         contexts = [await service.get_step_context(step.step_id) for step in steps]
-        assert await service.rebuild_projections() > 0
+        assert (await service.rebuild_projections()).replayed > 0
         rebuilt_contexts = [await service.get_step_context(step.step_id) for step in await service.list_steps(task_id)]
         async with session_factory() as session:
             states = list((await session.execute(select(AnsichContextStateRow).order_by(AnsichContextStateRow.chain_depth))).scalars())

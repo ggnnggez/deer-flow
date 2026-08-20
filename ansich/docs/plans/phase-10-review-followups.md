@@ -158,6 +158,7 @@
     - 与 `[0, 2, 3, 1, 1]` 的吻合:先缺一轮(证据被推迟,那一轮的区间里没有它),随后几轮多出来(mark 回退把窗口撑宽),同一次运行里既有缺也有多、总和 7 > 5——正是「证据推迟 → mark 回退 → 后面的窗口变宽」的形状。
     - Phase 11 候选修法:在 `_claim_assessor_job` 里记住下调**前**的 mark,`_advance_assessor_watermark` 发现「本次 claim 组的最高 watermark 低于它」时把它恢复回去,而不是停在这次 claim 的 watermark。与 F10-6 配对处理(同属 assessor 侧的串行化/水位治理)。
     - 缺的测试牙齿:`backend/tests/ansich/test_sql_safety.py::test_absorbed_low_watermark_window_survives_an_evaluation_rollback` 已经把这个场景整条驱动出来了,却只断言了安全的那一半(晚到 ToolCall 被判到),从不数已收敛 ToolCall 的 assertion / `ansich_scope_conclusions` 条数。补上这条计数断言,假设 (c) 就能被证实或证伪。
+    - **这条计数断言的实测结果(P11-B Task 3,2026-08-21;不改本条状态,状态归 T12)**:已补,已收敛 ToolCall 的 `ansich_scope_conclusions` 是 **8**,而 8 正是诚实值——该测试的 trigger 本身就是 settled ToolCall 的 `effect.observed`,重判有真凭据。也就是说**这条测试证伪了假设 (c) 在它自己那个形状里的可达性**,它测的是「吸收 + 评估回滚」,不是「晚到低水位」。假设 (c) 的机制在代码里为真,但要复现必须让某个 job 的 watermark 落在**已推进的 mark 之下**,而载体只能是 `scope.snapshotted`(它不指名 ToolCall,因此在等待期不会毒化跨越它的窗口;换成 `authorization.*`/`effect.*` 则每个跨越它的评估都会因主体 Entity 缺失而回滚,mark 根本推不过去)。新增的红先回归:`test_a_dependency_deferred_job_below_the_mark_does_not_re_judge_the_band`(去掉恢复后 mark 由 10 退到 5)。
 - 后续观察(P11-A 批,2026-08-20,**不改状态、不是新诊断**):
   - **门禁边界的确切位置**(来自 Task 2 fix round 的复审,本条此前只说了「充分性未证」,现在能说得更准):那两条 load-flaky 的 scope-safety 测试**本来就**调了 `only_test_driven_assessments`。所以它们再翻红**不是门禁失效**,而是门禁根本不管那一段——`only_test_driven_assessments` 覆盖的是**评估的节奏**(周期评估与第一轮那次无条件评估),不覆盖 dependency-wait / 自愈路径上的那次**读**。下一次加固要补的是**给那次等待一个 settle gate**,而不是把现有门禁调宽或再调大超时。
   - **假设 (c) 形状在本批被再次目击两次,证据强度不同,分开记**:

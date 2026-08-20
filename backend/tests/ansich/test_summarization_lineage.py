@@ -141,7 +141,7 @@ async def test_partial_list_content_trim_records_an_incomplete_compression_inven
     await service.flush_task(task_id)
     compression = await service.get_context_compression(frozen.compression_id)
     compression_list = await service.list_context_compressions(task_id)
-    replayed = await service.rebuild_projections()
+    rebuild = await service.rebuild_projections()
     rebuilt_compression = await service.get_context_compression(frozen.compression_id)
     rebuilt_compression_list = await service.list_context_compressions(task_id)
     observations = await service.list_observations(task_id)
@@ -150,7 +150,8 @@ async def test_partial_list_content_trim_records_an_incomplete_compression_inven
 
     assert compression is not None
     assert compression.status == "incomplete"
-    assert replayed > 0
+    assert rebuild.replayed > 0
+    assert rebuild.unsettled == 0
     assert rebuilt_compression is not None
     assert rebuilt_compression.status == "incomplete"
     assert [item.compression_id for item in compression_list] == [frozen.compression_id]
@@ -245,7 +246,7 @@ async def test_sql_compression_query_reads_typed_ordered_memberships(tmp_path) -
 
     try:
         compression = await service.get_context_compression(compression_id)
-        replayed = await service.rebuild_projections()
+        rebuild = await service.rebuild_projections()
         rebuilt_compression = await service.get_context_compression(compression_id)
     finally:
         await service.stop()
@@ -265,7 +266,8 @@ async def test_sql_compression_query_reads_typed_ordered_memberships(tmp_path) -
         "removed",
     ]
     assert [item.ordinal for item in compression.items] == [0, 1, 0, 1, 0, 1]
-    assert replayed > 0
+    assert rebuild.replayed > 0
+    assert rebuild.unsettled == 0
     assert rebuilt_compression == compression
 
 

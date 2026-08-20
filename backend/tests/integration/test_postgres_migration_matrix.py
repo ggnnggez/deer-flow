@@ -544,9 +544,10 @@ async def test_ansich_service_records_and_projects_on_postgres() -> None:
             assert len(stats) == 1
             assert (stats[0].assessed_count, stats[0].pass_count) == (1, 1)
 
-            replayed = await service.rebuild_projections()
+            rebuild = await service.rebuild_projections()
 
-            assert replayed > 0
+            assert rebuild.replayed > 0
+            assert rebuild.unsettled == 0
             assert await service.get_current_belief(task_id, "quality.correctness") is not None
             async with session_factory() as session:
                 assert await session.get(AnsichEvaluationIndexRow, evaluation_obs_id) is not None

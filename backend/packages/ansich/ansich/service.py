@@ -15,7 +15,7 @@ from ansich.backend import AnsichBackend
 from ansich.budget import BudgetHealthBelief, TaskBudgetsView
 from ansich.compression import ContextCompressionSummaryView, ContextCompressionView
 from ansich.context_state import ContextStateView
-from ansich.contracts import AnsichHealth, ControlValue, FlushResult, LostRange, ObservationEnvelope, Producer, ProducerHealth, RecordReceipt, TaskLifecycleScope, TaskView, WriterHealth
+from ansich.contracts import AnsichHealth, ControlValue, FlushResult, LostRange, ObservationEnvelope, Producer, ProducerHealth, RebuildOutcome, RecordReceipt, TaskLifecycleScope, TaskView, WriterHealth
 from ansich.environment import (
     EnvironmentHistoryView,
     TaskEnvironmentView,
@@ -62,6 +62,14 @@ _PRODUCER_ACCOUNT_LIMIT = 256
 # entries costs no honesty — an id nothing remembers is also in no queue and in
 # no database, so it is presumed lost rather than reported pending (RA6).
 _LOST_OBSERVATION_ID_LIMIT = 4096
+
+
+def _as_rebuild_outcome(result: object) -> RebuildOutcome:
+    """Normalize a backend's rebuild answer onto the reporting contract."""
+
+    if isinstance(result, RebuildOutcome):
+        return result
+    return RebuildOutcome(replayed=int(result), unsettled=0)  # type: ignore[arg-type]
 
 
 def _serialized_observation_size(observation: ObservationEnvelope) -> int:
@@ -1448,13 +1456,22 @@ class AnsichService:
             list_snapshot_exposures=self._backend.list_snapshot_exposures,
         )
 
-    async def rebuild_projections(self) -> int:
+    async def rebuild_projections(self) -> RebuildOutcome:
+        """Replay every durable job, and say what the replay left behind.
+
+        The result carries ``unsettled`` as well as ``replayed`` because a
+        rebuild that drained its queue has not necessarily finished: see
+        ``RebuildOutcome``. A backend that answers with a bare count predates
+        that contract and is taken at its word (``unsettled=0``) -- it has no
+        job table to be behind on.
+        """
+
         rebuild = getattr(self._backend, "rebuild_projections", None)
         if not callable(rebuild):
-            return 0
+            return RebuildOutcome(replayed=0, unsettled=0)
         projection_lock = self._projection_lock
         if projection_lock is None:
-            rebuilt = int(await rebuild())
+            rebuilt = _as_rebuild_outcome(await rebuild())
             await self._assess_operations_unlocked()
             return rebuilt
         # This lock is the *in-process* half of the guard: it keeps the
@@ -1464,7 +1481,7 @@ class AnsichService:
         # (``sql.py::_maintenance_lock``: a Postgres advisory lock, and a
         # documented no-op on single-writer SQLite).
         async with projection_lock:
-            rebuilt = int(await rebuild())
+            rebuilt = _as_rebuild_outcome(await rebuild())
             await self._assess_operations_unlocked()
             return rebuilt
 

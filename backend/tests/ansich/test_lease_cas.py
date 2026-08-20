@@ -398,7 +398,7 @@ async def test_absorbed_sibling_cannot_be_re_armed_by_the_previous_owner(tmp_pat
         await _add_assessor_job(low_job_id, 1)
         a_claim = await workers.a._claim_assessor_job()
         assert a_claim is not None
-        assert a_claim[0] == low_job_id
+        assert a_claim.job_id == low_job_id
 
         # A higher-watermark sibling lands while A is still evaluating, and A's
         # lease expires before it can finish.
@@ -406,17 +406,17 @@ async def test_absorbed_sibling_cannot_be_re_armed_by_the_previous_owner(tmp_pat
         await _expire_assessor_lease(workers.a_sessions, low_job_id)
         b_claim = await workers.b._claim_assessor_job()
         assert b_claim is not None
-        assert b_claim[0] == high_job_id
+        assert b_claim.job_id == high_job_id
 
         absorbed = await _assessor_job(workers.a_sessions, low_job_id)
         assert absorbed.status == "completed"
-        assert absorbed.lease_generation == a_claim[-1] + 1
+        assert absorbed.lease_generation == a_claim.lease_generation + 1
 
         await workers.a._record_assessor_error(
             low_job_id,
-            a_claim[-2],
+            a_claim.attempts,
             RuntimeError("late failure on an absorbed sibling"),
-            lease_generation=a_claim[-1],
+            lease_generation=a_claim.lease_generation,
         )
 
         after_stale_error = await _assessor_job(workers.a_sessions, low_job_id)
@@ -530,10 +530,11 @@ async def test_rebuild_re_pend_bumps_generations_so_an_in_flight_completion_cann
 
         workers.b.project_pending = stale_write_then_replay  # type: ignore[method-assign]
 
-        replayed = await workers.b.rebuild_projections()
+        rebuild = await workers.b.rebuild_projections()
 
         assert stale_write["result"] is False
-        assert replayed == 2
+        assert rebuild.replayed == 2
+        assert rebuild.unsettled == 0
         rebuilt = await _projection_job(workers.a_sessions, a_claim[0])
         assert rebuilt.status == "completed"
         # Claim (1) -> rebuild re-pend (2) -> the replay's own claim (3).
@@ -574,11 +575,17 @@ async def test_retry_reports_the_rows_it_re_armed_and_leaves_an_in_flight_job_al
 
 
 class _RecordingSession:
-    """Minimal session stand-in that records the SQL a maintenance lock emits."""
+    """Minimal session stand-in that records the SQL a maintenance lock emits.
 
-    def __init__(self, dialect_name: str | None, statements: list[tuple[str, object]]) -> None:
+    ``raise_on`` makes one statement fail after it has been recorded, which is
+    how the cancelled-acquire path is driven: the statement really was sent, so
+    the grant may have landed server-side while the reply was in flight.
+    """
+
+    def __init__(self, dialect_name: str | None, statements: list[tuple[str, object]], *, raise_on: str | None = None) -> None:
         self.bind = None if dialect_name is None else SimpleNamespace(dialect=SimpleNamespace(name=dialect_name))
         self._statements = statements
+        self._raise_on = raise_on
 
     async def __aenter__(self) -> _RecordingSession:
         return self
@@ -587,7 +594,10 @@ class _RecordingSession:
         return None
 
     async def execute(self, statement: object, parameters: object = None) -> None:
-        self._statements.append((" ".join(str(statement).split()), parameters))
+        rendered = " ".join(str(statement).split())
+        self._statements.append((rendered, parameters))
+        if self._raise_on is not None and self._raise_on in rendered:
+            raise TimeoutError(f"cancelled: {rendered}")
 
     async def rollback(self) -> None:
         self._statements.append(("ROLLBACK", None))
@@ -628,6 +638,8 @@ async def test_maintenance_lock_serialises_on_postgres_and_no_ops_elsewhere(dial
     assert not any("pg_advisory_unlock" in sql for sql, _ in inside)
     unlock_index = _statement_index(statements, "pg_advisory_unlock")
     assert statements[unlock_index][1] == {"key": _PG_MAINTENANCE_LOCK_KEY}
+    # The rollback comes first on purpose -- see the ordering test below.
+    assert _statement_index(statements, "ROLLBACK") < unlock_index
 
 
 @pytest.mark.anyio
@@ -647,3 +659,152 @@ async def test_maintenance_lock_refuses_to_run_when_the_dialect_is_unresolvable(
             pass
 
     assert statements == []
+
+
+@pytest.mark.anyio
+async def test_rebuild_on_an_empty_backlog_reports_nothing_replayed_and_nothing_left(tmp_path):
+    """F10-26, the trivial end of the domain: zero is an honest answer."""
+
+    async with _two_workers(tmp_path) as workers:
+        rebuild = await workers.a.rebuild_projections()
+
+        assert (rebuild.replayed, rebuild.unsettled) == (0, 0)
+
+
+@pytest.mark.anyio
+async def test_rebuild_reports_the_dependency_pending_job_it_could_not_settle(tmp_path):
+    """F10-26: "this round claimed nothing" is not "the rebuild is done".
+
+    A job waiting on a projection dependency parks itself 250ms in the future,
+    which puts it outside the claim's ``available_at <= now`` predicate. The
+    drain loop's exit condition cannot see it, so before this the rebuild
+    returned a replay count that read as complete while an Observation was
+    still unprojected -- and the caller's next read got a partial projection
+    with nothing to say so.
+    """
+
+    async with _two_workers(tmp_path) as workers:
+        task_id = new_id()
+        orphan_task_id, step_id = new_id(), new_id()
+        await workers.a.persist_and_project(
+            [
+                _task_created(task_id, source_id="run-rebuild-unsettled"),
+                # A Step whose Task was never observed: a replay-safe dependency
+                # wait that no amount of replaying can settle.
+                ObservationEnvelope(
+                    kind="step.started",
+                    occurred_at=_OCCURRED_AT,
+                    task_id=orphan_task_id,
+                    step_id=step_id,
+                    subject_type="step",
+                    subject_id=step_id,
+                    producer=Producer(name="lease-cas-rebuild-unsettled", version="1", instance_id="test"),
+                    producer_seq=1,
+                    source_event_id="lease-cas:rebuild-unsettled:step:started",
+                    correlation_id=orphan_task_id,
+                    payload={"step_seq": 1, "actor_kind": "lead_agent"},
+                ),
+            ]
+        )
+        while await workers.a.project_pending(limit=10):
+            pass
+
+        rebuild = await workers.a.rebuild_projections()
+
+        assert rebuild.replayed == 2
+        # Both of the Step's projectors (``task-step`` and ``task-usage``) wait
+        # on the same missing Task, so both are still outstanding.
+        assert rebuild.unsettled == 2
+        async with workers.a_sessions() as session:
+            waiting = await session.scalar(select(AnsichProjectionJobRow).where(AnsichProjectionJobRow.projector_name == "task-step"))
+        assert waiting is not None
+        # Still claimable, just not yet: that is exactly what the drain cannot
+        # see and what the count now says out loud.
+        assert waiting.status == "pending"
+        assert waiting.dependency_pending_since is not None
+
+
+@pytest.mark.anyio
+async def test_rebuild_reports_a_job_another_worker_claimed_mid_replay(tmp_path):
+    """F10-26 folded together with the ``processed == 0`` ambiguity the CAS added.
+
+    Since Task 2 a replay round can return zero because its claims were taken
+    over rather than because the queue is empty, and the drain loop treats the
+    two identically. Both are the same fact to the caller -- work this pass did
+    not settle -- so both are counted.
+
+    On SQLite the interleaving is scripted (one writer, no ``skip_locked``);
+    the deployment where it happens by itself is PostgreSQL, where two workers
+    genuinely claim in parallel and the rebuild holds only the maintenance lock,
+    which a projector loop never takes.
+    """
+
+    async with _two_workers(tmp_path) as workers:
+        task_id = new_id()
+        await workers.a.persist_and_project([_task_created(task_id, source_id="run-rebuild-taken-over")])
+        while await workers.a.project_pending(limit=10):
+            pass
+        stolen: dict[str, object] = {}
+        original_claim = workers.b._claim_projection_job
+
+        async def claim_after_a_takes_one():
+            if "a" not in stolen:
+                # A claims one of the freshly re-pended rows before the replay
+                # gets to it, and holds the lease for the rest of the rebuild.
+                stolen["a"] = await workers.a._claim_projection_job()
+            return await original_claim()
+
+        workers.b._claim_projection_job = claim_after_a_takes_one  # type: ignore[method-assign]
+
+        rebuild = await workers.b.rebuild_projections()
+
+        assert stolen["a"] is not None
+        assert rebuild.unsettled == 1
+        async with workers.b_sessions() as session:
+            in_flight = await session.get(AnsichProjectionJobRow, stolen["a"][0])
+        assert in_flight is not None
+        assert in_flight.status == "processing"
+        assert in_flight.lease_owner == workers.a._lease_owner
+
+
+@pytest.mark.anyio
+async def test_maintenance_lock_still_unlocks_when_the_acquire_is_cancelled():
+    """A cancelled acquire is not proof that no lock was taken.
+
+    ``database.command_timeout`` cancels a pending ``pg_advisory_lock`` from the
+    client side, but the grant can land on the server while the reply is in
+    flight. The unlock therefore has to run on this path too; a spurious
+    ``pg_advisory_unlock`` returns false and costs nothing, while a skipped one
+    leaves the maintenance lock held until the connection closes.
+    """
+
+    statements: list[tuple[str, object]] = []
+    backend = SqlAnsichBackend(lambda: _RecordingSession("postgresql", statements, raise_on="pg_advisory_lock"))  # type: ignore[arg-type]
+
+    with pytest.raises(TimeoutError):
+        async with backend._maintenance_lock():
+            raise AssertionError("the guarded body must not run when the acquire fails")
+
+    assert _statement_index(statements, "pg_advisory_lock") < _statement_index(statements, "ROLLBACK") < _statement_index(statements, "pg_advisory_unlock")
+
+
+@pytest.mark.anyio
+async def test_maintenance_lock_rolls_back_before_unlocking():
+    """Ordering, not decoration: the unlock has to reach the server.
+
+    After a DBAPI failure the session is inactive and every further ``execute``
+    raises ``PendingRollbackError`` client-side -- so an unlock issued before
+    the rollback would be swallowed by the guard around it and the lock would
+    stay held for the life of the connection. ``ROLLBACK`` makes the connection
+    usable again, and a session-level advisory lock survives it. The recording
+    stub cannot reproduce the inactive state, so this test pins the *order*;
+    the behaviour it protects is provable only against a real server.
+    """
+
+    statements: list[tuple[str, object]] = []
+    backend = SqlAnsichBackend(lambda: _RecordingSession("postgresql", statements))  # type: ignore[arg-type]
+
+    async with backend._maintenance_lock():
+        pass
+
+    assert _statement_index(statements, "ROLLBACK") < _statement_index(statements, "pg_advisory_unlock")

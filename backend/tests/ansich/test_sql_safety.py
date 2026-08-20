@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import contextlib
+from collections.abc import AsyncIterator
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
@@ -16,7 +18,7 @@ from ansich import (
     ToolEffect,
     new_id,
 )
-from sqlalchemy import create_engine, event, func, inspect, select, text
+from sqlalchemy import create_engine, event, func, inspect, select, text, update
 from sqlalchemy.dialects import postgresql
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 from sqlalchemy.pool import Pool
@@ -35,6 +37,7 @@ from deerflow.ansich.persistence.models import (
     AnsichCurrentBeliefRow,
     AnsichEntityRow,
     AnsichObservationRow,
+    AnsichProjectionJobRow,
     AnsichRelationRow,
     AnsichScopeConclusionRow,
     AnsichScopeRow,
@@ -42,6 +45,7 @@ from deerflow.ansich.persistence.models import (
     AnsichToolCallAuthorizationRow,
     AnsichToolEffectRow,
 )
+from deerflow.ansich.persistence.sql import SqlAnsichBackend
 from deerflow.persistence.base import Base
 
 
@@ -751,7 +755,7 @@ async def test_sql_projects_scopes_authorization_and_effects_as_typed_rows(
                     )
                 ).scalars()
             )
-        replayed = await service.rebuild_projections()
+        rebuild = await service.rebuild_projections()
         rebuilt_scopes = await service.get_task_scopes(task_id)
         rebuilt_authorization = await service.get_tool_authorization(tool_call_id)
         rebuilt_effects = await service.get_tool_effects(tool_call_id)
@@ -785,7 +789,8 @@ async def test_sql_projects_scopes_authorization_and_effects_as_typed_rows(
     assert effects.effects == (effect,)
     assert conclusion_count >= 4
     assert unverified_current is not None
-    assert replayed > 0
+    assert rebuild.replayed > 0
+    assert rebuild.unsettled == 0
     assert rebuilt_scopes == task_scopes
     assert rebuilt_authorization == authorization
     assert rebuilt_effects == effects
@@ -1906,6 +1911,7 @@ async def test_absorbed_low_watermark_window_survives_an_evaluation_rollback(tmp
 
         async with session_factory() as session:
             late_conclusions = await session.scalar(select(func.count()).select_from(AnsichScopeConclusionRow).where(AnsichScopeConclusionRow.tool_call_id == late_id))
+            settled_conclusions = await session.scalar(select(func.count()).select_from(AnsichScopeConclusionRow).where(AnsichScopeConclusionRow.tool_call_id == settled_id))
             final_mark = await session.get(
                 AnsichAssessorWatermarkRow,
                 (task_id, "scope-safety", "1.0.0"),
@@ -1921,4 +1927,704 @@ async def test_absorbed_low_watermark_window_survives_an_evaluation_rollback(tmp
     # The retry claims the high sibling alone; the absorbed low siblings are
     # already completed, so only a durable widening can still cover them.
     assert late_conclusions == 4
+    # F10-10 hypothesis (c)'s named tooth: count the *converged* subject too,
+    # not just the late one. Eight is the honest number here and it refutes the
+    # hypothesis in this shape -- the settled ToolCall carries the trigger's own
+    # ``effect.observed``, so the retry's window names it for a real reason and
+    # judges it a second time. What this test cannot exhibit is a converged
+    # ToolCall pulled into the window by nothing but a lowered mark; that needs
+    # a job whose watermark lands *under* an already-advanced mark, which is
+    # ``test_a_dependency_deferred_job_below_the_mark_does_not_re_judge_the_band``.
+    assert settled_conclusions == 8
     assert final_watermark == trigger_seq
+
+
+def _scope_snapshot_observation(
+    *,
+    task_id: str,
+    scope_id: str,
+    obs_id: str,
+    producer: Producer,
+    observed_at: datetime,
+    label: str,
+    external_ref_hash: str,
+    parent_scope_id: str | None = None,
+) -> ObservationEnvelope:
+    """A ``scope.snapshotted`` that names no ToolCall and no ``within_scope``.
+
+    Two properties make it the only usable carrier for the "late job below the
+    mark" shape. It is scope-safety evidence, so projecting it mints a
+    scope-safety assessor job at its own ``ingest_seq``; and it names no
+    ToolCall, so while it sits unprojected it does *not* poison the evidence
+    windows that span it -- an unprojected ``authorization.*``/``effect.*`` row
+    would, because its ToolCall Entity is what ``_persist_assessment`` waits
+    for, and every evaluation over that window would roll back instead.
+    """
+
+    scope = ScopeDescriptor(
+        scope_id=scope_id,
+        scope_kind="workspace",
+        external_ref_hash=external_ref_hash,
+        display_label=label,
+        parent_scope_id=parent_scope_id,
+        created_obs_id=obs_id,
+    )
+    return ObservationEnvelope(
+        obs_id=obs_id,
+        kind="scope.snapshotted",
+        occurred_at=observed_at,
+        task_id=task_id,
+        subject_type="scope",
+        subject_id=scope_id,
+        producer=producer,
+        source_event_id=f"{label}:scope:snapshotted",
+        correlation_id=label,
+        payload={"scope": scope.model_dump(mode="json")},
+    )
+
+
+#: Availability injections. Both are fixture constants rather than offsets from
+#: a live clock, so no decision in these tests can land between a simulated and
+#: a real ``now``: ``_UNAVAILABLE_AT`` is far enough ahead that nothing can make
+#: a held job claimable by accident, ``_AVAILABLE_AT`` far enough behind that
+#: nothing can keep a released one held.
+_UNAVAILABLE_AT = datetime(2099, 1, 1, tzinfo=UTC)
+_AVAILABLE_AT = datetime(2026, 1, 1, tzinfo=UTC)
+
+
+@pytest.mark.anyio
+async def test_a_dependency_deferred_job_below_the_mark_does_not_re_judge_the_band(tmp_path) -> None:
+    """F10-10 hypothesis (c): a late low job must not drag the mark backwards.
+
+    The mechanism, on the ordinary self-heal path. A Scope observation whose
+    parent Scope has not landed is deferred by ``_project_safety``, so its
+    scope-safety job is minted only once the parent arrives -- and by then a
+    higher watermark has settled the mark above it. Claiming that lone job
+    widens the mark down below its own watermark (which absorption requires),
+    and the advance afterwards raises it back only to the job's own watermark.
+    The mark ends up a whole band below the evidence it has actually judged, so
+    the next trigger re-opens that band and re-judges every converged ToolCall
+    in it -- one extra Assertion and one extra ``ansich_scope_conclusions`` row
+    each, because scope-safety stamps ``as_of`` with the assessment time and
+    ``_persist_assessment``'s dedupe cannot absorb it.
+
+    ``scope.snapshotted`` is the only usable carrier for the "late job below the
+    mark" shape, and that is a fact about the code rather than a convenience: an
+    unprojected ``authorization.*``/``effect.*`` row names a ToolCall whose
+    Entity ``_persist_assessment`` waits for, so *every* evaluation whose window
+    spans it rolls back and the mark cannot get past it in the first place. A
+    Scope observation names no ToolCall, so it is invisible to the window while
+    it waits and mints a real job when it lands.
+
+    Domain: a dependency-deferred arrival below an advanced mark. Ordinary
+    absorption plus an evaluation rollback is
+    ``test_absorbed_low_watermark_window_survives_an_evaluation_rollback``; the
+    stale-claim drop is ``test_a_dropped_assessor_completion_rolls_back_...``.
+    """
+
+    engine, session_factory = _scope_safety_service(tmp_path, "scope-safety-deferred-below-mark.db")
+    async with engine.begin() as connection:
+        await connection.run_sync(Base.metadata.create_all)
+    service = create_sql_ansich_service(
+        session_factory,
+        flush_interval_ms=60_000,
+        # The deferred Scope observation cannot settle until its parent lands,
+        # so every flush until then spends this whole budget waiting.
+        terminal_flush_timeout_ms=2_000,
+        projector_poll_interval_ms=5,
+        operations_assessment_interval_ms=60_000,
+    )
+    # Every assessment here is the test's own: the choreography depends on
+    # exactly which evidence window each evaluation sees.
+    only_test_driven_assessments(service)
+    await service.start()
+    task_id, step_id = new_id(), new_id()
+    converged_id, trigger_id = new_id(), new_id()
+    parent_scope_id, child_scope_id = new_id(), new_id()
+    child_scope_obs_id, parent_scope_obs_id = new_id(), new_id()
+    # Past-dated on purpose (global clock rule).
+    observed_at = datetime(2026, 7, 1, 13, tzinfo=UTC)
+    producer = Producer(name="scope-safety-deferred", version="1", instance_id="test")
+
+    async def _ingest_seq(obs_id: str) -> int:
+        async with session_factory() as session:
+            ingest_seq = await session.scalar(select(AnsichObservationRow.ingest_seq).where(AnsichObservationRow.obs_id == obs_id))
+        assert ingest_seq is not None, f"Observation {obs_id} was never persisted"
+        return int(ingest_seq)
+
+    async def _mark() -> int | None:
+        async with session_factory() as session:
+            row = await session.get(AnsichAssessorWatermarkRow, (task_id, "scope-safety", "1.0.0"))
+        return None if row is None else row.evidence_watermark
+
+    async def _conclusions(tool_call_id: str) -> int:
+        async with session_factory() as session:
+            return int(await session.scalar(select(func.count()).select_from(AnsichScopeConclusionRow).where(AnsichScopeConclusionRow.tool_call_id == tool_call_id)) or 0)
+
+    async def _set_availability(watermark: int, available_at: datetime) -> None:
+        async with session_factory() as session, session.begin():
+            result = await session.execute(
+                update(AnsichAssessorJobRow)
+                .where(
+                    AnsichAssessorJobRow.assessor_name == "scope-safety",
+                    AnsichAssessorJobRow.evidence_watermark == watermark,
+                )
+                .values(available_at=available_at)
+            )
+        assert result.rowcount == 1, f"expected exactly one scope-safety job at watermark {watermark}"
+
+    try:
+        await _start_scope_safety_task(
+            service,
+            task_id=task_id,
+            step_id=step_id,
+            observed_at=observed_at,
+            producer=producer,
+            label="deferred",
+        )
+        service.record_batch(
+            _scope_safety_tool_call_batch(
+                task_id=task_id,
+                step_id=step_id,
+                tool_call_id=converged_id,
+                call_seq=1,
+                producer=producer,
+                observed_at=observed_at,
+                label="deferred-converged",
+            )
+            + _scope_safety_tool_call_batch(
+                task_id=task_id,
+                step_id=step_id,
+                tool_call_id=trigger_id,
+                call_seq=2,
+                producer=producer,
+                observed_at=observed_at,
+                label="deferred-trigger",
+            )
+        )
+        await service.flush_task(task_id)
+
+        # (1) The Scope observation whose parent has not landed. It stays
+        # ``pending`` and mints no assessor job at all while it waits.
+        service.record(
+            _scope_snapshot_observation(
+                task_id=task_id,
+                scope_id=child_scope_id,
+                obs_id=child_scope_obs_id,
+                producer=producer,
+                observed_at=observed_at,
+                label="deferred-child",
+                external_ref_hash="c" * 64,
+                parent_scope_id=parent_scope_id,
+            )
+        )
+        await service.flush_task(task_id)
+        await anyio.sleep(0.3)
+        async with session_factory() as session:
+            assert await session.scalar(select(func.count()).select_from(AnsichAssessorJobRow).where(AnsichAssessorJobRow.assessor_name == "scope-safety")) == 0
+
+        # (2) Evidence at higher sequences, then the parent Scope, which frees
+        # the deferred child to project and mint its own low-watermark job.
+        converged_batch = _scope_safety_evidence_batch(
+            task_id=task_id,
+            step_id=step_id,
+            tool_call_id=converged_id,
+            producer=producer,
+            observed_at=observed_at,
+            label="deferred-converged",
+            with_observed_effect=True,
+        )
+        service.record_batch(converged_batch)
+        await service.flush_task(task_id)
+        service.record(
+            _scope_snapshot_observation(
+                task_id=task_id,
+                scope_id=parent_scope_id,
+                obs_id=parent_scope_obs_id,
+                producer=producer,
+                observed_at=observed_at,
+                label="deferred-parent",
+                external_ref_hash="d" * 64,
+            )
+        )
+        await service.flush_task(task_id)
+        await anyio.sleep(0.5)
+
+        deferred_seq = await _ingest_seq(child_scope_obs_id)
+        converged_seq = await _ingest_seq(converged_batch[-1].obs_id)
+        parent_seq = await _ingest_seq(parent_scope_obs_id)
+        assert deferred_seq < converged_seq < parent_seq
+
+        # (3) Hold the late job back for one assessment. Without this the claim
+        # would absorb it into the parent Scope's own higher-watermark job and
+        # never evaluate it alone -- which is the arrangement, not the bug: the
+        # real system separates them by the projector's own retry timing.
+        await _set_availability(deferred_seq, _UNAVAILABLE_AT)
+        await service.assess_operations(now=observed_at)
+        assert await _mark() == parent_seq
+        assert await _conclusions(converged_id) == 4
+
+        # (4) The late job is claimed alone, at a watermark below the mark. Its
+        # evidence names no ToolCall, so this evaluation writes no conclusion --
+        # it only settles the mark, which is the whole point.
+        await _set_availability(deferred_seq, _AVAILABLE_AT)
+        await service.assess_operations(now=observed_at + timedelta(minutes=1))
+        mark_after_late_job = await _mark()
+
+        # (5) One new trigger, on a ToolCall of its own.
+        trigger = _scope_safety_observed_effect(
+            task_id=task_id,
+            step_id=step_id,
+            tool_call_id=trigger_id,
+            producer=producer,
+            observed_at=observed_at,
+            label="deferred-trigger",
+        )
+        service.record(trigger)
+        await service.flush_task(task_id)
+        await anyio.sleep(0.3)
+        trigger_seq = await _ingest_seq(trigger.obs_id)
+        await service.assess_operations(now=observed_at + timedelta(minutes=2))
+
+        converged_conclusions = await _conclusions(converged_id)
+        trigger_conclusions = await _conclusions(trigger_id)
+        final_mark = await _mark()
+    finally:
+        await service.stop()
+        await engine.dispose()
+
+    # The mechanism itself: the late job settles the mark at the watermark it
+    # evaluated *or* the one the claim found, whichever is higher. Without the
+    # restore this is ``deferred_seq`` and the mark has un-judged the band above
+    # it, none of which this evaluation looked at.
+    assert mark_after_late_job == parent_seq
+    # The safe half, unchanged: the trigger's own subject is judged.
+    assert trigger_conclusions == 4
+    # The cost hypothesis (c) predicts. The converged ToolCall carries no new
+    # evidence, so no window may name it and its conclusions stay at four.
+    assert converged_conclusions == 4
+    assert final_mark == trigger_seq
+
+
+class _AssessorWorkers:
+    """Two independent backends over one SQLite file, plus a read handle each."""
+
+    def __init__(self, first: SqlAnsichBackend, second: SqlAnsichBackend, sessions: async_sessionmaker) -> None:
+        self.a = first
+        self.b = second
+        self.sessions = sessions
+
+
+@contextlib.asynccontextmanager
+async def _two_assessor_workers(tmp_path: Path, name: str) -> AsyncIterator[_AssessorWorkers]:
+    """Two engines, two backends, one database -- two real workers.
+
+    Separate engines rather than a shared session factory, because the subject
+    is two *workers*: each mints its own process-lifetime ``lease_owner``, which
+    is precisely what a completion CAS has to see through. SQLite renders
+    ``skip_locked`` as empty and shows both backends the same row, which makes
+    it the deterministic substrate for a takeover script (the same reasoning as
+    ``tests/ansich/test_lease_cas.py``).
+    """
+
+    database_path = tmp_path / name
+    engines = [create_async_engine(f"sqlite+aiosqlite:///{database_path}") for _ in range(2)]
+    for engine in engines:
+
+        @event.listens_for(engine.sync_engine, "connect")
+        def _enable_foreign_keys(dbapi_connection, _connection_record):
+            cursor = dbapi_connection.cursor()
+            cursor.execute("PRAGMA foreign_keys=ON")
+            cursor.close()
+
+    async with engines[0].begin() as connection:
+        await connection.run_sync(Base.metadata.create_all)
+    sessions = [async_sessionmaker(engine, expire_on_commit=False) for engine in engines]
+    try:
+        yield _AssessorWorkers(
+            SqlAnsichBackend(sessions[0]),
+            SqlAnsichBackend(sessions[1]),
+            sessions[0],
+        )
+    finally:
+        for engine in engines:
+            await engine.dispose()
+
+
+def _take_over_the_scope_safety_claim(workers: _AssessorWorkers, record: dict[str, object]):
+    """Splice a takeover between A's assessor claim and A's evaluation.
+
+    The claim and the evaluation are two transactions, and SQLite has one
+    writer, so B cannot claim anything while A holds the evaluation open. The
+    takeover therefore rides on A's own claim call, exactly as the projection
+    side does in ``test_lease_cas.py``.
+    """
+
+    original_claim = workers.a._claim_assessor_job
+
+    async def claim_then_lose_the_lease():
+        claim = await original_claim()
+        if claim is not None and claim.assessor_name == "scope-safety" and "a" not in record:
+            record["a"] = claim
+            async with workers.sessions() as session, session.begin():
+                await session.execute(update(AnsichAssessorJobRow).where(AnsichAssessorJobRow.job_id == claim.job_id).values(lease_expires_at=_EXPIRED_LEASE_AT))
+            record["b"] = await workers.b._claim_assessor_job()
+        return claim
+
+    workers.a._claim_assessor_job = claim_then_lose_the_lease  # type: ignore[method-assign]
+    return record
+
+
+#: Injected lease expiry (global clock rule): a lease is expired by writing a
+#: timestamp that is in the past under any clock, never by moving a fake one.
+_EXPIRED_LEASE_AT = datetime(2026, 1, 1, tzinfo=UTC)
+_ASSESSOR_TASK_OBSERVED_AT = datetime(2026, 7, 1, 14, tzinfo=UTC)
+
+
+async def _drain_projections(backend: SqlAnsichBackend) -> None:
+    while await backend.project_pending(limit=50):
+        pass
+
+
+async def _run_assessors(backend: SqlAnsichBackend, *, now: datetime, limit: int = 500) -> int:
+    return await backend._process_assessor_jobs(
+        now=now,
+        incomplete_tasks=frozenset(),
+        global_loss=False,
+        limit=limit,
+    )
+
+
+async def _scope_safety_mark(sessions: async_sessionmaker, task_id: str) -> int | None:
+    async with sessions() as session:
+        row = await session.get(AnsichAssessorWatermarkRow, (task_id, "scope-safety", "1.0.0"))
+    return None if row is None else row.evidence_watermark
+
+
+async def _scope_conclusion_count(sessions: async_sessionmaker, tool_call_id: str) -> int:
+    async with sessions() as session:
+        return int(await session.scalar(select(func.count()).select_from(AnsichScopeConclusionRow).where(AnsichScopeConclusionRow.tool_call_id == tool_call_id)) or 0)
+
+
+@pytest.mark.anyio
+async def test_a_dropped_assessor_completion_rolls_back_its_whole_evaluation(tmp_path) -> None:
+    """Controller ruling PB4: on the assessor path the drop costs everything.
+
+    A dropped completion means the lease expired and somebody else owns the job
+    now. On the projection path that is safe to leave committed -- projectors
+    are idempotent and the new owner converges on the same rows (RB4(5)). The
+    assessor path has one write idempotency cannot repair: the evidence mark,
+    which is not a projection but a *claim about what has been judged*, and
+    which the new owner reads as the lower bound of its own window. So the
+    whole evaluation goes back and the new owner redoes it in full.
+
+    Domain: the stale-drop half of the assessor watermark work. The composed
+    case, where the stale advance also erases the new owner's claim-time
+    widening, is ``test_a_stale_evaluation_cannot_erase_the_new_owners_window``.
+    """
+
+    async with _two_assessor_workers(tmp_path, "scope-safety-pb4-drop.db") as workers:
+        task_id, step_id, tool_call_id = new_id(), new_id(), new_id()
+        producer = Producer(name="scope-safety-pb4", version="1", instance_id="test")
+        await workers.a.persist_and_project(
+            [
+                ObservationEnvelope.task_lifecycle(
+                    kind="task.created",
+                    task_id=task_id,
+                    source_kind="deerflow_run",
+                    source_id="pb4-drop",
+                    occurred_at=_ASSESSOR_TASK_OBSERVED_AT,
+                    source_event_id="pb4-drop:task:created",
+                ),
+                ObservationEnvelope(
+                    kind="step.started",
+                    occurred_at=_ASSESSOR_TASK_OBSERVED_AT,
+                    task_id=task_id,
+                    step_id=step_id,
+                    subject_type="step",
+                    subject_id=step_id,
+                    producer=producer,
+                    source_event_id="pb4-drop:step:started",
+                    correlation_id="pb4-drop",
+                    payload={"step_seq": 1, "actor_kind": "lead_agent"},
+                ),
+                *_scope_safety_tool_call_batch(
+                    task_id=task_id,
+                    step_id=step_id,
+                    tool_call_id=tool_call_id,
+                    call_seq=1,
+                    producer=producer,
+                    observed_at=_ASSESSOR_TASK_OBSERVED_AT,
+                    label="pb4-drop",
+                ),
+            ]
+        )
+        await _drain_projections(workers.a)
+        # Drain the assessors ``tool.issued`` mints (repetition/frequency) so the
+        # only claimable jobs left are scope-safety and the takeover below is
+        # unambiguous about which row it is racing.
+        await _run_assessors(workers.a, now=_ASSESSOR_TASK_OBSERVED_AT)
+
+        evidence = _scope_safety_evidence_batch(
+            task_id=task_id,
+            step_id=step_id,
+            tool_call_id=tool_call_id,
+            producer=producer,
+            observed_at=_ASSESSOR_TASK_OBSERVED_AT,
+            label="pb4-drop",
+            with_observed_effect=True,
+        )
+        await workers.a.persist_and_project(list(evidence))
+        await _drain_projections(workers.a)
+
+        record: dict[str, object] = {}
+        _take_over_the_scope_safety_claim(workers, record)
+        await _run_assessors(workers.a, now=_ASSESSOR_TASK_OBSERVED_AT, limit=1)
+
+        a_claim = record["a"]
+        b_claim = record["b"]
+        assert b_claim is not None
+        assert b_claim.job_id == a_claim.job_id
+        assert b_claim.lease_generation == a_claim.lease_generation + 1
+
+        # Nothing A's evaluation wrote may survive: not the conclusions, not the
+        # Assertions behind them, and above all not the mark.
+        assert await _scope_conclusion_count(workers.sessions, tool_call_id) == 0
+        assert await _scope_safety_mark(workers.sessions, task_id) is None
+        async with workers.sessions() as session:
+            assertion_count = await session.scalar(select(func.count()).select_from(AnsichBeliefAssertionRow).where(AnsichBeliefAssertionRow.assessor_name == "scope-safety"))
+            error_count = await session.scalar(select(func.count()).select_from(AnsichAssessorErrorRow))
+            job = await session.get(AnsichAssessorJobRow, b_claim.job_id)
+        assert assertion_count == 0
+        # A drop is a change of owner, not a failure of the work: no durable
+        # error row, no re-arm, and no attempt charged beyond the two claims.
+        assert error_count == 0
+        assert job is not None
+        assert job.status == "processing"
+        assert job.lease_owner == workers.b._lease_owner
+        assert job.lease_generation == b_claim.lease_generation
+        assert workers.a.stale_completion_count == 1
+
+        # The new owner then produces the outcome, in full and exactly once.
+        async with workers.sessions() as session, session.begin():
+            await session.execute(update(AnsichAssessorJobRow).where(AnsichAssessorJobRow.job_id == b_claim.job_id).values(lease_expires_at=_EXPIRED_LEASE_AT))
+        await _run_assessors(workers.b, now=_ASSESSOR_TASK_OBSERVED_AT, limit=1)
+
+        assert await _scope_conclusion_count(workers.sessions, tool_call_id) == 4
+        assert await _scope_safety_mark(workers.sessions, task_id) == a_claim.evidence_watermark
+        async with workers.sessions() as session:
+            settled = await session.get(AnsichAssessorJobRow, b_claim.job_id)
+        assert settled is not None
+        assert settled.status == "completed"
+
+
+@pytest.mark.anyio
+async def test_a_stale_evaluation_cannot_erase_the_new_owners_window(tmp_path) -> None:
+    """PB4 composed with the pre-claim restore: the reviewer's five steps.
+
+    The interleaving Task 2's review constructed. (i) A claims a group whose
+    lowest member sits under the mark, so the claim widens the mark down over
+    it. (ii) A's lease expires and B re-claims the surviving job, inheriting
+    that widened window as its own lower bound. (iii) A's evaluation finishes
+    anyway and its advance -- ``max(its watermark, the mark it found at claim
+    time)``, which the hypothesis-(c) restore makes *higher*, not lower --
+    would raise the mark back over the band B is about to judge. (iv) B then
+    reads its window start from that mark and finds it empty, so the band the
+    widening opened is judged by nobody: A left the job to B, and B was told
+    there was nothing to do.
+
+    PB4 closes it at the source. A's completion fails its compare-and-set, so
+    A's whole transaction goes back -- including the advance -- and the mark B
+    inherited from its own claim is still there when B reads it. The two fixes
+    have to be checked together precisely because the restore makes a stale
+    advance reach further.
+
+    One residual is deliberate and visible in the numbers below: the widening
+    itself lives in the *claim's* transaction and survives the rollback (P9-M2
+    -- absorption completes the group's lower jobs there too, so a widening
+    that rolled back would strand them). B therefore re-judges the band, which
+    is the bounded, safe cost the widening has always carried.
+    """
+
+    async with _two_assessor_workers(tmp_path, "scope-safety-pb4-window.db") as workers:
+        task_id, step_id, tool_call_id = new_id(), new_id(), new_id()
+        parent_scope_id, child_scope_id = new_id(), new_id()
+        child_scope_obs_id, parent_scope_obs_id = new_id(), new_id()
+        producer = Producer(name="scope-safety-pb4-window", version="1", instance_id="test")
+
+        async def _ingest_seq(obs_id: str) -> int:
+            async with workers.sessions() as session:
+                ingest_seq = await session.scalar(select(AnsichObservationRow.ingest_seq).where(AnsichObservationRow.obs_id == obs_id))
+            assert ingest_seq is not None, f"Observation {obs_id} was never persisted"
+            return int(ingest_seq)
+
+        async def _set_assessor_availability(watermark: int, available_at: datetime) -> None:
+            async with workers.sessions() as session, session.begin():
+                result = await session.execute(
+                    update(AnsichAssessorJobRow)
+                    .where(
+                        AnsichAssessorJobRow.assessor_name == "scope-safety",
+                        AnsichAssessorJobRow.evidence_watermark == watermark,
+                    )
+                    .values(available_at=available_at)
+                )
+            assert result.rowcount == 1, f"expected exactly one scope-safety job at watermark {watermark}"
+
+        await workers.a.persist_and_project(
+            [
+                ObservationEnvelope.task_lifecycle(
+                    kind="task.created",
+                    task_id=task_id,
+                    source_kind="deerflow_run",
+                    source_id="pb4-window",
+                    occurred_at=_ASSESSOR_TASK_OBSERVED_AT,
+                    source_event_id="pb4-window:task:created",
+                ),
+                ObservationEnvelope(
+                    kind="step.started",
+                    occurred_at=_ASSESSOR_TASK_OBSERVED_AT,
+                    task_id=task_id,
+                    step_id=step_id,
+                    subject_type="step",
+                    subject_id=step_id,
+                    producer=producer,
+                    source_event_id="pb4-window:step:started",
+                    correlation_id="pb4-window",
+                    payload={"step_seq": 1, "actor_kind": "lead_agent"},
+                ),
+                *_scope_safety_tool_call_batch(
+                    task_id=task_id,
+                    step_id=step_id,
+                    tool_call_id=tool_call_id,
+                    call_seq=1,
+                    producer=producer,
+                    observed_at=_ASSESSOR_TASK_OBSERVED_AT,
+                    label="pb4-window",
+                ),
+            ]
+        )
+        await _drain_projections(workers.a)
+        await _run_assessors(workers.a, now=_ASSESSOR_TASK_OBSERVED_AT)
+
+        # The dependency-deferred Scope observation: invisible to every window
+        # while it waits (it names no ToolCall), and the source of the low
+        # watermark that makes the later claim widen the mark at all.
+        await workers.a.persist_and_project(
+            [
+                _scope_snapshot_observation(
+                    task_id=task_id,
+                    scope_id=child_scope_id,
+                    obs_id=child_scope_obs_id,
+                    producer=producer,
+                    observed_at=_ASSESSOR_TASK_OBSERVED_AT,
+                    label="pb4-window-child",
+                    external_ref_hash="c" * 64,
+                    parent_scope_id=parent_scope_id,
+                )
+            ]
+        )
+        await _drain_projections(workers.a)
+        evidence = _scope_safety_evidence_batch(
+            task_id=task_id,
+            step_id=step_id,
+            tool_call_id=tool_call_id,
+            producer=producer,
+            observed_at=_ASSESSOR_TASK_OBSERVED_AT,
+            label="pb4-window",
+            with_observed_effect=True,
+        )
+        await workers.a.persist_and_project(list(evidence))
+        await workers.a.persist_and_project(
+            [
+                _scope_snapshot_observation(
+                    task_id=task_id,
+                    scope_id=parent_scope_id,
+                    obs_id=parent_scope_obs_id,
+                    producer=producer,
+                    observed_at=_ASSESSOR_TASK_OBSERVED_AT,
+                    label="pb4-window-parent",
+                    external_ref_hash="d" * 64,
+                )
+            ]
+        )
+        await _drain_projections(workers.a)
+        # The deferred projection's own backoff is brought forward rather than
+        # waited out: there is no projector loop behind a bare backend.
+        async with workers.sessions() as session, session.begin():
+            await session.execute(update(AnsichProjectionJobRow).where(AnsichProjectionJobRow.obs_id == child_scope_obs_id).values(available_at=_AVAILABLE_AT))
+        await _drain_projections(workers.a)
+
+        deferred_seq = await _ingest_seq(child_scope_obs_id)
+        parent_seq = await _ingest_seq(parent_scope_obs_id)
+
+        # The mark settles above the late job, which is held back for exactly
+        # one round so it is claimed on its own rather than absorbed here.
+        await _set_assessor_availability(deferred_seq, _UNAVAILABLE_AT)
+        await _run_assessors(workers.a, now=_ASSESSOR_TASK_OBSERVED_AT)
+        assert await _scope_safety_mark(workers.sessions, task_id) == parent_seq
+        assert await _scope_conclusion_count(workers.sessions, tool_call_id) == 4
+
+        await _set_assessor_availability(deferred_seq, _AVAILABLE_AT)
+        trigger = _scope_safety_observed_effect(
+            task_id=task_id,
+            step_id=step_id,
+            tool_call_id=tool_call_id,
+            producer=producer,
+            observed_at=_ASSESSOR_TASK_OBSERVED_AT,
+            label="pb4-window-trigger",
+        )
+        await workers.a.persist_and_project([trigger])
+        await _drain_projections(workers.a)
+        trigger_seq = await _ingest_seq(trigger.obs_id)
+
+        record: dict[str, object] = {}
+        _take_over_the_scope_safety_claim(workers, record)
+        # Each round assesses at its own ``now``: scope-safety stamps ``as_of``
+        # with the assessment time, so a round that reuses an earlier one is
+        # absorbed by ``_persist_assessment``'s dedupe and writes nothing --
+        # which would make "the new owner redid the work" unobservable.
+        await _run_assessors(workers.a, now=_ASSESSOR_TASK_OBSERVED_AT + timedelta(minutes=1), limit=1)
+
+        a_claim = record["a"]
+        b_claim = record["b"]
+        # (i) A claimed the group the late job seeds and absorbed it, so the
+        # claim widened the mark down below it; the pre-claim mark it carries is
+        # what makes a stale advance reach *past* the new owner's window.
+        assert a_claim.evidence_watermark == trigger_seq
+        assert a_claim.pre_claim_watermark == parent_seq
+        assert b_claim is not None
+        assert b_claim.job_id == a_claim.job_id
+        assert b_claim.pre_claim_watermark == deferred_seq - 1
+
+        # (iv) with PB4: A's advance never lands, so the window B inherited is
+        # still open when B reads it.
+        assert await _scope_safety_mark(workers.sessions, task_id) == deferred_seq - 1
+        async with workers.sessions() as session:
+            b_window_start = await workers.b._scope_safety_window_start(session, task_id=task_id)
+            absorbed = await session.scalar(select(AnsichAssessorJobRow).where(AnsichAssessorJobRow.evidence_watermark == deferred_seq))
+            job = await session.get(AnsichAssessorJobRow, b_claim.job_id)
+            error_count = await session.scalar(select(func.count()).select_from(AnsichAssessorErrorRow))
+        assert b_window_start == deferred_seq - 1
+        assert await _scope_conclusion_count(workers.sessions, tool_call_id) == 4
+        # The absorption itself is not rolled back: it lives in the claim's
+        # transaction, which is exactly why the widening has to live there too.
+        assert absorbed is not None
+        assert absorbed.status == "completed"
+        assert job is not None
+        assert job.status == "processing"
+        assert job.lease_owner == workers.b._lease_owner
+        assert error_count == 0
+        assert workers.a.stale_completion_count == 1
+
+        # The new owner judges the band the widening opened, and settles the
+        # mark itself.
+        async with workers.sessions() as session, session.begin():
+            await session.execute(update(AnsichAssessorJobRow).where(AnsichAssessorJobRow.job_id == b_claim.job_id).values(lease_expires_at=_EXPIRED_LEASE_AT))
+        await _run_assessors(workers.b, now=_ASSESSOR_TASK_OBSERVED_AT + timedelta(minutes=2), limit=1)
+
+        assert await _scope_conclusion_count(workers.sessions, tool_call_id) == 8
+        assert await _scope_safety_mark(workers.sessions, task_id) == trigger_seq
+        async with workers.sessions() as session:
+            settled = await session.get(AnsichAssessorJobRow, b_claim.job_id)
+        assert settled is not None
+        assert settled.status == "completed"

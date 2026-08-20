@@ -678,13 +678,15 @@ Scope-safety is assessed incrementally: each conclusion depends only on one
 `tool_call_id`'s own snapshots and effects, so a trigger re-judges just the
 ToolCalls named by evidence in the new watermark window and leaves converged
 conclusions unwritten (they are stamped with the assessment time, so a rewrite
-would append an assertion every trigger rather than dedupe). One case still
-rewrites them: claiming lowers the mark below the group's lowest watermark while
-the later advance only raises it back to that claim's own watermark, so a
-dependency-deferred job landing under an already-advanced mark widens the next
-window across the whole band and re-judges every converged ToolCall in it — see
-F10-10 hypothesis (c) in `ansich/docs/plans/phase-10-review-followups.md`, where
-the fix is scheduled for Phase 11. The window's lower
+would append an assertion every trigger rather than dedupe). Keeping that true
+takes one more step, because claiming lowers the mark below the group's lowest
+watermark: the claim carries the mark it found *before* widening it, and the
+evaluation settles at `max(its own watermark, that pre-claim mark)`. Without
+that restore a dependency-deferred job landing under an already-advanced mark
+leaves the mark a whole band low, and the next trigger re-judges every converged
+ToolCall in it — F10-10 hypothesis (c), fixed in P11-B. Restoring cannot skip
+evidence: the pre-claim mark is itself a value some earlier evaluation reached
+by judging everything below it. The window's lower
 bound is `ansich_assessor_watermarks`, written inside the evaluation's own
 transaction and deleted by `rebuild_projections()` with the conclusions it
 describes — an assessor job's `completed` status cannot serve as that bound
@@ -1221,11 +1223,16 @@ re-claimed it, a rebuild re-pended it, or a claim absorbed it) and the write is
 exception there would only re-arm the row under its feet. Whatever the losing
 worker already projected stays committed — projector idempotency is the backstop
 that makes the drop safe, and the new owner converges on the same read model.
-That backstop covers the **projection** path only: an assessor evaluation also
-advances `ansich_assessor_watermarks`, which a dropped completion must not leave
-committed (it can raise the mark over a band the new owner has not judged), so
-the assessor path's transaction rollback is owned by the hypothesis-(c) work
-rather than settled here. Drops are counted in a process-local debug counter
+That backstop covers the **projection** path only. An assessor evaluation also
+advances `ansich_assessor_watermarks`, which is not a projection but a claim
+about what has been judged, and which the next owner reads as the lower bound of
+its own window — idempotency cannot repair it. So on the assessor path a dropped
+completion costs the **whole evaluation**: `_complete_assessor_job` returning
+false raises `_StaleAssessorClaim` inside the evaluation's transaction, and the
+assessments, alert episodes and the mark roll back with the job status
+(controller ruling PB4). It is not charged as a failure — no durable error row,
+no re-arm — because it is a change of owner, not a fault, and the new owner
+redoes the work in full. Drops are counted in a process-local debug counter
 (`SqlAnsichBackend.stale_completion_count`), deliberately **not** a
 health field. Why a generation rather than `lease_owner`: that id is one
 `uuid4` per process, so a worker whose lease expired mid-work re-claims the same
@@ -1247,7 +1254,11 @@ rejected — unbounded at the database, but bounded in practice by
 request and the call fails loudly, the same exposure the schema bootstrap's
 advisory lock already carries. A cancelled acquire is not proof that no lock was
 taken (the grant can land while the reply is in flight), so the unlock runs on
-that path too. **The wait is not free for the waiting worker:**
+that path too, and the `finally` rolls back *before* unlocking — after a DBAPI
+failure the session is inactive and any further statement raises client-side, so
+an unlock issued first would never reach the server, while a session-level
+advisory lock survives the `ROLLBACK` itself. **The wait is not free for the
+waiting worker:**
 `AnsichService` holds its process-local `_projection_lock` around the backend
 call, so a queued operator stalls its own projector loop and any terminal
 barrier behind it for the whole wait. On single-writer SQLite the DB lock is a
@@ -1263,6 +1274,22 @@ only `failed` rows — a leased row belongs to a worker still entitled to finish
 it — returns the rowcount it actually re-armed, and never resets the
 generation, which stays monotonic for the row's lifetime precisely so an older
 claim's number can never match again.
+
+`rebuild_projections()` answers with a `RebuildOutcome(replayed, unsettled)`
+rather than a bare count (F10-26). Its drain loop stops when a round claims
+nothing, and that is **not** the same statement as "the rebuild is done": a job
+inside its 250ms dependency backoff is outside the claim's `available_at <= now`
+predicate, and since the CAS a round can also return zero because its claims
+were taken over. `unsettled` counts every projection or assessor job still
+`pending`/`retry`/`processing` when the pass returns (`failed` rows are settled,
+badly, and already surfaced through the failed-job count). Reporting rather than
+waiting is deliberate: this call holds the maintenance lock *and* the caller's
+`_projection_lock`, so waiting out a dependency — up to
+`projector_dependency_timeout_seconds` — would stall an operator and a projector
+loop for an interval the rebuild does not control, and durably failing a job
+that would have settled in 250ms destroys work. A rebuild is idempotent, so a
+caller that wants completeness calls again. `AnsichService.rebuild_projections`
+normalizes a backend that still answers with a bare int to `unsettled=0`.
 
 `tests/ansich/test_lease_cas.py` proves these as explicit interleaving scripts
 (two engines and two backends over one SQLite file, lease expiry injected as a

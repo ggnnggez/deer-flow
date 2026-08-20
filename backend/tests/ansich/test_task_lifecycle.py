@@ -712,7 +712,7 @@ async def test_rebuild_is_mutually_exclusive_with_background_projection():
         async with anyio.create_task_group() as task_group:
 
             async def run_rebuild() -> None:
-                assert await service.rebuild_projections() == 3
+                assert (await service.rebuild_projections()).replayed == 3
 
             task_group.start_soon(run_rebuild)
             await backend.rebuild_started.wait()

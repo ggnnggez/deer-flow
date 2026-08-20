@@ -1225,13 +1225,14 @@ async def test_rebuild_reproduces_index_rows_stats_and_current_beliefs(tmp_path)
         await service.flush_task(second_task)
         before = await _projection_snapshot(session_factory)
 
-        replayed = await service.rebuild_projections()
+        rebuild = await service.rebuild_projections()
         after = await _projection_snapshot(session_factory)
 
         async with session_factory() as session:
             failure_count = await session.scalar(select(func.count()).select_from(AnsichProjectionErrorRow))
 
-    assert replayed > 0
+    assert rebuild.replayed > 0
+    assert rebuild.unsettled == 0
     assert failure_count == 0
     assert len(before["index"]) == 4
     assert len(before["beliefs"]) == 3

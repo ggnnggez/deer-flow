@@ -6,7 +6,7 @@ import logging
 from collections.abc import AsyncIterator, Sequence
 from contextlib import asynccontextmanager
 from datetime import UTC, datetime, timedelta
-from typing import Literal, cast
+from typing import Literal, NamedTuple, cast
 from uuid import uuid4
 
 from ansich import (
@@ -29,6 +29,7 @@ from ansich import (
     ObservationEnvelope,
     PossibleExposureItemView,
     Producer,
+    RebuildOutcome,
     StepView,
     TaskScopesView,
     TaskScopeView,
@@ -403,6 +404,35 @@ logger = logging.getLogger(__name__)
 
 class _ProjectionDependencyPending(RuntimeError):
     """A replay-safe projection dependency has not landed yet."""
+
+
+class _StaleAssessorClaim(RuntimeError):
+    """This worker no longer owns the assessor job it just evaluated.
+
+    Raised inside the evaluation transaction so that transaction rolls back
+    whole (controller ruling PB4). Never surfaces to a caller: the loop that
+    raises it also catches it, treats the job as somebody else's, and writes no
+    error row -- the drop is not a failure of the work, it is a change of owner.
+    """
+
+
+class _AssessorClaim(NamedTuple):
+    """One claimed assessor job plus what the claim transaction observed.
+
+    ``pre_claim_watermark`` is the durable evidence mark as it stood *before*
+    this claim widened it down over the group (``_widen_assessor_watermark``).
+    The evaluation restores it, so a job whose own watermark sits under an
+    already-advanced mark cannot drag that mark backwards -- see
+    ``_advance_assessor_watermark``.
+    """
+
+    job_id: str
+    subject_id: str
+    assessor_name: str
+    evidence_watermark: int
+    attempts: int
+    lease_generation: int
+    pre_claim_watermark: int | None
 
 
 def _projectors_for_kind(kind: str) -> tuple[tuple[str, str], ...]:
@@ -854,6 +884,18 @@ class SqlAnsichBackend:
                 )
                 yield
             finally:
+                # Rollback first, unlock second. After a DBAPI error the
+                # session is left in an inactive state and *every* further
+                # ``execute`` raises ``PendingRollbackError`` before reaching
+                # the server -- so an unlock issued first would be swallowed by
+                # the handler below and the lock would be held until the
+                # connection closed. ``ROLLBACK`` makes the connection usable
+                # again, and a session-level ``pg_advisory_lock`` survives it
+                # (it is bound to the session, not the transaction), so the
+                # unlock still has something to release. The stub session in
+                # the tests cannot reproduce the inactive state; the real
+                # PostgreSQL proof belongs to the opt-in tier.
+                await session.rollback()
                 try:
                     await session.execute(
                         text("SELECT pg_advisory_unlock(:key)"),
@@ -864,7 +906,6 @@ class SqlAnsichBackend:
                         "ansich maintenance: pg_advisory_unlock raised; the session close will release it",
                         exc_info=True,
                     )
-                await session.rollback()
 
     async def initialize_metrics(self) -> None:
         await self._refresh_failed_job_count()
@@ -1169,7 +1210,7 @@ class SqlAnsichBackend:
             )
         return pending is not None
 
-    async def rebuild_projections(self) -> int:
+    async def rebuild_projections(self) -> RebuildOutcome:
         """Delete rebuildable Phase 1 state and replay every durable job.
 
         A single-operator maintenance operation: the whole delete-re-pend-replay
@@ -1184,12 +1225,38 @@ class SqlAnsichBackend:
         row and mark the job settled before the replay ever claimed it, quietly
         dropping that Observation from the rebuilt read model. Raising the
         generation makes that write fail its compare-and-set instead.
+
+        The drain loop's exit condition -- "a round claimed nothing" -- is not
+        the same thing as "the rebuild is done" (F10-26), so the return value
+        says both: ``replayed`` and ``unsettled``. Waiting for the stragglers
+        instead was the other option and was rejected: a dependency-pending job
+        is invisible for its 250ms backoff and can legitimately take up to
+        ``projector_dependency_timeout_seconds`` to give up, and this call
+        already holds both the cross-worker maintenance lock and (through
+        ``AnsichService``) the caller's own projector lock, so waiting would
+        stall an operator and that worker's projector loop for an interval the
+        rebuild does not control. Reporting is bounded and honest; re-running a
+        rebuild is idempotent, so the caller can simply call again.
         """
 
         async with self._maintenance_lock():
             return await self._rebuild_projections_locked()
 
-    async def _rebuild_projections_locked(self) -> int:
+    async def _unsettled_job_count(self) -> int:
+        """Jobs that are neither completed nor durably failed, both tables.
+
+        The one number behind ``RebuildOutcome.unsettled``: it covers the
+        dependency-pending job hiding inside its backoff window *and* the job a
+        concurrent worker took over mid-rebuild, because from the caller's side
+        those are the same fact -- work this pass did not settle.
+        """
+
+        async with self._session_factory() as session:
+            projection_jobs = await session.scalar(select(func.count()).select_from(AnsichProjectionJobRow).where(AnsichProjectionJobRow.status.in_((*_CLAIMABLE_JOB_STATUSES, "processing"))))
+            assessor_jobs = await session.scalar(select(func.count()).select_from(AnsichAssessorJobRow).where(AnsichAssessorJobRow.status.in_((*_CLAIMABLE_JOB_STATUSES, "processing"))))
+        return int(projection_jobs or 0) + int(assessor_jobs or 0)
+
+    async def _rebuild_projections_locked(self) -> RebuildOutcome:
         async with self._session_factory() as session, session.begin():
             for model in (
                 AnsichAlertReadModelRow,
@@ -1284,7 +1351,10 @@ class SqlAnsichBackend:
             if processed == 0:
                 await self.assess_operations()
                 await self._refresh_context_metrics()
-                return replayed
+                return RebuildOutcome(
+                    replayed=replayed,
+                    unsettled=await self._unsettled_job_count(),
+                )
 
     async def retry_failed_projections(self, *, task_id: str | None = None) -> int:
         """Requeue failed durable jobs and settle them without deleting projections.
@@ -1711,9 +1781,7 @@ class SqlAnsichBackend:
         if summary is not None:
             summary.observability_status = "degraded"
 
-    async def _claim_assessor_job(
-        self,
-    ) -> tuple[str, str, str, int, int, int] | None:
+    async def _claim_assessor_job(self) -> _AssessorClaim | None:
         """Claim one assessor job, absorbing its currently claimable siblings.
 
         Absorption flips the group's lower jobs to ``completed`` here, in the
@@ -1722,6 +1790,12 @@ class SqlAnsichBackend:
         therefore also widens the durable evidence mark down to just below the
         group's lowest watermark (see ``_widen_assessor_watermark``), making the
         widening exactly as durable as the absorption that requires it.
+
+        The mark as it stood *before* that widening is carried out of here in
+        the claim, because only the widening's own transaction can still see it.
+        A successful evaluation restores it (``_advance_assessor_watermark``):
+        the widening exists to cover this group, not to forget what an earlier
+        assessment already settled.
 
         Absorption is a takeover as much as the claim itself is: an absorbed
         sibling may have been leased by a worker whose lease has since expired
@@ -1789,6 +1863,11 @@ class SqlAnsichBackend:
             job.lease_expires_at = now + timedelta(seconds=self._projector_lease_seconds)
             job.lease_generation = (job.lease_generation or 0) + 1
             claimed_generation = job.lease_generation
+            existing_mark = await session.get(
+                AnsichAssessorWatermarkRow,
+                (job.subject_id, job.assessor_name, job.assessor_version),
+            )
+            pre_claim_watermark = None if existing_mark is None else existing_mark.evidence_watermark
             await self._widen_assessor_watermark(
                 session,
                 subject_id=job.subject_id,
@@ -1796,13 +1875,14 @@ class SqlAnsichBackend:
                 assessor_version=job.assessor_version,
                 window_start_exclusive=min(grouped.evidence_watermark for grouped in grouped_jobs) - 1,
             )
-            return (
-                job.job_id,
-                job.subject_id,
-                job.assessor_name,
-                job.evidence_watermark,
-                job.attempts,
-                claimed_generation,
+            return _AssessorClaim(
+                job_id=job.job_id,
+                subject_id=job.subject_id,
+                assessor_name=job.assessor_name,
+                evidence_watermark=job.evidence_watermark,
+                attempts=job.attempts,
+                lease_generation=claimed_generation,
+                pre_claim_watermark=pre_claim_watermark,
             )
 
     async def _complete_assessor_job(
@@ -1817,6 +1897,11 @@ class SqlAnsichBackend:
         See ``_complete_projection_job``: rowcount zero means the row moved on
         (a later claim absorbed or re-claimed it) and the write is dropped
         without an exception, leaving the outcome to whoever holds it now.
+
+        The caller decides what a drop costs, and on this path it costs the
+        whole evaluation: ``_process_assessor_jobs`` turns ``False`` into
+        ``_StaleAssessorClaim`` inside the evaluation's transaction so the
+        assessments and the evidence mark roll back with the job status.
         """
 
         result = await session.execute(
@@ -1927,7 +2012,15 @@ class SqlAnsichBackend:
             claim = await self._claim_assessor_job()
             if claim is None:
                 break
-            job_id, task_id, assessor_name, evidence_watermark, attempt, lease_generation = claim
+            job_id = claim.job_id
+            task_id = claim.subject_id
+            assessor_name = claim.assessor_name
+            evidence_watermark = claim.evidence_watermark
+            attempt = claim.attempts
+            lease_generation = claim.lease_generation
+            # Counted inside the transaction, added to the caller's total only
+            # once it commits: a rolled-back evaluation changed nothing.
+            evaluated = 0
             try:
                 async with self._session_factory() as session, session.begin():
                     if assessor_name == ACTION_REPETITION_ASSESSOR.name:
@@ -1939,14 +2032,14 @@ class SqlAnsichBackend:
                         )
                         signal = assessment.model_copy(update={"field_name": "behavior_signal:action-repetition"})
                         assertion, assertion_changed = await self._persist_assessment(session, signal)
-                        changed += int(assertion_changed)
-                        changed += await self._reconcile_alerts_for_assessment(
+                        evaluated += int(assertion_changed)
+                        evaluated += await self._reconcile_alerts_for_assessment(
                             session,
                             assessment=assessment,
                             source_assertion_id=assertion.assertion_id,
                             now=now,
                         )
-                        changed += await self._refresh_behavior_belief(
+                        evaluated += await self._refresh_behavior_belief(
                             session,
                             task_id=task_id,
                             now=now,
@@ -1963,8 +2056,8 @@ class SqlAnsichBackend:
                                 session,
                                 assessment,
                             )
-                            changed += int(assertion_changed)
-                            changed += await self._reconcile_alerts_for_assessment(
+                            evaluated += int(assertion_changed)
+                            evaluated += await self._reconcile_alerts_for_assessment(
                                 session,
                                 assessment=assessment,
                                 source_assertion_id=assertion.assertion_id,
@@ -1983,8 +2076,8 @@ class SqlAnsichBackend:
                                 session,
                                 assessment,
                             )
-                            changed += int(assertion_changed)
-                            changed += await self._reconcile_alerts_for_assessment(
+                            evaluated += int(assertion_changed)
+                            evaluated += await self._reconcile_alerts_for_assessment(
                                 session,
                                 assessment=assessment,
                                 source_assertion_id=assertion.assertion_id,
@@ -1995,8 +2088,8 @@ class SqlAnsichBackend:
                             session,
                             signal,
                         )
-                        changed += int(signal_changed)
-                        changed += await self._refresh_behavior_belief(
+                        evaluated += int(signal_changed)
+                        evaluated += await self._refresh_behavior_belief(
                             session,
                             task_id=task_id,
                             now=now,
@@ -2010,8 +2103,8 @@ class SqlAnsichBackend:
                         )
                         if assessment is not None:
                             assertion, assertion_changed = await self._persist_assessment(session, assessment)
-                            changed += int(assertion_changed)
-                            changed += await self._reconcile_alerts_for_assessment(
+                            evaluated += int(assertion_changed)
+                            evaluated += await self._reconcile_alerts_for_assessment(
                                 session,
                                 assessment=assessment,
                                 source_assertion_id=assertion.assertion_id,
@@ -2035,7 +2128,7 @@ class SqlAnsichBackend:
                                     session,
                                     assessment,
                                 )
-                                changed += int(assertion_changed)
+                                evaluated += int(assertion_changed)
                                 conclusion = await session.get(
                                     AnsichScopeConclusionRow,
                                     assertion.assertion_id,
@@ -2048,7 +2141,7 @@ class SqlAnsichBackend:
                                             conclusion_kind=str(assessment.value["conclusion"]),
                                         )
                                     )
-                                changed += await self._reconcile_alerts_for_assessment(
+                                evaluated += await self._reconcile_alerts_for_assessment(
                                     session,
                                     assessment=assessment,
                                     source_assertion_id=assertion.assertion_id,
@@ -2062,6 +2155,7 @@ class SqlAnsichBackend:
                             task_id=task_id,
                             assessor=SCOPE_SAFETY_ASSESSOR,
                             evidence_watermark=evidence_watermark,
+                            pre_claim_watermark=claim.pre_claim_watermark,
                         )
                     else:
                         raise ValueError(f"unknown Ansich assessor: {assessor_name}")
@@ -2071,16 +2165,34 @@ class SqlAnsichBackend:
                         "failed",
                         "interrupted",
                     }:
-                        changed += await self._resolve_terminal_alerts(
+                        evaluated += await self._resolve_terminal_alerts(
                             session,
                             task_id=task_id,
                             now=now,
                         )
-                    await self._complete_assessor_job(
+                    if not await self._complete_assessor_job(
                         session,
                         job_id=job_id,
                         lease_generation=lease_generation,
-                    )
+                    ):
+                        # Controller ruling PB4: on the assessor path the new
+                        # owner owns the outcome *in full*. Everything above --
+                        # assertions, conclusions, alert episodes and the
+                        # evidence mark -- is one indivisible statement about a
+                        # window this worker no longer has the right to settle,
+                        # and the mark is the half that cannot be repaired by
+                        # idempotency (unlike the projection path, where RB4(5)
+                        # is a real backstop): committing it would tell the new
+                        # owner that a band it has not judged is already
+                        # covered, and its own window start is read from that
+                        # mark. So the whole transaction goes back.
+                        raise _StaleAssessorClaim(job_id)
+                changed += evaluated
+            except _StaleAssessorClaim:
+                # Not a failure of the work: no durable error row, no re-arm,
+                # no health charge. ``_complete_assessor_job`` has already
+                # counted the drop. Whoever holds the job now will redo it.
+                continue
             except Exception as exc:
                 await self._record_assessor_error(
                     job_id,
@@ -2152,7 +2264,24 @@ class SqlAnsichBackend:
         task_id: str,
         assessor: AssessorDescriptor,
         evidence_watermark: int,
+        pre_claim_watermark: int | None = None,
     ) -> None:
+        """Settle the mark at everything this worker knows to be judged.
+
+        Two numbers bound that: the watermark this evaluation just covered, and
+        the mark the claim found before widening it down over the group. The
+        second one is the fix for F10-10 hypothesis (c): the claim lowers the
+        mark unconditionally so the group's lowest evidence is inside the
+        window, and an evaluation whose own watermark sits *under* an
+        already-advanced mark would otherwise leave that lowering in place
+        forever — every later trigger then re-opens the whole band and re-judges
+        every converged ToolCall in it. Restoring the pre-claim mark cannot skip
+        anything: it is itself a value some earlier evaluation reached by
+        judging everything below it, and this evaluation judged the window the
+        widening opened.
+        """
+
+        target = evidence_watermark if pre_claim_watermark is None else max(evidence_watermark, pre_claim_watermark)
         mark = await session.get(
             AnsichAssessorWatermarkRow,
             (task_id, assessor.name, assessor.version),
@@ -2163,19 +2292,16 @@ class SqlAnsichBackend:
                     subject_id=task_id,
                     assessor_name=assessor.name,
                     assessor_version=assessor.version,
-                    evidence_watermark=evidence_watermark,
+                    evidence_watermark=target,
                     updated_at=datetime.now(UTC),
                 )
             )
             return
         # This advance path never lowers: a job claimed out of watermark order
         # settles evidence the higher assessment already covered. Lowering the
-        # mark is a claim-time act only (``_widen_assessor_watermark``), so a
-        # watermark arriving here below the stored one leaves the row untouched
-        # — which also means a claim-time widening this advance cannot reach is
-        # not restored here (F10-10 hypothesis (c), fix owned by Phase 11).
-        if evidence_watermark > mark.evidence_watermark:
-            mark.evidence_watermark = evidence_watermark
+        # mark is a claim-time act only (``_widen_assessor_watermark``).
+        if target > mark.evidence_watermark:
+            mark.evidence_watermark = target
             mark.updated_at = datetime.now(UTC)
 
     @staticmethod

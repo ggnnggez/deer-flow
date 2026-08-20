@@ -645,6 +645,30 @@ class FlushResult(BaseModel):
     timed_out: bool = False
 
 
+class RebuildOutcome(BaseModel):
+    """What one ``rebuild_projections()`` pass actually accomplished.
+
+    ``replayed`` is the number of projection jobs the replay settled.
+
+    ``unsettled`` is the honest half, and it exists because "this round found
+    nothing to project" is **not** the same statement as "the rebuild is
+    complete" (F10-26). Two things can leave work behind that the drain loop
+    cannot see: a job waiting on a projection dependency is invisible to the
+    claim for the length of its backoff, and a job another worker took over
+    stopped being this replay's to settle. Both are counted here -- every
+    projection or assessor job still ``pending``/``retry``/``processing`` when
+    the pass returns -- so the caller can decide whether to run it again rather
+    than reading a complete-looking count off an incomplete rebuild. ``failed``
+    rows are deliberately not counted: they are settled, badly, and already
+    surfaced through the failed-job count and its operator retry path.
+    """
+
+    model_config = ConfigDict(frozen=True)
+
+    replayed: int
+    unsettled: int
+
+
 class LostRange(BaseModel):
     model_config = ConfigDict(frozen=True)
 
