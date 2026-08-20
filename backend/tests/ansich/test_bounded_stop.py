@@ -319,19 +319,18 @@ async def test_stopping_mid_isolation_charges_the_remainder_exactly_once(caplog:
         writer_backoff_initial_ms=5_000,
     )
     await service.start()
-    try:
-        assert all(receipt.accepted for receipt in service.record_batch(observations))
-        await asyncio.wait_for(service.parked.wait(), timeout=10)
-        parked = service.get_health()
+    assert all(receipt.accepted for receipt in service.record_batch(observations))
+    await asyncio.wait_for(service.parked.wait(), timeout=10)
+    parked = service.get_health()
 
-        loop = asyncio.get_running_loop()
-        started_at = loop.time()
-        with caplog.at_level(logging.WARNING, logger="ansich.service"):
-            await asyncio.wait_for(service.stop(), timeout=30)
-        elapsed = loop.time() - started_at
-        health = service.get_health()
-    finally:
-        pass
+    loop = asyncio.get_running_loop()
+    started_at = loop.time()
+    with caplog.at_level(logging.WARNING, logger="ansich.service"):
+        # No teardown guard: `stop()` is the subject here, and the backend needs
+        # no release — the stop event is what ends the wait the writer is in.
+        await asyncio.wait_for(service.stop(), timeout=30)
+    elapsed = loop.time() - started_at
+    health = service.get_health()
 
     assert elapsed < _STOP_CEILING_SECONDS, f"stop() sat through the backoff: {elapsed:.2f}s"
     assert backend.landed == [observations[0].source_event_id]

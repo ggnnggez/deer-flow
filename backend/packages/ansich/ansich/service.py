@@ -712,7 +712,9 @@ class AnsichService:
         the boolean of the write that was attempted for it —
 
         1. queued, or in a writer's hands: ``pending``. It is on its way.
-        2. charged as lost: ``failed``. Something refused it.
+        2. charged as lost — which a cancelled write can be even after its
+           commit landed (see ``_drain_writer``), so this rung errs toward
+           reporting loss: ``failed``.
         3. durable: whatever its projection jobs say.
         4. none of the above: ``failed``, presumed lost. An accepted ``obs_id``
            that is in no queue, no writer's hands and no database — the shape a
@@ -775,8 +777,27 @@ class AnsichService:
         opinion about the same id and only the first is entitled to it: an
         outstanding row is in no database yet, and a charged row is in no
         database ever. See ``record_evaluation`` for what each rung means.
+
+        **The last rung's precondition is that the caller owns the id.** Both
+        call sites do — one just recorded the Observation into *this* collector,
+        the other read the id back out of storage — and "absent everywhere means
+        lost" is sound only for such an id. The queue and the in-flight buffer
+        are process-local while the database is shared, so under
+        ``GATEWAY_WORKERS > 1`` (one collector per worker, one database) a future
+        route that resolved an arbitrary ``obs_id`` would report ``failed`` for a
+        row sitting alive in a peer worker's queue. A route like that needs a
+        different last rung, not this one.
         """
 
+        # Rungs 1 and 2 cannot disagree about a row this process owns end to
+        # end, so their order is a declaration rather than a tested behaviour:
+        # nothing charges a row it is still holding. The reviewer found the one
+        # path that can produce both at once — `record_batch`'s
+        # `event_loop_closed` branch charges the whole batch while the rows the
+        # writer already popped are still in `_in_flight` — and it is reachable
+        # only after the loop is closed, which is pre-existing and outside this
+        # resolution. Rung 1 winning there is also the right answer: those rows
+        # are in a writer's hands, not gone.
         with self._lock:
             if self._observation_outstanding(obs_id):
                 return "pending"
@@ -1548,6 +1569,16 @@ class AnsichService:
         the same locked write — a row counted lost while still reported as
         queued would be reported twice.
 
+        **A batch cancelled after its commit landed is charged anyway.** The
+        cancellation can arrive between storage committing the write and the
+        call returning, and nothing distinguishes that from a write that never
+        happened, so the batch is both durable and counted as lost:
+        ``dropped_count``, the lost ranges, and the receipt path's tracking set
+        all over-report. That is the direction chosen — a loss claimed that did
+        not happen, never a loss that happened and was not claimed — and it is
+        process-local: after a restart the same Observation resolves through
+        storage and reads correctly.
+
         The WARNING is emitted once, from here, and is deliberately **not**
         rate-limited: a drain happens once per process, and a shutdown that lost
         rows must not be swallowed by an unrelated drop sixty seconds earlier.
@@ -1572,6 +1603,13 @@ class AnsichService:
                 self._record_observation_loss(sequence, observation)
             # A range charged before the drain and merely *extended* by it stays
             # out of this slice; the count above is the exact figure either way.
+            #
+            # The suppressed count is passed but deliberately neither consumed
+            # nor re-armed: this warning is outside the rate limiter, so it
+            # reports how much the window has swallowed without claiming to have
+            # discharged it. A later `_warn_batch_loss` inside the same 60s
+            # window still carries the same figure — the shutdown line is extra
+            # information, not a replacement for the rate-limited one.
             self._emit_drop_warning(
                 reason="stop_drain_timeout",
                 observation_count=self._dropped_count - charged_before,
