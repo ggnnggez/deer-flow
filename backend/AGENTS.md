@@ -453,8 +453,13 @@ the worker task is scheduled; the worker records started and terminal signals.
 Collection is non-blocking and fail-open. A bounded in-process writer first
 commits Observation plus `task-structural@1`/`task-control@1` jobs, and a
 separate leased projector loop builds Task, Scope, Relation, Transition, Belief,
-and Task-summary projections. Projection failures never roll back the raw
-Observation; they create projection-error rows and degrade Ansich health.
+and Task-summary projections. A refused batch is not lost on the spot: the
+writer retries it on a bounded exponential backoff and, once that budget is
+spent, splits it item by item so one unwritable Observation costs only itself
+(P11-A paragraph below). What genuinely cannot be written is charged as a lost
+range and reported, never dropped silently. Projection failures never roll back
+the raw Observation; they create projection-error rows and degrade Ansich
+health.
 Replay-safe dependency waits have their own durable first-seen timestamp and
 `projector_dependency_timeout_seconds` deadline; they do not consume ordinary
 projector attempts, but cross the deadline into the same durable failed-job and
@@ -492,7 +497,10 @@ overflow remains fail-open, but emits an immediate structured WARNING carrying
 the UTC detection time, reason, task/producer/sequence ranges, and queue
 watermarks; warnings are rate-limited to one per service per 60 seconds and log
 handler failures are swallowed. A later successful Observation write also
-persists unreported task-scoped ranges as `observability.degraded`; periodic
+persists unreported task-scoped ranges as `observability.degraded` — a
+**process-wide** range has no Task to subject and therefore cannot be written
+at all, so it is held in an explicit unreported bucket instead of being walked
+past as if it had been (P11-A paragraph below); periodic
 operations assessment copies current in-memory ranges into the active-task read
 model, but that read-model field is refreshed from empty memory after restart
 and is not the durable source of record for historical loss.
@@ -862,11 +870,23 @@ assertion plus a `conflicting_assertion_count` counted from the retained ones.
 one nothing asserted is synthesized as `unassessed` with
 `source={"name": "none", "version": "1"}`, `unknown` authority/fidelity, no
 `as_of`, and no evidence, because a completed Task is not proof of a pass.
-`record_evaluation()` returns a receipt instead of blocking on projection —
-`applied`/`failed` once the job settled, `pending` otherwise — and a rejected
-intake or a flush that did not persist reports `failed` rather than `pending`,
-since no job exists to poll; a replayed intake returns the stored Observation id
-with `idempotent_replay=true`. `GET /evaluations/{obs_id}/payload` is the only
+`record_evaluation()` returns a receipt instead of blocking on projection, and
+since P11-A that receipt is resolved from the state the Observation is actually
+in rather than from the verdict of the write attempted for it. The rungs are
+ordered and only the first that holds an opinion is entitled to it: still queued
+or in a writer's hands is `pending`; charged as lost is `failed`; durable is
+whatever its projection jobs say — and *no* job for an id the caller was told
+was accepted is `failed`, not `pending`, because jobs commit in the same
+transaction as the Observation they belong to; absent from all three is
+`failed`, presumed lost. A rejected intake still short-circuits to `failed`. The
+consequence to know: a **terminal-flush timeout now reads `pending`**, because
+RA5② returns those rows to the queue and the Observation is alive — the
+pre-P11-A rule called the same state `failed`. The last rung is sound only for
+an `obs_id` this process owns (one collector per Gateway worker, one shared
+database), which is why no route resolves an arbitrary id through it; a
+`GATEWAY_WORKERS > 1` deployment that wanted one would need a different last
+rung. A replayed intake returns the stored Observation id with
+`idempotent_replay=true`. `GET /evaluations/{obs_id}/payload` is the only
 read that returns `expected`/`actual`/`rationale`: admin-only, actor-logged,
 `Cache-Control: no-store`, and guarded on the Observation kind so it cannot
 become a generic payload reader.
@@ -1053,6 +1073,139 @@ detail stays the single-call API read. The history filter is by `subject_id`
 while the available index is `(kind, occurred_at)`; environment volume is
 heartbeat-order, so the residual scan is accepted and a
 `(subject_id, kind, occurred_at)` index is the registered follow-up.
+
+**P11-A write-side resilience** (one batch, 2026-08-20, `246964e5..31dc9907`,
+the first slice of Phase 11: spec §2 plus F10-7; see
+`ansich/docs/plans/11-resilience-replay-and-retention.md` §2 and
+`ansich/docs/plans/README.md`). This batch hardens the *write* side of
+collection — lifecycle, per-producer accounting, the writer's failure handling,
+the terminal barrier, the evaluation receipt and shutdown — and touches nothing
+about leases, watermarks, replay or retention. Zero migrations; head stays
+`0026_ansich_environment`.
+
+*Lifecycle.* `packages/ansich/ansich/lifecycle.py::derive_status` is a pure,
+memoryless function over `LifecycleInputs`: seven states (`starting`,
+`recovering` and `shutting_down` join the existing four), answered from current
+facts only so no stored state can drift out of sync with the service it
+describes. `LEGAL_TRANSITIONS` is the clamp, and it is **wider than spec §2's
+sketch**: the spec's eight edges are the nominal arc and are kept as a pinned
+subset (`tests/ansich/test_lifecycle.py::SPEC_SECTION_2_EDGES`), while the
+clamp is the derivation's real reachable closure — 17 edges, each with a
+one-line reachability justification in the module, covering operator recovery
+(`degraded -> healthy` when a retry clears `failed_jobs` outright), shutdown
+from any running state, the boundary reads right after `start()`, and restart.
+Widening the clamp to the closure is a **recorded deviation** from the spec
+text, taken because clamping to an illustrative sketch would fail on ordinary
+operation; the complement that must stay illegal is pinned by negative
+sequences. `recovering` requires **incident evidence** — an unreported lost
+range or a writer retry backlog — never a bare queue depth: a load burst is not
+an incident, and keying on it would manufacture a `healthy -> recovering`
+transition the spec's graph does not contain. `start()`/`stop()` carry a
+re-entrancy guard (stopping mid-`start()` raises rather than draining loops
+that do not exist yet).
+
+*Per-producer accounting.* Health carries one row per `(producer name,
+instance_id)` — accepted, dropped, last accepted sequence, serialization
+failures, last successful flush — in an LRU bounded at 256 entries. **Wording
+duty:** `evicted_producer_count` counts eviction **events**, not distinct
+producers; under thrash it over-reports the number of producers that fell out
+of health, and it exists so a producer can leave health but never silently.
+
+*Writer.* A refused batch is retried on a bounded exponential backoff
+(`writer_backoff_initial_ms` doubling to `writer_backoff_max_ms`, at most
+`writer_retry_max_attempts`), parked in flight while it waits. **A wait holds
+no lock**: `_persist_lock` covers the pop plus the first attempt atomically and
+is released around every retry wait, so a terminal barrier may overtake a
+*waiting* writer but never a *working* one. That interleaving is deliberate —
+ingest order and collector order diverging is this system's existing
+late-arrival shape, which watermark widening already exists for — and it is
+stated in `_flush_batch`'s docstring rather than hidden. When the batch budget
+is exhausted the batch bisects to per-item isolation
+(`writer_item_max_attempts`), so one poison row is charged alone with reason
+`poison_observation` and its neighbours proceed. **Wording duty:**
+`poison_observation_count` cannot distinguish a genuinely unwritable row from a
+total outage that outlived every budget — under a total outage the queue drains
+to loss at a bounded rate and each item is charged the same way. v1 still has
+no disk spool/WAL, so that loss is real: unflushed data at process death
+remains a documented known limitation, not a claim of losslessness. One more
+honest asymmetry: a write **cancelled after its commit landed** is charged as
+lost anyway (nothing distinguishes it from a write that never happened), so
+`dropped_count`, the lost ranges and the receipt's tracking set over-report in
+that window. Over-reporting loss is the chosen direction, and it is
+process-local — after a restart the same Observation resolves through storage
+and reads correctly.
+
+*Terminal barrier.* `flush_task(task_id)` is bounded by a **collector
+sequence**, not by a Task: `S` is that Task's highest queued sequence at call
+time and every queued row at or below `S` is placed in order, so flushing one
+Task legitimately places a neighbour's earlier rows — that is what "flushed
+through `S`" means, and the by-Task extraction it replaced reordered the one
+sequence every reader treats as authoritative. **A timeout no longer drops what
+it took**: rows the call could not place go back to the *head* of the queue in
+collector order and the writer places them when storage answers, inverting the
+previous drop semantics. `FlushResult` gains `persisted_through`, `lost_ranges`
+and `timed_out`. **Wording duty:** `persisted_through` is the highest
+**contiguous** persisted collector sequence — it stops *below* the first
+sequence that is not durable, so after any loss it degenerates to the
+pre-first-incident prefix and stays there. That is deliberate (semantics (a):
+an under-claim is honest, an over-claim is not); it must always be read beside
+`lost_ranges`, which is what gives the full picture. A barrier's own selection
+is registered as in flight for the duration of its write, so rows off the queue
+and not yet in storage cannot read as durable to a concurrent reader. **Wording
+duty:** `WriterHealth.in_flight_count` therefore means *all* outstanding rows,
+including a barrier's, not just the writer coroutine's batch.
+
+*Process-wide loss (RA8②).* An `observability.degraded` Observation is subjected
+to the lost range's Task, so a range with `task_id=None` — charged for
+something that never was an Observation — cannot be written at all. Such ranges
+are filed in an explicit unreported bucket, surfaced as
+`AnsichHealth.unreported_global_lost_range_count`, and are **never** marked
+reported unless something wrote them; the report cursor advances past them only
+because they are accounted elsewhere. Making them durable needs a stable
+process-wide Alert/Observation subject, which is P11-B's host-`Scope` work.
+
+*Shutdown.* `stop_drain_timeout_ms` is the drain's whole budget and it bounds
+the **attempt**, not the number of attempts: `wait_for` cancels the writer, so
+a `persist_and_project` that never answers costs the budget rather than the
+process. Whatever the drain could not place is charged and reported in exactly
+one un-rate-limited WARNING. This is true of the **writer only** — the
+projector join is still unconditional and unbounded (it holds no rows of its
+own), and the full shutdown ordering of §8 belongs to batch C. Two honest
+residuals: a backend that shields itself from cancellation or blocks the loop
+synchronously still wedges `stop()`; and a drain that finishes *within* budget
+having charged some rows says so only through counters — no warning is emitted
+for it, which is an operator-visibility gap worth knowing before reading a
+quiet shutdown as a clean one.
+
+*Loss reporting.* Coalescing never silently extends an already-reported range:
+an extension opens its own range and is reported in its own right, so
+"already reported" stays a fact rather than a cursor artefact. The synthetic
+`ansich-collector` reporter still writes `producer_seq=lost_range.last_sequence`
+— a **collector** sequence in a producer-sequence field, and the last remaining
+site where the two numbering spaces are mixed.
+
+*Config.* Five new startup-only `AnsichConfig` knobs, mirrored in
+`config.example.yaml`: `writer_retry_max_attempts` (5),
+`writer_backoff_initial_ms` (100), `writer_backoff_max_ms` (5000),
+`writer_item_max_attempts` (2), `stop_drain_timeout_ms` (10000).
+
+*Also in this batch.* HOTFIX-0 (`ae731b18`) unified the `wall_time` evidence
+order across both `budget_health` writers behind the shared pure
+`ansich.budget.order_wall_time_evidence`; the structural half of that hazard is
+registered as F10-24. F10-7 (the receipt that could stay `pending` forever) is
+closed by the state-based ladder described in the Phase 10 receipt paragraph
+above. The frontend consumes all seven statuses end to end and renders
+`starting`/`shutting_down` as a muted phase line rather than a green
+"Data healthy" claim (see `frontend/AGENTS.md`).
+
+What this batch did **not** establish: multi-worker projection semantics are
+untouched and remain P11-B (leases, watermarks, health DB merge, alerts);
+process-wide lost ranges are accounted honestly in memory but are not durable
+until P11-B's host-`Scope` subject exists; there is still no spool/WAL, so a
+process death before flush loses whatever was queued; and shutdown is bounded
+for the writer only — the projector join stays unbounded until batch C rewrites
+the §8 ordering. Replay, retention, raw-read audit and the acceptance drills are
+untouched.
 
 **Workspace change review**: `packages/harness/deerflow/workspace_changes/`
 captures a pre-run and post-run snapshot of the thread-owned `workspace` and

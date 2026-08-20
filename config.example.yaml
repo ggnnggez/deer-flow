@@ -15,7 +15,7 @@
 # ============================================================================
 # Bump this number when the config schema changes.
 # Run `make config-upgrade` to merge new fields into your local config.yaml.
-config_version: 33
+config_version: 34
 
 # ============================================================================
 # Logging
@@ -1826,6 +1826,21 @@ ansich:
   # Canonical JSON payloads larger than this move to ansich_payloads and are
   # available only through the admin raw-payload endpoint.
   inline_payload_max_bytes: 65536
+  # Write-side resilience. A refused batch is retried on a bounded exponential
+  # backoff (initial delay doubling up to the cap) instead of being lost on the
+  # spot; the writer waits off the Agent call stack and holds no lock while it
+  # waits.
+  writer_retry_max_attempts: 5
+  writer_backoff_initial_ms: 100
+  writer_backoff_max_ms: 5000
+  # Once the batch budget is spent the batch is split item by item, so one
+  # unwritable ("poison") Observation is charged alone instead of blocking the
+  # rest of the queue.
+  writer_item_max_attempts: 2
+  # Budget for the writer's drain at shutdown. It bounds the in-flight attempt
+  # itself (a persist that never returns is cancelled), not just the queued
+  # backlog; whatever cannot be placed by then is charged as lost and reported.
+  stop_drain_timeout_ms: 10000
   # Outer Run liveness is independent of LangGraph/model/tool events. The stale
   # rule must allow at least two complete heartbeat intervals.
   heartbeat_interval_seconds: 10

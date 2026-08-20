@@ -31,30 +31,38 @@ class AnsichAssessorConfig(BaseModel):
 
 
 class AnsichConfig(BaseModel):
-    """Restart-required configuration for the embedded Ansich service."""
+    """Restart-required configuration for the embedded Ansich service.
 
-    enabled: bool = Field(default=False, description="Enable embedded Ansich collection and developer/operator APIs.")
-    queue_capacity: int = Field(default=10_000, ge=1, description="Maximum in-process observations waiting for persistence.")
+    The whole ``ansich`` section is registered restart-required in
+    ``deerflow.config.reload_boundary.STARTUP_ONLY_FIELDS``, so **every** field
+    below carries the standardised ``startup-only:`` marker. The prefix is not
+    decoration: it is the token IDE hover and any future "needs restart"
+    scanner pivot on, and a field missing it reads as hot-reloadable while its
+    neighbours do not.
+    """
+
+    enabled: bool = Field(default=False, description="startup-only: Enable embedded Ansich collection and developer/operator APIs.")
+    queue_capacity: int = Field(default=10_000, ge=1, description="startup-only: Maximum in-process observations waiting for persistence.")
     queue_byte_capacity: int = Field(
         default=64 * 1024 * 1024,
         ge=1,
-        description="Maximum canonical serialized bytes held in the in-process observation queue.",
+        description="startup-only: Maximum canonical serialized bytes held in the in-process observation queue.",
     )
-    batch_size: int = Field(default=100, ge=1, description="Maximum observations written in one storage batch.")
-    flush_interval_ms: int = Field(default=100, ge=1, description="Maximum delay before the writer flushes a partial batch.")
-    terminal_flush_timeout_ms: int = Field(default=2_000, ge=1, description="Maximum terminal Task flush wait; timeout never fails the DeerFlow Run.")
-    projector_poll_interval_ms: int = Field(default=250, ge=1, description="Polling interval for pending projection jobs.")
-    projector_lease_seconds: int = Field(default=30, ge=1, description="Lease duration for a claimed projection job.")
-    projector_max_attempts: int = Field(default=5, ge=1, description="Maximum projection attempts before a job is marked failed.")
+    batch_size: int = Field(default=100, ge=1, description="startup-only: Maximum observations written in one storage batch.")
+    flush_interval_ms: int = Field(default=100, ge=1, description="startup-only: Maximum delay before the writer flushes a partial batch.")
+    terminal_flush_timeout_ms: int = Field(default=2_000, ge=1, description="startup-only: Maximum terminal Task flush wait; timeout never fails the DeerFlow Run.")
+    projector_poll_interval_ms: int = Field(default=250, ge=1, description="startup-only: Polling interval for pending projection jobs.")
+    projector_lease_seconds: int = Field(default=30, ge=1, description="startup-only: Lease duration for a claimed projection job.")
+    projector_max_attempts: int = Field(default=5, ge=1, description="startup-only: Maximum projection attempts before a job is marked failed.")
     projector_dependency_timeout_seconds: int = Field(
         default=300,
         ge=1,
-        description="Maximum time a projection job may wait for a replay-safe dependency before it is marked failed.",
+        description="startup-only: Maximum time a projection job may wait for a replay-safe dependency before it is marked failed.",
     )
     inline_payload_max_bytes: int = Field(
         default=65_536,
         ge=1,
-        description="Largest canonical JSON Observation payload stored inline before using ansich_payloads.",
+        description="startup-only: Largest canonical JSON Observation payload stored inline before using ansich_payloads.",
     )
     writer_retry_max_attempts: int = Field(
         default=5,
@@ -79,49 +87,54 @@ class AnsichConfig(BaseModel):
     stop_drain_timeout_ms: int = Field(
         default=10_000,
         ge=1,
-        description="startup-only: total budget for persisting whatever is still queued when the collector stops.",
+        description=(
+            "startup-only: total budget for the writer's drain at collector stop. It bounds the in-flight "
+            "attempt itself — the drain cancels a persist that has not returned — not merely the queued "
+            "backlog or a number of retries, so a wedged storage call cannot hold shutdown open. Whatever "
+            "the drain could not place by then is charged as lost and reported in one warning."
+        ),
     )
     heartbeat_interval_seconds: int = Field(
         default=10,
         ge=1,
-        description="Interval between outer Run worker liveness observations.",
+        description="startup-only: Interval between outer Run worker liveness observations.",
     )
     heartbeat_stale_after_seconds: int = Field(
         default=30,
         ge=1,
-        description="Age after which the heartbeat assessor may judge a running Task stale.",
+        description="startup-only: Age after which the heartbeat assessor may judge a running Task stale.",
     )
     long_dwell_seconds: int = Field(
         default=120,
         ge=1,
-        description="Dwell threshold used by the operator-facing Task assessor.",
+        description="startup-only: Dwell threshold used by the operator-facing Task assessor.",
     )
     evaluation_min_cohort_samples: int = Field(
         default=5,
         ge=1,
-        description="Assessed samples required on both sides before a release quality cohort is comparable.",
+        description="startup-only: Assessed samples required on both sides before a release quality cohort is comparable.",
     )
     evaluation_max_payload_bytes: int = Field(
         default=262_144,
         ge=1,
-        description="Largest accepted evaluation record payload; larger submissions are rejected rather than truncated.",
+        description="startup-only: Largest accepted evaluation record payload; larger submissions are rejected rather than truncated.",
     )
     environment_probe_enabled: bool = Field(
         default=True,
-        description="Enable environment probe collection.",
+        description="startup-only: Enable environment probe collection.",
     )
     environment_sample_interval_seconds: int | None = Field(
         default=None,
         ge=1,
-        description="Interval for environment sampling; None uses heartbeat_interval_seconds.",
+        description="startup-only: Interval for environment sampling; None uses heartbeat_interval_seconds.",
     )
     environment_per_command_sampling: bool = Field(
         default=True,
-        description="Enable per-command environment sampling.",
+        description="startup-only: Enable per-command environment sampling.",
     )
     assessors: AnsichAssessorConfig = Field(
         default_factory=AnsichAssessorConfig,
-        description="Versioned runaway and frequency assessor thresholds.",
+        description="startup-only: Versioned runaway and frequency assessor thresholds.",
     )
 
     @property
