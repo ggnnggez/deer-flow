@@ -35,6 +35,7 @@
 | F10-25 | `record_evaluation` 的重放查询无守卫:存储不可用时 `OperationalError` 直接抛给调用方,RA6 回执阶梯整条不可达(既存,自 `c1349843`) | ⬜ 未修复 | — | — |
 | F10-26 | rebuild 完整性:`rebuild_projections()` 可能在依赖延迟的 job 尚未结算时就以「首轮空扫」宣告完成(本批四次目击) | ⬜ 未修复 | — | — |
 | F10-27 | 装配不对称:`create_embedded_ansich_service` 的无存储分支漏传三个 knob;`operations_assessment_interval_ms` 至今没有 `AnsichConfig` 字段,生产恒为 1000ms | ⬜ 未修复 | — | — |
+| F10-28 | 健康线的两处 UI 级留观:中性线态(phase/unknown)的**渲染层**零覆盖(图标三元式曾在本批被反转过);task 作用域在系统 phase 期间仍称「本任务数据完整」 | ⬜ 未修复 | — | — |
 
 留观标记:F10-10 的第 4 条证据(`test_step_attempt_and_context_are_queryable_after_projection`)**未证实**——只做了排除法,没拿到原始失败文本。若它再轮换红,**先抓失败文本再修**,不要按已有的三条诊断类推。另:F10-10 的门禁只被 Task 8 的验收负载证明过(`e53cefbc` 记录了这条边界),Task 9 的更重负载下仍有 2 条已上门禁的测试翻红,详见该条的「后续观察」。
 
@@ -348,3 +349,11 @@
 - 侦察附注(同一处的另一半,登记在此以免再被当成新发现):`operations_assessment_interval_ms` **至今没有 `AnsichConfig` 字段**——它只是 `create_sql_ansich_service` 的一个 kwarg,生产装配从不传它,因此生产上恒为构造函数默认值 **1000ms**。读本仓库的 ansich 配置时不要以为这个间隔可配;它同时也是 F10-10 里「默认档 1 Hz」那一半的来源。
 - 方向:两件事一起做——(a) 让两个分支共用一份 knob 映射(或让无存储分支复用同一个 kwargs 字典),使漏传在结构上不可能;(b) 若要让运营者能调这个间隔,给 `operations_assessment_interval_ms` 补一个 `AnsichConfig` 字段(startup-only,与本节其余字段同姿势并同步 `config.example.yaml`),否则在文档里写明它不可配。
 - 归属:P11-B,或下一次触达 ansich 配置/装配的改动顺带处理。
+
+## F10-28. 健康线的两处 UI 级留观(P11-A 批 T9 复审遗留)
+
+- 状态:⬜ 未修复。来源:P11-A 批 Task 9 的两轮评审,批终审确认需要持久落点(此前只在 SDD 台账里)。
+- 第一处——中性线态的渲染层零覆盖:`frontend/src/components/workspace/ansich/projection-health.tsx` 的图标选择是一个裸三元式(`line === "healthy" ? ActivityIcon : CircleHelpIcon`),本批(PA15)恰好**反转过一次**它的锚定条件;纯函数层(resolver 的 `line` 四态)已被突变验证充分钉住,但 JSX 分支没有任何测试执行——e2e 夹具只有 `healthy`。把它反转回去,翡翠"完整"图标会重新出现在 phase 线上,而所有现有 gate 保持全绿。
+- 验收准则(评审已给定,照此写用例):**翡翠 `ActivityIcon` 只属于 `healthy`;phase 与 unknown 两种线态都必须是哑光 help 图标**。落法:一组「中性线态」e2e 用例(`starting` 夹具 + `unknown`(计数不可用)夹具),与既有 ansich e2e 同套路(路由桩)。仓库没有组件级 DOM 测试设施,e2e 是唯一载体。
+- 第二处——task 作用域在系统 phase 期间的诚实性:`taskProjectionScope` 在无硬故障、无本任务 attention 时把 status 合成为 `"healthy"`,于是系统 `starting`/`shutting_down` 期间任务页仍渲染绿色「本任务数据完整」——PA15 刚在系统作用域移除的那句话,在下一层原样存在。与既定规则(任务只继承硬故障)一致,且两个 phase 在 HTTP 上近乎不可观测(lifespan 先启服务后放流量、关停先排空请求),故为 minor;但它与第一处是同一个诚实性问题,修第一处时应一并裁定(方向:phase 期间任务页也用 phase 线态,或在文档里明确接受)。
+- 归属:下一次触达该组件的 UI 批(或 P11-B 若其健康面板工作触达此处)。

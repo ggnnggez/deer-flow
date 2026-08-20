@@ -1621,7 +1621,11 @@ class AnsichService:
         """Return one producer instance's account, creating it on first sighting.
 
         Callers must already hold ``self._lock``: this is pure dict work, which
-        is what keeps it legal on ``record()``'s non-blocking path.
+        is what keeps it legal on ``record()``'s non-blocking path. One caveat
+        to that guarantee applies lock-wide: three loss paths emit a
+        ``logger.warning`` while holding this lock (intake overflow, poison
+        isolation, the stop drain), so "non-blocking" is defended against
+        IO/await but not against a pathologically slow log handler.
 
         The map is bounded at ``_PRODUCER_ACCOUNT_LIMIT`` and evicts the least
         recently touched entry first, so a pathological ``instance_id`` cannot

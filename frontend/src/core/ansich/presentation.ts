@@ -162,7 +162,9 @@ const LIFECYCLE_PHASE_STATUSES: ReadonlySet<AnsichHealthStatus> = new Set([
 /**
  * Whether this status is a lifecycle phase rather than a claim about the data.
  */
-export function isProjectionLifecyclePhase(status: AnsichHealthStatus): boolean {
+export function isProjectionLifecyclePhase(
+  status: AnsichHealthStatus,
+): boolean {
   return LIFECYCLE_PHASE_STATUSES.has(status);
 }
 
