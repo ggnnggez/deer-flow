@@ -37,7 +37,8 @@ from ansich.quality import (
 from ansich.release import AgentRuntimeDescriptor, RuntimeBuildDescriptor, build_agent_release
 from pydantic import ValidationError
 from sqlalchemy import event, func, select
-from sqlalchemy.exc import OperationalError
+from sqlalchemy.exc import DataError, DisconnectionError, IntegrityError, InterfaceError, OperationalError, ProgrammingError
+from sqlalchemy.exc import TimeoutError as SQLAlchemyTimeoutError
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 
 from deerflow.ansich import create_embedded_ansich_service, create_sql_ansich_service
@@ -249,6 +250,16 @@ def _producer(name: str = "ansich-evaluation-api") -> Producer:
     return Producer(name=name, version="1", instance_id="gateway")
 
 
+def _locked_database() -> OperationalError:
+    """The failure SQLite reports when another connection holds the write lock."""
+
+    return OperationalError(
+        "SELECT ansich_observations.obs_id",
+        {},
+        sqlite3.OperationalError("database is locked"),
+    )
+
+
 class _ReadOutage:
     """A session factory whose *next* session refuses to open, exactly once.
 
@@ -261,30 +272,38 @@ class _ReadOutage:
     synchronous, and the replay lookup raises inside ``__aenter__`` before its
     first suspension point, so no other coroutine can run in between and take
     the refusal instead.
+
+    ``arm`` takes the exception because the failures that mean "the adapter
+    cannot answer" are not one type and are not even one branch of SQLAlchemy's
+    tree: pool exhaustion (``sqlalchemy.exc.TimeoutError``) and a detected
+    disconnect (``DisconnectionError``) descend straight from
+    ``SQLAlchemyError`` with no ``DBAPIError`` in between.
     """
 
     def __init__(self, session_factory: async_sessionmaker[AsyncSession]) -> None:
         self._session_factory = session_factory
-        self.armed = False
+        self._armed: Exception | None = None
         self.refusal_count = 0
 
+    def arm(self, exc: Exception | None = None) -> None:
+        self._armed = _locked_database() if exc is None else exc
+
     def __call__(self):
-        if not self.armed:
+        if self._armed is None:
             return self._session_factory()
-        self.armed = False
+        refusal, self._armed = self._armed, None
         self.refusal_count += 1
-        return _RefusedSession()
+        return _RefusedSession(refusal)
 
 
 class _RefusedSession:
-    """What opening a session against a locked database raises."""
+    """A session that raises its armed failure instead of opening."""
+
+    def __init__(self, exc: Exception) -> None:
+        self._exc = exc
 
     async def __aenter__(self):
-        raise OperationalError(
-            "SELECT ansich_observations.obs_id",
-            {},
-            sqlite3.OperationalError("database is locked"),
-        )
+        raise self._exc
 
     async def __aexit__(self, *exc_info) -> bool:
         return False
@@ -526,7 +545,7 @@ async def test_a_storage_outage_on_the_replay_lookup_raises_a_typed_error(tmp_pa
         await service.flush_task(task_id)
 
         assert outage is not None
-        outage.armed = True
+        outage.arm()
         with pytest.raises(StorageUnavailableError):
             await service.record_evaluation(record, source_event_id=None, producer=_producer())
 
@@ -545,6 +564,78 @@ async def test_a_storage_outage_on_the_replay_lookup_raises_a_typed_error(tmp_pa
     assert healed.idempotent_replay is False
     assert healed.projection_status == "applied"
     assert after_recovery == 1
+
+
+@pytest.mark.anyio
+async def test_the_replay_lookup_types_the_cannot_answer_family_but_not_a_bug(tmp_path) -> None:
+    """Controller ruling PB6: the catch set is the *meaning*, not one base class.
+
+    ``StorageUnavailableError`` says "I could not read", so what it must cover is
+    every way the adapter fails to answer — and SQLAlchemy does not put those in
+    one place. ``OperationalError`` and ``InterfaceError`` are ``DBAPIError``
+    subclasses, but ``sqlalchemy.exc.TimeoutError`` (pool exhaustion, the
+    likeliest production shape of "not answering" — every connection is busy and
+    the checkout waits out ``pool_timeout``) and ``DisconnectionError`` descend
+    straight from ``SQLAlchemyError``. A ``DBAPIError``-shaped catch lets both of
+    those out untranslated, which is the same package-boundary leak F10-25 was
+    filed for.
+
+    The exclusions are the other half of the meaning and are asserted here, not
+    just documented: ``ProgrammingError``, ``IntegrityError`` and ``DataError``
+    *are* ``DBAPIError`` subclasses, and every one of them is a **bug** — a bad
+    statement, a violated constraint, a value the column cannot hold. Storage
+    answered; it said no. Calling that "unavailable" would invite a caller to
+    retry a query that will never work, so those keep falling to the route's
+    pre-existing blanket handler instead.
+    """
+
+    task_id, run_id = new_id(), "eval-service-cannot-answer"
+    record = _benchmark(task_id)
+    outage: _ReadOutage | None = None
+
+    def _wrap(session_factory: async_sessionmaker[AsyncSession]) -> _ReadOutage:
+        nonlocal outage
+        outage = _ReadOutage(session_factory)
+        return outage
+
+    cannot_answer: tuple[Exception, ...] = (
+        _locked_database(),
+        InterfaceError("SELECT 1", {}, sqlite3.InterfaceError("connection already closed")),
+        SQLAlchemyTimeoutError("QueuePool limit of size 5 overflow 10 reached, connection timed out"),
+        DisconnectionError("server closed the connection unexpectedly"),
+    )
+    # Storage answered — it said no. A retry cannot help any of these.
+    is_a_bug: tuple[Exception, ...] = (
+        ProgrammingError("SELECT nope", {}, sqlite3.ProgrammingError("no such column: nope")),
+        IntegrityError("INSERT ...", {}, sqlite3.IntegrityError("UNIQUE constraint failed")),
+        DataError("SELECT ...", {}, sqlite3.DataError("value out of range")),
+    )
+
+    async with _evaluation_service(
+        tmp_path,
+        "ansich-evaluation-cannot-answer.db",
+        wrap_session_factory=_wrap,
+        projector_poll_interval_ms=60_000,
+    ) as (service, _):
+        service.record(_task_created(task_id, run_id))
+        await service.flush_task(task_id)
+        assert outage is not None
+
+        for failure in cannot_answer:
+            outage.arm(failure)
+            with pytest.raises(StorageUnavailableError) as typed:
+                await service.record_evaluation(record, source_event_id=None, producer=_producer())
+            # The driver failure is preserved as the cause rather than replaced,
+            # so an operator still gets the original text in the traceback.
+            assert typed.value.__cause__ is failure
+
+        for bug in is_a_bug:
+            outage.arm(bug)
+            with pytest.raises(type(bug)) as raised:
+                await service.record_evaluation(record, source_event_id=None, producer=_producer())
+            assert raised.value is bug
+
+    assert outage.refusal_count == len(cannot_answer) + len(is_a_bug)
 
 
 @pytest.mark.anyio

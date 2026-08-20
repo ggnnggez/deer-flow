@@ -21,6 +21,23 @@ class StorageUnavailableError(Exception):
     asking about may be perfectly durable, and this error asserts nothing about
     it either way.
 
+    **What an adapter must translate into it** (controller ruling PB6). The
+    boundary is that meaning — "could not answer" — not whichever base class a
+    driver library happens to hang its failures from. In the SQLAlchemy adapter
+    those are four types that do *not* share one branch: ``OperationalError``
+    and ``InterfaceError`` are ``DBAPIError`` subclasses, while pool exhaustion
+    (``sqlalchemy.exc.TimeoutError``) and a detected disconnect
+    (``DisconnectionError``) descend straight from ``SQLAlchemyError``. A catch
+    written against ``DBAPIError`` alone therefore leaks the two most likely
+    production outages — an exhausted pool above all — straight through this
+    boundary untranslated.
+
+    Equally, a failure where storage *did* answer and said no —
+    ``ProgrammingError``, ``IntegrityError``, ``DataError`` — is a **bug**, not
+    unavailability, and must not be translated. Typing a malformed statement or
+    a violated constraint as "unavailable" tells the caller to retry something
+    that can never succeed.
+
     Its first user is ``AnsichService.record_evaluation``'s replay lookup
     (F10-25), and the way it is *not* handled there is the part worth keeping:
 

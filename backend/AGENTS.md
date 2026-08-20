@@ -469,14 +469,22 @@ must flush their `ansich_entities` parent before an autoflush can insert the
 child row; Ansich SQL tests that cover this path must enable
 `PRAGMA foreign_keys=ON`. Externalized Observation payloads likewise flush their
 `ansich_payloads` parent before inserting the referencing Observation. A row
-whose payload was externalized keeps `payload_json IS NULL`, so **every** reader
-that validates a stored payload has to hydrate it back from `ansich_payloads`
+whose payload was externalized keeps `payload_json IS NULL`, so a reader that
+validates a stored payload has to hydrate it back from `ansich_payloads`
 first — validating the column directly hands the model a `None`. The projection
 claim does this, and so does the scope-safety assessor's evidence read
 (`_assess_scope_safety_at` via `_hydrated_observation_payload`, F10-23); a
 payload row that has gone missing raises on both paths rather than degrading to
 an empty dict, because an empty payload validates into a *different* verdict and
-would fabricate a conclusion instead of reporting unreadable evidence.
+would fabricate a conclusion instead of reporting unreadable evidence — the
+same raise also re-opens F10-23's Task-wide stall, which is why deleting a
+payload row is a retention concern, not just a storage one. **Not every reader
+does this yet**, and the two that do not are open, not fixed: `contracts.py`'s
+`environment.sampled` branch *raises* on a `None` payload (unconditionally — an
+externalized environment sample cannot be read back at all), and
+`get_environment_history` guard-and-skips one, so the sample silently drops
+out of the trend series. Both are the safe direction (loud, or an honest gap)
+rather than a fabricated reading, and F10-29 owns closing the class.
 Task-summary assertion pointers are nullable with `ON DELETE SET NULL`, so a
 missing derived assertion preserves the paginated Task row and marks it
 degraded instead of violating the FK or deleting the summary. Persisted
@@ -910,7 +918,17 @@ outside everything the write side has for an outage. When storage cannot answer
 it, the backend raises `ansich.errors.StorageUnavailableError` (a
 dependency-free type defined at the package boundary so the driver's exception
 tree never leaves the adapter) and `POST /evaluations` maps it to its existing
-503 through an explicit clause. The receipt vocabulary is deliberately
+503 through an explicit clause. What the adapter translates is chosen by that
+meaning — "could not answer" — rather than by one convenient base class
+(controller ruling PB6, `sql.py::_STORAGE_CANNOT_ANSWER`): `OperationalError`
+and `InterfaceError` are `DBAPIError` subclasses, but pool exhaustion
+(`sqlalchemy.exc.TimeoutError`) and a detected disconnect (`DisconnectionError`)
+descend straight from `SQLAlchemyError`, so a `DBAPIError`-shaped catch leaked
+the two likeliest production outages untranslated. `ProgrammingError` /
+`IntegrityError` / `DataError` are deliberately **excluded** — storage answered
+and said no, so they are bugs, and typing them as unavailability would invite a
+retry of a query that can never succeed; they keep falling to the route's
+blanket handler. The receipt vocabulary is deliberately
 unchanged: it is **not** answered `failed` — that would report ignorance ("I
 cannot tell whether this is a replay") as knowledge ("it is lost") — the error
 is **not** swallowed so the write can proceed, which would skip the dedupe and

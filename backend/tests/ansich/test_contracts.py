@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import ast
+import sys
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -59,6 +60,33 @@ def test_ansich_core_has_no_deerflow_or_web_framework_imports() -> None:
                     violations.append(f"{path.relative_to(package_root)} imports {module}")
 
     assert violations == []
+
+
+def test_ansich_errors_module_imports_only_the_standard_library() -> None:
+    """``ansich.errors`` is dependency-free, and that is executable here.
+
+    The package-wide check above forbids only frameworks — every other module in
+    ``ansich`` may and does import pydantic. ``errors`` may not, and the reason
+    is its job: a backend adapter outside this package translates its driver's
+    exception tree into ``StorageUnavailableError`` so callers can name the
+    condition **without adopting the adapter's dependencies**. A type that
+    dragged pydantic or SQLAlchemy in with it would defeat the boundary it
+    exists to draw, silently and without any other test noticing.
+    """
+
+    module_path = Path(__file__).parents[2] / "packages" / "ansich" / "ansich" / "errors.py"
+    tree = ast.parse(module_path.read_text(encoding="utf-8"), filename=str(module_path))
+    imported: list[str] = []
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            imported.extend(alias.name for alias in node.names)
+        elif isinstance(node, ast.ImportFrom):
+            # A relative import (``node.module is None`` or ``level > 0``) is an
+            # intra-package one, which is exactly what must not appear here.
+            imported.append(node.module if node.level == 0 and node.module else "ansich")
+
+    non_stdlib = sorted({module for module in imported if module.split(".", maxsplit=1)[0] not in sys.stdlib_module_names})
+    assert non_stdlib == []
 
 
 def test_phase_two_observation_accepts_step_subject_with_explicit_parent() -> None:

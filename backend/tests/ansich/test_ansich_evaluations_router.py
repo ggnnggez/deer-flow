@@ -446,6 +446,14 @@ async def test_post_evaluation_answers_503_when_the_replay_lookup_hits_a_storage
     reached through an explicit clause rather than the blanket
     ``except Exception`` that would swallow a genuine bug into the same shape.
     Nothing is recorded, so a retry is a first intake and not a replay.
+
+    **The message assertion is the whole test.** The blanket
+    ``except Exception -> 503`` predates this fix, so status code, detail shape
+    and the recorded count are all satisfied by the *pre-fix* route — asserting
+    only those would pin nothing. ``detail["message"]`` is the one observable
+    that separates the typed clause ("Ansich storage is unavailable") from the
+    blanket ("Ansich evaluation write failed"), so it is what makes this a
+    regression rather than a description.
     """
 
     task_id, run_id = new_id(), "eval-router-read-outage"
@@ -467,6 +475,7 @@ async def test_post_evaluation_answers_503_when_the_replay_lookup_hits_a_storage
         recorded = await harness.count_recorded_evaluations()
 
     assert posted.status_code == 503
+    assert posted.json()["detail"]["message"] == "Ansich storage is unavailable"
     assert posted.json()["detail"]["projection_status"]["storage_available"] is True
     assert recorded == 0
 

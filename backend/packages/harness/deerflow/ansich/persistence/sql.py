@@ -179,7 +179,8 @@ from ansich.usage import (
 from sqlalchemy import and_, case, delete, func, or_, select, text, update
 from sqlalchemy.dialects.postgresql import insert as postgresql_insert
 from sqlalchemy.dialects.sqlite import insert as sqlite_insert
-from sqlalchemy.exc import DBAPIError
+from sqlalchemy.exc import DisconnectionError, InterfaceError, OperationalError
+from sqlalchemy.exc import TimeoutError as SqlAlchemyTimeoutError
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from sqlalchemy.orm import aliased
 
@@ -400,6 +401,30 @@ _CLAIMABLE_JOB_STATUSES = ("pending", "retry")
 #: 2**63 so it is a valid signed bigint lock id. Changing it effectively
 #: releases the prior lock, so do not change it without coordinating.
 _PG_MAINTENANCE_LOCK_KEY = 0x0DEE_A115_C4A5_0027
+#: The failures that mean *the adapter could not answer*, and which therefore
+#: cross the ``ansich`` package boundary as ``StorageUnavailableError``
+#: (controller ruling PB6). The set is chosen by that meaning rather than by a
+#: convenient base class, because SQLAlchemy does not put these in one branch:
+#: ``OperationalError`` and ``InterfaceError`` are ``DBAPIError`` subclasses,
+#: while ``TimeoutError`` (pool exhaustion -- every connection busy and the
+#: checkout waits out ``pool_timeout``, the likeliest production shape of "not
+#: answering") and ``DisconnectionError`` descend straight from
+#: ``SQLAlchemyError`` with no ``DBAPIError`` in between. Catching ``DBAPIError``
+#: therefore let those two out untranslated, which is exactly the leak F10-25
+#: was filed for.
+#:
+#: What is deliberately **excluded** matters as much: ``ProgrammingError``,
+#: ``IntegrityError`` and ``DataError`` are ``DBAPIError`` subclasses too, and
+#: every one of them is a *bug* -- a malformed statement, a violated constraint,
+#: a value the column cannot hold. Storage answered; it said no. Typing those as
+#: unavailability would invite a caller to retry a query that can never succeed,
+#: so they stay untranslated and fall to the route's blanket handler.
+_STORAGE_CANNOT_ANSWER = (
+    OperationalError,
+    InterfaceError,
+    SqlAlchemyTimeoutError,
+    DisconnectionError,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -3616,13 +3641,13 @@ class SqlAnsichBackend:
         ``sqlalchemy.exc.*`` type at a caller that has no reason to import
         SQLAlchemy (F10-25).
 
-        A DBAPI failure is translated to ``StorageUnavailableError`` and nothing
-        else changes: the call still fails, because the two alternatives are
-        both worse. Reporting ``failed`` would state as knowledge ("it is
-        lost") what is only ignorance ("I cannot tell whether this is a
-        replay"), and swallowing the error to record anyway would skip the
-        dedupe and mint a second Observation whose id the receipt would then
-        point at.
+        A failure from ``_STORAGE_CANNOT_ANSWER`` is translated to
+        ``StorageUnavailableError`` and nothing else changes: the call still
+        fails, because the two alternatives are both worse. Reporting ``failed``
+        would state as knowledge ("it is lost") what is only ignorance ("I
+        cannot tell whether this is a replay"), and swallowing the error to
+        record anyway would skip the dedupe and mint a second Observation whose
+        id the receipt would then point at.
         """
 
         try:
@@ -3638,11 +3663,7 @@ class SqlAnsichBackend:
                     .order_by(AnsichObservationRow.ingest_seq)
                     .limit(1)
                 )
-        except DBAPIError as exc:
-            # Every connection- and statement-level failure the driver can
-            # report is a ``DBAPIError`` subclass (``OperationalError``,
-            # ``InterfaceError``, ...). Anything narrower would let one driver's
-            # spelling of "the database is not there" through untranslated.
+        except _STORAGE_CANNOT_ANSWER as exc:
             raise StorageUnavailableError("Ansich storage could not answer the evaluation replay lookup") from exc
 
     async def get_observation_projection_status(
@@ -5167,9 +5188,18 @@ class SqlAnsichBackend:
         for row in rows:
             payload = row.payload_json
             if payload is None:
-                # Environment payloads are small and never externalized, but a
-                # payload-ref row would carry no readable metrics here, so it
-                # is skipped rather than counted as a reading.
+                # RETRACTION: this used to claim environment payloads are "never
+                # externalized". They can be -- nothing exempts this kind from
+                # `inline_payload_max_bytes`; it is only that they are usually
+                # small enough not to cross it. So this branch is reachable, and
+                # what it does is guard-and-skip: the sample drops out of the
+                # series rather than being hydrated. That is the safe direction
+                # for a trend read (an absent point is an honest gap the
+                # sparkline breaks across, never an interpolated or zeroed
+                # reading), but it does under-report, and it is one of the open
+                # siblings of F10-23 -- the assessor's evidence read was fixed by
+                # hydrating; this one and `contracts.py`'s `environment.sampled`
+                # payload-None raise were not. F10-29 owns the class.
                 continue
             if payload.get("environment_scope") != environment_scope:
                 continue
