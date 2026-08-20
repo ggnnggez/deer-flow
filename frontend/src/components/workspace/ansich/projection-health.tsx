@@ -199,7 +199,9 @@ export function AnsichHealthBadge({
  * still appears, labeled as system-level, because the Task's data comes from
  * the same projection and must not be reported as clean. When the Task's
  * failure count is unknown the line stays neutral rather than green: an
- * unanswered request is not a clean bill of health.
+ * unanswered request is not a clean bill of health. Neither is a collector that
+ * is still starting or shutting down, so those name the phase in the same
+ * neutral treatment instead of claiming the data is complete.
  */
 export function AnsichProjectionHealthBanner({
   health,
@@ -293,22 +295,26 @@ export function AnsichProjectionHealthBanner({
         </div>
       ) : (
         <div className="text-muted-foreground flex items-center gap-2 text-sm">
-          {line === "unknown" ? (
-            <CircleHelpIcon className="size-4" aria-hidden />
-          ) : (
+          {line === "healthy" ? (
             <ActivityIcon className="size-4 text-emerald-600" aria-hidden />
+          ) : (
+            <CircleHelpIcon className="size-4" aria-hidden />
           )}
           <span
             className={cn(
               "font-medium",
-              line === "unknown" ? "text-muted-foreground" : "text-foreground",
+              line === "healthy" ? "text-foreground" : "text-muted-foreground",
             )}
           >
-            {line === "unknown"
-              ? t.ansich.healthCountUnavailable
-              : isTaskScope
-                ? t.ansich.healthTaskComplete
-                : t.ansich.dataHealthy}
+            {line === "phase"
+              ? // A lifecycle phase names itself: the status word is the whole
+                // information, and it is not a claim about the data.
+                `${t.ansich.projection}: ${t.ansich.health[health.status]}`
+              : line === "unknown"
+                ? t.ansich.healthCountUnavailable
+                : isTaskScope
+                  ? t.ansich.healthTaskComplete
+                  : t.ansich.dataHealthy}
           </span>
           <span aria-hidden>·</span>
           <span className="tabular-nums">

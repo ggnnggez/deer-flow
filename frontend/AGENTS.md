@@ -134,9 +134,14 @@ while `starting` and `shutting_down` are transient lifecycle phases — neither
 raises attention on its own, and neither takes part in the worsen comparison in
 either direction, the same posture as an unknown count. A phase excuses only the
 status: a failed job, a lost range, or unavailable storage recorded during one
-still raises the banner. Persisted dismissal records validate their status
-against the contract's own `ANSICH_HEALTH_STATUSES` list rather than a second
-literal copy, so a record taken at any of the seven survives a reload. Every metric label in that drawer has a keyboard-focusable
+still raises the banner. A phase is equally not a clean bill of health, so
+instead of the emerald completeness line it renders a fourth line state
+(`phase`) in the same muted treatment as the unknown-count line, naming the
+status word itself; it is dismissible by nobody and clears no dismissal record,
+because acknowledging nothing is not a recovery. Persisted dismissal records
+validate their status against the contract's own `ANSICH_HEALTH_STATUSES` list
+rather than a second literal copy, so a record taken at any of the seven
+survives a reload. Every metric label in that drawer has a keyboard-focusable
 help trigger whose localized tooltip explains the metric's definition and diagnostic
 meaning; failed-job help stays separate from the clickable failed-job value. UUIDs on
 list rows and the hero downgrade to their leading

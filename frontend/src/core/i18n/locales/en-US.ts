@@ -510,7 +510,7 @@ export const enUS: Translations = {
     writerBackoffUntil: "Backoff until",
     rowsInFlight: "Rows in flight",
     isolatedDrops: "Isolated drops",
-    unreportedGlobalLoss: "Unreported global loss",
+    unreportedGlobalLoss: "Unreported global loss ranges",
     producers: "Producers",
     producerEvictions: "Account evictions",
     serializationFailures: "Serialization failures",

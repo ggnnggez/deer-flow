@@ -494,7 +494,7 @@ export const zhCN: Translations = {
     writerBackoffUntil: "退避至",
     rowsInFlight: "在途行数",
     isolatedDrops: "隔离丢弃",
-    unreportedGlobalLoss: "未上报全局丢失",
+    unreportedGlobalLoss: "未上报全局丢失区间",
     producers: "采集器账目",
     producerEvictions: "账目淘汰次数",
     serializationFailures: "序列化失败",

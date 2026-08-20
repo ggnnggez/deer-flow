@@ -492,6 +492,13 @@ describe("topProducersByDropped", () => {
       rows: [],
       hiddenCount: 2,
     });
+    // A negative limit is where an unguarded slice misbehaves twice over: it
+    // keeps a row it was asked not to show, and reports more hidden producers
+    // than the ledger holds.
+    expect(topProducersByDropped(rows, -1)).toEqual({
+      rows: [],
+      hiddenCount: 2,
+    });
     expect(topProducersByDropped([], 8)).toEqual({ rows: [], hiddenCount: 0 });
   });
 });
@@ -512,7 +519,7 @@ function lostRange(
 
 function projectionHealth(
   overrides: Partial<{
-    status: "healthy" | "degraded" | "failed" | "stopped";
+    status: AnsichHealthStatus;
     failed_jobs: number;
     lost_ranges: AnsichLostRange[];
     storage_available: boolean;
@@ -958,6 +965,48 @@ describe("resolveProjectionHealthDisplay", () => {
       dismissible: true,
       clearDismissal: false,
     });
+  });
+
+  it("names a transient lifecycle phase instead of claiming completeness", () => {
+    // A projector that has not begun, or is stopping on purpose, has produced
+    // no evidence of completeness — and healthy requires positive evidence
+    // (`selectPrimarySignal`'s rule, applied to the projection itself). The
+    // phases are a symmetric pair and get the same answer.
+    for (const status of ["starting", "shutting_down"] as const) {
+      const phase = systemProjectionScope(projectionHealth({ status }));
+
+      expect(phase.attention).toBe(false);
+      expect(resolveProjectionHealthDisplay(phase, null)).toEqual({
+        line: "phase",
+        showBadge: false,
+        dismissible: false,
+        clearDismissal: false,
+      });
+      // A phase is not a recovery either: it acknowledges nothing, so it must
+      // not discard a record taken against a real incident. Same posture as an
+      // unknown count.
+      expect(
+        resolveProjectionHealthDisplay(phase, attentionScope.snapshot),
+      ).toEqual({
+        line: "phase",
+        showBadge: false,
+        dismissible: false,
+        clearDismissal: false,
+      });
+    }
+  });
+
+  it("leaves the healthy and recovering answers untouched", () => {
+    const healthy = systemProjectionScope(projectionHealth());
+    const recovering = systemProjectionScope(
+      projectionHealth({ status: "recovering" }),
+    );
+
+    expect(resolveProjectionHealthDisplay(healthy, null).line).toBe("healthy");
+    // `recovering` is an unfinished incident, so it never reaches the
+    // no-attention branch at all.
+    expect(recovering.attention).toBe(true);
+    expect(resolveProjectionHealthDisplay(recovering, null).line).toBe("banner");
   });
 
   it("clears the record on recovery so the next incident starts as a banner", () => {

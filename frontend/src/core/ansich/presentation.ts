@@ -147,17 +147,33 @@ export function selectPrimarySignal(
 }
 
 /**
- * The statuses that are not, by themselves, an incident. `starting` and
- * `shutting_down` are transient lifecycle phases — nothing has run yet, or an
- * orderly stop is in progress (its failure tier is `stopped`, one transition
- * later) — and a banner on every process start and stop is exactly what teaches
- * operators to ignore the banner. `recovering` is deliberately absent: nothing
- * is failing right now, but the incident that caused it is not over.
+ * The transient lifecycle phases: nothing has run yet, or an orderly stop is in
+ * progress (its failure tier is `stopped`, one transition later). Neither is an
+ * incident — a banner on every process start and stop is exactly what teaches
+ * operators to ignore the banner — and neither is a clean bill of health, since
+ * a projector that has not begun has produced no evidence of completeness.
+ * They are a symmetric pair and are never split.
  */
-const NON_ATTENTION_HEALTH_STATUSES: ReadonlySet<string> = new Set([
-  "healthy",
+const LIFECYCLE_PHASE_STATUSES: ReadonlySet<AnsichHealthStatus> = new Set([
   "starting",
   "shutting_down",
+]);
+
+/**
+ * Whether this status is a lifecycle phase rather than a claim about the data.
+ */
+export function isProjectionLifecyclePhase(status: AnsichHealthStatus): boolean {
+  return LIFECYCLE_PHASE_STATUSES.has(status);
+}
+
+/**
+ * The statuses that are not, by themselves, an incident: a clean projection and
+ * the two lifecycle phases. `recovering` is deliberately absent — nothing is
+ * failing right now, but the incident that caused it is not over.
+ */
+const NON_ATTENTION_HEALTH_STATUSES: ReadonlySet<AnsichHealthStatus> = new Set([
+  "healthy",
+  ...LIFECYCLE_PHASE_STATUSES,
 ]);
 
 /**
@@ -410,12 +426,14 @@ export function projectionHealthWorsened(
 
 /**
  * The inline health line this scope renders: the attention banner, the
- * completeness claim, the neutral line for a scope whose failure count is
- * unknown, or nothing at all while the banner is collapsed behind its badge.
+ * completeness claim, the neutral line naming a lifecycle phase, the neutral
+ * line for a scope whose failure count is unknown, or nothing at all while the
+ * banner is collapsed behind its badge.
  */
 export type AnsichProjectionHealthLine =
   | "banner"
   | "healthy"
+  | "phase"
   | "unknown"
   | "none";
 
@@ -434,24 +452,29 @@ export interface AnsichProjectionHealthDisplay {
  * failure. A worsening state or a full recovery drops the record, so the next
  * incident opens as a banner again rather than silently as a badge — but only a
  * recovery a real count can vouch for: unknown is not a rise, not completeness,
- * and not recovery either.
+ * and not recovery either. Neither is a lifecycle phase, which acknowledges
+ * nothing and claims nothing.
  */
 export function resolveProjectionHealthDisplay(
   scope: AnsichProjectionScope,
   dismissed: AnsichHealthSnapshot | null,
 ): AnsichProjectionHealthDisplay {
   if (!scope.attention) {
+    // A phase outranks an unknown count as the reason for making no claim: it
+    // is the more specific answer, and it is the one an operator can act on.
+    const phase = isProjectionLifecyclePhase(scope.status);
     const unknown = scope.failedJobs === null;
     return {
-      // A scope that cannot count its failed jobs may not claim completeness.
-      line: unknown ? "unknown" : "healthy",
+      // Neither a scope in a lifecycle phase nor one that cannot count its
+      // failed jobs may claim completeness.
+      line: phase ? "phase" : unknown ? "unknown" : "healthy",
       showBadge: false,
       dismissible: false,
-      // Nor is unknown a recovery: keep the record until a real count says so.
-      // Clearing here would let the pending window after a reload — where
+      // Nor is either one a recovery: keep the record until a real count says
+      // so. Clearing here would let the pending window after a reload — where
       // sessionStorage survives but the query cache does not — discard a
       // dismissal, making its lifetime a request race.
-      clearDismissal: !unknown && dismissed !== null,
+      clearDismissal: !phase && !unknown && dismissed !== null,
     };
   }
   if (scope.hardFailure) {
