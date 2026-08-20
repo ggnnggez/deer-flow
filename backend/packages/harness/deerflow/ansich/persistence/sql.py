@@ -7583,7 +7583,11 @@ class SqlAnsichBackend:
         descendants = list((await session.execute(select(AnsichTaskAncestryRow).where(AnsichTaskAncestryRow.ancestor_task_id == child_task_id))).scalars())
         if any(descendant.descendant_task_id == parent_task_id for descendant in descendants):
             raise ValueError("Task spawn would create an ancestry cycle")
-        ancestor_depths = [(parent_task_id, 0), *[(row.ancestor_task_id, row.depth) for row in ancestors]]
+        # Sorted at the source because two consumers read this list: the
+        # ancestry insert loop just below, and `_backfill_spawn_usage`'s lock
+        # traversal. `ancestors` comes from an unordered select, so without
+        # this the traversal order is storage order.
+        ancestor_depths = sorted([(parent_task_id, 0), *[(row.ancestor_task_id, row.depth) for row in ancestors]])
         descendant_depths = [(child_task_id, 0), *[(row.descendant_task_id, row.depth) for row in descendants]]
         for ancestor_id, ancestor_depth in ancestor_depths:
             for descendant_id, descendant_depth in descendant_depths:
@@ -7643,7 +7647,15 @@ class SqlAnsichBackend:
             ).all()
         )
         changed: set[tuple[str, str]] = set()
-        for ancestor_task_id in ancestor_task_ids:
+        # Sorted, and this loop is the one that makes the ordering load-bearing:
+        # `_store_usage_contribution` takes P11-A's `FOR UPDATE OF` on the
+        # high-water contribution row inside it, so those locks are acquired
+        # BEFORE any summary lock in the same transaction. Ordering only the
+        # `changed` fan-out below would leave the earlier, unordered half of the
+        # same transaction free to cross with a peer. Sorted here rather than
+        # only at the caller so the ordering is a property of the function that
+        # takes the locks, not of every caller remembering to pre-sort.
+        for ancestor_task_id in sorted(ancestor_task_ids):
             for row, source_kind in local_rows:
                 inserted = await self._store_usage_contribution(
                     session,

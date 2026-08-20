@@ -474,6 +474,34 @@ def _record_summary_refreshes(monkeypatch: pytest.MonkeyPatch) -> list[tuple[str
     return recorded
 
 
+def _record_contribution_writes(monkeypatch: pytest.MonkeyPatch) -> list[str]:
+    """Record the order the fan-out reaches each aggregate's contribution row.
+
+    This is the *earlier* half of the same transaction: a high-water
+    contribution takes P11-A's ``FOR UPDATE OF`` inside
+    ``_store_usage_contribution``, before any summary lock. Ordering the
+    summary fan-out alone would leave this half free to cross with a peer.
+    """
+
+    recorded: list[str] = []
+    original = ansich_sql.SqlAnsichBackend._store_usage_contribution.__func__
+
+    async def _patched(cls, session, *, aggregate_task_id, **kwargs):
+        recorded.append(aggregate_task_id)
+        return await original(cls, session, aggregate_task_id=aggregate_task_id, **kwargs)
+
+    monkeypatch.setattr(ansich_sql.SqlAnsichBackend, "_store_usage_contribution", classmethod(_patched))
+    return recorded
+
+
+def _first_appearance(values: list[str]) -> list[str]:
+    seen: list[str] = []
+    for value in values:
+        if value not in seen:
+            seen.append(value)
+    return seen
+
+
 async def _add_unsorted_ancestors(session_factory, descendant_task_id: str) -> tuple[str, ...]:
     """Give one Task three ancestors, stored in deliberately unsorted order.
 
@@ -547,10 +575,7 @@ async def test_usage_fan_out_locks_its_targets_in_a_worker_independent_order(tmp
             )
             await service.flush_task(task_id)
 
-    first_touch: list[str] = []
-    for target_task_id, _dimension, _scope in recorded:
-        if target_task_id not in first_touch:
-            first_touch.append(target_task_id)
+    first_touch = _first_appearance([target_task_id for target_task_id, _dimension, _scope in recorded])
     assert len(first_touch) == 4, recorded
     assert first_touch == sorted(first_touch), recorded
     # The ancestry read itself is ordered, so the traversal it feeds is a
@@ -561,19 +586,42 @@ async def test_usage_fan_out_locks_its_targets_in_a_worker_independent_order(tmp
 
 
 @pytest.mark.anyio
-async def test_spawn_backfill_refreshes_summaries_in_a_worker_independent_order(tmp_path, monkeypatch):
-    """A `set` iterates in hash order, which differs between processes.
+async def test_spawn_backfill_takes_both_its_lock_traversals_in_a_worker_independent_order(tmp_path, monkeypatch):
+    """Both halves of the backfill transaction, not just the summary fan-out.
 
-    Hash order is stable within one process but not across them (string hashing
-    is seeded per interpreter), so the pre-fix iteration satisfied the sorted
-    assertion below only by coincidence -- a different coincidence per run.
+    The ancestor loop comes first and takes P11-A's ``FOR UPDATE OF`` on each
+    high-water contribution row; the ``changed`` fan-out follows and takes the
+    summary locks. Its input is a ``set``, whose iteration order is stable
+    within one interpreter but not across them (string hashing is seeded per
+    process), while the ancestor tuple arrives in whatever order the caller's
+    unordered ancestry select produced -- so before this fix either half could
+    satisfy the sorted assertions below by coincidence, a different coincidence
+    per run.
+
+    The heartbeat below is what makes the first half a real lock rather than a
+    plain insert: ``wall_time_ms`` is the one max-type dimension, so only a
+    ``task.heartbeat``-sourced contribution takes the locked high-water path.
     """
 
     async with _representative_state(tmp_path, "rollup-backfill-order") as (service, task_id, budget):
+        service.record(
+            ObservationEnvelope.task_heartbeat(
+                task_id=task_id,
+                run_id="run-rollup-serialization",
+                occurred_at=_OCCURRED_AT + timedelta(seconds=10),
+                elapsed_ms=10_000,
+                worker_id="worker-rollup",
+                ownership_epoch="epoch-rollup",
+                source_event_id="run:run-rollup-serialization:task:heartbeat:1",
+            )
+        )
+        await service.flush_task(task_id)
         backend = service._backend
         await service.stop()
+        # Deliberately unsorted, the shape an unordered ancestry select gives.
         ancestors = ("zzz-ancestor", "aaa-ancestor", "mmm-ancestor")
-        recorded = _record_summary_refreshes(monkeypatch)
+        contributions = _record_contribution_writes(monkeypatch)
+        summaries = _record_summary_refreshes(monkeypatch)
         async with backend._session_factory() as session, session.begin():
             await backend._backfill_spawn_usage(
                 session,
@@ -582,9 +630,13 @@ async def test_spawn_backfill_refreshes_summaries_in_a_worker_independent_order(
                 updated_at=_ASSESSED_AT,
             )
 
-    assert len(recorded) >= 4, recorded
-    assert all(scope == "inclusive" for _task, _dimension, scope in recorded), recorded
-    pairs = [(target, dimension) for target, dimension, _scope in recorded]
+    # First half: the contribution rows, including the locked high-water one.
+    assert _first_appearance(contributions) == sorted(ancestors), contributions
+    assert any(dimension == "wall_time_ms" for _task, dimension, _scope in summaries), summaries
+    # Second half: the summary rows.
+    assert len(summaries) >= 4, summaries
+    assert all(scope == "inclusive" for _task, _dimension, scope in summaries), summaries
+    pairs = [(target, dimension) for target, dimension, _scope in summaries]
     assert pairs == sorted(pairs), pairs
 
 
