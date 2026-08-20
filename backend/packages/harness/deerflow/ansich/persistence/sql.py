@@ -7655,6 +7655,17 @@ class SqlAnsichBackend:
         # same transaction free to cross with a peer. Sorted here rather than
         # only at the caller so the ordering is a property of the function that
         # takes the locks, not of every caller remembering to pre-sort.
+        #
+        # Why the two fan-out functions may traverse the (aggregate, dimension)
+        # grid in different major orders and still not deadlock: both take a
+        # given aggregate's contribution lock before its summary lock and walk
+        # aggregates ascending, so the lowest shared aggregate's contribution
+        # row is a serializing prefix for any pair of workers. That argument
+        # leans on two facts that must survive future edits: the insert/skip
+        # shape never drops a lower shared aggregate while keeping a higher
+        # one, and MAX_TYPE_USAGE_DIMENSIONS has exactly one member (a second
+        # max-type dimension would interleave a second locked row per
+        # aggregate and needs this argument re-derived).
         for ancestor_task_id in sorted(ancestor_task_ids):
             for row, source_kind in local_rows:
                 inserted = await self._store_usage_contribution(
@@ -9604,12 +9615,16 @@ class SqlAnsichBackend:
         if payload.coverage == "uninstrumented":
             return
 
-        for metric, value in payload.metrics.items():
+        for metric, value in sorted(payload.metrics.items()):
             # Lock the row BEFORE reading it: sibling projections of the same
             # Scope can land on this row concurrently and every branch below is
             # a read-modify-write, so an unlocked read would lose an update
             # under Postgres READ COMMITTED. Same discipline as
             # _upsert_high_water_contribution; FOR UPDATE is a no-op on SQLite.
+            # sorted(): two workers projecting sibling samples for one Scope
+            # must acquire these per-metric row locks in the same order, or
+            # dict order (which differs across processes) can deadlock them —
+            # the same cross-worker lock-ordering rule as the usage fan-out.
             row = await session.get(AnsichEnvironmentStateRow, (scope_id, payload.environment_scope, metric), with_for_update=True)
             if row is None:
                 session.add(
