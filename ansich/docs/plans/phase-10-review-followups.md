@@ -390,11 +390,12 @@
 
 ## F10-30. settle-budget flake 家族(与 F10-10 明确分开)
 
-- 状态:⬜ 未修复(测试侧;生产行为是 fail-open 预算语义,非 bug)。来源:P11-B 批 T2-T4 的争用复测逐步识别,T4 修复轮定名。
-- 成员(全部 `terminal_flush_timeout_ms=100` 构造、24-hog 争用下全红——成员 1/2 两侧各 3/3 且文本一致,成员 3 一侧 3/3、另一侧存档 2 轮):
+- 状态:⬜ 未修复(测试侧;生产行为是 fail-open 预算语义,非 bug)。来源:P11-B 批 T2-T4 的争用复测逐步识别,T4 修复轮定名;成员 4 由 T5 复审补登。
+- 成员 1-3(全部 `terminal_flush_timeout_ms=100` 构造、24-hog 争用下全红——成员 1/2 两侧各 3/3 且文本一致,成员 3 一侧 3/3、另一侧存档 2 轮):
   1. `test_externalized_scope_authorization_and_effect_payloads_read_back`(:1195,`stored_payload_state == {}`——flush 预算内没写完);
   2. `test_scope_safety_dependency_wait_crosses_deadline_into_failed_job_and_retry`(:514,`NoneType.job_id`——作业未建);
-  3. `test_scope_safety_waits_for_subject_entity_then_self_heals`(同型)。
-- 为什么不是 F10-10:其中两条**已上** `only_test_driven_assessments` 门禁——该门禁管评估**节奏**,管不了 **flush 预算**输给负载;P11-A 的屏障语义(超时退回队首)使测试在重排队中读到空态。两族必须分开记,否则会把「加大门禁」的错误结论套到这一族上。
-- 方向:这三条测试的读断言前补一个对 flush/重排队路径的确定性 settle 等待(或争用级运行放宽终端预算);普通负载下极少翻红,合并门禁仍以安静机全绿为准。
+  3. `test_scope_safety_waits_for_subject_entity_then_self_heals`(同型)。成员 3 在 T5 的第一轮验收里(`tests/ansich` 与 bootstrap 组**并行**跑)再次翻红一次,单独重跑立即绿,安静机全量两轮全绿——按本条记账,未改判。
+  4. `test_late_scope_evidence_reassesses_only_its_own_tool_call`(`test_sql_safety.py:1535`,T5 复审者的一次运行:`converged_before` 读到 `(8, 8, …)` 而非期望的 `(4, 4, …)`,即已收敛的 tool_call 被重估了一遍——正是 phase-9-review-followups.md:72 记录的**修复前**形状「从 4 涨到 8」;单独跑 3/3 绿)。**构造与前三条不同,必须一并记**:它不设 `terminal_flush_timeout_ms=100`(用默认终端预算),而是把 `flush_interval_ms`/`projector_poll_interval_ms` 都压到 60s,于是整个 settle 完全由 `flush_task()` 那一次预算承担、投影没有第二次轮询兜底——预算输给负载时两条证据落在**不同的 watermark 区间**,第二次触发就会连带重估已收敛的 subject。所以症状不是「读到空态」而是「读到多判了一轮」,机理仍是同一条:settle 预算输给负载。
+- 为什么不是 F10-10:成员 3/4 **已上** `only_test_driven_assessments` 门禁、成员 4 还已把周期压到 60s——该门禁管评估**节奏**,管不了 **flush 预算**输给负载;P11-A 的屏障语义(超时退回队首)使测试在重排队中读到空态或半态。两族必须分开记,否则会把「加大门禁」的错误结论套到这一族上——成员 4 尤其是反例:F10-10 的两种手段它都已经用尽。
+- 方向:这四条测试的读断言前补一个对 flush/重排队路径的确定性 settle 等待(或争用级运行放宽终端预算);成员 4 另需保证两条证据在**同一** watermark 区间内落地再断言。普通负载下极少翻红,合并门禁仍以安静机全绿为准。
 - 归属:下一次测试卫生波;F10-10 留观的兄弟条目。

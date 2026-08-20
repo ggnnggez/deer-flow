@@ -55,6 +55,8 @@ from deerflow.ansich.persistence.models import (
     AnsichActiveTaskReadModelRow,
     AnsichBeliefAssertionRow,
     AnsichCurrentBeliefRow,
+    AnsichEntityRow,
+    AnsichTaskAncestryRow,
     AnsichTaskBudgetRow,
     AnsichTaskUsageRow,
 )
@@ -442,6 +444,151 @@ async def test_usage_summary_locks_the_summary_before_rescanning_contributions(t
 
 
 # --------------------------------------------------------------------------
+# (b2) Lock ORDER: the usage fan-out must be worker-independent
+# --------------------------------------------------------------------------
+
+
+def _record_summary_refreshes(monkeypatch: pytest.MonkeyPatch) -> list[tuple[str, str, str]]:
+    """Record the order the fan-out reaches each usage summary.
+
+    ``_refresh_usage_summary``'s very first statement is that summary row's
+    ``SELECT … FOR UPDATE`` (pinned by the shape test above), so the order of
+    these calls *is* the lock acquisition order -- which is the thing two
+    workers have to agree on.
+    """
+
+    recorded: list[tuple[str, str, str]] = []
+    original = ansich_sql.SqlAnsichBackend._refresh_usage_summary
+
+    async def _patched(session, *, task_id, dimension, aggregation_scope, updated_at):
+        recorded.append((task_id, dimension, aggregation_scope))
+        return await original(
+            session,
+            task_id=task_id,
+            dimension=dimension,
+            aggregation_scope=aggregation_scope,
+            updated_at=updated_at,
+        )
+
+    monkeypatch.setattr(ansich_sql.SqlAnsichBackend, "_refresh_usage_summary", staticmethod(_patched))
+    return recorded
+
+
+async def _add_unsorted_ancestors(session_factory, descendant_task_id: str) -> tuple[str, ...]:
+    """Give one Task three ancestors, stored in deliberately unsorted order.
+
+    Insertion order is what an unordered SQLite select returns, so a fan-out
+    that walks the ancestry read as it arrives produces ``z, a, m`` here. No
+    matching ``ansich_tasks`` rows are created: this suite's engines run without
+    ``PRAGMA foreign_keys``, and the fan-out reads only the ancestry table.
+    """
+
+    ancestors = ("zzz-ancestor", "aaa-ancestor", "mmm-ancestor")
+    async with session_factory() as session, session.begin():
+        for depth, ancestor_task_id in enumerate(ancestors, start=1):
+            session.add(
+                AnsichTaskAncestryRow(
+                    ancestor_task_id=ancestor_task_id,
+                    descendant_task_id=descendant_task_id,
+                    depth=depth,
+                    established_obs_id=new_id(),
+                )
+            )
+    return ancestors
+
+
+@pytest.mark.anyio
+async def test_usage_fan_out_locks_its_targets_in_a_worker_independent_order(tmp_path, monkeypatch):
+    """Ancestry order must not decide lock order (PG deadlock window).
+
+    Before the summary lock was explicit its row lock came from the flush,
+    where SQLAlchemy's unit of work orders writes by mapper and primary key --
+    worker-independent for free. An explicit ``FOR UPDATE`` takes it in
+    traversal order instead, so two workers fanning out over overlapping
+    ancestor sets could take the same rows in opposite orders and deadlock.
+    """
+
+    async with _representative_state(tmp_path, "rollup-fanout-order") as (service, task_id, budget):
+        session_factory = service._backend._session_factory
+        await _add_unsorted_ancestors(session_factory, task_id)
+        recorded = _record_summary_refreshes(monkeypatch)
+        attempt_id = new_id()
+        with _record_statements() as statements:
+            service.record_batch(
+                (
+                    ObservationEnvelope(
+                        kind="llm.requested",
+                        occurred_at=_OCCURRED_AT + timedelta(seconds=3),
+                        task_id=task_id,
+                        subject_type="llm_attempt",
+                        subject_id=attempt_id,
+                        producer=_PRODUCER,
+                        source_event_id=f"attempt:{attempt_id}:requested",
+                        correlation_id=task_id,
+                        payload={
+                            "attempt_no": 1,
+                            "actor_kind": "system_operation",
+                            "operation_id": new_id(),
+                            "operation_kind": "other",
+                        },
+                    ),
+                    ObservationEnvelope(
+                        kind="llm.responded",
+                        occurred_at=_OCCURRED_AT + timedelta(seconds=4),
+                        task_id=task_id,
+                        subject_type="llm_attempt",
+                        subject_id=attempt_id,
+                        producer=_PRODUCER,
+                        source_event_id=f"attempt:{attempt_id}:responded",
+                        correlation_id=task_id,
+                        payload={"attempt_no": 1, "latency_ms": 20, "usage": {"total_tokens": 7}},
+                    ),
+                )
+            )
+            await service.flush_task(task_id)
+
+    first_touch: list[str] = []
+    for target_task_id, _dimension, _scope in recorded:
+        if target_task_id not in first_touch:
+            first_touch.append(target_task_id)
+    assert len(first_touch) == 4, recorded
+    assert first_touch == sorted(first_touch), recorded
+    # The ancestry read itself is ordered, so the traversal it feeds is a
+    # function of the ids rather than of storage order.
+    ancestry_reads = [item for item in statements if item.touches("ansich_task_ancestry")]
+    assert ancestry_reads, [item.sql for item in statements]
+    assert any("order by ansich_task_ancestry.ancestor_task_id" in item.sql for item in ancestry_reads), [item.sql for item in ancestry_reads]
+
+
+@pytest.mark.anyio
+async def test_spawn_backfill_refreshes_summaries_in_a_worker_independent_order(tmp_path, monkeypatch):
+    """A `set` iterates in hash order, which differs between processes.
+
+    Hash order is stable within one process but not across them (string hashing
+    is seeded per interpreter), so the pre-fix iteration satisfied the sorted
+    assertion below only by coincidence -- a different coincidence per run.
+    """
+
+    async with _representative_state(tmp_path, "rollup-backfill-order") as (service, task_id, budget):
+        backend = service._backend
+        await service.stop()
+        ancestors = ("zzz-ancestor", "aaa-ancestor", "mmm-ancestor")
+        recorded = _record_summary_refreshes(monkeypatch)
+        async with backend._session_factory() as session, session.begin():
+            await backend._backfill_spawn_usage(
+                session,
+                ancestor_task_ids=ancestors,
+                descendant_task_ids=(task_id,),
+                updated_at=_ASSESSED_AT,
+            )
+
+    assert len(recorded) >= 4, recorded
+    assert all(scope == "inclusive" for _task, _dimension, scope in recorded), recorded
+    pairs = [(target, dimension) for target, dimension, _scope in recorded]
+    assert pairs == sorted(pairs), pairs
+
+
+# --------------------------------------------------------------------------
 # (c) First-writer race: ON CONFLICT DO NOTHING, then re-read
 # --------------------------------------------------------------------------
 
@@ -567,19 +714,11 @@ class _RecordingSession:
         return type("_Result", (), {"scalar_one_or_none": staticmethod(lambda: "inserted")})()
 
 
-@pytest.mark.anyio
-async def test_first_write_upsert_renders_on_conflict_on_postgresql_as_well():
-    """The branch every other test here cannot reach.
-
-    The whole suite runs on SQLite, so the ``postgresql_insert`` half of
-    ``_insert_ignoring_conflict`` is never executed by it -- and PostgreSQL is
-    the only dialect where the race it closes is real. This pins the dispatch
-    and the rendered conflict target without a server.
-    """
-
-    session = _RecordingSession("postgresql")
-    won = await ansich_sql._insert_ignoring_conflict(
-        session,
+#: Every ``_insert_ignoring_conflict`` call site in ``sql.py``, as
+#: ``(model, values, index_elements, returning column)``. Kept as data so the
+#: PostgreSQL rendering of each is compiled rather than hand-verified.
+_FIRST_WRITE_UPSERTS = (
+    (
         AnsichTaskUsageRow,
         {
             "task_id": "task",
@@ -590,15 +729,56 @@ async def test_first_write_upsert_renders_on_conflict_on_postgresql_as_well():
             "complete_through_ingest_seq": 1,
             "updated_at": _OCCURRED_AT,
         },
-        index_elements=["task_id", "dimension", "aggregation_scope"],
-        returning=AnsichTaskUsageRow.task_id,
+        ["task_id", "dimension", "aggregation_scope"],
+        AnsichTaskUsageRow.task_id,
+    ),
+    (
+        AnsichActiveTaskReadModelRow,
+        {"task_id": "task", "run_id": "run", "source_kind": "deerflow_run"},
+        ["task_id"],
+        AnsichActiveTaskReadModelRow.task_id,
+    ),
+    (
+        AnsichEntityRow,
+        {"entity_id": "obs", "entity_type": "task_budget", "discovered_obs_id": "obs"},
+        ["entity_id"],
+        AnsichEntityRow.entity_id,
+    ),
+    (
+        AnsichTaskBudgetRow,
+        {"entity_id": "obs", "task_id": "task", "dimension": "total_tokens"},
+        ["entity_id"],
+        AnsichTaskBudgetRow.entity_id,
+    ),
+)
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize(("model", "values", "index_elements", "returning"), _FIRST_WRITE_UPSERTS, ids=lambda item: getattr(item, "__tablename__", ""))
+async def test_first_write_upsert_renders_on_conflict_on_postgresql_as_well(model, values, index_elements, returning):
+    """The branch every other test here cannot reach.
+
+    The whole suite runs on SQLite, so the ``postgresql_insert`` half of
+    ``_insert_ignoring_conflict`` is never executed by it -- and PostgreSQL is
+    the only dialect where the race it closes is real. Every call site is
+    compiled here rather than one representative, so a conflict target that is
+    wrong for a particular table cannot hide behind a sibling that is right.
+    """
+
+    session = _RecordingSession("postgresql")
+    won = await ansich_sql._insert_ignoring_conflict(
+        session,
+        model,
+        values,
+        index_elements=index_elements,
+        returning=returning,
     )
 
     assert won is True
     compiled = " ".join(str(session.statements[0].compile(dialect=postgresql.dialect())).split()).lower()
-    assert compiled.startswith("insert into ansich_task_usage")
-    assert "on conflict (task_id, dimension, aggregation_scope) do nothing" in compiled
-    assert compiled.endswith("returning ansich_task_usage.task_id")
+    assert compiled.startswith(f"insert into {model.__tablename__}")
+    assert f"on conflict ({', '.join(index_elements)}) do nothing" in compiled
+    assert compiled.endswith(f"returning {model.__tablename__}.{returning.key}")
 
 
 @pytest.mark.anyio

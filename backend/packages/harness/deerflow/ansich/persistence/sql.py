@@ -6292,9 +6292,14 @@ class SqlAnsichBackend:
             # below ("has anything changed?") is what an interleaved peer can
             # invalidate, leaving `updated_at` describing a value the row no
             # longer holds. Locking first is what makes the compare-and-write
-            # of each row atomic. Ordered by `task_id` so two ticks holding
-            # overlapping row sets take them in the same order and cannot
-            # deadlock.
+            # of each row atomic. Ordered by `task_id` so two ticks acquire
+            # THIS set in the same order — that is the whole claim, and it is
+            # narrower than "these two ticks cannot deadlock": the DELETE below
+            # takes locks on the complementary set in an order nothing here
+            # specifies, and two ticks with different `running_task_ids`
+            # snapshots can cross-hold across the two sets. That shape predates
+            # this change and is not made worse by it; ordering the FOR UPDATE
+            # set is what this lock owns.
             #
             # Honest residual, deliberately not fixed here: every input above
             # was read in *earlier, already-committed* sessions, so this lock
@@ -7655,7 +7660,13 @@ class SqlAnsichBackend:
                 )
                 if inserted:
                     changed.add((ancestor_task_id, row.dimension))
-        for aggregate_task_id, dimension in changed:
+        # `sorted`, not bare set iteration: `_refresh_usage_summary` takes a
+        # FOR UPDATE on each summary row, and a `set` of strings iterates in
+        # hash order — which differs between processes, so two workers whose
+        # `changed` sets overlap would take the same rows in opposite orders
+        # and deadlock on PostgreSQL. Same lock-ordering rule as `_project_usage`'s
+        # sorted `targets`; T9's tier is where a crossed order aborts for real.
+        for aggregate_task_id, dimension in sorted(changed):
             await self._refresh_usage_summary(
                 session,
                 task_id=aggregate_task_id,
@@ -8104,8 +8115,32 @@ class SqlAnsichBackend:
                 if existing_tool_contribution is not None:
                     continue
             high_water = observation.kind in HIGH_WATER_USAGE_KINDS and contribution.dimension in MAX_TYPE_USAGE_DIMENSIONS
-            ancestor_ids = tuple((await session.execute(select(AnsichTaskAncestryRow.ancestor_task_id).where(AnsichTaskAncestryRow.descendant_task_id == contribution.source_task_id))).scalars())
-            targets = (contribution.source_task_id, *ancestor_ids)
+            # Lock ORDER, not just lock presence. Every target below is locked
+            # by row: the contribution row (`_upsert_high_water_contribution`)
+            # and, since the F10-6/F10-20 收口, the usage summary
+            # (`_refresh_usage_summary`). Two workers fanning out over
+            # overlapping ancestor sets therefore have to take those rows in
+            # the SAME order or PostgreSQL aborts one of them as a deadlock.
+            # Before the summary lock became an explicit FOR UPDATE its row
+            # lock was taken at flush time, where SQLAlchemy's unit of work
+            # orders writes by mapper and primary key — worker-independent for
+            # free. Making the lock explicit moved it into *traversal* order,
+            # so the ordering has to be restored deliberately.
+            #
+            # Sorting the whole tuple, not just the ancestry read: source-first
+            # is not a total order. A worker fanning out for an ancestor starts
+            # at that ancestor, while a worker fanning out for its descendant
+            # reaches the same row in sorted position, so the two cross on any
+            # ancestor that sorts below it. Reduction order does not affect the
+            # result — each target owns an independent contribution row and
+            # summary — so a total order costs nothing. Same reason
+            # `_refresh_active_task_read_model` orders its locked set and
+            # `_backfill_spawn_usage` sorts `changed`.
+            # A crossed order surfaces as a real abort only on PostgreSQL:
+            # T9's two-worker tier, tests/integration/test_postgres_multiworker.py.
+            ancestry_statement = select(AnsichTaskAncestryRow.ancestor_task_id).where(AnsichTaskAncestryRow.descendant_task_id == contribution.source_task_id).order_by(AnsichTaskAncestryRow.ancestor_task_id)
+            ancestor_ids = tuple((await session.execute(ancestry_statement)).scalars())
+            targets = tuple(sorted((contribution.source_task_id, *ancestor_ids)))
             for aggregate_task_id in targets:
                 inserted = await self._store_usage_contribution(
                     session,
