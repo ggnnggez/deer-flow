@@ -472,7 +472,10 @@ child row; Ansich SQL tests that cover this path must enable
 whose payload was externalized keeps `payload_json IS NULL`, so a reader that
 validates a stored payload has to hydrate it back from `ansich_payloads`
 first — validating the column directly hands the model a `None`. The projection
-claim does this, and so does the scope-safety assessor's evidence read
+claim does this for every kind **except** `environment.sampled` (it builds the
+envelope before hydrating, so an externalized environment sample fails the
+claim itself and its projection job goes durably failed — F10-29's most severe
+instance), and so does the scope-safety assessor's evidence read
 (`_assess_scope_safety_at` via `_hydrated_observation_payload`, F10-23); a
 payload row that has gone missing raises on both paths rather than degrading to
 an empty dict, because an empty payload validates into a *different* verdict and

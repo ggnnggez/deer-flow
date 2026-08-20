@@ -391,7 +391,7 @@
 ## F10-30. settle-budget flake 家族(与 F10-10 明确分开)
 
 - 状态:⬜ 未修复(测试侧;生产行为是 fail-open 预算语义,非 bug)。来源:P11-B 批 T2-T4 的争用复测逐步识别,T4 修复轮定名。
-- 成员(全部 `terminal_flush_timeout_ms=100` 构造、24-hog 争用下 3/3 全红、修改前后两侧一致):
+- 成员(全部 `terminal_flush_timeout_ms=100` 构造、24-hog 争用下全红——成员 1/2 两侧各 3/3 且文本一致,成员 3 一侧 3/3、另一侧存档 2 轮):
   1. `test_externalized_scope_authorization_and_effect_payloads_read_back`(:1195,`stored_payload_state == {}`——flush 预算内没写完);
   2. `test_scope_safety_dependency_wait_crosses_deadline_into_failed_job_and_retry`(:514,`NoneType.job_id`——作业未建);
   3. `test_scope_safety_waits_for_subject_entity_then_self_heals`(同型)。
