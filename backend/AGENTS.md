@@ -468,7 +468,15 @@ SQLite production connections enforce foreign keys, so typed child projections
 must flush their `ansich_entities` parent before an autoflush can insert the
 child row; Ansich SQL tests that cover this path must enable
 `PRAGMA foreign_keys=ON`. Externalized Observation payloads likewise flush their
-`ansich_payloads` parent before inserting the referencing Observation.
+`ansich_payloads` parent before inserting the referencing Observation. A row
+whose payload was externalized keeps `payload_json IS NULL`, so **every** reader
+that validates a stored payload has to hydrate it back from `ansich_payloads`
+first — validating the column directly hands the model a `None`. The projection
+claim does this, and so does the scope-safety assessor's evidence read
+(`_assess_scope_safety_at` via `_hydrated_observation_payload`, F10-23); a
+payload row that has gone missing raises on both paths rather than degrading to
+an empty dict, because an empty payload validates into a *different* verdict and
+would fabricate a conclusion instead of reporting unreadable evidence.
 Task-summary assertion pointers are nullable with `ON DELETE SET NULL`, so a
 missing derived assertion preserves the paginated Task row and marks it
 degraded instead of violating the FK or deleting the summary. Persisted
@@ -897,7 +905,17 @@ an `obs_id` this process owns (one collector per Gateway worker, one shared
 database), which is why no route resolves an arbitrary id through it; a
 `GATEWAY_WORKERS > 1` deployment that wanted one would need a different last
 rung. A replayed intake returns the stored Observation id with
-`idempotent_replay=true`. `GET /evaluations/{obs_id}/payload` is the only
+`idempotent_replay=true` — and that replay lookup is a *read*, so it sits
+outside everything the write side has for an outage. When storage cannot answer
+it, the backend raises `ansich.errors.StorageUnavailableError` (a
+dependency-free type defined at the package boundary so the driver's exception
+tree never leaves the adapter) and `POST /evaluations` maps it to its existing
+503 through an explicit clause. The receipt vocabulary is deliberately
+unchanged: it is **not** answered `failed` — that would report ignorance ("I
+cannot tell whether this is a replay") as knowledge ("it is lost") — the error
+is **not** swallowed so the write can proceed, which would skip the dedupe and
+mint a phantom receipt id, and no fourth `EvaluationProjectionStatus` value
+exists for it (F10-25). `GET /evaluations/{obs_id}/payload` is the only
 read that returns `expected`/`actual`/`rationale`: admin-only, actor-logged,
 `Cache-Control: no-store`, and guarded on the Observation kind so it cannot
 become a generic payload reader.

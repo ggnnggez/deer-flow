@@ -28,6 +28,7 @@ from ansich.contracts import (
     TaskView,
     WriterHealth,
 )
+from ansich.errors import StorageUnavailableError
 from ansich.evaluation import (
     EVALUATION_OBSERVATION_KIND,
     QUALITY_DIMENSIONS,
@@ -170,6 +171,7 @@ __all__ = [
     "ResolvedBelief",
     "ScopeDescriptor",
     "ScoreScale",
+    "StorageUnavailableError",
     "TaskLifecycleScope",
     "TaskScopesView",
     "TaskScopeView",

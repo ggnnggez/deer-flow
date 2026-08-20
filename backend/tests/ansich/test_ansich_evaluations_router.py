@@ -12,6 +12,7 @@ from uuid import uuid4
 import pytest
 from _router_auth_helpers import make_authed_test_app
 from ansich import AnsichService, ObservationEnvelope, Producer, ToolEffect, new_id
+from ansich.errors import StorageUnavailableError
 from ansich.evaluation import EVALUATION_OBSERVATION_KIND
 from ansich.release import AgentRuntimeDescriptor, build_agent_release
 from httpx import ASGITransport, AsyncClient
@@ -23,6 +24,7 @@ from app.gateway.deps import snapshot_ansich_evaluation_settings
 from app.gateway.routers import ansich as ansich_router
 from deerflow.ansich import create_embedded_ansich_service, create_sql_ansich_service
 from deerflow.ansich.persistence.models import AnsichBeliefAssertionRow, AnsichObservationRow
+from deerflow.ansich.persistence.sql import SqlAnsichBackend
 from deerflow.config.ansich_config import AnsichConfig
 from deerflow.persistence.base import Base
 
@@ -431,6 +433,42 @@ async def test_post_evaluation_records_the_record_and_replays_the_idempotency_ke
     assert listed.status_code == 200
     assert [item["evaluation_obs_id"] for item in listed.json()["evaluations"]] == [first.json()["observation_id"]]
     assert listed.json()["evaluations"][0]["authority_class"] == "soft_human"
+
+
+@pytest.mark.anyio
+async def test_post_evaluation_answers_503_when_the_replay_lookup_hits_a_storage_outage(tmp_path, monkeypatch) -> None:
+    """F10-25: the named storage error lands on the route's existing 503 path.
+
+    The health probe ahead of it is process-local and still reports storage as
+    available, so ``_ensure_queryable`` cannot catch this — the outage is only
+    discovered by the read itself. What the route owes the caller is the same
+    503-with-``projection_status`` it already answers for a failed subject query,
+    reached through an explicit clause rather than the blanket
+    ``except Exception`` that would swallow a genuine bug into the same shape.
+    Nothing is recorded, so a retry is a first intake and not a replay.
+    """
+
+    task_id, run_id = new_id(), "eval-router-read-outage"
+
+    async def _refuse(self, source_event_id: str) -> str | None:
+        raise StorageUnavailableError("Ansich storage could not answer the evaluation replay lookup")
+
+    async with _evaluation_harness(tmp_path, "ansich-evaluations-read-outage.db") as harness:
+        harness.service.record(_task_created(task_id, run_id))
+        await harness.service.flush_task(task_id)
+
+        monkeypatch.setattr(SqlAnsichBackend, "find_evaluation_observation", _refuse)
+        posted = await harness.client.post(
+            "/api/ansich/evaluations",
+            headers={"Idempotency-Key": "eval-router-read-outage-1"},
+            json=_annotation_body(task_id),
+        )
+        monkeypatch.undo()
+        recorded = await harness.count_recorded_evaluations()
+
+    assert posted.status_code == 503
+    assert posted.json()["detail"]["projection_status"]["storage_available"] is True
+    assert recorded == 0
 
 
 @pytest.mark.anyio

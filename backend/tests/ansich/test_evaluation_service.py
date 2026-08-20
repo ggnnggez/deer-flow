@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import sqlite3
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from datetime import UTC, datetime, timedelta
@@ -19,6 +20,7 @@ from ansich import (
     build_evaluation_observation,
     new_id,
 )
+from ansich.errors import StorageUnavailableError
 from ansich.evaluation import (
     QUALITY_DIMENSIONS,
     UNASSESSED_SOURCE,
@@ -35,6 +37,7 @@ from ansich.quality import (
 from ansich.release import AgentRuntimeDescriptor, RuntimeBuildDescriptor, build_agent_release
 from pydantic import ValidationError
 from sqlalchemy import event, func, select
+from sqlalchemy.exc import OperationalError
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 
 from deerflow.ansich import create_embedded_ansich_service, create_sql_ansich_service
@@ -246,10 +249,53 @@ def _producer(name: str = "ansich-evaluation-api") -> Producer:
     return Producer(name=name, version="1", instance_id="gateway")
 
 
+class _ReadOutage:
+    """A session factory whose *next* session refuses to open, exactly once.
+
+    The write-scoped ``_StorageFault`` in ``test_write_resilience_integration``
+    deliberately leaves reads alone (a fault that took the reads down made every
+    write assertion unanswerable). F10-25 is the other half: the read that
+    ``record_evaluation`` does *first*, before anything is queued.
+
+    Arming for one session is what makes the landing site exact. The arm is
+    synchronous, and the replay lookup raises inside ``__aenter__`` before its
+    first suspension point, so no other coroutine can run in between and take
+    the refusal instead.
+    """
+
+    def __init__(self, session_factory: async_sessionmaker[AsyncSession]) -> None:
+        self._session_factory = session_factory
+        self.armed = False
+        self.refusal_count = 0
+
+    def __call__(self):
+        if not self.armed:
+            return self._session_factory()
+        self.armed = False
+        self.refusal_count += 1
+        return _RefusedSession()
+
+
+class _RefusedSession:
+    """What opening a session against a locked database raises."""
+
+    async def __aenter__(self):
+        raise OperationalError(
+            "SELECT ansich_observations.obs_id",
+            {},
+            sqlite3.OperationalError("database is locked"),
+        )
+
+    async def __aexit__(self, *exc_info) -> bool:
+        return False
+
+
 @asynccontextmanager
 async def _evaluation_service(
     tmp_path: Path,
     database_name: str,
+    *,
+    wrap_session_factory=None,
     **overrides: object,
 ) -> AsyncIterator[tuple[AnsichService, async_sessionmaker[AsyncSession]]]:
     engine = create_async_engine(
@@ -273,7 +319,8 @@ async def _evaluation_service(
         "operations_assessment_interval_ms": 60_000,
     }
     settings.update(overrides)
-    service = create_sql_ansich_service(session_factory, **settings)
+    backend_factory = session_factory if wrap_session_factory is None else wrap_session_factory(session_factory)
+    service = create_sql_ansich_service(backend_factory, **settings)
     await service.start()
     try:
         yield service, session_factory
@@ -430,6 +477,74 @@ async def test_record_evaluation_replays_a_known_source_event_id(tmp_path) -> No
     assert second.projection_status == "applied"
     assert observation_count == 1
     assert index_count == 1
+
+
+@pytest.mark.anyio
+async def test_a_storage_outage_on_the_replay_lookup_raises_a_typed_error(tmp_path) -> None:
+    """F10-25: the replay lookup answers with a named error, not a driver one.
+
+    ``record_evaluation``'s first act is a read — "have I seen this intake
+    identity before?" — and that read had no guard: an outage covering it threw
+    ``sqlalchemy.exc.OperationalError`` straight through the ``ansich`` package
+    boundary at the caller, so RA6's whole receipt ladder was unreachable and
+    the caller had to know SQLAlchemy to recognize the condition.
+
+    The three options the reviewer weighed, and why this is the one:
+
+    * **Not** ``failed``. ``failed`` means "I know it is gone"; here the truth
+      is "I do not know whether this is a replay". Reporting ignorance as
+      knowledge is the worse lie, and no fourth
+      ``EvaluationProjectionStatus`` value is minted for it either.
+    * **Not** swallow-and-record. Skipping the dedupe would record the same
+      evaluation twice and hand back a receipt pointing at the second one — a
+      phantom id — which is the worst of the three.
+    * A typed error at the boundary, which the route already maps to its 503.
+
+    So the receipt semantics are unchanged, and the outage costs the caller a
+    retry rather than a wrong answer: nothing is recorded, and the retry after
+    the outage is a first intake, not a replay.
+    """
+
+    task_id, run_id = new_id(), "eval-service-read-outage"
+    record = _benchmark(task_id)
+    outage: _ReadOutage | None = None
+
+    def _wrap(session_factory: async_sessionmaker[AsyncSession]) -> _ReadOutage:
+        nonlocal outage
+        outage = _ReadOutage(session_factory)
+        return outage
+
+    async with _evaluation_service(
+        tmp_path,
+        "ansich-evaluation-read-outage.db",
+        wrap_session_factory=_wrap,
+        # Quiet the polling loops so the armed refusal cannot be spent by a
+        # background session opened between the arm and the call under test.
+        projector_poll_interval_ms=60_000,
+    ) as (service, session_factory):
+        service.record(_task_created(task_id, run_id))
+        await service.flush_task(task_id)
+
+        assert outage is not None
+        outage.armed = True
+        with pytest.raises(StorageUnavailableError):
+            await service.record_evaluation(record, source_event_id=None, producer=_producer())
+
+        async with session_factory() as session:
+            during_outage = await session.scalar(select(func.count()).select_from(AnsichObservationRow).where(AnsichObservationRow.kind == "evaluation.recorded"))
+
+        # Storage answers again: the same intake identity records once, as a
+        # first intake -- the failed lookup minted no Observation to replay onto.
+        healed = await service.record_evaluation(record, source_event_id=None, producer=_producer())
+
+        async with session_factory() as session:
+            after_recovery = await session.scalar(select(func.count()).select_from(AnsichObservationRow).where(AnsichObservationRow.kind == "evaluation.recorded"))
+
+    assert outage.refusal_count == 1
+    assert during_outage == 0
+    assert healed.idempotent_replay is False
+    assert healed.projection_status == "applied"
+    assert after_recovery == 1
 
 
 @pytest.mark.anyio

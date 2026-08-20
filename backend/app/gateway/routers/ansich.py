@@ -11,6 +11,7 @@ from typing import Literal
 from ansich.alerts import AlertWorkflowConflict
 from ansich.contracts import ControlValue, NamedVersion, Producer, TaskLifecycleScope
 from ansich.credentials import contains_credential_like_material
+from ansich.errors import StorageUnavailableError
 from ansich.evaluation import (
     EvaluationDimension,
     EvaluationKind,
@@ -1549,6 +1550,21 @@ async def record_evaluation(
         )
     except ValueError as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
+    except StorageUnavailableError as exc:
+        # The replay lookup could not be answered, so the contract deliberately
+        # refuses to guess (F10-25): it neither calls the evaluation `failed` --
+        # that would report ignorance as knowledge -- nor skips the dedupe and
+        # records a second Observation. `_ensure_queryable` above cannot see
+        # this: its health read is process-local and still says storage is
+        # available. The clause is explicit so this stays the *named* condition
+        # rather than sharing a mapping with any unexpected failure below.
+        raise HTTPException(
+            status_code=503,
+            detail={
+                "message": "Ansich storage is unavailable",
+                "projection_status": _projection_status(service),
+            },
+        ) from exc
     except Exception as exc:
         raise HTTPException(
             status_code=503,

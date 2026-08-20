@@ -30,9 +30,9 @@
 | F10-20 | `_refresh_usage_summary` 仍是未加锁的全量重算+无条件赋值——F10-6 的同族问题,就在本批加锁那一层的上面 | ⬜ 未修复 | — | — |
 | F10-21 | 生产路径的 effect 恒 `scope_id=None`,`attempted_/realized_scope_violation` 两类结论在生产上不可达 | ⬜ 未修复 | — | — |
 | F10-22 | `sudo`/`env`/`timeout` 等包装命令下的 effect 分类未裁定,`sudo rm -rf` 目前落回 `process_execute` | ⬜ 未修复 | — | — |
-| F10-23 | `_assess_scope_safety_at` 直接校验原始行的 `payload_json`、不 hydrate externalized payload,externalized 的 `authorization.*`/`effect.*` 证据会把 assessor job 打成 durable failed(F10-8 同一危害类的 assessor 侧兄弟,既存) | ⬜ 未修复 | — | — |
+| F10-23 | `_assess_scope_safety_at` 直接校验原始行的 `payload_json`、不 hydrate externalized payload,externalized 的 `authorization.*`/`effect.*` 证据会把 assessor job 打成 durable failed(F10-8 同一危害类的 assessor 侧兄弟,既存) | ✅ 已修复 | 2026-08-21 | 本次变更 |
 | F10-24 | `budget_health:*` 有两个生产写者,`asserted_at` 决胜在模拟事件钟与真实 ingest 墙钟之间比较——证据序已由 `order_wall_time_evidence` 收敛(`ae731b18`),但**断言结构形状**(`as_of_known` vs `enforcement`/`shadow`)仍随决胜漂移 | ⬜ 未修复(证据序半已修) | — | `ae731b18` |
-| F10-25 | `record_evaluation` 的重放查询无守卫:存储不可用时 `OperationalError` 直接抛给调用方,RA6 回执阶梯整条不可达(既存,自 `c1349843`) | ⬜ 未修复 | — | — |
+| F10-25 | `record_evaluation` 的重放查询无守卫:存储不可用时 `OperationalError` 直接抛给调用方,RA6 回执阶梯整条不可达(既存,自 `c1349843`) | ✅ 已修复 | 2026-08-21 | 本次变更 |
 | F10-26 | rebuild 完整性:`rebuild_projections()` 可能在依赖延迟的 job 尚未结算时就以「首轮空扫」宣告完成(本批四次目击) | ⬜ 未修复 | — | — |
 | F10-27 | 装配不对称:`create_embedded_ansich_service` 的无存储分支漏传三个 knob;`operations_assessment_interval_ms` 至今没有 `AnsichConfig` 字段,生产恒为 1000ms | ⬜ 未修复 | — | — |
 | F10-28 | 健康线的两处 UI 级留观:中性线态(phase/unknown)的**渲染层**零覆盖(图标三元式曾在本批被反转过);task 作用域在系统 phase 期间仍称「本任务数据完整」 | ⬜ 未修复 | — | — |
@@ -279,7 +279,12 @@
 
 ## F10-23. assessor 读证据时不 hydrate externalized payload
 
-- 状态:⬜ 未修复。来源:Phase 11 前加固批的**批终审**(不是 Phase 10 终审)。经核实是**既存缺陷**——在该批的基线 `38767157` 上已经是这个形状,非本批引入。
+- 状态:✅ 已修复(2026-08-21,P11-B Task 4,本次变更待提交)。取的是方向 (a):`_assess_scope_safety_at` 的两处 `model_validate` 前先过新的 `SqlAnsichBackend._hydrated_observation_payload`,它按 `_claim_projection_job` 认领时那条 payload-store 读路径的同一形状把 `ansich_payloads` 读回来。三个细节值得记:
+  - **hydrate 挪到了两个 kind 分支里面**,不是循环开头。`affected` 过滤仍然读裸 `row.payload_json`(`_scope_safety_evidence_subject` 的契约就是「便宜地读、读不到返回 None」),所以 externalized 行照旧不被跳过、照旧被完整判一遍——保守方向不变,只是这一遍现在读得到证据了。PB5 的 `effective_watermark` 算术一个字没动。
+  - **payload 行真的不见了就抛**,不降级成空 dict:空 payload 会校验成**另一个结论**,静默会伪造一条判断,而不是报告证据读不出来。与认领路径的 `RuntimeError("Ansich payload disappeared")` 同一取舍。
+  - **红先证据**:`inline_payload_max_bytes=16` 逼出 externalize 后,一次 `assess_operations` 就在 `ansich_assessor_errors` 里留下一条 `ValidationError`(非依赖类异常,`durable_failure=True`,第一次尝试就写错误行),该 ToolCall 的 `scope_safety:*` 断言为 **0** 条。修复后错误行 0 条、job 全 `completed`、断言 4 条。
+- 回归钉子(两条,`backend/tests/ansich/test_sql_safety.py`):`test_externalized_authorization_and_effect_evidence_does_not_fail_the_assessor_job`(先断言四条证据行确实是 `payload_json IS NULL AND payload_ref_id IS NOT NULL`,再断言零错误行、job 全 `completed`、结论非空)与 `test_externalized_evidence_reaches_the_same_scope_safety_conclusions_as_inline`(同一份 fixture 跑两遍、只换阈值,断言 `scope_safety:*` 断言值与 `ansich_scope_conclusions` 的 kind 集合逐字相同)。**第二条是必要的**:只断言「不产失败作业」的话,一个「读不到就跳过」的守卫也能绿,而它会拿被截断的证据去判同一个 ToolCall。
+- 未一并处理(明确记下,不要读成已清零):`_scope_safety_evidence_subject` 仍然对 externalized 行返回 `None`,于是 `_scope_safety_tool_calls_in_window` 仍然退回全扫。这是**保守且正确**的方向(全扫只会多判,不会少判),代价是 externalized 证据在场时增量窗口失效;真要收窄得让那个「便宜地读」的契约本身能 hydrate,那是一次独立裁决。同一危害类里 `environment.sampled` 还有一条**更硬**的兄弟:`contracts.py` 的该分支写的是 `if self.payload is None: raise`,externalized 的环境采样连读回来都不行——尚未登记,发现于本次巡查。
 - 位置:`backend/packages/harness/deerflow/ansich/persistence/sql.py::_assess_scope_safety_at`(sql.py:1873-1884)。
 - 现状:该函数直接取 observation 行的 `row.payload_json or {}`,随后 `AuthorizationSnapshot.model_validate(payload.get("snapshot"))` / `ToolEffect.model_validate(payload.get("effect"))`,**中间没有任何 `ansich_payloads` 的 hydrate 步骤**。一条走了 externalize 的 `authorization.*`/`effect.*` observation 在库里就是 `payload_json IS NULL`,于是这里拿到 `None`,`model_validate` 直接抛 `ValidationError`。F10-8 修的是**投影认领**那一侧(`contracts.py` 的 envelope 校验器,contracts.py:243-278),这条 assessor 侧的原始行读取是同一危害类下另一条独立的、仍然敞开的兄弟。
 - 出错方向(诚实但吵闹的那个):assessor job 按非依赖类异常耗尽 attempts,转成 durable `failed` 并进入 failed-job 诊断面;**不会**产出被伪造的 scope-safety 结论,fail-open 也保持——业务执行不受影响。真实代价是该 ToolCall 的 safety 姿态从「unknown / 未评估」退化成一条需要运维处理的失败作业——且影响面不止这一条 ToolCall:失败的评估会回滚水位推进,`affected` 过滤器也跳不过读不出的行(`_scope_safety_evidence_subject` 对 externalized 行返回 `None`),毒行因此落进之后每一个评估窗口,该 **Task** 的 scope-safety 评估整体停摆,直到失败作业被处理。
@@ -310,7 +315,13 @@
 
 ## F10-25. `record_evaluation` 的重放查询无守卫
 
-- 状态:⬜ 未修复。来源:P11-A 批 Task 8(写侧故障注入验收)的**实测**,修法建议由该 task 的复审给出。经核实是**既存缺陷**——自 `c1349843` 起就是这个形状,非本批引入,本批也按指令只登记不修。
+- 状态:✅ 已修复(2026-08-21,P11-B Task 4,本次变更待提交)。照复审建议原样落地,三处:
+  - **类型**:新文件 `backend/packages/ansich/ansich/errors.py::StorageUnavailableError`。零依赖(不进 pydantic、不进 SQLAlchemy)——这正是它存在的理由:适配器可以 import 驱动的异常树,但**放出包边界的**必须是每个调用方都能指名的东西。
+  - **转译**:`sql.py::find_evaluation_observation` 把 `DBAPIError` 转成它。抓 `DBAPIError` 而不是 `OperationalError`,是因为「数据库不在」在不同驱动下的拼法不止一种——`OperationalError`、`InterfaceError` 等都是 `DBAPIError` 的子类,抓窄了就会漏一种拼法未经转译地跑出包边界。**只包这一条读**:其余读路径已由路由的 `_ensure_queryable` 答 503,不在本条范围内。
+  - **映射**:`app/gateway/routers/ansich.py::record_evaluation` 在既有的 `except Exception → 503` **之前**加一条显式 `except StorageUnavailableError → 503`(带 `projection_status`)。状态码没变,变的是这条 503 现在是**具名条件**而不是与任何意外故障共用一个兜底。注意 `_ensure_queryable` 抓不到它:那次健康读是进程本地的、此刻仍报 `storage_available=True`,故障只有那次读自己才发现得了。
+  - **回执语义一字未改**:不答 `failed`(那是「知道它丢了」,这里是「不知道是不是重放」),不吞异常照常记录(去重被跳过会铸出幻影回执 id),也没有新增第四个 `EvaluationProjectionStatus` 取值。代价是调用方要重试一次,换掉的是一个错误答案。
+- 回归钉子(两条):`backend/tests/ansich/test_evaluation_service.py::test_a_storage_outage_on_the_replay_lookup_raises_a_typed_error`——新的 `_ReadOutage` 只让**下一次**开 session 失败一次(P11-A 的 `_StorageFault` 是写侧的,故意不碰读),因为 arm 是同步的、重放查询在第一个挂起点之前就抛,所以落点是确定的;它同时断言故障期间**零 Observation 落库**、痊愈后同一 intake 身份是 `idempotent_replay=False` 的首次入库(证明失败的那次查询没有铸出任何可被重放的东西)。`backend/tests/ansich/test_ansich_evaluations_router.py::test_post_evaluation_answers_503_when_the_replay_lookup_hits_a_storage_outage`——HTTP 侧钉 503 + `projection_status`(且 `storage_available` 仍为 `true`,把「健康读看不见这次故障」也钉住)。RED 证据:修复前 `record_evaluation` 抛的是 `sqlalchemy.exc.OperationalError`,栈顶正是诊断记录的 `sql.py` 的 `async with self._session_factory() as session:` 那一行。
+- 来源:P11-A 批 Task 8(写侧故障注入验收)的**实测**,修法建议由该 task 的复审给出。经核实是**既存缺陷**——自 `c1349843` 起就是这个形状,非该批引入,该批按指令只登记不修。
 - 位置:`backend/packages/ansich/ansich/service.py::record_evaluation` 的第一步幂等查询 `find_evaluation_observation`,落到 `backend/packages/harness/deerflow/ansich/persistence/sql.py::find_evaluation_observation`。
 - 现状:`record_evaluation` 做的第一件事是按 `source_event_id` 查重放,而这次**读**没有任何守卫。存储在那一刻不可用(一次总体故障同时覆盖读)时,异常直接沿调用栈抛给调用方,而不是由 RA6 的回执阶梯答出一个终态。实测捕获(Task 8 的 tail-drop 场景**首轮死在这里**,不是死在断言上):
 

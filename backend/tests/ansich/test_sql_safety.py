@@ -3297,3 +3297,199 @@ async def test_the_mark_never_settles_below_what_an_earlier_evaluation_reached(t
                 pre_claim_watermark=None,
             )
         assert await _scope_safety_mark(workers.sessions, task_id) == 9
+
+
+async def _scope_safety_assessment_snapshot(
+    tmp_path,
+    *,
+    database_name: str,
+    label: str,
+    inline_payload_max_bytes: int,
+) -> dict[str, object]:
+    """Drive one whole scope-safety assessment and report what it produced.
+
+    Every knob but ``inline_payload_max_bytes`` is fixed, so two runs that
+    differ only in it differ only in *where the evidence lives* — inline in the
+    Observation row, or externalized into ``ansich_payloads`` with
+    ``payload_json IS NULL``. The conclusions are a pure function of the
+    evidence, so the two runs must agree; anything else means the assessor is
+    reading the storage layout rather than the evidence.
+    """
+
+    engine, session_factory = _scope_safety_service(tmp_path, database_name)
+    async with engine.begin() as connection:
+        await connection.run_sync(Base.metadata.create_all)
+    service = create_sql_ansich_service(
+        session_factory,
+        flush_interval_ms=60_000,
+        projector_poll_interval_ms=60_000,
+        operations_assessment_interval_ms=60_000,
+        inline_payload_max_bytes=inline_payload_max_bytes,
+    )
+    only_test_driven_assessments(service)
+    await service.start()
+    task_id, step_id, tool_call_id = new_id(), new_id(), new_id()
+    observed_at = datetime(2026, 8, 20, 11, tzinfo=UTC)
+    producer = Producer(name="scope-safety-hydrate", version="1", instance_id="test")
+    try:
+        await _start_scope_safety_task(
+            service,
+            task_id=task_id,
+            step_id=step_id,
+            observed_at=observed_at,
+            producer=producer,
+            label=label,
+        )
+        service.record_batch(
+            _scope_safety_tool_call_batch(
+                task_id=task_id,
+                step_id=step_id,
+                tool_call_id=tool_call_id,
+                call_seq=1,
+                producer=producer,
+                observed_at=observed_at,
+                label=label,
+            )
+        )
+        await service.flush_task(task_id)
+        service.record_batch(
+            _scope_safety_evidence_batch(
+                task_id=task_id,
+                step_id=step_id,
+                tool_call_id=tool_call_id,
+                producer=producer,
+                observed_at=observed_at,
+                label=label,
+                with_observed_effect=True,
+            )
+        )
+        await service.flush_task(task_id)
+        await service.assess_operations(now=observed_at)
+
+        async with session_factory() as session:
+            evidence_rows = list(
+                (
+                    await session.execute(
+                        select(AnsichObservationRow)
+                        .where(
+                            AnsichObservationRow.task_id == task_id,
+                            AnsichObservationRow.kind.in_(
+                                (
+                                    "authorization.evaluated",
+                                    "authorization.allowed",
+                                    "effect.intended",
+                                    "effect.observed",
+                                )
+                            ),
+                        )
+                        .order_by(AnsichObservationRow.ingest_seq)
+                    )
+                ).scalars()
+            )
+            job_statuses = sorted(
+                (
+                    await session.execute(
+                        select(AnsichAssessorJobRow.status).where(
+                            AnsichAssessorJobRow.subject_id == task_id,
+                            AnsichAssessorJobRow.assessor_name == SCOPE_SAFETY_ASSESSOR.name,
+                        )
+                    )
+                ).scalars()
+            )
+            assessor_errors = sorted(
+                (await session.execute(select(AnsichAssessorErrorRow.error_type).join(AnsichAssessorJobRow, AnsichAssessorJobRow.job_id == AnsichAssessorErrorRow.job_id).where(AnsichAssessorJobRow.subject_id == task_id))).scalars()
+            )
+            conclusions = sorted(
+                (row.field_name, row.value_json["value"])
+                for row in (
+                    await session.execute(
+                        select(AnsichBeliefAssertionRow).where(
+                            AnsichBeliefAssertionRow.subject_id == tool_call_id,
+                            AnsichBeliefAssertionRow.field_name.like("scope_safety:%"),
+                        )
+                    )
+                ).scalars()
+            )
+            conclusion_kinds = sorted((await session.execute(select(AnsichScopeConclusionRow.conclusion_kind).where(AnsichScopeConclusionRow.tool_call_id == tool_call_id))).scalars())
+    finally:
+        await service.stop()
+        await engine.dispose()
+
+    return {
+        "externalized": tuple((row.kind, row.payload_json is None and row.payload_ref_id is not None) for row in evidence_rows),
+        "job_statuses": tuple(job_statuses),
+        "assessor_errors": tuple(assessor_errors),
+        "conclusions": tuple(conclusions),
+        "conclusion_kinds": tuple(conclusion_kinds),
+    }
+
+
+@pytest.mark.anyio
+async def test_externalized_authorization_and_effect_evidence_does_not_fail_the_assessor_job(tmp_path) -> None:
+    """F10-23: the assessor reads its evidence, not the row's storage layout.
+
+    ``_assess_scope_safety_at`` used to validate ``row.payload_json`` straight,
+    so an ``authorization.*``/``effect.*`` Observation whose payload had been
+    externalized handed ``model_validate`` a ``None`` and raised. That is a
+    non-dependency exception, so it burns an attempt, writes a durable assessor
+    error and eventually fails the job — and the damage is not confined to one
+    ToolCall: a failed evaluation rolls back the watermark advance, and the
+    ``affected`` filter cannot skip a row it cannot read, so the poison row
+    lands in every later window and the whole Task's scope-safety assessment
+    stalls until an operator clears the job.
+
+    ``inline_payload_max_bytes=16`` is what forces the externalization: both
+    payloads are small, which is why the default configuration almost never
+    reaches this shape (the same threshold F10-8's regression uses).
+    """
+
+    snapshot = await _scope_safety_assessment_snapshot(
+        tmp_path,
+        database_name="scope-safety-externalized-evidence.db",
+        label="hydrate-externalized",
+        inline_payload_max_bytes=16,
+    )
+
+    # The premise: every piece of evidence really is externalized.
+    assert snapshot["externalized"] == (
+        ("authorization.evaluated", True),
+        ("authorization.allowed", True),
+        ("effect.intended", True),
+        ("effect.observed", True),
+    )
+    # The regression itself: no error was charged and no job was left un-settled.
+    assert snapshot["assessor_errors"] == ()
+    assert set(snapshot["job_statuses"]) == {"completed"}
+    # And the assessment actually happened rather than quietly finding nothing.
+    assert snapshot["conclusions"] != ()
+
+
+@pytest.mark.anyio
+async def test_externalized_evidence_reaches_the_same_scope_safety_conclusions_as_inline(tmp_path) -> None:
+    """F10-23: hydrating restores the evidence, it does not approximate it.
+
+    Not failing the job is only half the fix — a guard that skipped the
+    unreadable row would satisfy the assertion above while silently judging the
+    ToolCall on a truncated prefix. The same fixture is therefore run twice with
+    only the externalization threshold swapped, and the conclusions must be
+    identical.
+    """
+
+    externalized = await _scope_safety_assessment_snapshot(
+        tmp_path,
+        database_name="scope-safety-parity-externalized.db",
+        label="hydrate-parity-externalized",
+        inline_payload_max_bytes=16,
+    )
+    inline = await _scope_safety_assessment_snapshot(
+        tmp_path,
+        database_name="scope-safety-parity-inline.db",
+        label="hydrate-parity-inline",
+        inline_payload_max_bytes=65_536,
+    )
+
+    assert all(externalized_flag for _, externalized_flag in externalized["externalized"])
+    assert not any(externalized_flag for _, externalized_flag in inline["externalized"])
+    assert externalized["conclusions"] == inline["conclusions"]
+    assert externalized["conclusion_kinds"] == inline["conclusion_kinds"]
+    assert externalized["assessor_errors"] == inline["assessor_errors"] == ()

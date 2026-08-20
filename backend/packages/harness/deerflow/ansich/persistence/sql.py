@@ -128,6 +128,7 @@ from ansich.environment import (
     assess_environment_leak,
     assess_environment_pressure,
 )
+from ansich.errors import StorageUnavailableError
 from ansich.evaluation import (
     EVALUATION_OBSERVATION_KIND,
     EvaluationProjectionStatus,
@@ -178,6 +179,7 @@ from ansich.usage import (
 from sqlalchemy import and_, case, delete, func, or_, select, text, update
 from sqlalchemy.dialects.postgresql import insert as postgresql_insert
 from sqlalchemy.dialects.sqlite import insert as sqlite_insert
+from sqlalchemy.exc import DBAPIError
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from sqlalchemy.orm import aliased
 
@@ -2336,6 +2338,39 @@ class SqlAnsichBackend:
             mark.updated_at = datetime.now(UTC)
 
     @staticmethod
+    async def _hydrated_observation_payload(
+        session: AsyncSession,
+        row: AnsichObservationRow,
+    ) -> dict:
+        """One Observation's payload, with an externalized one read back.
+
+        A payload over ``inline_payload_max_bytes`` is stored in
+        ``ansich_payloads`` and the row keeps ``payload_json IS NULL``, so a
+        reader that validates the column directly hands its model a ``None``.
+        Every other consumer of a stored payload already hydrates —
+        ``_claim_projection_job`` does it inside the claim, which is the shape
+        mirrored here; the assessor's raw-row read was the sibling F10-8 left
+        open (F10-23).
+
+        A payload row that has gone missing raises rather than degrading to an
+        empty dict, for the same reason the claim path raises: an empty payload
+        would validate into a *different* verdict, so silence would fabricate a
+        conclusion instead of reporting that the evidence cannot be read.
+        """
+
+        if row.payload_json is not None:
+            return row.payload_json
+        if row.payload_ref_id is None:
+            return {}
+        payload = await session.get(AnsichPayloadRow, row.payload_ref_id)
+        if payload is None:
+            raise RuntimeError(f"Ansich payload disappeared: {row.payload_ref_id}")
+        decoded = json.loads(payload.body.decode(payload.encoding))
+        if not isinstance(decoded, dict):
+            raise ValueError("Ansich observation payload must decode to an object")
+        return decoded
+
+    @staticmethod
     def _scope_safety_evidence_subject(row: AnsichObservationRow) -> str | None:
         """``tool_call_id`` an observation carries, read without validating it.
 
@@ -2447,16 +2482,17 @@ class SqlAnsichBackend:
         snapshots_by_tool: dict[str, dict[str, AuthorizationSnapshot]] = {}
         effects_by_tool: dict[str, dict[str, ToolEffect]] = {}
         for row in rows:
-            payload = row.payload_json or {}
             # A re-judged ToolCall still needs its complete evidence, so only
             # rows that positively belong to an unaffected ToolCall are skipped;
             # anything unreadable keeps the original validation behaviour.
             if affected is not None and (subject := self._scope_safety_evidence_subject(row)) is not None and subject not in affected:
                 continue
             if row.kind.startswith("authorization."):
+                payload = await self._hydrated_observation_payload(session, row)
                 snapshot = AuthorizationSnapshot.model_validate(payload.get("snapshot"), strict=False)
                 snapshots_by_tool.setdefault(snapshot.tool_call_id, {})[snapshot.snapshot_id] = snapshot
             elif row.kind.startswith("effect."):
+                payload = await self._hydrated_observation_payload(session, row)
                 effect = ToolEffect.model_validate(payload.get("effect"), strict=False)
                 effects_by_tool.setdefault(effect.tool_call_id, {})[effect.effect_id] = effect
         tool_call_ids = sorted(snapshots_by_tool.keys() | effects_by_tool.keys())
@@ -3571,20 +3607,43 @@ class SqlAnsichBackend:
             return await self._belief_assertion_view(session, assertion)
 
     async def find_evaluation_observation(self, source_event_id: str) -> str | None:
-        """Return the Observation id an evaluation intake identity already has."""
+        """Return the Observation id an evaluation intake identity already has.
 
-        async with self._session_factory() as session:
-            return await session.scalar(
-                select(AnsichObservationRow.obs_id)
-                .where(
-                    AnsichObservationRow.kind == EVALUATION_OBSERVATION_KIND,
-                    AnsichObservationRow.source_event_id == source_event_id,
+        This is the first thing ``record_evaluation`` does, and it is a *read*,
+        so it sits outside everything the write side has for an outage: it is
+        not queued, not charged, not flushed. An unguarded driver exception here
+        therefore left the RA6 receipt ladder unreachable and threw a
+        ``sqlalchemy.exc.*`` type at a caller that has no reason to import
+        SQLAlchemy (F10-25).
+
+        A DBAPI failure is translated to ``StorageUnavailableError`` and nothing
+        else changes: the call still fails, because the two alternatives are
+        both worse. Reporting ``failed`` would state as knowledge ("it is
+        lost") what is only ignorance ("I cannot tell whether this is a
+        replay"), and swallowing the error to record anyway would skip the
+        dedupe and mint a second Observation whose id the receipt would then
+        point at.
+        """
+
+        try:
+            async with self._session_factory() as session:
+                return await session.scalar(
+                    select(AnsichObservationRow.obs_id)
+                    .where(
+                        AnsichObservationRow.kind == EVALUATION_OBSERVATION_KIND,
+                        AnsichObservationRow.source_event_id == source_event_id,
+                    )
+                    # The uniqueness constraint also spans the producer identity, so
+                    # pin the replay to the first intake rather than an arbitrary one.
+                    .order_by(AnsichObservationRow.ingest_seq)
+                    .limit(1)
                 )
-                # The uniqueness constraint also spans the producer identity, so
-                # pin the replay to the first intake rather than an arbitrary one.
-                .order_by(AnsichObservationRow.ingest_seq)
-                .limit(1)
-            )
+        except DBAPIError as exc:
+            # Every connection- and statement-level failure the driver can
+            # report is a ``DBAPIError`` subclass (``OperationalError``,
+            # ``InterfaceError``, ...). Anything narrower would let one driver's
+            # spelling of "the database is not there" through untranslated.
+            raise StorageUnavailableError("Ansich storage could not answer the evaluation replay lookup") from exc
 
     async def get_observation_projection_status(
         self,
