@@ -505,6 +505,19 @@ export const enUS: Translations = {
     queueHighWatermark: "Queue high-watermark",
     queueBytes: "Queue bytes",
     queueByteHighWatermark: "Queue byte high-watermark",
+    writer: "Writer",
+    writerConsecutiveFailures: "Consecutive failures",
+    writerBackoffUntil: "Backoff until",
+    rowsInFlight: "Rows in flight",
+    isolatedDrops: "Isolated drops",
+    unreportedGlobalLoss: "Unreported global loss",
+    producers: "Producers",
+    producerEvictions: "Account evictions",
+    serializationFailures: "Serialization failures",
+    lastSuccessfulFlush: "Last flush",
+    producersEmpty:
+      "No producer accounting has been recorded in this process yet.",
+    producersMore: (count: string) => `${count} more producers not shown`,
     systemMetricDescriptions: {
       queue:
         "Current Observations waiting in the in-process persistence queue. Sustained values near capacity indicate writer backpressure.",
@@ -532,6 +545,20 @@ export const enUS: Translations = {
         "Persisted context snapshots that still reference at least one unavailable ContentBlock. They can become complete if the missing content arrives later.",
       missingBlocks:
         "Unresolved ContentBlock references across persisted context snapshots and states. This counts references, not necessarily unique blocks.",
+      writerConsecutiveFailures:
+        "Write attempts that have failed one after another since the last success. It resets as soon as a write lands, so it describes the current streak rather than the incident's total.",
+      writerBackoffUntil:
+        "When the writer will next attempt a write after a failure. A dash means it is not waiting.",
+      rowsInFlight:
+        "Observations a writer is currently holding — parked batches and a terminal flush write alike. They have already left the queue, so this is the only place they are counted, and it is not a measure of writer backlog on its own.",
+      isolatedDrops:
+        "Observations storage kept refusing on their own, dropped individually so the rest of their batch could still be written. This counts rows; it does not by itself separate a few unwritable rows from a longer storage incident.",
+      unreportedGlobalLoss:
+        "Recorded loss ranges that belong to no single Task, so nothing could write them back into the Observation stream. They are counted here so the gap stays visible instead of being inferred from its absence.",
+      producers:
+        "Per-producer accounting for this Gateway process. Only the producers dropping the most are listed; any remainder is counted below the table.",
+      producerEvictions:
+        "Times the bounded producer ledger evicted an entry to make room for a newly seen producer. It counts eviction events, not how many distinct producers were lost — one producer can be evicted and re-created repeatedly.",
     },
     snapshotRequests: "Snapshot requests",
     snapshotItems: "Snapshot items",

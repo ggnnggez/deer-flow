@@ -489,6 +489,18 @@ export const zhCN: Translations = {
     queueHighWatermark: "队列最高水位",
     queueBytes: "队列字节",
     queueByteHighWatermark: "队列字节最高水位",
+    writer: "写入器",
+    writerConsecutiveFailures: "连续失败",
+    writerBackoffUntil: "退避至",
+    rowsInFlight: "在途行数",
+    isolatedDrops: "隔离丢弃",
+    unreportedGlobalLoss: "未上报全局丢失",
+    producers: "采集器账目",
+    producerEvictions: "账目淘汰次数",
+    serializationFailures: "序列化失败",
+    lastSuccessfulFlush: "最近落库",
+    producersEmpty: "本进程尚未记录到任何采集器账目。",
+    producersMore: (count: string) => `另有 ${count} 个采集器未在表中显示`,
     systemMetricDescriptions: {
       queue:
         "当前在进程内等待持久化的 Observation 数量。持续接近容量表示写入端存在背压。",
@@ -516,6 +528,20 @@ export const zhCN: Translations = {
         "仍引用至少一个不可用 ContentBlock 的持久化上下文快照数。缺失内容晚到后可以恢复为完整。",
       missingBlocks:
         "持久化上下文快照和状态中尚未解析的 ContentBlock 引用数。它统计引用，不一定是去重后的内容块数。",
+      writerConsecutiveFailures:
+        "自上一次写入成功以来连续失败的写入尝试次数。只要有一次写入成功即归零，因此它表示当前这一段连败，不是本次事故的累计值。",
+      writerBackoffUntil:
+        "写入失败后，写入器下一次尝试写入的时间。显示为「—」表示当前没有在等待。",
+      rowsInFlight:
+        "当前由写入器持有的 Observation 行数：既包含被搁置的批次，也包含终止刷写自身的那次写入。它们已经离开队列，因此只有这里能看到；它本身并不等于写入积压。",
+      isolatedDrops:
+        "被存储单独持续拒绝、因而被单独丢弃的 Observation 行数——丢弃它们是为了让同批次的其他行仍能写入。它统计的是行数，本身不足以区分「少量不可写的行」与「一段较长的存储故障」。",
+      unreportedGlobalLoss:
+        "不归属于任何单个 Task、因而无法写回 Observation 流的已记录丢失区间数量。在此计数是为了让这段缺口保持可见，而不是靠它的缺席去推断。",
+      producers:
+        "本次 Gateway 进程内按采集器分列的账目。表中只列出丢弃最多的若干个，其余数量在表格下方给出。",
+      producerEvictions:
+        "有界的采集器账目为容纳新出现的采集器而淘汰条目的次数。它统计的是淘汰事件，不是丢失了多少个不同的采集器——同一个采集器可能被反复淘汰并重新建立。",
     },
     snapshotRequests: "快照请求",
     snapshotItems: "快照条目",

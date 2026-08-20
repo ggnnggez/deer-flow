@@ -2,6 +2,7 @@ import type {
   AnsichAlertType,
   AnsichHealth,
   AnsichLostRange,
+  AnsichProducerHealth,
   AnsichQualityBelief,
 } from "./types";
 
@@ -146,9 +147,26 @@ export function selectPrimarySignal(
 }
 
 /**
+ * The statuses that are not, by themselves, an incident. `starting` and
+ * `shutting_down` are transient lifecycle phases — nothing has run yet, or an
+ * orderly stop is in progress (its failure tier is `stopped`, one transition
+ * later) — and a banner on every process start and stop is exactly what teaches
+ * operators to ignore the banner. `recovering` is deliberately absent: nothing
+ * is failing right now, but the incident that caused it is not over.
+ */
+const NON_ATTENTION_HEALTH_STATUSES: ReadonlySet<string> = new Set([
+  "healthy",
+  "starting",
+  "shutting_down",
+]);
+
+/**
  * Whether projection health warrants a page-level banner rather than a compact
- * status line (IA §5.2): non-healthy status, any failed job, any lost range, or
- * storage unavailable. A healthy line must never hide these.
+ * status line (IA §5.2): a status that names an incident, any failed job, any
+ * lost range, or storage unavailable. A healthy line must never hide these.
+ *
+ * A lifecycle phase excuses only the status. A failed job or a lost range
+ * recorded during one is evidence in its own right and still raises the banner.
  */
 export function isProjectionAttention(health: {
   status: AnsichHealthStatus;
@@ -157,7 +175,7 @@ export function isProjectionAttention(health: {
   storage_available: boolean;
 }): boolean {
   return (
-    health.status !== "healthy" ||
+    !NON_ATTENTION_HEALTH_STATUSES.has(health.status) ||
     health.failed_jobs > 0 ||
     health.lost_ranges.length > 0 ||
     !health.storage_available
@@ -326,20 +344,40 @@ export function taskProjectionScope(
   );
 }
 
-const HEALTH_STATUS_RANK: Record<AnsichHealthStatus, number> = {
-  // `starting` and `shutting_down` are lifecycle phases, not failures: nothing
-  // has run yet, or an orderly stop is in progress (its failure tier is
-  // `stopped`, one transition later), so neither can be worse than the state a
-  // dismissal was taken against. `recovering` sits between healthy and
-  // degraded: the incident is not over, but nothing is failing right now.
-  starting: 0,
+/**
+ * The severity order a dismissal is compared across. `recovering` sits between
+ * healthy and degraded: nothing is failing right now, but the incident is not
+ * over. `failed` and `stopped` are equally bad — both mean the projection
+ * cannot be trusted at all.
+ *
+ * `starting` and `shutting_down` are deliberately absent rather than ranked
+ * alongside healthy. They are lifecycle phases, not tiers of an incident, so
+ * they take part in no comparison at all — the same posture as an unknown
+ * failure count, which is no number rather than a small one.
+ */
+const HEALTH_STATUS_RANK: Partial<Record<AnsichHealthStatus, number>> = {
   healthy: 0,
   recovering: 1,
   degraded: 2,
   failed: 3,
-  shutting_down: 0,
   stopped: 3,
 };
+
+/**
+ * Whether the status alone got worse. A status this build cannot rank — a
+ * lifecycle phase, or one a newer build wrote into the record — yields no
+ * verdict in either direction: calling it worse would re-promote the banner on
+ * every poll, and calling it better would be a claim just as unfounded.
+ */
+function healthStatusWorsened(
+  dismissed: AnsichHealthStatus,
+  current: AnsichHealthStatus,
+): boolean {
+  const before = HEALTH_STATUS_RANK[dismissed];
+  const after = HEALTH_STATUS_RANK[current];
+  if (before === undefined || after === undefined) return false;
+  return after > before;
+}
 
 /**
  * Whether the projection got worse than the state an operator dismissed. Only
@@ -366,7 +404,7 @@ export function projectionHealthWorsened(
   return (
     failedJobsRose ||
     current.lostObservations > dismissed.lostObservations ||
-    HEALTH_STATUS_RANK[current.status] > HEALTH_STATUS_RANK[dismissed.status]
+    healthStatusWorsened(dismissed.status, current.status)
   );
 }
 
@@ -437,6 +475,45 @@ export function resolveProjectionHealthDisplay(
     showBadge: false,
     dismissible: true,
     clearDismissal: dismissed !== null,
+  };
+}
+
+/**
+ * How many producer rows the System details drawer lists before it starts
+ * counting the rest. The Collector's ledger is bounded but still far larger
+ * than a drawer should tile.
+ */
+export const ANSICH_PRODUCER_ROW_LIMIT = 8;
+
+export interface AnsichBoundedProducers {
+  rows: AnsichProducerHealth[];
+  /** Producers the table did not list. Rendered, never silently dropped. */
+  hiddenCount: number;
+}
+
+/**
+ * The producer rows worth showing first — the ones dropping the most — plus how
+ * many were left out, because a truncated table with nothing to say about the
+ * remainder reads as the whole ledger.
+ *
+ * Ties fall back to producer identity, the same key the Collector orders its
+ * own ledger by, so two reads of an unchanged ledger render the same table
+ * rather than one that reshuffles with arrival order.
+ */
+export function topProducersByDropped(
+  producers: readonly AnsichProducerHealth[],
+  limit: number = ANSICH_PRODUCER_ROW_LIMIT,
+): AnsichBoundedProducers {
+  const ordered = [...producers].sort(
+    (left, right) =>
+      right.dropped_count - left.dropped_count ||
+      left.producer_name.localeCompare(right.producer_name) ||
+      left.producer_instance_id.localeCompare(right.producer_instance_id),
+  );
+  const kept = Math.max(0, limit);
+  return {
+    rows: ordered.slice(0, kept),
+    hiddenCount: Math.max(0, ordered.length - kept),
   };
 }
 

@@ -15,7 +15,12 @@ import {
   TooltipContent,
   TooltipTrigger,
 } from "@/components/ui/tooltip";
-import { countLostObservations } from "@/core/ansich/presentation";
+import {
+  countLostObservations,
+  formatAnsichTimestamp,
+  shortId,
+  topProducersByDropped,
+} from "@/core/ansich/presentation";
 import type { AnsichHealth } from "@/core/ansich/types";
 import { useI18n } from "@/core/i18n/hooks";
 
@@ -49,8 +54,9 @@ export function AnsichSystemHealthDrawer({
   open: boolean;
   onOpenChange: (open: boolean) => void;
 }) {
-  const { t } = useI18n();
+  const { t, locale } = useI18n();
   const lostCount = countLostObservations(health.lost_ranges);
+  const producers = topProducersByDropped(health.producers);
   const [failedJobsOpen, setFailedJobsOpen] = useState(false);
 
   return (
@@ -63,7 +69,7 @@ export function AnsichSystemHealthDrawer({
               {t.ansich.projection} · {t.ansich.health[health.status]}
             </SheetDescription>
           </SheetHeader>
-          <div className="grid grid-cols-2 gap-x-6 gap-y-3 px-4 pb-6">
+          <div className="grid grid-cols-2 gap-x-6 gap-y-3 px-4">
             <HealthMetric
               label={t.ansich.queue}
               value={`${health.queue_depth}/${health.queue_capacity}`}
@@ -72,9 +78,7 @@ export function AnsichSystemHealthDrawer({
             <HealthMetric
               label={t.ansich.queueHighWatermark}
               value={String(health.queue_high_watermark)}
-              description={
-                t.ansich.systemMetricDescriptions.queueHighWatermark
-              }
+              description={t.ansich.systemMetricDescriptions.queueHighWatermark}
             />
             <HealthMetric
               label={t.ansich.queueBytes}
@@ -90,9 +94,7 @@ export function AnsichSystemHealthDrawer({
             />
             <HealthMetric
               label={t.ansich.watermark}
-              value={
-                health.watermark === null ? "—" : String(health.watermark)
-              }
+              value={health.watermark === null ? "—" : String(health.watermark)}
               description={t.ansich.systemMetricDescriptions.watermark}
             />
             <HealthMetric
@@ -136,6 +138,13 @@ export function AnsichSystemHealthDrawer({
               description={t.ansich.systemMetricDescriptions.lost}
             />
             <HealthMetric
+              label={t.ansich.unreportedGlobalLoss}
+              value={String(health.unreported_global_lost_range_count)}
+              description={
+                t.ansich.systemMetricDescriptions.unreportedGlobalLoss
+              }
+            />
+            <HealthMetric
               label={t.ansich.snapshotRequests}
               value={`${health.snapshot_request_count} (${health.snapshot_observations_accepted}/${health.snapshot_observations_dropped})`}
               description={t.ansich.systemMetricDescriptions.snapshotRequests}
@@ -157,6 +166,122 @@ export function AnsichSystemHealthDrawer({
               value={String(health.missing_content_block_count)}
               description={t.ansich.systemMetricDescriptions.missingBlocks}
             />
+          </div>
+          <div className="px-4 pt-5">
+            <div className="text-muted-foreground text-xs font-medium uppercase">
+              {t.ansich.writer}
+            </div>
+            <div className="mt-2 grid grid-cols-2 gap-x-6 gap-y-3">
+              <HealthMetric
+                label={t.ansich.writerConsecutiveFailures}
+                value={String(health.writer.consecutive_failures)}
+                description={
+                  t.ansich.systemMetricDescriptions.writerConsecutiveFailures
+                }
+              />
+              <HealthMetric
+                label={t.ansich.writerBackoffUntil}
+                value={formatAnsichTimestamp(
+                  health.writer.backoff_until,
+                  locale,
+                )}
+                description={
+                  t.ansich.systemMetricDescriptions.writerBackoffUntil
+                }
+              />
+              <HealthMetric
+                label={t.ansich.rowsInFlight}
+                value={String(health.writer.in_flight_count)}
+                description={t.ansich.systemMetricDescriptions.rowsInFlight}
+              />
+              <HealthMetric
+                label={t.ansich.isolatedDrops}
+                value={String(health.writer.poison_observation_count)}
+                description={t.ansich.systemMetricDescriptions.isolatedDrops}
+              />
+            </div>
+          </div>
+          <div className="px-4 pt-5 pb-6">
+            <div className="text-muted-foreground flex items-center gap-1 text-xs font-medium uppercase">
+              {t.ansich.producers}
+              <MetricHelp
+                description={t.ansich.systemMetricDescriptions.producers}
+              />
+            </div>
+            {producers.rows.length === 0 ? (
+              <p className="text-muted-foreground mt-2 text-xs">
+                {t.ansich.producersEmpty}
+              </p>
+            ) : (
+              <div className="mt-2 overflow-x-auto">
+                <table className="w-full text-left text-xs">
+                  <thead className="text-muted-foreground">
+                    <tr>
+                      <th className="p-2">{t.ansich.producer}</th>
+                      <th className="p-2">{t.ansich.accepted}</th>
+                      <th className="p-2">{t.ansich.dropped}</th>
+                      <th className="p-2">{t.ansich.serializationFailures}</th>
+                      <th className="p-2">{t.ansich.lastSuccessfulFlush}</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {producers.rows.map((producer) => (
+                      <tr
+                        key={`${producer.producer_name}:${producer.producer_instance_id}`}
+                        className="border-t"
+                      >
+                        <td className="p-2">
+                          <div className="font-mono">
+                            {producer.producer_name}
+                          </div>
+                          <div
+                            className="text-muted-foreground font-mono"
+                            title={producer.producer_instance_id}
+                          >
+                            {shortId(producer.producer_instance_id)}
+                          </div>
+                        </td>
+                        <td className="p-2 font-mono tabular-nums">
+                          {producer.accepted_count}
+                        </td>
+                        <td
+                          className={
+                            producer.dropped_count > 0
+                              ? "text-destructive p-2 font-mono font-medium tabular-nums"
+                              : "p-2 font-mono tabular-nums"
+                          }
+                        >
+                          {producer.dropped_count}
+                        </td>
+                        <td className="p-2 font-mono tabular-nums">
+                          {producer.serialization_failures}
+                        </td>
+                        <td className="p-2">
+                          {formatAnsichTimestamp(
+                            producer.last_successful_flush_at,
+                            locale,
+                          )}
+                        </td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+            )}
+            {producers.hiddenCount > 0 ? (
+              <p className="text-muted-foreground mt-2 text-xs">
+                {t.ansich.producersMore(producers.hiddenCount.toLocaleString())}
+              </p>
+            ) : null}
+            <div className="mt-3">
+              <HealthMetric
+                label={t.ansich.producerEvictions}
+                value={String(health.evicted_producer_count)}
+                description={
+                  t.ansich.systemMetricDescriptions.producerEvictions
+                }
+              />
+            </div>
           </div>
         </SheetContent>
       </Sheet>

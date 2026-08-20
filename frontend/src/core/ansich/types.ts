@@ -112,15 +112,62 @@ export interface AnsichLostRange {
   producer_instance_id: string | null;
 }
 
+/**
+ * Every lifecycle state the Collector derives (spec 11 §2), as a runtime list so
+ * code that has to *validate* one — a persisted dismissal record, say — reuses
+ * the contract instead of restating it as a second literal list that can drift.
+ */
+export const ANSICH_HEALTH_STATUSES = [
+  "starting",
+  "healthy",
+  "degraded",
+  "recovering",
+  "failed",
+  "shutting_down",
+  "stopped",
+] as const;
+
+/**
+ * One producer instance's own accounting. The ledger is bounded in the
+ * Collector, and an entry evicted from it is counted in
+ * `AnsichHealth.evicted_producer_count` rather than disappearing silently.
+ *
+ * `last_accepted_sequence` and `last_successful_flush_at` are `null` when this
+ * producer has never had one — never a zero or an epoch, which would read as a
+ * real reading.
+ */
+export interface AnsichProducerHealth {
+  producer_name: string;
+  producer_instance_id: string;
+  accepted_count: number;
+  dropped_count: number;
+  last_accepted_sequence: number | null;
+  serialization_failures: number;
+  last_successful_flush_at: string | null;
+}
+
+/**
+ * The persistence writer's own state.
+ *
+ * `in_flight_count` is every outstanding row — the writer's parked batches and
+ * a terminal flush barrier's own write alike. Those rows have left
+ * `queue_depth`, so this is the only place they are visible; it is not a
+ * writer-backlog gauge.
+ *
+ * `poison_observation_count` counts rows storage kept refusing individually,
+ * which were dropped alone so their batch-mates could land. It is a monotonic
+ * row count and nothing more: it does not separate a handful of unwritable rows
+ * from a longer storage incident.
+ */
+export interface AnsichWriterHealth {
+  consecutive_failures: number;
+  backoff_until: string | null;
+  in_flight_count: number;
+  poison_observation_count: number;
+}
+
 export interface AnsichHealth {
-  status:
-    | "starting"
-    | "healthy"
-    | "degraded"
-    | "recovering"
-    | "failed"
-    | "shutting_down"
-    | "stopped";
+  status: (typeof ANSICH_HEALTH_STATUSES)[number];
   queue_depth: number;
   queue_capacity: number;
   queue_bytes: number;
@@ -144,6 +191,20 @@ export interface AnsichHealth {
   snapshot_visible_bytes: number;
   incomplete_snapshot_count: number;
   missing_content_block_count: number;
+  producers: AnsichProducerHealth[];
+  writer: AnsichWriterHealth;
+  /**
+   * How many times the bounded producer ledger evicted an entry — eviction
+   * events, not distinct producers lost, since the same producer can be evicted
+   * and re-created repeatedly.
+   */
+  evicted_producer_count: number;
+  /**
+   * Loss with no Task to subject an `observability.degraded` Observation
+   * against, so nothing has written it into the Observation stream. Counted
+   * here so the gap is visible rather than inferred from its absence elsewhere.
+   */
+  unreported_global_lost_range_count: number;
 }
 
 export type AnsichFailedJobKind = "projection" | "assessor";

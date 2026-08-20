@@ -8,6 +8,7 @@ import {
   writeAnsichHealthDismissal,
   type AnsichHealthDismissalStorage,
 } from "@/core/ansich/health-dismissal";
+import { ANSICH_HEALTH_STATUSES } from "@/core/ansich/types";
 
 class MemoryStorage implements AnsichHealthDismissalStorage {
   readonly values = new Map<string, string>();
@@ -90,6 +91,24 @@ describe("Ansich health dismissal storage", () => {
     });
   });
 
+  it("round-trips a dismissal taken at any collector status", () => {
+    // A record dismissed while the collector was `recovering` used to fail
+    // validation and re-promote its banner on the next poll — the validator
+    // still knew only the four statuses that existed before the lifecycle
+    // states landed.
+    const storage = new MemoryStorage();
+    const key = buildAnsichHealthDismissalKey("task-1");
+
+    for (const status of ANSICH_HEALTH_STATUSES) {
+      writeAnsichHealthDismissal(storage, key, { ...snapshot, status });
+
+      expect(readAnsichHealthDismissal(storage, key)).toEqual({
+        ...snapshot,
+        status,
+      });
+    }
+  });
+
   it("treats a malformed or foreign record as no dismissal", () => {
     const storage = new MemoryStorage();
     const key = buildAnsichHealthDismissalKey("task-1");
@@ -103,6 +122,12 @@ describe("Ansich health dismissal storage", () => {
     storage.values.set(
       key,
       JSON.stringify({ version: 1, failedJobs: "two", lostObservations: 1 }),
+    );
+    expect(readAnsichHealthDismissal(storage, key)).toBeNull();
+
+    storage.values.set(
+      key,
+      JSON.stringify({ version: 1, ...snapshot, status: "reticulating" }),
     );
     expect(readAnsichHealthDismissal(storage, key)).toBeNull();
   });

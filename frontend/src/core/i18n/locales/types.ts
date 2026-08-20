@@ -413,6 +413,18 @@ export interface Translations {
     queueHighWatermark: string;
     queueBytes: string;
     queueByteHighWatermark: string;
+    writer: string;
+    writerConsecutiveFailures: string;
+    writerBackoffUntil: string;
+    rowsInFlight: string;
+    isolatedDrops: string;
+    unreportedGlobalLoss: string;
+    producers: string;
+    producerEvictions: string;
+    serializationFailures: string;
+    lastSuccessfulFlush: string;
+    producersEmpty: string;
+    producersMore: (count: string) => string;
     systemMetricDescriptions: {
       queue: string;
       queueHighWatermark: string;
@@ -428,6 +440,13 @@ export interface Translations {
       snapshotItems: string;
       incompleteSnapshots: string;
       missingBlocks: string;
+      writerConsecutiveFailures: string;
+      writerBackoffUntil: string;
+      rowsInFlight: string;
+      isolatedDrops: string;
+      unreportedGlobalLoss: string;
+      producers: string;
+      producerEvictions: string;
     };
     snapshotRequests: string;
     snapshotItems: string;

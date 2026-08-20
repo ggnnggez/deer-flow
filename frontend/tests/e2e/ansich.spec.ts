@@ -49,6 +49,25 @@ const HEALTH = {
   snapshot_visible_bytes: 11,
   incomplete_snapshot_count: 0,
   missing_content_block_count: 0,
+  producers: [
+    {
+      producer_name: "deerflow-run",
+      producer_instance_id: "worker-1",
+      accepted_count: 3,
+      dropped_count: 0,
+      last_accepted_sequence: 3,
+      serialization_failures: 0,
+      last_successful_flush_at: "2026-08-19T10:00:00Z",
+    },
+  ],
+  writer: {
+    consecutive_failures: 0,
+    backoff_until: null,
+    in_flight_count: 0,
+    poison_observation_count: 0,
+  },
+  evicted_producer_count: 0,
+  unreported_global_lost_range_count: 0,
 };
 const TASK = {
   task_id: TASK_ID,
@@ -821,6 +840,9 @@ test("admin navigates from Ansich operations to evidence-backed Task detail", as
   await expect(page.getByText("Data healthy")).toBeVisible();
   await page.getByRole("button", { name: "System details" }).first().click();
   await expect(page.getByText("Queue bytes", { exact: true })).toBeVisible();
+  // Writer and producer accounting live in the same metric wall.
+  await expect(page.getByText("Rows in flight", { exact: true })).toBeVisible();
+  await expect(page.getByText("deerflow-run", { exact: true })).toBeVisible();
   await page
     .getByRole("button", {
       name: "Current Observations waiting in the in-process persistence queue. Sustained values near capacity indicate writer backpressure.",

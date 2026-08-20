@@ -1,4 +1,5 @@
-import type { AnsichHealthSnapshot } from "./presentation";
+import type { AnsichHealthSnapshot, AnsichHealthStatus } from "./presentation";
+import { ANSICH_HEALTH_STATUSES } from "./types";
 
 const HEALTH_DISMISSAL_VERSION = 1;
 const HEALTH_DISMISSAL_PREFIX = "deerflow:ansich-health-dismissed:v1";
@@ -54,6 +55,20 @@ function notify(): void {
   }
 }
 
+/**
+ * Whether a persisted record's status is one the Collector can actually report.
+ * It reads the contract's own list rather than restating the values here: a
+ * second literal list drifts, and this one already did — a record dismissed at
+ * `recovering` failed validation and re-promoted its banner once the lifecycle
+ * states landed.
+ */
+function isHealthStatus(value: unknown): value is AnsichHealthStatus {
+  return (
+    typeof value === "string" &&
+    (ANSICH_HEALTH_STATUSES as readonly string[]).includes(value)
+  );
+}
+
 export function readAnsichHealthDismissal(
   storage: AnsichHealthDismissalStorage | null | undefined,
   key: string,
@@ -78,10 +93,7 @@ export function readAnsichHealthDismissal(
       // `null` is a recorded unknown and must survive the round trip as one.
       !(typeof parsed.failedJobs === "number" || parsed.failedJobs === null) ||
       typeof parsed.lostObservations !== "number" ||
-      (parsed.status !== "healthy" &&
-        parsed.status !== "degraded" &&
-        parsed.status !== "failed" &&
-        parsed.status !== "stopped")
+      !isHealthStatus(parsed.status)
     ) {
       return null;
     }

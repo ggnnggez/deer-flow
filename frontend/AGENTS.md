@@ -123,11 +123,20 @@ button in the page title row that restores it, so the warning moves rather than
 leaving the accessibility tree. The dismissed state (failed/lost counts plus
 status) is kept per scope in `sessionStorage` (`core/ansich/health-dismissal.ts`,
 system and each Task independent); a rising count or a worsening status
-(healthy < degraded < failed/stopped) drops the record and re-promotes the
-banner, a recovery a real count can vouch for clears it so the next incident
-opens as a banner again (an unknown count clears nothing — otherwise the pending
-window after a reload would discard the record), and a
-hard failure renders no dismiss button at all. Every metric label in that drawer has a keyboard-focusable
+(healthy < recovering < degraded < failed/stopped) drops the record and
+re-promotes the banner, a recovery a real count can vouch for clears it so the
+next incident opens as a banner again (an unknown count clears nothing —
+otherwise the pending window after a reload would discard the record), and a
+hard failure renders no dismiss button at all. The collector reports seven
+lifecycle states and the banner treats them in three groups: `recovering` is
+attention (the incident is not over) and takes part in the worsen order above,
+while `starting` and `shutting_down` are transient lifecycle phases — neither
+raises attention on its own, and neither takes part in the worsen comparison in
+either direction, the same posture as an unknown count. A phase excuses only the
+status: a failed job, a lost range, or unavailable storage recorded during one
+still raises the banner. Persisted dismissal records validate their status
+against the contract's own `ANSICH_HEALTH_STATUSES` list rather than a second
+literal copy, so a record taken at any of the seven survives a reload. Every metric label in that drawer has a keyboard-focusable
 help trigger whose localized tooltip explains the metric's definition and diagnostic
 meaning; failed-job help stays separate from the clickable failed-job value. UUIDs on
 list rows and the hero downgrade to their leading
@@ -150,7 +159,17 @@ failed jobs, the Context tab renders an explicit projection-unavailable warning
 instead of the ordinary no-context empty state; the wording remains cautious
 because projection health is process-wide. Projection health also renders queue
 count/byte capacity and both high-watermarks, plus snapshot
-request/item/incomplete/missing counters. When `failed_jobs` is non-zero the metric is clickable and opens `AnsichFailedJobsDialog`, which lists currently-failing projection/assessor jobs (Task-scoped on the Task detail page, global with per-Task retry grouping on the Operations page) and lazily fetches each job's full attempt-error history on expand. Raw ContentBlock bodies are fetched
+request/item/incomplete/missing counters, unreported global loss ranges (loss
+belonging to no single Task, which nothing could write back into the Observation
+stream), a writer block (consecutive failures, backoff until, rows in flight,
+isolated drops), and a bounded per-producer table ordered by dropped count
+(`topProducersByDropped`, top 8, remainder counted below the table, plus the
+producer-ledger eviction count). Copy for those is deliberately literal: rows in
+flight counts every outstanding row including a terminal flush write and is not
+a writer-backlog gauge, isolated drops names dropped rows without diagnosing
+whether the cause was a few unwritable rows or a longer outage, and account
+evictions counts eviction events rather than distinct producers lost. When
+`failed_jobs` is non-zero the metric is clickable and opens `AnsichFailedJobsDialog`, which lists currently-failing projection/assessor jobs (Task-scoped on the Task detail page, global with per-Task retry grouping on the Operations page) and lazily fetches each job's full attempt-error history on expand. Raw ContentBlock bodies are fetched
 lazily after an explicit admin click and must never be placed in the polling
 response or TanStack query cache pre-emptively. Tool raw and model-visible
 payloads use separate `no-store` API calls and separate buttons; never collapse

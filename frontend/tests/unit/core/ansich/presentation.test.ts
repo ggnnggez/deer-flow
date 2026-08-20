@@ -18,11 +18,15 @@ import {
   selectPrimarySignal,
   systemProjectionScope,
   taskProjectionScope,
+  topProducersByDropped,
   isProjectionAttention,
+  type AnsichHealthStatus,
 } from "@/core/ansich/presentation";
 import {
+  ANSICH_HEALTH_STATUSES,
   ANSICH_PRODUCED_ALERT_TYPES,
   type AnsichLostRange,
+  type AnsichProducerHealth,
   type AnsichQualityBelief,
 } from "@/core/ansich/types";
 
@@ -330,7 +334,7 @@ describe("evaluationDimensionLabelKey", () => {
 
 describe("isProjectionAttention", () => {
   const base = {
-    status: "healthy" as const,
+    status: "healthy" as AnsichHealthStatus,
     failed_jobs: 0,
     lost_ranges: [] as unknown[],
     storage_available: true,
@@ -345,6 +349,150 @@ describe("isProjectionAttention", () => {
     expect(isProjectionAttention({ ...base, storage_available: false })).toBe(
       true,
     );
+  });
+
+  it("raises the banner while the collector is recovering", () => {
+    // The incident is not over — nothing is failing *right now*, but the
+    // writer is still catching up from something that did.
+    expect(isProjectionAttention({ ...base, status: "recovering" })).toBe(true);
+  });
+
+  it("does not interrupt for a transient lifecycle phase", () => {
+    // Nothing has run yet, or an orderly stop is under way: neither is an
+    // incident, and a banner on every process start/stop is what teaches
+    // operators to ignore the banner.
+    expect(isProjectionAttention({ ...base, status: "starting" })).toBe(false);
+    expect(isProjectionAttention({ ...base, status: "shutting_down" })).toBe(
+      false,
+    );
+  });
+
+  it("still reports real evidence during a lifecycle phase", () => {
+    // The phase excuses only the status; a failed job or a lost range is
+    // evidence in its own right and must not be swallowed by it.
+    expect(
+      isProjectionAttention({ ...base, status: "starting", failed_jobs: 1 }),
+    ).toBe(true);
+    expect(
+      isProjectionAttention({
+        ...base,
+        status: "shutting_down",
+        lost_ranges: [{}],
+      }),
+    ).toBe(true);
+    expect(
+      isProjectionAttention({
+        ...base,
+        status: "starting",
+        storage_available: false,
+      }),
+    ).toBe(true);
+  });
+});
+
+describe("collector health statuses", () => {
+  it("mirrors every lifecycle state the collector can hand the UI", () => {
+    expect(ANSICH_HEALTH_STATUSES).toEqual([
+      "starting",
+      "healthy",
+      "degraded",
+      "recovering",
+      "failed",
+      "shutting_down",
+      "stopped",
+    ]);
+  });
+
+  it("decides the banner verdict for every one of them", () => {
+    // Nothing may fall through unclassified: a status nobody named would take
+    // whichever verdict the fallback happens to be rather than a decided one.
+    const attention = ANSICH_HEALTH_STATUSES.filter((status) =>
+      isProjectionAttention({
+        status,
+        failed_jobs: 0,
+        lost_ranges: [],
+        storage_available: true,
+      }),
+    );
+
+    expect(attention).toEqual(["degraded", "recovering", "failed", "stopped"]);
+  });
+});
+
+describe("topProducersByDropped", () => {
+  function producer(
+    name: string,
+    dropped: number,
+    overrides: Partial<AnsichProducerHealth> = {},
+  ): AnsichProducerHealth {
+    return {
+      producer_name: name,
+      producer_instance_id: "local",
+      accepted_count: 10,
+      dropped_count: dropped,
+      last_accepted_sequence: 42,
+      serialization_failures: 0,
+      last_successful_flush_at: null,
+      ...overrides,
+    };
+  }
+
+  it("keeps every producer when the ledger fits", () => {
+    const rows = [producer("a", 1), producer("b", 3)];
+
+    expect(topProducersByDropped(rows, 8)).toEqual({
+      rows: [producer("b", 3), producer("a", 1)],
+      hiddenCount: 0,
+    });
+  });
+
+  it("shows the worst offenders and counts what it did not show", () => {
+    const rows = [
+      producer("a", 0),
+      producer("b", 5),
+      producer("c", 2),
+      producer("d", 9),
+    ];
+
+    const bounded = topProducersByDropped(rows, 2);
+
+    expect(bounded.rows.map((row) => row.producer_name)).toEqual(["d", "b"]);
+    // A truncated table must say so, or it reads as the whole ledger.
+    expect(bounded.hiddenCount).toBe(2);
+  });
+
+  it("orders totally, so an unchanged ledger renders the same table twice", () => {
+    // Ties fall back to producer identity, the same key the backend orders its
+    // ledger by, rather than to arrival order.
+    const rows = [
+      producer("b", 4, { producer_instance_id: "i-2" }),
+      producer("a", 4, { producer_instance_id: "i-1" }),
+      producer("a", 4, { producer_instance_id: "i-0" }),
+    ];
+
+    expect(
+      topProducersByDropped(rows, 8).rows.map(
+        (row) => `${row.producer_name}:${row.producer_instance_id}`,
+      ),
+    ).toEqual(["a:i-0", "a:i-1", "b:i-2"]);
+  });
+
+  it("never mutates the ledger it was handed", () => {
+    const rows = [producer("a", 1), producer("b", 3)];
+
+    topProducersByDropped(rows, 8);
+
+    expect(rows.map((row) => row.producer_name)).toEqual(["a", "b"]);
+  });
+
+  it("survives a degenerate limit instead of rendering a negative slice", () => {
+    const rows = [producer("a", 1), producer("b", 3)];
+
+    expect(topProducersByDropped(rows, 0)).toEqual({
+      rows: [],
+      hiddenCount: 2,
+    });
+    expect(topProducersByDropped([], 8)).toEqual({ rows: [], hiddenCount: 0 });
   });
 });
 
@@ -595,6 +743,65 @@ describe("projectionHealthWorsened", () => {
         { ...snapshot, failedJobs: null, lostObservations: 9 },
       ),
     ).toBe(true);
+  });
+
+  it("ranks recovering between healthy and degraded", () => {
+    const at = (status: AnsichHealthStatus) => ({ ...snapshot, status });
+
+    // An unfinished incident is worse news than a clean projection…
+    expect(projectionHealthWorsened(at("healthy"), at("recovering"))).toBe(
+      true,
+    );
+    // …and degrading again while recovering is worse still.
+    expect(projectionHealthWorsened(at("recovering"), at("degraded"))).toBe(
+      true,
+    );
+    // Improving is not worsening: a collapsed banner stays collapsed.
+    expect(projectionHealthWorsened(at("degraded"), at("recovering"))).toBe(
+      false,
+    );
+    expect(projectionHealthWorsened(at("recovering"), at("healthy"))).toBe(
+      false,
+    );
+    expect(projectionHealthWorsened(at("recovering"), at("failed"))).toBe(true);
+  });
+
+  it("leaves the transient lifecycle phases out of the comparison entirely", () => {
+    // `starting` and `shutting_down` are not tiers of an incident, so they
+    // cannot be compared against one — in either direction. Same posture as an
+    // unknown count: no number, therefore no rise.
+    const at = (status: AnsichHealthStatus) => ({ ...snapshot, status });
+
+    expect(projectionHealthWorsened(at("degraded"), at("shutting_down"))).toBe(
+      false,
+    );
+    expect(projectionHealthWorsened(at("healthy"), at("starting"))).toBe(false);
+    expect(projectionHealthWorsened(at("starting"), at("failed"))).toBe(false);
+    expect(projectionHealthWorsened(at("shutting_down"), at("degraded"))).toBe(
+      false,
+    );
+    // The other dimensions still decide on their own.
+    expect(
+      projectionHealthWorsened(at("starting"), {
+        ...snapshot,
+        status: "starting",
+        lostObservations: 9,
+      }),
+    ).toBe(true);
+  });
+
+  it("treats a status it cannot rank as no change, never as a rise", () => {
+    // Defensive: a record written by a newer build carries a status this one
+    // has never heard of. Guessing it is worse would re-interrupt on every
+    // poll; guessing it is better would be a claim too.
+    const foreign = "reticulating" as AnsichHealthStatus;
+
+    expect(
+      projectionHealthWorsened({ ...snapshot, status: foreign }, snapshot),
+    ).toBe(false);
+    expect(
+      projectionHealthWorsened(snapshot, { ...snapshot, status: foreign }),
+    ).toBe(false);
   });
 
   it("re-surfaces when a never-acknowledged count resolves to real failures", () => {
