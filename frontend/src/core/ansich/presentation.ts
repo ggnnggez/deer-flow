@@ -670,6 +670,10 @@ Object.freeze(UNREADABLE_DATABASE_HEALTH);
  * Projector order is the backend's (registration order), not a ranking: the row
  * that needs attention is marked, not moved, so an operator reading the panel
  * twice sees the same table.
+ *
+ * `attention` follows the same rule one level down: an unknown number never
+ * coerces to a clean one. A reachable block whose `failed_jobs` is `null` is a
+ * count nobody read, so it warrants attention rather than a green headline.
  */
 export function getDatabaseHealthPresentation(
   database: AnsichDatabaseHealth | null | undefined,
@@ -709,8 +713,14 @@ export function getDatabaseHealthPresentation(
     staleCompletions: database.stale_completion_count,
     settledThrough,
     outstanding: projectors.reduce((total, row) => total + row.outstanding, 0),
+    // `null` is unknown, never zero — so an unreadable count warrants attention
+    // rather than coercing to "no failed jobs" and returning a green headline
+    // built on a number nobody read. Same direction as the `unreachable` branch
+    // above, which sets `attention: true` for the same reason; and the same
+    // honest form the panel's own row selector uses two lines from here.
     attention:
-      (database.failed_jobs ?? 0) > 0 ||
+      database.failed_jobs === null ||
+      database.failed_jobs > 0 ||
       projectors.some((row) => row.attention),
   };
 }

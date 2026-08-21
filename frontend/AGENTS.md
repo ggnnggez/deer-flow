@@ -230,7 +230,11 @@ reachable store with durably failed jobs is `attention` in the destructive tone,
 never a green "reachable" — connecting successfully is not a clean bill of health,
 and that is the very condition `projection_failure` alerts on; `unreadable` keeps
 its own amber tone because nothing known is a different claim from something
-failing.
+failing. A reachable block whose `failed_jobs` is `null` — unknown, which in this
+block never means zero — also resolves to `attention` rather than to a fourth
+state: the badge answers "does an operator need to look", and an unreadable count
+answers yes exactly as a nonzero one does. `unreadable` stays separate because
+there the *whole* block is unknown, not one number in it.
 
 **Known issue on that page (pre-existing, not introduced by the lens, and
 deliberately left alone):** the Operations page renders the selected lens's query

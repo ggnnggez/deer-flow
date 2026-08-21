@@ -130,6 +130,37 @@ describe("databaseHealthBadge", () => {
       "unreadable",
     );
   });
+
+  it("never calls an unknown failed-job count healthy", () => {
+    // `null` means unknown here and nowhere means zero. A `?? 0` would coerce
+    // this into "no failed jobs" and hand back a green headline built on a
+    // number nobody read — the one thing the block's own contract forbids, and
+    // the opposite of what the `unreachable` branch does with the same
+    // uncertainty. Unknown belongs in `attention`, not in a fourth state: the
+    // badge's job is "does an operator need to look at this", and the answer
+    // for an unreadable count is yes, exactly as for a nonzero one.
+    const view = getDatabaseHealthPresentation(
+      reachable({
+        projectors: [
+          {
+            projector_name: "task-structural",
+            projector_version: "1",
+            pending: 0,
+            retry: 0,
+            processing: 0,
+            failed: 0,
+            complete_through: 88,
+          },
+        ],
+        failed_jobs: null,
+      }),
+    );
+
+    expect(view.failedJobs).toBeNull();
+    expect(view.attention).toBe(true);
+    expect(databaseHealthBadge(view)).not.toBe("healthy");
+    expect(databaseHealthBadge(view)).toBe("attention");
+  });
 });
 
 describe("getDatabaseHealthPresentation", () => {
