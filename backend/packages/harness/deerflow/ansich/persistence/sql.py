@@ -5,7 +5,7 @@ import json
 import logging
 import socket
 import time
-from collections.abc import AsyncIterator, Sequence
+from collections.abc import AsyncIterator, Iterable, Mapping, Sequence
 from contextlib import asynccontextmanager
 from datetime import UTC, datetime, timedelta
 from typing import Literal, NamedTuple, cast
@@ -690,35 +690,58 @@ def _periodic_budget_rows_statement():
 
 
 def _projector_status_counts_statement():
-    """Per-``(projector, version, status)`` job counts, grouped projector-first.
+    """Per-``(projector, version, status)`` counts over *unsettled* jobs only.
 
-    The column order is a pinned contract, not a style preference: this group is
-    served by ``ix_ansich_projection_jobs_projector_status``, whose columns are
-    ``(projector_name, status)``. Grouping by status first leaves that index
-    unusable as a prefix and turns the health read into a full scan of every job
-    row ever written. ``projector_version`` sits between the two indexed columns
-    because it is a low-cardinality tiebreak, not a filter.
+    The ``status IN`` predicate is what keeps this read bounded, and it is the
+    only thing that does. Measured on PostgreSQL 16 with 1.2M job rows:
+
+    * without a status predicate -- Parallel Seq Scan, ~200ms;
+    * with it -- ``Index Scan using ix_ansich_projection_jobs_claim``
+      (``Index Cond: status = ANY(...)``), ~0.1ms.
+
+    The index that serves it is therefore the **status-leading** claim index,
+    not ``ix_ansich_projection_jobs_projector_status``; dropping the latter
+    changes neither this plan nor its cost. GROUP BY key order is irrelevant to
+    both (grouping keys are an unordered set the planner may reorder, and the
+    two orders produce identical plans), so nothing here depends on it.
+
+    Restricting to unsettled statuses costs nothing in answers either:
+    ``ProjectorHealth`` exposes only those four buckets, so a ``completed``
+    count read here would be computed and then dropped. The consequence is that
+    a fully settled projector is absent from this result, which is why the row
+    set is named by ``ansich_projector_versions`` instead
+    (``_projector_registry_statement``).
+
+    This runs on the 1 Hz operations tick and on every ``GET /health``, over a
+    table with no retention, so an unbounded form here is a scan that grows
+    forever.
     """
 
-    return select(
-        AnsichProjectionJobRow.projector_name,
-        AnsichProjectionJobRow.projector_version,
-        AnsichProjectionJobRow.status,
-        func.count(),
-    ).group_by(
-        AnsichProjectionJobRow.projector_name,
-        AnsichProjectionJobRow.projector_version,
-        AnsichProjectionJobRow.status,
+    return (
+        select(
+            AnsichProjectionJobRow.projector_name,
+            AnsichProjectionJobRow.projector_version,
+            AnsichProjectionJobRow.status,
+            func.count(),
+        )
+        .where(AnsichProjectionJobRow.status.in_(_UNSETTLED_JOB_STATUSES))
+        .group_by(
+            AnsichProjectionJobRow.projector_name,
+            AnsichProjectionJobRow.projector_version,
+            AnsichProjectionJobRow.status,
+        )
     )
 
 
 def _unsettled_projector_minimum_statement():
-    """Lowest ingest sequence each projector still owes, grouped projector-first.
+    """Lowest ingest sequence each projector still owes. One minus it is the mark.
 
-    One minus this is the projector's continuity mark (RB6①). Same index and
-    the same reason for the grouping order as
-    ``_projector_status_counts_statement``; the join is to the Observation's
-    primary key.
+    Same predicate and the same serving index as
+    ``_projector_status_counts_statement`` -- measured
+    ``Index Scan using ix_ansich_projection_jobs_claim`` on the jobs side, then
+    a unique-index lookup per row on ``ansich_observations.obs_id`` for the
+    join. Bounded by the number of *unsettled* jobs, which is the backlog, not
+    the history.
     """
 
     return (
@@ -736,6 +759,65 @@ def _unsettled_projector_minimum_statement():
             AnsichProjectionJobRow.projector_name,
             AnsichProjectionJobRow.projector_version,
         )
+    )
+
+
+def _projector_registry_statement():
+    """The projectors health reports on: one row per registered version.
+
+    The counts read only sees unsettled work, so it cannot name a projector that
+    has nothing outstanding -- and "caught up" is precisely the state health
+    most needs to show. The registry can: a ``(name, version)`` row is written
+    in the same transaction as that pair's first job
+    (``persist_and_project`` / ``_ensure_spawn_reconcile_job``), so its key set
+    is exactly the set of projectors that have ever had a job. Rows equal the
+    number of registered projector versions -- single digits.
+    """
+
+    return select(
+        AnsichProjectorVersionRow.projector_name,
+        AnsichProjectorVersionRow.projector_version,
+    )
+
+
+def _projector_health_rows(
+    *,
+    registry: Iterable[tuple[str, str]],
+    counts: Mapping[tuple[str, str], Mapping[str, int]],
+    unsettled_minimum: Mapping[tuple[str, str], int],
+    highest: int | None,
+) -> tuple[ProjectorHealth, ...]:
+    """Assemble the per-projector rows from three reads that may disagree.
+
+    The key set is the **union** of all three deliberately. The reads are one
+    transaction but not one snapshot (PostgreSQL defaults to READ COMMITTED, a
+    fresh snapshot per statement), so a projector whose first job lands between
+    two of them appears in one and not the others. Built from any single read,
+    such a projector's low continuity mark would silently drop out of the
+    store-wide minimum -- an over-claim by omission, and over-claiming is the
+    one direction this number must never go.
+
+    A projector with no unsettled minimum is complete through everything the
+    store holds; that is also the answer for the registry rows the counts read
+    no longer returns.
+    """
+
+    keys = {*registry, *counts, *unsettled_minimum}
+    return tuple(
+        ProjectorHealth(
+            projector_name=projector_name,
+            projector_version=projector_version,
+            pending=counts.get(key, {}).get("pending", 0),
+            retry=counts.get(key, {}).get("retry", 0),
+            processing=counts.get(key, {}).get("processing", 0),
+            failed=counts.get(key, {}).get("failed", 0),
+            # A hole below the projector's furthest progress is what this mark
+            # reports, so it is the minimum unsettled sequence minus one --
+            # never the maximum settled one.
+            complete_through=(unsettled_minimum[key] - 1 if key in unsettled_minimum else highest),
+        )
+        for key in sorted(keys)
+        for projector_name, projector_version in (key,)
     )
 
 
@@ -1571,29 +1653,43 @@ class SqlAnsichBackend:
     async def _database_projection_snapshot(self) -> _DatabaseProjectionSnapshot:
         """The one query set behind both the health block and the read-model stamp.
 
-        Four bounded reads, in this order:
+        **Read order carries a correctness property, not just a style.** These
+        statements share a transaction but not a snapshot: PostgreSQL's default
+        READ COMMITTED takes a fresh snapshot for every statement, so rows
+        committed by another worker mid-way are visible to the later reads and
+        not the earlier ones. ``MAX(ingest_seq)`` is therefore read **first**.
+        A projector with nothing unsettled is reported complete through that
+        value, and reading it first means it can only be *older* than the
+        backlog reads that follow -- so a job created in between makes the mark
+        under-claim (it lags by one tick and self-corrects) instead of
+        over-claim. Over-claiming is the direction that cannot be tolerated: the
+        PB7 publish guard reads a mark it can never reach again as "every later
+        tick is staler" and stops updating the active-Task read model until the
+        offending job settles, which a replay-safe dependency may legitimately
+        delay by ``projector_dependency_timeout_seconds``.
 
-        1. Counts grouped ``(projector_name, projector_version, status)``.
-           Projector-first is a pinned contract, not a style choice: the group
-           is served by ``ix_ansich_projection_jobs_projector_status``, whose
-           column order is ``(projector_name, status)``, and grouping by status
-           first would leave the index unusable as a prefix.
-        2. ``MIN(ingest_seq)`` over each projector's *unsettled* jobs. That
-           minus one is the projector's continuity mark.
-        3. The highest ``ingest_seq`` in the store, which is what a projector
-           with nothing unsettled is complete through.
-        4. ``recorded_at`` of the single oldest unsettled row, by primary key.
-           This is the index-friendly form of the lag the spec asks for
+        The reads, in order:
+
+        1. The highest ``ingest_seq`` in the store (primary key).
+        2. The projector registry, which names the rows -- see
+           ``_projector_registry_statement`` for why the counts read cannot.
+        3. Per-``(projector, version, status)`` counts over unsettled jobs.
+        4. ``MIN(ingest_seq)`` over each projector's unsettled jobs.
+        5. ``recorded_at`` of the single oldest unsettled row, **by primary
+           key**. This is the index-friendly form of the lag the spec asks for
            (RB6②): ``recorded_at`` carries no index of its own, so ordering or
            filtering on it would be a full scan of the Observation table. The
-           minimum is already known from (2), so its age costs one PK lookup.
+           minimum is already known from (4), so its age costs one PK lookup.
+        6. The two durable failure counts.
         """
 
         now = datetime.now(UTC)
         async with self._session_factory() as session:
+            # First, and deliberately: see the docstring.
+            highest_ingest_seq = await session.scalar(select(func.max(AnsichObservationRow.ingest_seq)))
+            registry_rows = (await session.execute(_projector_registry_statement())).all()
             count_rows = (await session.execute(_projector_status_counts_statement())).all()
             unsettled_rows = (await session.execute(_unsettled_projector_minimum_statement())).all()
-            highest_ingest_seq = await session.scalar(select(func.max(AnsichObservationRow.ingest_seq)))
             oldest_unsettled = min((ingest_seq for _, _, ingest_seq in unsettled_rows if ingest_seq is not None), default=None)
             oldest_recorded_at = None if oldest_unsettled is None else await session.scalar(select(AnsichObservationRow.recorded_at).where(AnsichObservationRow.ingest_seq == oldest_unsettled))
             projection_failures = await session.scalar(select(func.count()).select_from(AnsichProjectionJobRow).where(AnsichProjectionJobRow.status == "failed"))
@@ -1604,21 +1700,11 @@ class SqlAnsichBackend:
         counts: dict[tuple[str, str], dict[str, int]] = {}
         for projector_name, projector_version, status, count in count_rows:
             counts.setdefault((projector_name, projector_version), {})[status] = int(count or 0)
-        projectors = tuple(
-            ProjectorHealth(
-                projector_name=projector_name,
-                projector_version=projector_version,
-                pending=status_counts.get("pending", 0),
-                retry=status_counts.get("retry", 0),
-                processing=status_counts.get("processing", 0),
-                failed=status_counts.get("failed", 0),
-                # A hole below the projector's furthest progress is what this
-                # mark reports, so it is the minimum unsettled sequence minus
-                # one -- never the maximum settled one. Caught up entirely, the
-                # projector is complete through everything the store holds.
-                complete_through=(highest if (projector_name, projector_version) not in unsettled_minimum else unsettled_minimum[(projector_name, projector_version)] - 1),
-            )
-            for (projector_name, projector_version), status_counts in sorted(counts.items())
+        projectors = _projector_health_rows(
+            registry=[(projector_name, projector_version) for projector_name, projector_version in registry_rows],
+            counts=counts,
+            unsettled_minimum=unsettled_minimum,
+            highest=highest,
         )
         lag_ms = 0 if oldest_recorded_at is None else max(0, int((now - _as_utc(oldest_recorded_at)).total_seconds() * 1000))
         return _DatabaseProjectionSnapshot(
@@ -7150,10 +7236,29 @@ class SqlAnsichBackend:
                     select(AnsichActiveTaskReadModelRow).where(AnsichActiveTaskReadModelRow.task_id.in_([view.task_id for view in views])).order_by(AnsichActiveTaskReadModelRow.task_id),
                 )
             }
+            # The sweep is guarded by the same basis as the publish below (PB7).
+            # `running_task_ids` was read in an earlier, already-committed
+            # session like every other input, so a staler tick's snapshot can
+            # predate a Task starting and delete the row a fresher tick just
+            # published. Deleting it does more than lose a row: it resets the
+            # basis this guard reads to NULL, disarming the guard for that Task
+            # until something republishes. So a tick that is staler than a row
+            # does not sweep it either; the next tick that is not staler does,
+            # which is why nothing leaks.
+            sweep = delete(AnsichActiveTaskReadModelRow)
             if running_task_ids:
-                await session.execute(delete(AnsichActiveTaskReadModelRow).where(AnsichActiveTaskReadModelRow.task_id.not_in(running_task_ids)))
+                sweep = sweep.where(AnsichActiveTaskReadModelRow.task_id.not_in(running_task_ids))
+            if projection.complete_through is None:
+                # No basis at all: may only sweep rows that have none either.
+                sweep = sweep.where(AnsichActiveTaskReadModelRow.projection_watermark.is_(None))
             else:
-                await session.execute(delete(AnsichActiveTaskReadModelRow))
+                sweep = sweep.where(
+                    or_(
+                        AnsichActiveTaskReadModelRow.projection_watermark.is_(None),
+                        AnsichActiveTaskReadModelRow.projection_watermark <= projection.complete_through,
+                    )
+                )
+            await session.execute(sweep)
             for view in views:
                 budget_status = "unknown"
                 for candidate in ("exceeded", "warning", "unknown", "within"):

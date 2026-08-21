@@ -114,9 +114,19 @@ class AnsichProjectionJobRow(Base):
     __table_args__ = (
         UniqueConstraint("obs_id", "projector_name", "projector_version", name="uq_ansich_projection_job_version"),
         Index("ix_ansich_projection_jobs_claim", "status", "available_at", "lease_expires_at"),
-        # Per-projector status-split counts for the health merge: a health read
-        # groups this table by ``(projector_name, status)``, which without this
-        # index is a full scan of every job row ever written.
+        # Serves the reads that filter on a *named* projector plus a status:
+        # the projection-failure Alert producer's per-group evidence query
+        # (``sql.py::_assess_projection_failures``, ``status='failed' AND
+        # projector_name=? AND projector_version=?``), measured as an Index Scan
+        # on this index.
+        #
+        # It is deliberately **not** what bounds the health merge, despite the
+        # name it was given in 0027: those statements filter on ``status`` alone
+        # and are served by the status-leading ``..._claim`` index below. A
+        # GROUP BY over ``(projector_name, status)`` uses no index at all --
+        # grouping keys are an unordered set the planner may reorder, so only a
+        # WHERE predicate makes an index applicable. Verified with EXPLAIN
+        # (ANALYZE) on PostgreSQL 16; dropping this index changes no health plan.
         Index("ix_ansich_projection_jobs_projector_status", "projector_name", "status"),
     )
 

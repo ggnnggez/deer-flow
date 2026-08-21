@@ -840,8 +840,10 @@ class ProjectorHealth(BaseModel):
 
     It is computed on read rather than stored (RB6③): the spec asks for a
     maintained projector watermark, and a stored copy of a number this cheap to
-    derive is a copy that drifts. The index ``ix_ansich_projection_jobs_projector_status``
-    is what keeps the derivation bounded.
+    derive is a copy that drifts. What keeps the derivation bounded is that both
+    reads behind it filter to the unsettled statuses, so they touch the backlog
+    rather than the history -- see ``sql.py::_projector_status_counts_statement``
+    for the measurement and the index that actually serves it.
     """
 
     model_config = ConfigDict(frozen=True)
@@ -864,10 +866,13 @@ class DatabaseHealth(BaseModel):
     the collection hot path -- so this block is produced by its own ``async``
     call and joined to the process block by the HTTP layer.
 
-    ``status`` is the reachability of that call, nothing more. When it is
-    ``unreachable`` every other field is at its default and the process-side
-    block is still served in full: ``GET /health`` stays the one endpoint that
-    reads while storage is down.
+    ``status`` is the reachability of that call, nothing more, and it is the
+    field every other one is conditional on: when it is ``unreachable`` the
+    projector rows are empty and every number is ``None``, because a block that
+    could not be read must not render as "0ms behind, 0 failed jobs" to a
+    consumer that forgot to branch. ``None`` means unknown here and nowhere
+    means zero. The process-side block is still served in full either way:
+    ``GET /health`` stays the one endpoint that reads while storage is down.
 
     ``failed_jobs`` is the **authoritative** failed-job count, read live from
     both job tables. ``AnsichHealth.failed_jobs`` keeps its name and its
@@ -880,17 +885,15 @@ class DatabaseHealth(BaseModel):
 
     ``stale_completion_count`` is the one field here that is **not** database
     truth: it is the reporting worker's own count of writes dropped because the
-    job had been taken over. It is ``None`` when unknown -- including whenever
-    ``status`` is ``unreachable`` -- rather than a zero that would read as "no
-    takeovers happened".
+    job had been taken over.
     """
 
     model_config = ConfigDict(frozen=True)
 
     status: Literal["reachable", "unreachable"]
     projectors: tuple[ProjectorHealth, ...] = ()
-    lag_ms: int = 0
-    failed_jobs: int = 0
+    lag_ms: int | None = None
+    failed_jobs: int | None = None
     stale_completion_count: int | None = None
 
 

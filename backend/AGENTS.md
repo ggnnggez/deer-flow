@@ -1589,16 +1589,22 @@ onto the collection hot path. The database half is a separate
 `async AnsichService.get_database_health()` with its own budget
 (`ansich.health_database_timeout_ms`, 2000) and a blanket `except Exception`;
 any failure — no such backend method, a raise, a call that outlives the budget —
-answers `database.status="unreachable"` with the rest of the block at defaults
-while the process block is served in full. That is the point: `GET /health`
-stays the one Ansich route readable while storage is down, and `_ensure_queryable`
-is untouched. Only `database.failed_jobs` is **authoritative** (a live count over
-both job tables); the process-local `AnsichHealth.failed_jobs` keeps its name and
-is **advisory** — it counts what this worker has seen fail, so under several
-workers it is a fraction of the truth. `database.stale_completion_count` is the
-one field in that block which is not database truth at all: it is the reporting
-worker's own dropped-write counter, and it is `None` rather than `0` when
-unknown.
+answers `database.status="unreachable"` with every number in the block `None`
+while the process block is served in full. `None` means unknown and nothing in
+the block means zero: a panel that rendered `lag_ms`/`failed_jobs` without
+branching on `status` would otherwise report "0ms behind, 0 failed jobs" at the
+moment storage is down. That fallback is the point: `GET /health` stays the one
+Ansich route readable while storage is down, and `_ensure_queryable` is
+untouched. Note the budget is a cancellation deadline rather than a hard
+wall-clock bound — `asyncio.wait_for` cancels the inner call and then waits for
+it to unwind, and that unwind includes a rollback on a possibly-dead connection,
+so the observed wait can exceed it (bounded in practice by the driver's
+`command_timeout`). Only `database.failed_jobs` is **authoritative** (a live
+count over both job tables); the process-local `AnsichHealth.failed_jobs` keeps
+its name and is **advisory** — it counts what this worker has seen fail, so under
+several workers it is a fraction of the truth. `database.stale_completion_count`
+is the one field in that block which is not database truth at all: it is the
+reporting worker's own dropped-write counter.
 
 Per projector the block carries `(pending, retry, processing, failed)` and
 `complete_through`. `retry` is its own bucket because a re-armed job is work
@@ -1610,15 +1616,42 @@ it down no matter how far past that hole the projector has otherwise run, which
 is what makes it usable as a "nothing below here is owed" statement. It is
 derived rather than stored (a deviation from spec §4's "maintain a projector
 watermark", recorded here): a stored copy of a number this cheap to derive is a
-copy that drifts. `ix_ansich_projection_jobs_projector_status` (migration `0027`)
-is what bounds the derivation, and its `(projector_name, status)` column order is
-why both groupings lead with the projector column —
-`sql.py::_projector_status_counts_statement` /
-`::_unsettled_projector_minimum_statement` exist as named statements so a test
-can pin that. `lag_ms` is the age of the **oldest unsettled** row, read from the
-single Observation at `MIN(ingest_seq)` by primary key; `recorded_at` carries no
-index, so ordering or filtering on it would be a full table scan (spec §7.2's
-alternative form, taken deliberately).
+copy that drifts.
+
+**What bounds these reads is the `status IN (unsettled)` predicate, and only
+that.** Both statements exist as named functions
+(`sql.py::_projector_status_counts_statement` /
+`::_unsettled_projector_minimum_statement`) so a test can pin the predicate.
+Measured with `EXPLAIN (ANALYZE)` on PostgreSQL 16 at 1.2M job rows: without the
+predicate the counts statement is a Parallel Seq Scan (~200ms, on the 1 Hz
+operations tick *and* on every `GET /health`, over a table with no retention);
+with it, an Index Scan on **`ix_ansich_projection_jobs_claim`** — the
+*status-leading* index — at ~0.1ms. GROUP BY key order affects neither plan nor
+index (grouping keys are an unordered set the planner may reorder), so nothing
+here depends on it, and an earlier claim in this file that it did was wrong.
+`ix_ansich_projection_jobs_projector_status` (migration `0027`) serves the reads
+that name a projector *and* a status — `_assess_projection_failures`' per-group
+evidence query (`status='failed' AND projector_name=? AND projector_version=?`)
+— not the health merge; dropping it changes no health plan. Because the counts
+read no longer sees settled work, the row set is named by
+`ansich_projector_versions` instead (`_projector_registry_statement`), whose key
+set is exactly "projectors that have ever had a job", so a fully caught-up
+projector still appears with zeros. `lag_ms` is the age of the **oldest
+unsettled** row, read from the single Observation at `MIN(ingest_seq)` by
+primary key; `recorded_at` carries no index, so ordering or filtering on it
+would be a full table scan (spec §7.2's alternative form, taken deliberately).
+
+**Read order in `_database_projection_snapshot` is a correctness property.** The
+statements share a transaction but not a snapshot — PostgreSQL's default READ
+COMMITTED takes a fresh one per statement — so `MAX(ingest_seq)` is read
+**first**. A projector with nothing unsettled is reported complete through that
+value; reading it first means a job created mid-snapshot makes the mark
+*under*-claim (stale by one tick, self-correcting) rather than over-claim.
+Over-claiming is the intolerable direction: the publish guard below reads a mark
+it can never reach again as "every later tick is staler" and stops updating the
+read model until the offending job settles, which a replay-safe dependency may
+delay by `projector_dependency_timeout_seconds`. For the same reason the row set
+is the **union** of all three job-table reads, not the counts read alone.
 
 The same query set stamps the active-Task read model.
 `_refresh_active_task_read_model` used to copy `get_projection_metrics()` —
@@ -1635,9 +1668,22 @@ and a tick that started first can finish last. Inside the locked write, a tick
 whose `projection_watermark` is *below* the one already on the row skips that row
 whole and logs at DEBUG; the next tick republishes. It skips the whole row rather
 than the stamped fields alone because publishing a mixture of two ticks' facts
-would be a state neither of them observed. The mark only rises while a row
-exists, and `rebuild_projections()` deletes these rows outright, so a rebuild's
-reset cannot freeze the guard shut.
+would be a state neither of them observed. The **same basis guards the sweep**
+that deletes rows for Tasks no longer running: `running_task_ids` is read in an
+earlier committed session too, so a staler tick could otherwise delete a fresher
+row — and deleting it resets the basis to NULL, disarming the guard for that
+Task. A staler tick therefore neither publishes over nor deletes a fresher row;
+the next tick that is not staler does both, so nothing leaks. The mark only rises
+while a row exists, and `rebuild_projections()` deletes these rows outright, so a
+rebuild's reset cannot freeze the guard shut.
+
+One honest residual, on the deploy that lands this change only: rows written by
+the previous code carry the *old* stamp (that worker's highest projected
+`ingest_seq`), which sits at or above the new continuity mark. While any job is
+durably `failed`, such a row's basis stays above every new tick's and the row is
+skipped — visibly, once per tick, at DEBUG. Retrying the failed job or running a
+rebuild (the documented operator remedies for a failed job, and a rebuild deletes
+these rows) clears it.
 
 Two debts close with this slice. **F10-24**: both writers of a
 `budget_health:<dimension>:<scope>` Assertion — `_assess_budget_rows` on terminal

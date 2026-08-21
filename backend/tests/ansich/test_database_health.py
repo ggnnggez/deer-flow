@@ -37,9 +37,12 @@ from deerflow.ansich.persistence.models import (
     AnsichBeliefAssertionRow,
     AnsichObservationRow,
     AnsichProjectionJobRow,
+    AnsichTaskSummaryRow,
 )
 from deerflow.ansich.persistence.sql import (
+    _UNSETTLED_JOB_STATUSES,
     SqlAnsichBackend,
+    _projector_health_rows,
     _projector_status_counts_statement,
     _unsettled_projector_minimum_statement,
 )
@@ -99,21 +102,117 @@ def _projector(health: DatabaseHealth, name: str):
     return next(row for row in health.projectors if row.projector_name == name)
 
 
-def test_health_groupings_lead_with_the_projector_column_on_both_dialects():
-    """The T1 index's column order is a contract the grouping has to honour.
+def test_health_statements_are_bounded_by_the_unsettled_status_predicate():
+    """The real condition for these reads staying indexed is the WHERE clause.
 
-    ``ix_ansich_projection_jobs_projector_status`` is ``(projector_name,
-    status)``. A grouping that led with ``status`` would leave it unusable as a
-    prefix and turn the health read into a full scan of every job row ever
-    written, which is exactly the cost RB6 accepted the index to bound.
+    Measured on PostgreSQL 16 at 1.2M job rows: without a status predicate the
+    counts statement is a Parallel Seq Scan (201ms); with
+    ``status IN _UNSETTLED_JOB_STATUSES`` it is an Index Scan on the
+    status-leading ``ix_ansich_projection_jobs_claim`` (0.10ms). GROUP BY key
+    order changes neither the plan nor the index -- the planner is free to
+    reorder grouping keys -- so the predicate is what is pinned here, and both
+    statements must carry it. Dropping it would put a full scan of a table that
+    only ever grows on the 1 Hz operations tick and on every ``GET /health``.
     """
 
     for statement in (_projector_status_counts_statement(), _unsettled_projector_minimum_statement()):
         for dialect in (sqlite.dialect(), postgresql.dialect()):
-            compiled = " ".join(str(statement.compile(dialect=dialect)).upper().split())
-            group_by = compiled.split("GROUP BY", 1)[1]
-            assert group_by.strip().startswith("ANSICH_PROJECTION_JOBS.PROJECTOR_NAME")
-            assert "ANSICH_PROJECTION_JOBS.PROJECTOR_VERSION" in group_by
+            compiled = str(statement.compile(dialect=dialect, compile_kwargs={"literal_binds": True}))
+            flattened = " ".join(compiled.split())
+            assert " WHERE " in flattened, flattened
+            where_clause = flattened.split(" WHERE ", 1)[1]
+            assert "status IN " in where_clause, where_clause
+            for status in _UNSETTLED_JOB_STATUSES:
+                assert f"'{status}'" in where_clause, (status, where_clause)
+            # Settled work is never counted: the DTO exposes only the four
+            # unsettled buckets, so a `completed` row read here is read for
+            # nothing.
+            assert "'completed'" not in where_clause
+
+
+def test_the_snapshot_reads_the_highest_ingest_sequence_before_the_job_tables():
+    """Read order is the whole guard against an over-claiming mark (F2).
+
+    The four reads are one transaction but not one snapshot: PostgreSQL's
+    default READ COMMITTED takes a fresh snapshot per statement. If ``highest``
+    were read *after* the unsettled minimum, a projector that was caught up at
+    the earlier statement would be stamped complete through Observations that
+    were committed in between and whose jobs are still owed -- an over-claim,
+    which the PB7 guard then reads as "every later tick is staler" and freezes
+    the read model behind. Reading ``highest`` first makes the mark only ever
+    under-claim, which self-heals on the next tick.
+
+    Pinned structurally because SQLite gives every statement in a transaction
+    one snapshot, so the skew this defends against cannot be reproduced here.
+    """
+
+    import asyncio
+
+    from sqlalchemy import event
+    from sqlalchemy.ext.asyncio import async_sessionmaker as _maker
+    from sqlalchemy.ext.asyncio import create_async_engine as _engine_factory
+
+    async def _run() -> list[str]:
+        engine = _engine_factory("sqlite+aiosqlite://")
+        session_factory = _maker(engine, expire_on_commit=False)
+        async with engine.begin() as connection:
+            await connection.run_sync(Base.metadata.create_all)
+        backend = SqlAnsichBackend(session_factory)
+        seen: list[str] = []
+
+        def _capture(_connection, _cursor, statement, _parameters, _context, _executemany) -> None:
+            seen.append(" ".join(statement.split()))
+
+        event.listen(engine.sync_engine, "before_cursor_execute", _capture)
+        try:
+            await backend.get_database_health()
+        finally:
+            event.remove(engine.sync_engine, "before_cursor_execute", _capture)
+            await engine.dispose()
+        return seen
+
+    statements = asyncio.run(_run())
+    highest_at = next(index for index, item in enumerate(statements) if "max(ansich_observations.ingest_seq)" in item)
+    first_job_read = next(index for index, item in enumerate(statements) if "ansich_projection_jobs" in item)
+    assert highest_at < first_job_read, statements
+
+
+def test_a_projector_seen_by_only_one_read_still_appears_in_the_block():
+    """The other half of F2: the two job reads can disagree about the key set.
+
+    Under READ COMMITTED a projector's first-ever job can land between the
+    counts read and the unsettled-minimum read, so it appears in one and not the
+    other. Built from the counts alone, its (low) continuity mark would drop out
+    of the store-wide minimum entirely -- the same over-claim by another route.
+    """
+
+    rows = _projector_health_rows(
+        registry=(("task-control", "1"),),
+        counts={("task-control", "1"): {"pending": 2}},
+        unsettled_minimum={("task-control", "1"): 40, ("late-projector", "1"): 7},
+        highest=100,
+    )
+
+    by_name = {row.projector_name: row for row in rows}
+    assert set(by_name) == {"task-control", "late-projector"}
+    assert by_name["late-projector"].complete_through == 6
+    assert by_name["late-projector"].pending == 0
+    assert by_name["task-control"].complete_through == 39
+
+
+def test_a_projector_with_nothing_outstanding_still_appears_from_the_registry():
+    """The counts read no longer sees settled work, so the registry names the set."""
+
+    rows = _projector_health_rows(
+        registry=(("task-control", "1"), ("task-structural", "1")),
+        counts={},
+        unsettled_minimum={},
+        highest=100,
+    )
+
+    assert [row.projector_name for row in rows] == ["task-control", "task-structural"]
+    assert all(row.complete_through == 100 for row in rows)
+    assert all((row.pending, row.retry, row.processing, row.failed) == (0, 0, 0, 0) for row in rows)
 
 
 @pytest.mark.anyio
@@ -356,7 +455,10 @@ async def test_health_serves_the_process_block_in_full_when_the_database_is_unre
     body = response.json()
     assert body["database"]["status"] == "unreachable"
     assert body["database"]["projectors"] == []
-    assert body["database"]["failed_jobs"] == 0
+    # None, never 0: a block that could not be read must not render as "0ms
+    # behind, 0 failed jobs" to a consumer that forgot to branch on `status`.
+    assert body["database"]["failed_jobs"] is None
+    assert body["database"]["lag_ms"] is None
     assert body["database"]["stale_completion_count"] is None
     # The process side is untouched by the database side's failure.
     assert body["status"] == "failed"
@@ -575,6 +677,99 @@ async def test_a_staler_operations_tick_does_not_publish_over_a_fresher_read_mod
     # two ticks' facts would be a state neither of them observed.
     assert after_duration_ms == fresh_duration_ms
     assert after_updated_at == fresh_updated_at
+
+
+@pytest.mark.anyio
+async def test_a_staler_operations_tick_does_not_delete_a_fresher_read_model_row(tmp_path):
+    """PB7 has to cover the DELETE as well as the UPDATE (review F3).
+
+    The sweep that removes rows for Tasks no longer running reads its
+    ``running_task_ids`` in the same earlier, already-committed session as every
+    other input, and it runs *before* the per-row guard. A staler tick could
+    therefore delete a row a fresher tick had just published -- and deleting it
+    also resets the very basis the guard works from to NULL, disarming the guard
+    for that Task. The delete now carries the same staler-basis condition.
+    """
+
+    engine = create_async_engine(f"sqlite+aiosqlite:///{tmp_path / 'health-pb7-delete.db'}")
+    session_factory = async_sessionmaker(engine, expire_on_commit=False)
+    async with engine.begin() as connection:
+        await connection.run_sync(Base.metadata.create_all)
+    service = create_sql_ansich_service(session_factory, operations_assessment_interval_ms=60_000)
+    only_test_driven_assessments(service)
+    await service.start()
+    task_id = new_id()
+
+    try:
+        service.record_batch(
+            (
+                ObservationEnvelope.task_lifecycle(
+                    kind="task.created",
+                    task_id=task_id,
+                    source_kind="deerflow_run",
+                    source_id="run-health-pb7-delete",
+                    occurred_at=_OBSERVED_AT,
+                    source_event_id="run-health-pb7-delete:task:created",
+                ),
+                ObservationEnvelope.task_lifecycle(
+                    kind="task.started",
+                    task_id=task_id,
+                    source_kind="deerflow_run",
+                    source_id="run-health-pb7-delete",
+                    occurred_at=_OBSERVED_AT,
+                    source_event_id="run-health-pb7-delete:task:started",
+                ),
+            )
+        )
+        await service.flush_task(task_id)
+        backend = service._backend
+        fresh_at = datetime.now(UTC)
+        await service.assess_operations(now=fresh_at)
+        async with session_factory() as session:
+            fresh = await session.scalar(select(AnsichActiveTaskReadModelRow).where(AnsichActiveTaskReadModelRow.task_id == task_id))
+            fresh_watermark = fresh.projection_watermark
+        assert fresh_watermark is not None
+
+        # The Task leaves the running set, so the sweep below wants to delete
+        # its row — but this tick's basis is older than the row's.
+        async with session_factory() as session, session.begin():
+            await session.execute(update(AnsichTaskSummaryRow).where(AnsichTaskSummaryRow.task_id == task_id).values(control_value="completed"))
+        real_snapshot = backend._database_projection_snapshot
+        snapshot = await real_snapshot()
+        stale = snapshot._replace(complete_through=fresh_watermark - 1)
+        backend._database_projection_snapshot = lambda: _resolved(stale)  # type: ignore[assignment]
+        await service.assess_operations(now=fresh_at + timedelta(minutes=5))
+        async with session_factory() as session:
+            survived = await session.scalar(select(AnsichActiveTaskReadModelRow).where(AnsichActiveTaskReadModelRow.task_id == task_id))
+            survived_watermark = None if survived is None else survived.projection_watermark
+
+        # And the row is not leaked: a tick that is not staler sweeps it.
+        backend._database_projection_snapshot = real_snapshot  # type: ignore[assignment]
+        await service.assess_operations(now=fresh_at + timedelta(minutes=6))
+        async with session_factory() as session:
+            after_fresh_tick = await session.scalar(select(AnsichActiveTaskReadModelRow).where(AnsichActiveTaskReadModelRow.task_id == task_id))
+    finally:
+        await service.stop()
+        await engine.dispose()
+
+    assert survived_watermark == fresh_watermark
+    assert after_fresh_tick is None
+
+
+def test_an_unreachable_database_block_reports_unknown_rather_than_zero():
+    """None-when-unknown is a batch invariant, and it is user-visible here.
+
+    A panel that renders `database.lag_ms` / `database.failed_jobs` without
+    branching on `status` would otherwise show "0ms behind, 0 failed jobs" at
+    the exact moment storage is down.
+    """
+
+    unreachable = DatabaseHealth(status="unreachable")
+
+    assert unreachable.lag_ms is None
+    assert unreachable.failed_jobs is None
+    assert unreachable.stale_completion_count is None
+    assert unreachable.projectors == ()
 
 
 def _resolved(value):

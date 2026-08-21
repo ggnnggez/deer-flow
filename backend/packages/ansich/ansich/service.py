@@ -676,11 +676,20 @@ class AnsichService:
         the caller (``GET /api/ansich/health`` does the merge).
 
         Every failure lands on the same answer: ``status="unreachable"`` with
-        the rest of the block at its defaults. That includes a backend with no
-        such method (the in-memory and storage-unavailable backends), a raise,
-        and a call that outlives ``health_database_timeout_ms``. The process
-        side of health is unaffected either way -- ``GET /health`` stays the one
-        endpoint that reads while storage is down.
+        every number in the block ``None`` (unknown, never zero). That includes
+        a backend with no such method (the in-memory and storage-unavailable
+        backends), a raise, and a call that outlives
+        ``health_database_timeout_ms``. The process side of health is unaffected
+        either way -- ``GET /health`` stays the one endpoint that reads while
+        storage is down.
+
+        The budget is a **cancellation deadline, not a hard wall-clock bound**:
+        ``asyncio.wait_for`` cancels the inner coroutine and then waits for it to
+        unwind, and that unwind includes ``AsyncSession.__aexit__`` issuing a
+        rollback on a connection that may itself be dead. The observed wait can
+        therefore exceed the budget, bounded in practice by the driver's own
+        ``database.command_timeout``. It is still worth having: it turns an
+        indefinite stall into a bounded one and returns the honest answer.
         """
 
         provider = getattr(self._backend, "get_database_health", None)
