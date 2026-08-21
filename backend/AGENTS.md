@@ -1579,6 +1579,85 @@ heartbeat, dwell, budget and environment work along with both producers'.
 The next tick redoes it a second later; serializing Scope-subject reconciliation
 is not part of this slice.
 
+**P11-B health database merge and the read-model stamp** (spec §4/§9). Ansich
+health now answers with **two numbers of different standing**, and the wording
+matters. `GET /api/ansich/health` returns the process block it always did, plus
+an additive `database` block merged **at the route**: `AnsichService.get_health()`
+is synchronous, runs under the same `threading.Lock` as `record_batch` and does
+zero IO, so a database round trip inside it would put storage latency straight
+onto the collection hot path. The database half is a separate
+`async AnsichService.get_database_health()` with its own budget
+(`ansich.health_database_timeout_ms`, 2000) and a blanket `except Exception`;
+any failure — no such backend method, a raise, a call that outlives the budget —
+answers `database.status="unreachable"` with the rest of the block at defaults
+while the process block is served in full. That is the point: `GET /health`
+stays the one Ansich route readable while storage is down, and `_ensure_queryable`
+is untouched. Only `database.failed_jobs` is **authoritative** (a live count over
+both job tables); the process-local `AnsichHealth.failed_jobs` keeps its name and
+is **advisory** — it counts what this worker has seen fail, so under several
+workers it is a fraction of the truth. `database.stale_completion_count` is the
+one field in that block which is not database truth at all: it is the reporting
+worker's own dropped-write counter, and it is `None` rather than `0` when
+unknown.
+
+Per projector the block carries `(pending, retry, processing, failed)` and
+`complete_through`. `retry` is its own bucket because a re-armed job is work
+still owed, not work not yet started. `complete_through` is a **continuity**
+mark computed on read — `min(ingest_seq) - 1` over that projector's unsettled
+jobs (`pending`/`retry`/`processing`/`failed`), or the highest ingest sequence
+when nothing is outstanding. It is not a maximum: one durably failed job holds
+it down no matter how far past that hole the projector has otherwise run, which
+is what makes it usable as a "nothing below here is owed" statement. It is
+derived rather than stored (a deviation from spec §4's "maintain a projector
+watermark", recorded here): a stored copy of a number this cheap to derive is a
+copy that drifts. `ix_ansich_projection_jobs_projector_status` (migration `0027`)
+is what bounds the derivation, and its `(projector_name, status)` column order is
+why both groupings lead with the projector column —
+`sql.py::_projector_status_counts_statement` /
+`::_unsettled_projector_minimum_statement` exist as named statements so a test
+can pin that. `lag_ms` is the age of the **oldest unsettled** row, read from the
+single Observation at `MIN(ingest_seq)` by primary key; `recorded_at` carries no
+index, so ordering or filtering on it would be a full table scan (spec §7.2's
+alternative form, taken deliberately).
+
+The same query set stamps the active-Task read model.
+`_refresh_active_task_read_model` used to copy `get_projection_metrics()` —
+`self._watermark` and this process's own projection timestamps — onto every
+active Task row, so under two workers whichever ticked last published its private
+progress as if it were the system's. It now stamps the store-wide continuity mark
+(the lowest per-projector `complete_through`) and the database lag. Two things
+follow. First, the stamped watermark is a *continuity* number, so it is lower
+than the old one whenever anything is outstanding — that is the correction, not a
+regression. Second, the row carries a **monotonic publish guard** (controller
+ruling PB7): every input of a tick is read in earlier, already-committed
+sessions, so the `FOR UPDATE` lock serialises the writers but not the compute,
+and a tick that started first can finish last. Inside the locked write, a tick
+whose `projection_watermark` is *below* the one already on the row skips that row
+whole and logs at DEBUG; the next tick republishes. It skips the whole row rather
+than the stamped fields alone because publishing a mixture of two ticks' facts
+would be a state neither of them observed. The mark only rises while a row
+exists, and `rebuild_projections()` deletes these rows outright, so a rebuild's
+reset cannot freeze the guard shut.
+
+Two debts close with this slice. **F10-24**: both writers of a
+`budget_health:<dimension>:<scope>` Assertion — `_assess_budget_rows` on terminal
+control projection and the `absolute-limit` assessor — now store the same
+`value_json` shape. The terminal writer gained `enforcement`/`shadow` (knowable
+from the budget row, derived the same way the assessor derives them) and keeps
+`as_of_known`, the one key the assessor does not write, because only this writer
+falls its `as_of` back to `asserted_at`; the reader infers it when absent. The
+two assert at different clocks and the resolver separates them on `as_of` then
+`asserted_at`, so before this a field's *presence* was a race. **F10-27**: both
+`create_embedded_ansich_service` branches splat one
+`deerflow.ansich.service_knobs_from_config` mapping instead of spelling their own
+argument lists — the no-session-factory branch had been dropping
+`terminal_flush_timeout_ms`, `projector_poll_interval_ms` and
+`operations_assessment_interval_ms`. `operations_assessment_interval_ms` gained
+the `AnsichConfig` field it never had (startup-only, default 1000), beside the
+new `health_database_timeout_ms`; a test pins the mapping against
+`AnsichService.__init__`'s own keyword parameters, so a future knob cannot be
+threaded into one branch only. Tests: `tests/ansich/test_database_health.py`.
+
 **Workspace change review**: `packages/harness/deerflow/workspace_changes/`
 captures a pre-run and post-run snapshot of the thread-owned `workspace` and
 `outputs` directories. `runtime/runs/worker.py` performs the filesystem scan via

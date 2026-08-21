@@ -900,17 +900,13 @@ async def test_writer_resilience_config_reaches_the_service_and_the_backend(tmp_
     else), and the derived backoff schedule, which is what catches a threading
     bug that swapped the initial/max pair while both field reads still passed.
 
-    One asymmetry worth naming while looking straight at it, and deliberately
-    not fixed here: the ``session_factory is None`` branch of
-    ``create_embedded_ansich_service`` constructs ``AnsichService`` directly and
-    passes the five writer knobs but **not** ``terminal_flush_timeout_ms``,
-    ``projector_poll_interval_ms``, or ``operations_assessment_interval_ms``, so
-    a service with no storage silently runs those three at their constructor
-    defaults rather than at the operator's values. It is inert today — that
-    service refuses every record with ``storage_unavailable`` and has no
-    projector to poll — but it is a real gap between the two branches, and it
-    belongs to whoever next touches that constructor (T10 / P11-B), not to a
-    test-only task.
+    The asymmetry this test used to name as open is closed (F10-27): the
+    ``session_factory is None`` branch dropped ``terminal_flush_timeout_ms``,
+    ``projector_poll_interval_ms`` and ``operations_assessment_interval_ms``
+    because it spelled its own argument list. Both branches now splat the one
+    ``service_knobs_from_config`` mapping, and
+    ``tests/ansich/test_ansich_config.py`` pins that the mapping covers every
+    keyword ``AnsichService.__init__`` takes.
     """
 
     engine = create_async_engine(f"sqlite+aiosqlite:///{tmp_path / 'config-threading'}.db")
@@ -930,6 +926,8 @@ async def test_writer_resilience_config_reaches_the_service_and_the_backend(tmp_
         flush_interval_ms=44,
         terminal_flush_timeout_ms=3_300,
         projector_poll_interval_ms=125,
+        operations_assessment_interval_ms=61_000,
+        health_database_timeout_ms=1_750,
         # -- controls: pre-existing knobs on the backend side ---------------
         projector_lease_seconds=41,
         projector_max_attempts=9,
@@ -963,6 +961,8 @@ async def test_writer_resilience_config_reaches_the_service_and_the_backend(tmp_
         assert service._flush_interval_seconds == 0.044
         assert service._terminal_flush_timeout_seconds == 3.3
         assert service._projector_poll_interval_seconds == 0.125
+        assert service._operations_assessment_interval_seconds == 61.0
+        assert service._health_database_timeout_seconds == 1.75
         # Backend-side controls.
         backend = service._backend
         assert backend._projector_lease_seconds == 41
@@ -991,9 +991,9 @@ async def test_direct_sql_factory_threads_the_same_knobs_from_its_kwargs(tmp_pat
 
     ``create_sql_ansich_service`` is what the SQL suite and every direct caller
     use, so its kwargs are a public surface of their own rather than an
-    implementation detail of ``create_embedded_ansich_service``. It also owns
-    one knob the config path has no field for — ``operations_assessment_interval_ms``
-    — which is exactly the kind of parameter that goes unthreaded unnoticed.
+    implementation detail of ``create_embedded_ansich_service``. Its patient
+    ``terminal_flush_timeout_ms`` default is the one place the two paths
+    genuinely differ, and it is deliberate (see that factory's comment).
     """
 
     engine = create_async_engine(f"sqlite+aiosqlite:///{tmp_path / 'direct-threading'}.db")
@@ -1012,6 +1012,7 @@ async def test_direct_sql_factory_threads_the_same_knobs_from_its_kwargs(tmp_pat
         writer_backoff_max_ms=900,
         writer_item_max_attempts=5,
         stop_drain_timeout_ms=6_500,
+        health_database_timeout_ms=1_250,
         projector_lease_seconds=23,
         projector_max_attempts=8,
         projector_dependency_timeout_seconds=111,
@@ -1036,6 +1037,7 @@ async def test_direct_sql_factory_threads_the_same_knobs_from_its_kwargs(tmp_pat
         assert service._terminal_flush_timeout_seconds == 2.75
         assert service._projector_poll_interval_seconds == 0.175
         assert service._operations_assessment_interval_seconds == 2.5
+        assert service._health_database_timeout_seconds == 1.25
         backend = service._backend
         assert backend._projector_lease_seconds == 23
         assert backend._projector_max_attempts == 8

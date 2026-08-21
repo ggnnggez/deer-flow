@@ -2177,6 +2177,20 @@ async def list_context_compressions(
 
 @router.get("/health")
 async def get_health(request: Request) -> dict:
+    """Process health plus the additive database block, merged here (RB7③).
+
+    The merge lives at the route rather than inside ``get_health()`` because
+    that method is synchronous, runs under the collector's lock and does zero
+    IO — a database round trip there would sit on the collection hot path.
+
+    The two halves fail independently, and that is the property this endpoint
+    exists for: when storage is down the ``database`` block reads
+    ``unreachable`` and every process-side field is still served in full. This
+    stays the one Ansich route that answers while storage cannot.
+    """
+
     await require_admin_user(request, detail=_ADMIN_REQUIRED)
     service = _service_or_503(request)
-    return service.get_health().model_dump(mode="json")
+    health = service.get_health().model_dump(mode="json")
+    database = await service.get_database_health()
+    return {**health, "database": database.model_dump(mode="json")}

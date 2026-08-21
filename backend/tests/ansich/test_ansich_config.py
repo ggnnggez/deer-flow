@@ -1,11 +1,17 @@
+import inspect
 from datetime import UTC, datetime
 from unittest.mock import MagicMock
 
 import pytest
-from ansich import ObservationEnvelope, new_id
+from ansich import AnsichService, ObservationEnvelope, new_id
 from pydantic import ValidationError
 
-from deerflow.ansich import create_embedded_ansich_service, create_sql_ansich_service
+import deerflow.ansich as deerflow_ansich
+from deerflow.ansich import (
+    create_embedded_ansich_service,
+    create_sql_ansich_service,
+    service_knobs_from_config,
+)
 from deerflow.config.ansich_config import AnsichConfig
 
 
@@ -77,6 +83,72 @@ def test_writer_resilience_settings_reach_the_service_on_both_assembly_paths():
         assert service._writer_backoff_max_ms == 250
         assert service._writer_item_max_attempts == 4
         assert service._stop_drain_timeout_seconds == 7.5
+
+
+def test_every_service_knob_is_covered_by_the_shared_assembly_mapping():
+    """The structural half of F10-27: a service knob cannot be dropped by a branch.
+
+    ``create_embedded_ansich_service`` has two branches and both build an
+    ``AnsichService``. When each spelled its own argument list, the
+    no-session-factory one silently ran ``terminal_flush_timeout_ms``,
+    ``projector_poll_interval_ms`` and ``operations_assessment_interval_ms`` at
+    library defaults instead of the operator's values. Both branches now splat
+    ``service_knobs_from_config``, so the only way to drop a knob is to leave it
+    out of that one mapping — which this pins against the constructor itself.
+    """
+
+    service_parameters = {name for name, parameter in inspect.signature(AnsichService.__init__).parameters.items() if parameter.kind is inspect.Parameter.KEYWORD_ONLY}
+    # Not configuration: the host is read from the machine (or injected by a
+    # test), and the unavailability reason is which branch is assembling.
+    service_parameters -= {"hostname", "unavailable_reason"}
+
+    assert set(service_knobs_from_config(AnsichConfig())) == service_parameters
+
+
+def test_both_assembly_branches_receive_the_identical_service_knob_mapping():
+    """The behavioural half: the same values reach the service either way."""
+
+    configured = AnsichConfig(
+        enabled=True,
+        terminal_flush_timeout_ms=3_300,
+        projector_poll_interval_ms=125,
+        operations_assessment_interval_ms=61_000,
+        health_database_timeout_ms=1_750,
+    )
+    recorded: list[dict] = []
+
+    class _RecordingService:
+        def __init__(self, backend, **kwargs):
+            recorded.append(kwargs)
+
+    original = deerflow_ansich.AnsichService
+    deerflow_ansich.AnsichService = _RecordingService
+    try:
+        create_embedded_ansich_service(configured, None)
+        create_embedded_ansich_service(configured, MagicMock())
+    finally:
+        deerflow_ansich.AnsichService = original
+
+    without_storage, sql_backed = recorded
+    knobs = service_knobs_from_config(configured)
+    assert knobs["operations_assessment_interval_ms"] == 61_000
+    assert knobs["health_database_timeout_ms"] == 1_750
+    for name, value in knobs.items():
+        assert without_storage[name] == value, name
+        assert sql_backed[name] == value, name
+
+
+def test_operations_and_health_knobs_are_bounded_startup_only_fields():
+    config = AnsichConfig()
+
+    assert config.operations_assessment_interval_ms == 1_000
+    assert config.health_database_timeout_ms == 2_000
+    for field in ("operations_assessment_interval_ms", "health_database_timeout_ms"):
+        # Both are durations: zero would mean "assess continuously" / "no budget
+        # at all" spelled as a bound rather than as a switch.
+        with pytest.raises(ValidationError):
+            AnsichConfig.model_validate({field: 0})
+        assert AnsichConfig.model_fields[field].description.startswith("startup-only:")
 
 
 def test_evaluation_thresholds_are_overridable_and_bounded():

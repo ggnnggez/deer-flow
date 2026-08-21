@@ -15,7 +15,7 @@
 # ============================================================================
 # Bump this number when the config schema changes.
 # Run `make config-upgrade` to merge new fields into your local config.yaml.
-config_version: 34
+config_version: 35
 
 # ============================================================================
 # Logging
@@ -1818,6 +1818,13 @@ ansich:
   flush_interval_ms: 100
   terminal_flush_timeout_ms: 2000
   projector_poll_interval_ms: 250
+  # Cadence of the periodic operations assessment pass (heartbeat, dwell,
+  # budget, environment, and the process-subject Alert producers).
+  operations_assessment_interval_ms: 1000
+  # Budget for the database half of GET /api/ansich/health. Past it the response
+  # carries database.status=unreachable and the process-side fields are served
+  # unchanged, so a stalled store costs a bounded wait rather than the endpoint.
+  health_database_timeout_ms: 2000
   projector_lease_seconds: 30
   projector_max_attempts: 5
   # A missing replay-safe projection dependency becomes a visible failed job

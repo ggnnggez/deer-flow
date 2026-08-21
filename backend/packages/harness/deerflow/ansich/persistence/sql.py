@@ -108,7 +108,9 @@ from ansich.context_state import context_state_hash, materialize_context_state
 from ansich.contracts import (
     ANSICH_BOOTSTRAP_TASK_ID,
     ControlValue,
+    DatabaseHealth,
     LostRange,
+    ProjectorHealth,
     TaskLifecycleScope,
     UsageDimension,
     control_values_for_lifecycle_scope,
@@ -419,6 +421,12 @@ _TOOL_TERMINAL_PRECEDENCE = {
 #: (including a replay-safe dependency wait, which consumes no attempt), and a
 #: ``processing`` row only becomes claimable once its lease has expired.
 _CLAIMABLE_JOB_STATUSES = ("pending", "retry")
+#: Job statuses that leave an Observation *owed* -- the set the continuity mark
+#: is taken over (RB6①). ``failed`` belongs in it: a durably failed job has been
+#: given up on, but its Observation was never projected, so a mark that stepped
+#: over it would claim coverage nothing produced. ``processing`` belongs in it
+#: for the same reason from the other side: it is leased, not landed.
+_UNSETTLED_JOB_STATUSES = (*_CLAIMABLE_JOB_STATUSES, "processing", "failed")
 #: Stable advisory-lock key for the Ansich single-operator maintenance
 #: operations (``rebuild_projections`` / ``retry_failed_projections``). The
 #: value is mnemonic rather than random -- ``0DEE`` marks it as DeerFlow's,
@@ -488,6 +496,26 @@ class _AssessorClaim(NamedTuple):
     attempts: int
     lease_generation: int
     pre_claim_watermark: int | None
+
+
+class _DatabaseProjectionSnapshot(NamedTuple):
+    """One read of database-side projection truth, shared by two consumers.
+
+    ``get_database_health`` turns it into the additive ``database`` health block
+    (RB7); ``_refresh_active_task_read_model`` stamps ``complete_through`` and
+    ``lag_ms`` onto every active-Task row instead of the process-local counters
+    it used to copy (RB8) -- those describe only the ticking worker's own
+    progress, so under two workers whichever ticked last wrote its private
+    numbers over every Task row as if they were the system's.
+
+    ``complete_through`` is the store-wide continuity mark: the lowest
+    per-projector mark, ``None`` only when the store holds no Observations.
+    """
+
+    projectors: tuple[ProjectorHealth, ...]
+    lag_ms: int
+    failed_jobs: int
+    complete_through: int | None
 
 
 def _projectors_for_kind(kind: str) -> tuple[tuple[str, str], ...]:
@@ -661,6 +689,56 @@ def _periodic_budget_rows_statement():
     )
 
 
+def _projector_status_counts_statement():
+    """Per-``(projector, version, status)`` job counts, grouped projector-first.
+
+    The column order is a pinned contract, not a style preference: this group is
+    served by ``ix_ansich_projection_jobs_projector_status``, whose columns are
+    ``(projector_name, status)``. Grouping by status first leaves that index
+    unusable as a prefix and turns the health read into a full scan of every job
+    row ever written. ``projector_version`` sits between the two indexed columns
+    because it is a low-cardinality tiebreak, not a filter.
+    """
+
+    return select(
+        AnsichProjectionJobRow.projector_name,
+        AnsichProjectionJobRow.projector_version,
+        AnsichProjectionJobRow.status,
+        func.count(),
+    ).group_by(
+        AnsichProjectionJobRow.projector_name,
+        AnsichProjectionJobRow.projector_version,
+        AnsichProjectionJobRow.status,
+    )
+
+
+def _unsettled_projector_minimum_statement():
+    """Lowest ingest sequence each projector still owes, grouped projector-first.
+
+    One minus this is the projector's continuity mark (RB6①). Same index and
+    the same reason for the grouping order as
+    ``_projector_status_counts_statement``; the join is to the Observation's
+    primary key.
+    """
+
+    return (
+        select(
+            AnsichProjectionJobRow.projector_name,
+            AnsichProjectionJobRow.projector_version,
+            func.min(AnsichObservationRow.ingest_seq),
+        )
+        .join(
+            AnsichObservationRow,
+            AnsichObservationRow.obs_id == AnsichProjectionJobRow.obs_id,
+        )
+        .where(AnsichProjectionJobRow.status.in_(_UNSETTLED_JOB_STATUSES))
+        .group_by(
+            AnsichProjectionJobRow.projector_name,
+            AnsichProjectionJobRow.projector_version,
+        )
+    )
+
+
 def _as_utc(value: datetime) -> datetime:
     if value.tzinfo is None:
         return value.replace(tzinfo=UTC)
@@ -685,6 +763,26 @@ def _read_model_values_equal(current: object, candidate: object) -> bool:
     if isinstance(current, datetime) and isinstance(candidate, datetime):
         return _as_utc(current) == _as_utc(candidate)
     return current == candidate
+
+
+def _is_staler_publish(published: int | None, incoming: int | None) -> bool:
+    """Would writing ``incoming`` over ``published`` move the basis backwards?
+
+    The comparison behind the active-task read model's monotonic publish guard
+    (controller ruling PB7). ``published`` is the basis mark already on the row;
+    ``incoming`` is the basis the publishing tick read its inputs against.
+
+    A row with no mark yet has no basis to defend, so anything may publish over
+    it. Past that, an ``incoming`` of ``None`` counts as staler rather than as
+    equal: a tick that could not establish a basis must not erase one that was.
+    Equal marks are not stale -- two ticks that read the same world may both
+    publish, and the ordinary value compare below decides whether anything
+    changes.
+    """
+
+    if published is None:
+        return False
+    return incoming is None or incoming < published
 
 
 async def _lock_rollup_targets(session: AsyncSession, statement) -> list:
@@ -1446,6 +1544,97 @@ class SqlAnsichBackend:
             "failed_jobs": self._failed_jobs,
             **self._context_metrics,
         }
+
+    async def get_database_health(self) -> DatabaseHealth:
+        """Per-projector job counts, continuity marks and backlog lag (RB6/RB7).
+
+        Deliberately **not** folded into ``get_health()``: that one is
+        synchronous, runs under the collector's ``threading.Lock`` and does zero
+        IO, so a database round trip in there would put storage latency straight
+        onto the collection hot path. This is the separate ``async`` half; the
+        HTTP layer joins the two.
+
+        Every number here is read from the database, so two workers sharing one
+        store answer the same thing -- which is the whole point, since the
+        process-local counters cannot see each other's work.
+        """
+
+        snapshot = await self._database_projection_snapshot()
+        return DatabaseHealth(
+            status="reachable",
+            projectors=snapshot.projectors,
+            lag_ms=snapshot.lag_ms,
+            failed_jobs=snapshot.failed_jobs,
+            stale_completion_count=self._stale_completion_count,
+        )
+
+    async def _database_projection_snapshot(self) -> _DatabaseProjectionSnapshot:
+        """The one query set behind both the health block and the read-model stamp.
+
+        Four bounded reads, in this order:
+
+        1. Counts grouped ``(projector_name, projector_version, status)``.
+           Projector-first is a pinned contract, not a style choice: the group
+           is served by ``ix_ansich_projection_jobs_projector_status``, whose
+           column order is ``(projector_name, status)``, and grouping by status
+           first would leave the index unusable as a prefix.
+        2. ``MIN(ingest_seq)`` over each projector's *unsettled* jobs. That
+           minus one is the projector's continuity mark.
+        3. The highest ``ingest_seq`` in the store, which is what a projector
+           with nothing unsettled is complete through.
+        4. ``recorded_at`` of the single oldest unsettled row, by primary key.
+           This is the index-friendly form of the lag the spec asks for
+           (RB6②): ``recorded_at`` carries no index of its own, so ordering or
+           filtering on it would be a full scan of the Observation table. The
+           minimum is already known from (2), so its age costs one PK lookup.
+        """
+
+        now = datetime.now(UTC)
+        async with self._session_factory() as session:
+            count_rows = (await session.execute(_projector_status_counts_statement())).all()
+            unsettled_rows = (await session.execute(_unsettled_projector_minimum_statement())).all()
+            highest_ingest_seq = await session.scalar(select(func.max(AnsichObservationRow.ingest_seq)))
+            oldest_unsettled = min((ingest_seq for _, _, ingest_seq in unsettled_rows if ingest_seq is not None), default=None)
+            oldest_recorded_at = None if oldest_unsettled is None else await session.scalar(select(AnsichObservationRow.recorded_at).where(AnsichObservationRow.ingest_seq == oldest_unsettled))
+            projection_failures = await session.scalar(select(func.count()).select_from(AnsichProjectionJobRow).where(AnsichProjectionJobRow.status == "failed"))
+            assessor_failures = await session.scalar(select(func.count()).select_from(AnsichAssessorJobRow).where(AnsichAssessorJobRow.status == "failed"))
+
+        highest = None if highest_ingest_seq is None else int(highest_ingest_seq)
+        unsettled_minimum = {(projector_name, projector_version): int(ingest_seq) for projector_name, projector_version, ingest_seq in unsettled_rows if ingest_seq is not None}
+        counts: dict[tuple[str, str], dict[str, int]] = {}
+        for projector_name, projector_version, status, count in count_rows:
+            counts.setdefault((projector_name, projector_version), {})[status] = int(count or 0)
+        projectors = tuple(
+            ProjectorHealth(
+                projector_name=projector_name,
+                projector_version=projector_version,
+                pending=status_counts.get("pending", 0),
+                retry=status_counts.get("retry", 0),
+                processing=status_counts.get("processing", 0),
+                failed=status_counts.get("failed", 0),
+                # A hole below the projector's furthest progress is what this
+                # mark reports, so it is the minimum unsettled sequence minus
+                # one -- never the maximum settled one. Caught up entirely, the
+                # projector is complete through everything the store holds.
+                complete_through=(highest if (projector_name, projector_version) not in unsettled_minimum else unsettled_minimum[(projector_name, projector_version)] - 1),
+            )
+            for (projector_name, projector_version), status_counts in sorted(counts.items())
+        )
+        lag_ms = 0 if oldest_recorded_at is None else max(0, int((now - _as_utc(oldest_recorded_at)).total_seconds() * 1000))
+        return _DatabaseProjectionSnapshot(
+            projectors=projectors,
+            lag_ms=lag_ms,
+            failed_jobs=int(projection_failures or 0) + int(assessor_failures or 0),
+            # The store-wide continuity mark: the lowest of the per-projector
+            # marks, because a sequence is only genuinely covered once every
+            # projector has passed it. With no projector rows at all it falls
+            # back to the highest ingest sequence, matching the zero-jobs case
+            # of a single projector.
+            complete_through=min(
+                (row.complete_through for row in projectors if row.complete_through is not None),
+                default=highest,
+            ),
+        )
 
     async def _refresh_context_metrics(self) -> None:
         async with self._session_factory() as session:
@@ -6595,6 +6784,25 @@ class SqlAnsichBackend:
                 usage_evidence_obs_ids=usage_evidence,
             )
             field_name = f"budget_health:{belief.dimension}:{belief.aggregation_scope}"
+            # The assessor's shape, plus this writer's own `as_of_known`
+            # (F10-24). Both `_assess_budget_rows` (here, on terminal control
+            # projection) and `assess_absolute_limits` (the durable assessor)
+            # write `budget_health:<dimension>:<scope>` for the same Task, and
+            # the resolver picks between them on `as_of` then `asserted_at` --
+            # two clocks. So whichever one a reader gets must carry the same
+            # keys, or a field's presence becomes a race: `enforcement` and
+            # `shadow` are what an Alert condition and any operator view read to
+            # tell an enforced breach from a shadow one, and they were absent
+            # from exactly half the assertions. They are knowable here (the
+            # budget row carries `enforcement`, and shadow is its negation, the
+            # same derivation the assessor makes), so they are written.
+            #
+            # `as_of_known` stays, and is the one key the assessor does not
+            # write: this writer's `as_of` falls back to `asserted_at` when
+            # usage has no timestamp, so without the flag the reader cannot tell
+            # a real `as_of` from that fallback. The reader
+            # (`get_task_budget_health`) still infers it when absent, which is
+            # what keeps the assessor's assertions readable.
             value_json = {
                 "value": belief.value,
                 "dimension": belief.dimension,
@@ -6603,6 +6811,8 @@ class SqlAnsichBackend:
                 "warning_limit": belief.warning_limit,
                 "hard_limit": belief.hard_limit,
                 "overshoot": belief.overshoot,
+                "enforcement": budget.enforcement,
+                "shadow": not budget.enforcement,
                 "as_of_known": belief.as_of is not None,
             }
             current = await session.get(
@@ -6779,10 +6989,14 @@ class SqlAnsichBackend:
             running_task_ids = tuple((await session.execute(select(AnsichTaskSummaryRow.task_id).where(AnsichTaskSummaryRow.control_value == "running"))).scalars())
 
         views: list[ActiveTaskView] = []
-        # T10 (RB8) replaces this process-local metrics stamping with DB-derived
-        # numbers; the two `metrics.get(...)` reads below belong to that task,
-        # not to this one, which changes only the row-locking discipline.
-        metrics = self.get_projection_metrics()
+        # Database-derived, not process-local (RB8). `get_projection_metrics()`
+        # answers from `self._watermark` / `self._latest_projected_at`, which
+        # are this worker's own progress; stamping them onto every active-Task
+        # row made the read model say "projection has reached here" when it only
+        # knew where *one* worker had reached, and under two workers whichever
+        # ticked last overwrote the other's numbers. One bounded, indexed query
+        # set per tick buys a number both workers agree on.
+        projection = await self._database_projection_snapshot()
         for task_id in running_task_ids:
             task = await self.get_task(task_id)
             if task is None:
@@ -6897,8 +7111,8 @@ class SqlAnsichBackend:
                     budget_health=budget_health,
                     duration_ms=duration_ms,
                     observability_status=task.observability_status,
-                    projection_watermark=metrics.get("watermark"),
-                    projection_lag_ms=int(metrics.get("lag_ms", 0)),
+                    projection_watermark=projection.complete_through,
+                    projection_lag_ms=projection.lag_ms,
                     lost_ranges=task_lost_ranges,
                     last_evidence_at=(task.control.as_of if last_evidence_at is None else _as_utc(last_evidence_at)),
                     updated_at=now,
@@ -6921,13 +7135,12 @@ class SqlAnsichBackend:
             # this change and is not made worse by it; ordering the FOR UPDATE
             # set is what this lock owns.
             #
-            # Honest residual, deliberately not fixed here: every input above
-            # was read in *earlier, already-committed* sessions, so this lock
-            # serializes the writers, not the compute. A tick whose inputs are
-            # staler can still publish after a fresher one; ordering those
-            # needs a monotonic guard, not a row lock, and adding one would be
-            # a behaviour change rather than the locking discipline this task
-            # is scoped to.
+            # The residual T5 left here -- every input above was read in
+            # *earlier, already-committed* sessions, so this lock serializes the
+            # writers but not the compute, and a tick whose inputs are staler
+            # can still publish after a fresher one -- is closed below by the
+            # monotonic publish guard (controller ruling PB7), which is a
+            # compare-and-skip rather than a lock.
             # Lost-update proof on a real PostgreSQL server: T9's two-worker
             # tier, tests/integration/test_postgres_multiworker.py.
             locked_read_models = {
@@ -6993,6 +7206,28 @@ class SqlAnsichBackend:
                     row = await session.scalar(select(AnsichActiveTaskReadModelRow).where(AnsichActiveTaskReadModelRow.task_id == view.task_id).with_for_update())
                     if row is None:
                         raise RuntimeError("Ansich active-task read model upsert did not produce a row")
+                if _is_staler_publish(row.projection_watermark, view.projection_watermark):
+                    # Monotonic publish guard (PB7). The row lock makes each
+                    # write atomic but says nothing about *when* the values were
+                    # computed: every input of this view was read in earlier,
+                    # already-committed sessions, so a tick that started first
+                    # and finished last would otherwise overwrite a peer's
+                    # fresher row with older facts. `projection_watermark` is the
+                    # basis those facts were read against -- a store-wide
+                    # continuity mark that only rises while the row exists (a
+                    # rebuild deletes these rows outright, so its reset cannot
+                    # freeze the guard shut) -- so a lower one is proof this tick
+                    # read an older world. It skips the whole row rather than
+                    # part of it: publishing a mixture of two ticks' facts would
+                    # be a state neither of them observed. The next tick
+                    # republishes.
+                    logger.debug(
+                        "Ansich active-task read model publish skipped as stale for %s (row watermark %s, tick watermark %s)",
+                        view.task_id,
+                        row.projection_watermark,
+                        view.projection_watermark,
+                    )
+                    continue
                 if any(not _read_model_values_equal(getattr(row, key), value) for key, value in values.items()):
                     for key, value in values.items():
                         setattr(row, key, value)

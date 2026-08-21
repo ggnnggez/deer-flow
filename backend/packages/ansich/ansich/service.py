@@ -16,7 +16,22 @@ from ansich.backend import AnsichBackend
 from ansich.budget import BudgetHealthBelief, TaskBudgetsView
 from ansich.compression import ContextCompressionSummaryView, ContextCompressionView
 from ansich.context_state import ContextStateView
-from ansich.contracts import ANSICH_BOOTSTRAP_TASK_ID, AnsichHealth, ControlValue, FlushResult, LostRange, ObservationEnvelope, Producer, ProducerHealth, RebuildOutcome, RecordReceipt, TaskLifecycleScope, TaskView, WriterHealth
+from ansich.contracts import (
+    ANSICH_BOOTSTRAP_TASK_ID,
+    AnsichHealth,
+    ControlValue,
+    DatabaseHealth,
+    FlushResult,
+    LostRange,
+    ObservationEnvelope,
+    Producer,
+    ProducerHealth,
+    RebuildOutcome,
+    RecordReceipt,
+    TaskLifecycleScope,
+    TaskView,
+    WriterHealth,
+)
 from ansich.environment import (
     EnvironmentHistoryView,
     TaskEnvironmentView,
@@ -122,6 +137,7 @@ class AnsichService:
         writer_backoff_max_ms: int = 5_000,
         writer_item_max_attempts: int = 2,
         stop_drain_timeout_ms: int = 10_000,
+        health_database_timeout_ms: int = 2_000,
         hostname: str | None = None,
         unavailable_reason: str | None = None,
     ) -> None:
@@ -149,6 +165,8 @@ class AnsichService:
             raise ValueError("writer_item_max_attempts must be positive")
         if stop_drain_timeout_ms < 1:
             raise ValueError("stop_drain_timeout_ms must be positive")
+        if health_database_timeout_ms < 1:
+            raise ValueError("health_database_timeout_ms must be positive")
         self._capacity = queue_capacity
         self._byte_capacity = queue_byte_capacity
         self._batch_size = batch_size
@@ -164,6 +182,10 @@ class AnsichService:
         # wired once rather than three times.
         self._writer_item_max_attempts = writer_item_max_attempts
         self._stop_drain_timeout_seconds = stop_drain_timeout_ms / 1000
+        # The database health merge's whole budget. It is a health read, so a
+        # storage stall must cost the caller a bounded wait and an honest
+        # `unreachable`, never the page.
+        self._health_database_timeout_seconds = health_database_timeout_ms / 1000
         self._queue: deque[tuple[int, ObservationEnvelope, int]] = deque()
         self._queue_bytes = 0
         self._lock = Lock()
@@ -642,6 +664,39 @@ class AnsichService:
                 # from a reported count that used to include it (RA8②).
                 unreported_global_lost_range_count=len(self._unreported_global_ranges),
             )
+
+    async def get_database_health(self) -> DatabaseHealth:
+        """Database-side projection truth, as its own bounded async read (RB7).
+
+        Deliberately *not* part of ``get_health()``. That method is synchronous,
+        holds ``self._lock`` -- the same lock ``record_batch`` takes -- and does
+        no IO; a database round trip inside it would put storage latency on the
+        collection hot path, which is the one thing the collector's design has
+        never allowed. So the two halves are produced separately and joined by
+        the caller (``GET /api/ansich/health`` does the merge).
+
+        Every failure lands on the same answer: ``status="unreachable"`` with
+        the rest of the block at its defaults. That includes a backend with no
+        such method (the in-memory and storage-unavailable backends), a raise,
+        and a call that outlives ``health_database_timeout_ms``. The process
+        side of health is unaffected either way -- ``GET /health`` stays the one
+        endpoint that reads while storage is down.
+        """
+
+        provider = getattr(self._backend, "get_database_health", None)
+        if not callable(provider):
+            return DatabaseHealth(status="unreachable")
+        try:
+            return await asyncio.wait_for(
+                provider(),
+                timeout=self._health_database_timeout_seconds,
+            )
+        except Exception:
+            # Includes the timeout. `CancelledError` is a `BaseException` and is
+            # deliberately not caught: a cancelled health read has a caller that
+            # went away, not a database that did.
+            logger.debug("Ansich database health read failed", exc_info=True)
+            return DatabaseHealth(status="unreachable")
 
     def register_persistence_listener(
         self,

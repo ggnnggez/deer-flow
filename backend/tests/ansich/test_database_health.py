@@ -1,0 +1,700 @@
+"""Database-side health truth, its route merge, and the read-model stamp it feeds.
+
+Covers RB6 (per-projector counts, the continuity mark, the index-friendly lag),
+RB7 (the additive ``database`` block, its own timeout, the route-level merge and
+the unreachable fallback), RB8 (the active-task read model stamped from database
+truth rather than from one worker's private counters) and controller ruling PB7
+(the monotonic publish guard that keeps a staler tick from overwriting a fresher
+row).
+
+Most of these drive a bare ``SqlAnsichBackend`` rather than a started service.
+That is deliberate: what is under test is a set of queries over a job ledger in a
+particular state, and a running projector loop would keep settling the very jobs
+the state is built out of.
+"""
+
+from __future__ import annotations
+
+from datetime import UTC, datetime, timedelta
+from uuid import uuid4
+
+import pytest
+from _router_auth_helpers import make_authed_test_app
+from ansich import AnsichService, ObservationEnvelope, new_id
+from ansich.contracts import DatabaseHealth
+from httpx import ASGITransport, AsyncClient
+from sqlalchemy import select, update
+from sqlalchemy.dialects import postgresql, sqlite
+from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
+from support.ansich_settle import only_test_driven_assessments
+
+from app.gateway.auth.models import User
+from app.gateway.routers import ansich as ansich_router
+from deerflow.ansich import create_embedded_ansich_service, create_sql_ansich_service
+from deerflow.ansich.persistence.models import (
+    AnsichActiveTaskReadModelRow,
+    AnsichAssessorJobRow,
+    AnsichBeliefAssertionRow,
+    AnsichObservationRow,
+    AnsichProjectionJobRow,
+)
+from deerflow.ansich.persistence.sql import (
+    SqlAnsichBackend,
+    _projector_status_counts_statement,
+    _unsettled_projector_minimum_statement,
+)
+from deerflow.config.ansich_config import AnsichConfig
+from deerflow.persistence.base import Base
+
+_OBSERVED_AT = datetime(2026, 7, 18, 11, tzinfo=UTC)
+
+
+def admin_user() -> User:
+    return User(
+        id=uuid4(),
+        email="ansich-health-admin@example.com",
+        password_hash="x",
+        system_role="admin",
+    )
+
+
+async def _backend(tmp_path, name: str) -> tuple[SqlAnsichBackend, async_sessionmaker, object]:
+    engine = create_async_engine(f"sqlite+aiosqlite:///{tmp_path / name}")
+    session_factory = async_sessionmaker(engine, expire_on_commit=False)
+    async with engine.begin() as connection:
+        await connection.run_sync(Base.metadata.create_all)
+    return SqlAnsichBackend(session_factory), session_factory, engine
+
+
+def _created(task_id: str, ordinal: int) -> ObservationEnvelope:
+    return ObservationEnvelope.task_lifecycle(
+        kind="task.created",
+        task_id=task_id,
+        source_kind="deerflow_run",
+        source_id=f"run-health-{ordinal}",
+        occurred_at=_OBSERVED_AT + timedelta(seconds=ordinal),
+        source_event_id=f"run-health-{ordinal}:task:created",
+    )
+
+
+async def _ingest_seq_by_obs(session_factory, obs_ids: list[str]) -> dict[str, int]:
+    async with session_factory() as session:
+        rows = (await session.execute(select(AnsichObservationRow.obs_id, AnsichObservationRow.ingest_seq).where(AnsichObservationRow.obs_id.in_(obs_ids)))).all()
+    return {obs_id: ingest_seq for obs_id, ingest_seq in rows}
+
+
+async def _set_job_status(session_factory, *, obs_id: str, projector_name: str, status: str) -> None:
+    async with session_factory() as session, session.begin():
+        await session.execute(
+            update(AnsichProjectionJobRow)
+            .where(
+                AnsichProjectionJobRow.obs_id == obs_id,
+                AnsichProjectionJobRow.projector_name == projector_name,
+            )
+            .values(status=status)
+        )
+
+
+def _projector(health: DatabaseHealth, name: str):
+    return next(row for row in health.projectors if row.projector_name == name)
+
+
+def test_health_groupings_lead_with_the_projector_column_on_both_dialects():
+    """The T1 index's column order is a contract the grouping has to honour.
+
+    ``ix_ansich_projection_jobs_projector_status`` is ``(projector_name,
+    status)``. A grouping that led with ``status`` would leave it unusable as a
+    prefix and turn the health read into a full scan of every job row ever
+    written, which is exactly the cost RB6 accepted the index to bound.
+    """
+
+    for statement in (_projector_status_counts_statement(), _unsettled_projector_minimum_statement()):
+        for dialect in (sqlite.dialect(), postgresql.dialect()):
+            compiled = " ".join(str(statement.compile(dialect=dialect)).upper().split())
+            group_by = compiled.split("GROUP BY", 1)[1]
+            assert group_by.strip().startswith("ANSICH_PROJECTION_JOBS.PROJECTOR_NAME")
+            assert "ANSICH_PROJECTION_JOBS.PROJECTOR_VERSION" in group_by
+
+
+@pytest.mark.anyio
+async def test_per_projector_counts_split_every_claimable_status_including_retry(tmp_path):
+    """``retry`` is its own bucket, not folded into pending and not omitted.
+
+    A hard error re-arms a job to ``retry``; a bucket-less health page would
+    make that work disappear from view while it is still owed.
+    """
+
+    backend, session_factory, engine = await _backend(tmp_path, "health-counts.db")
+    observations = [_created(new_id(), ordinal) for ordinal in range(4)]
+    try:
+        await backend.persist_and_project(list(observations))
+        for observation, status in zip(observations, ("pending", "retry", "processing", "failed"), strict=True):
+            await _set_job_status(
+                session_factory,
+                obs_id=observation.obs_id,
+                projector_name="task-control",
+                status=status,
+            )
+        health = await backend.get_database_health()
+    finally:
+        await engine.dispose()
+
+    assert health.status == "reachable"
+    # Ordered by identity so two reads of an unchanged ledger are diffable.
+    assert [row.projector_name for row in health.projectors] == ["task-control", "task-structural"]
+    control = _projector(health, "task-control")
+    assert (control.pending, control.retry, control.processing, control.failed) == (1, 1, 1, 1)
+    structural = _projector(health, "task-structural")
+    assert (structural.pending, structural.retry, structural.processing, structural.failed) == (4, 0, 0, 0)
+    assert control.projector_version == "1"
+
+
+@pytest.mark.anyio
+async def test_complete_through_stops_below_a_hole_however_far_past_it_the_projector_ran(tmp_path):
+    """The mark is continuity, not progress: one failed job below settled work holds it down."""
+
+    backend, session_factory, engine = await _backend(tmp_path, "health-hole.db")
+    observations = [_created(new_id(), ordinal) for ordinal in range(4)]
+    try:
+        await backend.persist_and_project(list(observations))
+        ingest = await _ingest_seq_by_obs(session_factory, [item.obs_id for item in observations])
+        for index, observation in enumerate(observations):
+            # task-control: everything settled except the *second* row, which is
+            # durably failed, and the last row, which is still pending. The hole
+            # sits below the pending job on purpose — a mark taken as "highest
+            # settled" or "lowest pending" would both step over it.
+            status = "failed" if index == 1 else "completed" if index < 3 else "pending"
+            await _set_job_status(
+                session_factory,
+                obs_id=observation.obs_id,
+                projector_name="task-control",
+                status=status,
+            )
+            await _set_job_status(
+                session_factory,
+                obs_id=observation.obs_id,
+                projector_name="task-structural",
+                status="completed",
+            )
+        health = await backend.get_database_health()
+    finally:
+        await engine.dispose()
+
+    highest = max(ingest.values())
+    assert _projector(health, "task-control").complete_through == ingest[observations[1].obs_id] - 1
+    # Nothing unsettled at all: complete through everything the store holds.
+    assert _projector(health, "task-structural").complete_through == highest
+
+
+@pytest.mark.anyio
+async def test_a_re_armed_job_still_holds_the_continuity_mark_down(tmp_path):
+    """The T2 carry, at the mark rather than at the counts.
+
+    ``retry`` is unsettled work: its Observation has not been projected. A mark
+    that treated it as settled would claim coverage of an Observation nothing
+    has processed, which is the one thing this number must never do.
+    """
+
+    backend, session_factory, engine = await _backend(tmp_path, "health-retry-mark.db")
+    observations = [_created(new_id(), ordinal) for ordinal in range(3)]
+    try:
+        await backend.persist_and_project(list(observations))
+        ingest = await _ingest_seq_by_obs(session_factory, [item.obs_id for item in observations])
+        async with session_factory() as session, session.begin():
+            await session.execute(update(AnsichProjectionJobRow).values(status="completed"))
+        await _set_job_status(
+            session_factory,
+            obs_id=observations[1].obs_id,
+            projector_name="task-control",
+            status="retry",
+        )
+        health = await backend.get_database_health()
+    finally:
+        await engine.dispose()
+
+    assert _projector(health, "task-control").retry == 1
+    assert _projector(health, "task-control").complete_through == ingest[observations[1].obs_id] - 1
+    assert _projector(health, "task-structural").complete_through == max(ingest.values())
+
+
+@pytest.mark.anyio
+async def test_lag_is_the_age_of_the_oldest_unsettled_row_not_of_the_oldest_row(tmp_path):
+    """Behavioural pin on RB6②'s index-friendly form.
+
+    ``recorded_at`` carries no index, so the lag may never be found by ordering
+    or filtering on it. It is read from the single row at ``MIN(ingest_seq)``
+    over unsettled jobs — a primary-key lookup. The fixture makes
+    ``recorded_at`` disagree with ingest order in both directions, so a scan
+    over all rows (100s), or a minimum over the unsettled ones (50s), gives a
+    visibly different answer from the correct one (10s).
+    """
+
+    backend, session_factory, engine = await _backend(tmp_path, "health-lag.db")
+    observations = [_created(new_id(), ordinal) for ordinal in range(3)]
+    now = datetime.now(UTC)
+    try:
+        await backend.persist_and_project(list(observations))
+        ages = (timedelta(seconds=100), timedelta(seconds=10), timedelta(seconds=50))
+        async with session_factory() as session, session.begin():
+            for observation, age in zip(observations, ages, strict=True):
+                await session.execute(update(AnsichObservationRow).where(AnsichObservationRow.obs_id == observation.obs_id).values(recorded_at=now - age))
+        for projector_name in ("task-control", "task-structural"):
+            await _set_job_status(
+                session_factory,
+                obs_id=observations[0].obs_id,
+                projector_name=projector_name,
+                status="completed",
+            )
+        health = await backend.get_database_health()
+    finally:
+        await engine.dispose()
+
+    assert 9_000 <= health.lag_ms < 40_000
+
+
+@pytest.mark.anyio
+async def test_an_empty_backlog_reports_zero_lag_and_the_highest_ingest_sequence(tmp_path):
+    backend, session_factory, engine = await _backend(tmp_path, "health-empty.db")
+    observations = [_created(new_id(), ordinal) for ordinal in range(2)]
+    try:
+        await backend.persist_and_project(list(observations))
+        ingest = await _ingest_seq_by_obs(session_factory, [item.obs_id for item in observations])
+        async with session_factory() as session, session.begin():
+            await session.execute(update(AnsichProjectionJobRow).values(status="completed"))
+        health = await backend.get_database_health()
+    finally:
+        await engine.dispose()
+
+    assert health.lag_ms == 0
+    assert {row.complete_through for row in health.projectors} == {max(ingest.values())}
+
+
+@pytest.mark.anyio
+async def test_failed_jobs_counts_both_job_tables_and_stale_completions_are_exposed(tmp_path):
+    """``database.failed_jobs`` is the authoritative count; the process one is advisory."""
+
+    backend, session_factory, engine = await _backend(tmp_path, "health-failed.db")
+    observations = [_created(new_id(), ordinal) for ordinal in range(2)]
+    try:
+        await backend.persist_and_project(list(observations))
+        await _set_job_status(
+            session_factory,
+            obs_id=observations[0].obs_id,
+            projector_name="task-control",
+            status="failed",
+        )
+        async with session_factory() as session, session.begin():
+            # Inserted directly: this suite leaves `PRAGMA foreign_keys` off, and
+            # the assessor job's Task FK is not what is under test here.
+            session.add(
+                AnsichAssessorJobRow(
+                    job_id=new_id(),
+                    subject_id=observations[0].task_id,
+                    assessor_name="absolute-limit",
+                    assessor_version="1.0.0",
+                    evidence_watermark=1,
+                    status="failed",
+                )
+            )
+        health = await backend.get_database_health()
+    finally:
+        await engine.dispose()
+
+    assert health.failed_jobs == 2
+    # Process-local, and labelled as such by being answerable rather than zero.
+    assert health.stale_completion_count == backend.stale_completion_count == 0
+
+
+@pytest.mark.anyio
+async def test_the_database_block_reads_unreachable_when_the_query_set_fails():
+    service = AnsichService.in_memory()
+
+    async def _raise() -> DatabaseHealth:
+        raise RuntimeError("storage is down")
+
+    service._backend.get_database_health = _raise  # type: ignore[attr-defined]
+    health = await service.get_database_health()
+
+    assert health == DatabaseHealth(status="unreachable")
+
+
+@pytest.mark.anyio
+async def test_the_database_block_reads_unreachable_when_the_query_set_outlives_its_budget():
+    import asyncio
+
+    service = AnsichService.in_memory(batch_size=1)
+    service._health_database_timeout_seconds = 0.01
+
+    async def _hang() -> DatabaseHealth:
+        await asyncio.sleep(30)
+        raise AssertionError("the timeout should have fired")
+
+    service._backend.get_database_health = _hang  # type: ignore[attr-defined]
+    health = await service.get_database_health()
+
+    assert health.status == "unreachable"
+
+
+@pytest.mark.anyio
+async def test_health_serves_the_process_block_in_full_when_the_database_is_unreachable():
+    """``GET /health`` remains the one route readable while storage is down (RB7⑤)."""
+
+    service = create_embedded_ansich_service(AnsichConfig(enabled=True), None)
+    assert service is not None
+    await service.start()
+    app = make_authed_test_app(user_factory=admin_user)
+    app.state.ansich_service = service
+    app.include_router(ansich_router.router)
+
+    try:
+        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+            response = await client.get("/api/ansich/health")
+    finally:
+        await service.stop()
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["database"]["status"] == "unreachable"
+    assert body["database"]["projectors"] == []
+    assert body["database"]["failed_jobs"] == 0
+    assert body["database"]["stale_completion_count"] is None
+    # The process side is untouched by the database side's failure.
+    assert body["status"] == "failed"
+    assert body["queue_capacity"] == AnsichConfig().queue_capacity
+    assert "writer" in body and "producers" in body
+
+
+@pytest.mark.anyio
+async def test_health_survives_a_database_failure_injected_under_a_working_service(tmp_path):
+    """The other half of the fallback: storage that is *there* and cannot answer."""
+
+    engine = create_async_engine(f"sqlite+aiosqlite:///{tmp_path / 'health-injected.db'}")
+    session_factory = async_sessionmaker(engine, expire_on_commit=False)
+    async with engine.begin() as connection:
+        await connection.run_sync(Base.metadata.create_all)
+    service = create_sql_ansich_service(session_factory, operations_assessment_interval_ms=60_000)
+    only_test_driven_assessments(service)
+    await service.start()
+    task_id = new_id()
+
+    async def _refuse():
+        raise RuntimeError("connection reset by peer")
+
+    app = make_authed_test_app(user_factory=admin_user)
+    app.state.ansich_service = service
+    app.include_router(ansich_router.router)
+
+    try:
+        service.record(_created(task_id, 2))
+        await service.flush_task(task_id)
+        service._backend.get_database_health = _refuse
+        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+            response = await client.get("/api/ansich/health")
+    finally:
+        await service.stop()
+        await engine.dispose()
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["database"]["status"] == "unreachable"
+    # Process-side facts the collector really did observe are still reported.
+    assert body["accepted_count"] >= 1
+    assert body["storage_available"] is True
+    assert body["status"] in {"healthy", "degraded", "recovering", "starting"}
+
+
+@pytest.mark.anyio
+async def test_health_merges_the_database_block_beside_the_process_block(tmp_path):
+    engine = create_async_engine(f"sqlite+aiosqlite:///{tmp_path / 'health-route.db'}")
+    session_factory = async_sessionmaker(engine, expire_on_commit=False)
+    async with engine.begin() as connection:
+        await connection.run_sync(Base.metadata.create_all)
+    service = create_sql_ansich_service(session_factory, operations_assessment_interval_ms=60_000)
+    only_test_driven_assessments(service)
+    await service.start()
+    task_id = new_id()
+    app = make_authed_test_app(user_factory=admin_user)
+    app.state.ansich_service = service
+    app.include_router(ansich_router.router)
+
+    try:
+        service.record(_created(task_id, 1))
+        await service.flush_task(task_id)
+        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+            response = await client.get("/api/ansich/health")
+    finally:
+        await service.stop()
+        await engine.dispose()
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["database"]["status"] == "reachable"
+    names = {row["projector_name"] for row in body["database"]["projectors"]}
+    assert {"task-structural", "task-control"} <= names
+    assert body["database"]["failed_jobs"] == 0
+    # Additive: the process block is the same document it always was.
+    assert body["status"] in {"healthy", "degraded", "recovering", "starting"}
+    assert "database" not in service.get_health().model_dump(mode="json")
+
+
+@pytest.mark.anyio
+async def test_active_task_rows_are_stamped_from_database_truth_not_the_process_counter(tmp_path):
+    """RB8: two workers must read the same watermark off the same store.
+
+    The process-local counters describe only the ticking worker's own progress,
+    so under two workers whichever ticked last stamped its private numbers onto
+    every Task row. This drives them apart deliberately — the counters are set
+    to values no database read could produce — and pins that the row carries the
+    database's answer.
+    """
+
+    engine = create_async_engine(f"sqlite+aiosqlite:///{tmp_path / 'health-stamp.db'}")
+    session_factory = async_sessionmaker(engine, expire_on_commit=False)
+    async with engine.begin() as connection:
+        await connection.run_sync(Base.metadata.create_all)
+    service = create_sql_ansich_service(session_factory, operations_assessment_interval_ms=60_000)
+    only_test_driven_assessments(service)
+    await service.start()
+    task_id = new_id()
+
+    try:
+        service.record_batch(
+            (
+                ObservationEnvelope.task_lifecycle(
+                    kind="task.created",
+                    task_id=task_id,
+                    source_kind="deerflow_run",
+                    source_id="run-health-stamp",
+                    occurred_at=_OBSERVED_AT,
+                    source_event_id="run-health-stamp:task:created",
+                ),
+                ObservationEnvelope.task_lifecycle(
+                    kind="task.started",
+                    task_id=task_id,
+                    source_kind="deerflow_run",
+                    source_id="run-health-stamp",
+                    occurred_at=_OBSERVED_AT,
+                    source_event_id="run-health-stamp:task:started",
+                ),
+            )
+        )
+        await service.flush_task(task_id)
+        backend = service._backend
+        # A process counter that disagrees with the store in both fields.
+        backend._watermark = 9_999
+        backend._latest_recorded_at = datetime.now(UTC) - timedelta(hours=3)
+        backend._latest_projected_at = None
+        process_metrics = backend.get_projection_metrics()
+        database_health = await backend.get_database_health()
+        await service.assess_operations(now=datetime.now(UTC))
+        async with session_factory() as session:
+            row = await session.scalar(select(AnsichActiveTaskReadModelRow).where(AnsichActiveTaskReadModelRow.task_id == task_id))
+            watermark = row.projection_watermark
+            lag_ms = row.projection_lag_ms
+    finally:
+        await service.stop()
+        await engine.dispose()
+
+    assert process_metrics["watermark"] == 9_999
+    assert process_metrics["lag_ms"] > 3_000_000
+    assert watermark == _projector(database_health, "task-control").complete_through
+    assert watermark != process_metrics["watermark"]
+    assert lag_ms != process_metrics["lag_ms"]
+
+
+@pytest.mark.anyio
+async def test_a_staler_operations_tick_does_not_publish_over_a_fresher_read_model_row(tmp_path):
+    """Controller ruling PB7's two-tick inversion.
+
+    Every input of a tick is read in earlier, already-committed sessions, so a
+    tick that started first can finish last and overwrite a peer's fresher row
+    with older facts — the row lock serialises the writers, not the compute. The
+    guard compares the basis those facts were read against and skips.
+    """
+
+    engine = create_async_engine(f"sqlite+aiosqlite:///{tmp_path / 'health-pb7.db'}")
+    session_factory = async_sessionmaker(engine, expire_on_commit=False)
+    async with engine.begin() as connection:
+        await connection.run_sync(Base.metadata.create_all)
+    service = create_sql_ansich_service(session_factory, operations_assessment_interval_ms=60_000)
+    only_test_driven_assessments(service)
+    await service.start()
+    task_id = new_id()
+
+    try:
+        service.record_batch(
+            (
+                ObservationEnvelope.task_lifecycle(
+                    kind="task.created",
+                    task_id=task_id,
+                    source_kind="deerflow_run",
+                    source_id="run-health-pb7",
+                    occurred_at=_OBSERVED_AT,
+                    source_event_id="run-health-pb7:task:created",
+                ),
+                ObservationEnvelope.task_lifecycle(
+                    kind="task.started",
+                    task_id=task_id,
+                    source_kind="deerflow_run",
+                    source_id="run-health-pb7",
+                    occurred_at=_OBSERVED_AT,
+                    source_event_id="run-health-pb7:task:started",
+                ),
+            )
+        )
+        await service.flush_task(task_id)
+        backend = service._backend
+        # Tick one: the fresher worker publishes.
+        fresh_at = datetime.now(UTC)
+        await service.assess_operations(now=fresh_at)
+        async with session_factory() as session:
+            fresh = await session.scalar(select(AnsichActiveTaskReadModelRow).where(AnsichActiveTaskReadModelRow.task_id == task_id))
+            fresh_watermark = fresh.projection_watermark
+            fresh_duration_ms = fresh.duration_ms
+            fresh_updated_at = fresh.updated_at
+        assert fresh_watermark is not None
+
+        # Tick two: a peer whose inputs were read against an older basis. Its
+        # `now` is *later*, so without the guard its row would win on every
+        # field — which is exactly the inversion being ruled out.
+        snapshot = await backend._database_projection_snapshot()
+        stale = snapshot._replace(complete_through=fresh_watermark - 1, lag_ms=snapshot.lag_ms + 5_000)
+        backend._database_projection_snapshot = lambda: _resolved(stale)  # type: ignore[assignment]
+        await service.assess_operations(now=fresh_at + timedelta(minutes=5))
+        async with session_factory() as session:
+            after = await session.scalar(select(AnsichActiveTaskReadModelRow).where(AnsichActiveTaskReadModelRow.task_id == task_id))
+            after_watermark = after.projection_watermark
+            after_duration_ms = after.duration_ms
+            after_updated_at = after.updated_at
+    finally:
+        await service.stop()
+        await engine.dispose()
+
+    assert after_watermark == fresh_watermark
+    # The skip covers the whole row, not just the watermark: publishing a mix of
+    # two ticks' facts would be a state neither of them observed.
+    assert after_duration_ms == fresh_duration_ms
+    assert after_updated_at == fresh_updated_at
+
+
+def _resolved(value):
+    async def _call():
+        return value
+
+    return _call()
+
+
+@pytest.mark.anyio
+async def test_both_budget_health_writers_store_the_same_value_shape(tmp_path):
+    """F10-24's structural half: two writers, one readable shape.
+
+    ``_assess_budget_rows`` (terminal control projection) and the
+    ``absolute-limit`` assessor both write ``budget_health:<dimension>:<scope>``
+    for the same Task, and the resolver separates them on ``as_of`` then
+    ``asserted_at`` — two different clocks. So whichever assertion a reader gets
+    has to carry the same keys, or a field's presence becomes a race:
+    ``enforcement``/``shadow`` are what tells an enforced breach from a shadow
+    one and were absent from exactly half of them.
+    """
+
+    engine = create_async_engine(f"sqlite+aiosqlite:///{tmp_path / 'health-budget-shape.db'}")
+    session_factory = async_sessionmaker(engine, expire_on_commit=False)
+    async with engine.begin() as connection:
+        await connection.run_sync(Base.metadata.create_all)
+    service = create_sql_ansich_service(session_factory)
+    only_test_driven_assessments(service)
+    await service.start()
+    task_id = new_id()
+    configured = ObservationEnvelope.budget_configured(
+        task_id=task_id,
+        run_id="run-budget-shape",
+        occurred_at=_OBSERVED_AT,
+        dimension="total_tokens",
+        aggregation_scope="local",
+        warning_limit=80,
+        hard_limit=100,
+        enforcement=True,
+        source_kind="release_default",
+        requested_value=None,
+        effective_value=100,
+        source_event_id="run-budget-shape:budget:total_tokens",
+    )
+
+    try:
+        service.record_batch(
+            (
+                ObservationEnvelope.task_lifecycle(
+                    kind="task.created",
+                    task_id=task_id,
+                    source_kind="deerflow_run",
+                    source_id="run-budget-shape",
+                    occurred_at=_OBSERVED_AT,
+                    source_event_id="run-budget-shape:task:created",
+                ),
+                ObservationEnvelope.task_lifecycle(
+                    kind="task.started",
+                    task_id=task_id,
+                    source_kind="deerflow_run",
+                    source_id="run-budget-shape",
+                    occurred_at=_OBSERVED_AT,
+                    source_event_id="run-budget-shape:task:started",
+                ),
+                configured,
+                ObservationEnvelope(
+                    kind="llm.responded",
+                    subject_type="llm_attempt",
+                    subject_id=new_id(),
+                    task_id=task_id,
+                    occurred_at=_OBSERVED_AT + timedelta(seconds=1),
+                    producer=configured.producer,
+                    source_event_id="run-budget-shape:llm:responded",
+                    correlation_id="run-budget-shape",
+                    payload={"attempt_no": 1, "latency_ms": 10, "usage": {"total_tokens": 107}},
+                ),
+                ObservationEnvelope.task_lifecycle(
+                    kind="task.completed",
+                    task_id=task_id,
+                    source_kind="deerflow_run",
+                    source_id="run-budget-shape",
+                    occurred_at=_OBSERVED_AT + timedelta(seconds=2),
+                    source_event_id="run-budget-shape:task:completed",
+                ),
+            )
+        )
+        # Writer one: terminal control projection.
+        await service.flush_task(task_id)
+        # Writer two: the assessor, replayed over the same evidence. Its
+        # assertion coexists with the first — losing assertions are retained.
+        await service.rebuild_projections()
+        async with session_factory() as session:
+            assertions = list(
+                (
+                    await session.execute(
+                        select(AnsichBeliefAssertionRow).where(
+                            AnsichBeliefAssertionRow.subject_id == task_id,
+                            AnsichBeliefAssertionRow.field_name == "budget_health:total_tokens:local",
+                        )
+                    )
+                ).scalars()
+            )
+        by_writer = {row.source_name: row.value_json for row in assertions}
+        health = await service.get_task_budget_health(task_id)
+    finally:
+        await service.stop()
+        await engine.dispose()
+
+    assert set(by_writer) == {"budget-health", "absolute-limit"}
+    terminal = by_writer["budget-health"]
+    assessor = by_writer["absolute-limit"]
+    # The assessor's shape is the converged shape; the terminal writer adds only
+    # `as_of_known`, which the reader infers when it is absent.
+    assert set(assessor) <= set(terminal)
+    assert set(terminal) - set(assessor) == {"as_of_known"}
+    for key in assessor:
+        assert terminal[key] == assessor[key], key
+    assert terminal["enforcement"] is True
+    assert terminal["shadow"] is False
+    # And the reader stays shape-stable whichever writer it lands on.
+    assert len(health) == 1
+    assert health[0].value == "exceeded"
+    assert health[0].overshoot == 7

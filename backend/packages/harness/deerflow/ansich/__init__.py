@@ -96,6 +96,7 @@ def create_sql_ansich_service(
     writer_backoff_max_ms: int = 5_000,
     writer_item_max_attempts: int = 2,
     stop_drain_timeout_ms: int = 10_000,
+    health_database_timeout_ms: int = 2_000,
     projector_lease_seconds: int = 30,
     projector_max_attempts: int = 5,
     projector_dependency_timeout_seconds: int = 300,
@@ -143,8 +144,45 @@ def create_sql_ansich_service(
         writer_backoff_max_ms=writer_backoff_max_ms,
         writer_item_max_attempts=writer_item_max_attempts,
         stop_drain_timeout_ms=stop_drain_timeout_ms,
+        health_database_timeout_ms=health_database_timeout_ms,
         hostname=hostname,
     )
+
+
+def service_knobs_from_config(config) -> dict[str, object]:
+    """Map every ``AnsichConfig`` field ``AnsichService`` itself takes (F10-27).
+
+    Assembly has two branches — one with a session factory and one without —
+    and both construct an ``AnsichService``. They used to spell this mapping out
+    separately, and the no-session-factory branch quietly dropped three knobs
+    (``terminal_flush_timeout_ms``, ``projector_poll_interval_ms``,
+    ``operations_assessment_interval_ms``): a storage-unavailable deployment
+    silently ran on library defaults for settings its operator had configured.
+    That is the class of bug a duplicated argument list invites, so the mapping
+    exists once and both branches splat it. Adding a service-level knob means
+    adding one line *here* and nowhere else; forgetting a branch is no longer
+    expressible.
+
+    Scope is exactly the service's own constructor. Backend knobs (leases,
+    attempt limits, assessor thresholds) belong to the SQL branch alone, because
+    the other branch has no backend to give them to.
+    """
+
+    return {
+        "queue_capacity": config.queue_capacity,
+        "queue_byte_capacity": config.queue_byte_capacity,
+        "batch_size": config.batch_size,
+        "flush_interval_ms": config.flush_interval_ms,
+        "terminal_flush_timeout_ms": config.terminal_flush_timeout_ms,
+        "projector_poll_interval_ms": config.projector_poll_interval_ms,
+        "operations_assessment_interval_ms": config.operations_assessment_interval_ms,
+        "writer_retry_max_attempts": config.writer_retry_max_attempts,
+        "writer_backoff_initial_ms": config.writer_backoff_initial_ms,
+        "writer_backoff_max_ms": config.writer_backoff_max_ms,
+        "writer_item_max_attempts": config.writer_item_max_attempts,
+        "stop_drain_timeout_ms": config.stop_drain_timeout_ms,
+        "health_database_timeout_ms": config.health_database_timeout_ms,
+    }
 
 
 def environment_thresholds_from_config(assessors) -> EnvironmentThresholds:
@@ -174,30 +212,12 @@ def create_embedded_ansich_service(config, session_factory):
     if session_factory is None:
         return AnsichService(
             _UnavailableBackend(),
-            queue_capacity=config.queue_capacity,
-            queue_byte_capacity=config.queue_byte_capacity,
-            batch_size=config.batch_size,
-            flush_interval_ms=config.flush_interval_ms,
-            writer_retry_max_attempts=config.writer_retry_max_attempts,
-            writer_backoff_initial_ms=config.writer_backoff_initial_ms,
-            writer_backoff_max_ms=config.writer_backoff_max_ms,
-            writer_item_max_attempts=config.writer_item_max_attempts,
-            stop_drain_timeout_ms=config.stop_drain_timeout_ms,
+            **service_knobs_from_config(config),
             unavailable_reason="storage_unavailable",
         )
     return create_sql_ansich_service(
         session_factory,
-        queue_capacity=config.queue_capacity,
-        queue_byte_capacity=config.queue_byte_capacity,
-        batch_size=config.batch_size,
-        flush_interval_ms=config.flush_interval_ms,
-        terminal_flush_timeout_ms=config.terminal_flush_timeout_ms,
-        projector_poll_interval_ms=config.projector_poll_interval_ms,
-        writer_retry_max_attempts=config.writer_retry_max_attempts,
-        writer_backoff_initial_ms=config.writer_backoff_initial_ms,
-        writer_backoff_max_ms=config.writer_backoff_max_ms,
-        writer_item_max_attempts=config.writer_item_max_attempts,
-        stop_drain_timeout_ms=config.stop_drain_timeout_ms,
+        **service_knobs_from_config(config),
         projector_lease_seconds=config.projector_lease_seconds,
         projector_max_attempts=config.projector_max_attempts,
         projector_dependency_timeout_seconds=config.projector_dependency_timeout_seconds,
@@ -216,4 +236,5 @@ __all__ = [
     "create_embedded_ansich_service",
     "create_sql_ansich_service",
     "environment_thresholds_from_config",
+    "service_knobs_from_config",
 ]

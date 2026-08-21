@@ -52,6 +52,20 @@ class AnsichConfig(BaseModel):
     flush_interval_ms: int = Field(default=100, ge=1, description="startup-only: Maximum delay before the writer flushes a partial batch.")
     terminal_flush_timeout_ms: int = Field(default=2_000, ge=1, description="startup-only: Maximum terminal Task flush wait; timeout never fails the DeerFlow Run.")
     projector_poll_interval_ms: int = Field(default=250, ge=1, description="startup-only: Polling interval for pending projection jobs.")
+    operations_assessment_interval_ms: int = Field(
+        default=1_000,
+        ge=1,
+        description="startup-only: Interval between periodic operations assessment passes (heartbeat/dwell/budget/environment/process alerts).",
+    )
+    health_database_timeout_ms: int = Field(
+        default=2_000,
+        ge=1,
+        description=(
+            "startup-only: budget for the database half of the Ansich health read. Past it the response "
+            "carries database.status=unreachable and the process-side health fields are served unchanged, "
+            "so a stalled store costs a bounded wait rather than the health endpoint."
+        ),
+    )
     projector_lease_seconds: int = Field(default=30, ge=1, description="startup-only: Lease duration for a claimed projection job.")
     projector_max_attempts: int = Field(default=5, ge=1, description="startup-only: Maximum projection attempts before a job is marked failed.")
     projector_dependency_timeout_seconds: int = Field(

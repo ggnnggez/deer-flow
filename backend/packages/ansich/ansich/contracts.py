@@ -823,6 +823,77 @@ class WriterHealth(BaseModel):
     poison_observation_count: int = 0
 
 
+class ProjectorHealth(BaseModel):
+    """One projector's job ledger as the database holds it (RB6).
+
+    The four counts are the whole claimable/working/settled-badly split:
+    ``pending`` is never-attempted work, ``retry`` is work a hard error re-armed
+    (leaving it out would make re-armed jobs vanish from the health page while
+    they are still owed), ``processing`` is leased, and ``failed`` is durably
+    given up on. ``complete_through`` is a **continuity** mark, not a maximum:
+    ``min(ingest_seq) - 1`` over this projector's unsettled jobs, so it names
+    the last ingest sequence below which this projector has nothing outstanding.
+    A single hole keeps it low no matter how far past the hole the projector has
+    otherwise run -- that is the point. With nothing unsettled it is the highest
+    ingest sequence the store holds, and ``None`` only when the store holds no
+    Observations at all.
+
+    It is computed on read rather than stored (RB6③): the spec asks for a
+    maintained projector watermark, and a stored copy of a number this cheap to
+    derive is a copy that drifts. The index ``ix_ansich_projection_jobs_projector_status``
+    is what keeps the derivation bounded.
+    """
+
+    model_config = ConfigDict(frozen=True)
+
+    projector_name: str
+    projector_version: str
+    pending: int = 0
+    retry: int = 0
+    processing: int = 0
+    failed: int = 0
+    complete_through: int | None = None
+
+
+class DatabaseHealth(BaseModel):
+    """Database-side projection truth, merged into ``GET /health`` at the route.
+
+    Additive and separate from :class:`AnsichHealth` on purpose (RB7). Process
+    health is answered synchronously under the collector's lock with zero IO --
+    a database round trip inside that lock would put storage latency directly on
+    the collection hot path -- so this block is produced by its own ``async``
+    call and joined to the process block by the HTTP layer.
+
+    ``status`` is the reachability of that call, nothing more. When it is
+    ``unreachable`` every other field is at its default and the process-side
+    block is still served in full: ``GET /health`` stays the one endpoint that
+    reads while storage is down.
+
+    ``failed_jobs`` is the **authoritative** failed-job count, read live from
+    both job tables. ``AnsichHealth.failed_jobs`` keeps its name and its
+    process-local, advisory meaning (a worker counts what it has seen fail, and
+    other workers' failures are not in it).
+
+    ``lag_ms`` is the age of the *oldest unsettled* job's Observation: the row
+    at ``MIN(ingest_seq)`` over unsettled jobs, compared against now. It answers
+    "how far behind is the backlog", not "how long ago did anything arrive".
+
+    ``stale_completion_count`` is the one field here that is **not** database
+    truth: it is the reporting worker's own count of writes dropped because the
+    job had been taken over. It is ``None`` when unknown -- including whenever
+    ``status`` is ``unreachable`` -- rather than a zero that would read as "no
+    takeovers happened".
+    """
+
+    model_config = ConfigDict(frozen=True)
+
+    status: Literal["reachable", "unreachable"]
+    projectors: tuple[ProjectorHealth, ...] = ()
+    lag_ms: int = 0
+    failed_jobs: int = 0
+    stale_completion_count: int | None = None
+
+
 class AnsichHealth(BaseModel):
     model_config = ConfigDict(frozen=True)
 
