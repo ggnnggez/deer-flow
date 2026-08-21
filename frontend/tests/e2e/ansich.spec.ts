@@ -1933,7 +1933,10 @@ const DATABASE_HEALTH = {
       retry: 4,
       processing: 1,
       failed: 0,
-      complete_through: 41,
+      // Deliberately past the grouping threshold: a sequence mark is a position
+      // in the stream, compared against raw `ingest_seq` in logs, so it must
+      // render ungrouped even though counts beside it are grouped.
+      complete_through: 1_234_567,
     },
     {
       projector_name: "task-usage",
@@ -1941,12 +1944,12 @@ const DATABASE_HEALTH = {
       pending: 0,
       retry: 0,
       processing: 0,
-      failed: 3,
-      complete_through: 12,
+      failed: 1_234,
+      complete_through: 98_765,
     },
   ],
   lag_ms: 1_200,
-  failed_jobs: 3,
+  failed_jobs: 1_234,
   stale_completion_count: 7,
 };
 
@@ -1980,7 +1983,11 @@ test("operations observability lens reports the store's own projection ledger", 
   await page.goto("/workspace/ansich/operations");
   await page.getByRole("tab", { name: "Observability" }).click();
   const panel = page.getByRole("region", { name: "Observability health" });
-  await expect(panel.getByText("Storage reachable")).toBeVisible();
+  // The store answered, but three jobs have durably failed — the exact
+  // condition projection_failure opens an Alert for. A green "reachable"
+  // headline there would tell an operator scanning the badge that all is well.
+  await expect(panel.getByText("Jobs failing")).toBeVisible();
+  await expect(panel.getByText("Storage reachable")).toHaveCount(0);
 
   // Every unsettled bucket is its own column, `retry` included: a re-armed job
   // folded into "pending" would read as work nobody has started.
@@ -1994,18 +2001,20 @@ test("operations observability lens reports the store's own projection ledger", 
   await expect(structural.getByRole("cell").nth(2)).toHaveText("4");
   await expect(structural.getByRole("cell").nth(3)).toHaveText("1");
   await expect(structural.getByRole("cell").nth(4)).toHaveText("0");
-  await expect(structural.getByRole("cell").nth(5)).toHaveText("41");
+  await expect(structural.getByRole("cell").nth(5)).toHaveText("1234567");
   const usage = panel.getByRole("row").filter({ hasText: "task-usage" });
-  await expect(usage.getByRole("cell").nth(4)).toHaveText("3");
+  // A genuine quantity is grouped; the mark beside it is not.
+  await expect(usage.getByRole("cell").nth(4)).toHaveText("1,234");
 
-  // The store-wide mark is the lowest continuity mark (12, not 41): one
-  // projector still owing work holds the whole store's mark down.
+  // The store-wide mark is the lowest continuity mark (98765, not 1234567):
+  // one projector still owing work holds the whole store's mark down. It is
+  // rendered ungrouped, unlike the counts around it.
   await expect(
     panel
       .locator("div")
       .filter({ hasText: /^Settled through/ })
       .last(),
-  ).toContainText("12");
+  ).toContainText("98765");
 
   // The two failed-job counts are different claims and never share a label.
   await expect(
@@ -2013,7 +2022,7 @@ test("operations observability lens reports the store's own projection ledger", 
       .locator("div")
       .filter({ hasText: /^Failed jobs \(all workers\)/ })
       .last(),
-  ).toContainText("3");
+  ).toContainText("1,234");
   await expect(
     panel
       .locator("div")
@@ -2089,11 +2098,24 @@ test("process-subject alerts carry real labels and no Task link", async ({
 }) => {
   mockLangGraphAPI(page, { threads: [] });
   const HOST_SCOPE_ID = "5f695124-12f7-48fd-bc4e-54058924d85a";
+  // Every value below is the shape the real producers emit, so this spec is a
+  // contract pin rather than a plausible-looking fixture. See
+  // `ansich/process_health.py`: the field name is `<alert_type>:<group_key>`
+  // and the condition key is `projector:`/`producer:` + the same group key,
+  // where the group key joins the pair with `@`. Severities come from
+  // `alerts/episodes.py` — a failed projection is recoverable by retry
+  // (warning), while lost Observations never come back (critical). The config
+  // hashes are the real `canonical_config_hash` outputs: `{}` for
+  // projection-health, `{"window_seconds": 900}` for observability-loss.
+  const PROJECTOR_GROUP_KEY = "task-usage@1";
+  const PRODUCER_GROUP_KEY = "deerflow-run@worker-1";
   const processAlert = (
     alertId: string,
     alertType: string,
     rule: string,
     severity: string,
+    conditionKey: string,
+    configHash: string,
   ) => ({
     alert_id: alertId,
     subject_id: HOST_SCOPE_ID,
@@ -2108,8 +2130,8 @@ test("process-subject alerts carry real labels and no Task link", async ({
     updated_at: "2026-08-20T12:00:03Z",
     resolved_at: null,
     rule: { name: rule, version: "1" },
-    rule_config_hash: "c".repeat(64),
-    stable_condition_key: `${rule}-key`,
+    rule_config_hash: configHash,
+    stable_condition_key: conditionKey,
     source_assertion_id: `${alertId}-assertion`,
     resolution_reason: null,
     dismissal_reason: null,
@@ -2120,12 +2142,16 @@ test("process-subject alerts carry real labels and no Task link", async ({
     "projection_failure",
     "projection-health",
     "warning",
+    `projector:${PROJECTOR_GROUP_KEY}`,
+    "44136fa355b3678a1146ad16f7e8649e94fb4fc21fe77e8310c060f61caaff8a",
   );
   const lossAlert = processAlert(
     "2a695124-12f7-48fd-bc4e-54058924d85a",
     "observability_degradation",
     "observability-loss",
     "critical",
+    `producer:${PRODUCER_GROUP_KEY}`,
+    "fec4bea03556283e4a1e316386a3cbd5b355067f943cb9411912783226e9e6f4",
   );
   await page.route("**/api/ansich/operations/active-tasks?*", (route) =>
     route.fulfill({
@@ -2161,12 +2187,21 @@ test("process-subject alerts carry real labels and no Task link", async ({
             source_belief: {
               assertion_id: `${projectionAlert.alert_id}-assertion`,
               subject_id: HOST_SCOPE_ID,
-              field_name: "projection_health:task-usage:1",
-              value: { value: "failing", scan_truncated: false },
+              field_name: `projection_failure:${PROJECTOR_GROUP_KEY}`,
+              // The producer's real value shape. `scan_truncated` is NOT here:
+              // it belongs to observability-loss, whose scan can hit a cap;
+              // a projection verdict has nothing to be truncated about.
+              value: {
+                value: "failing",
+                condition_key: `projector:${PROJECTOR_GROUP_KEY}`,
+                group_key: PROJECTOR_GROUP_KEY,
+                projector_name: "task-usage",
+                projector_version: "1",
+              },
               as_of: "2026-08-20T12:00:03Z",
               asserted_at: "2026-08-20T12:00:03Z",
               assessor: { name: "projection-health", version: "1" },
-              config_hash: "c".repeat(64),
+              config_hash: projectionAlert.rule_config_hash,
               authority_class: "configured_rule",
               fidelity_class: "rule",
               confidence: null,
@@ -2197,5 +2232,11 @@ test("process-subject alerts carry real labels and no Task link", async ({
   await expect(detail.getByRole("link", { name: "Task" })).toHaveCount(0);
   await expect(
     detail.getByRole("button", { name: "Acknowledge" }),
+  ).toBeVisible();
+  // The Belief's field name is rendered verbatim, so this pins the producer's
+  // real naming (`projection_failure:<projector>@<version>`) rather than a
+  // shape the backend never emits.
+  await expect(
+    detail.getByText(`projection_failure:${PROJECTOR_GROUP_KEY}`),
   ).toBeVisible();
 });

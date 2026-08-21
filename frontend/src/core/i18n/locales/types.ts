@@ -452,8 +452,11 @@ export interface Translations {
       tab: string;
       title: string;
       description: string;
-      reachable: string;
-      unreachable: string;
+      badge: {
+        healthy: string;
+        attention: string;
+        unreadable: string;
+      };
       unreachableNote: string;
       projectors: string;
       projector: string;

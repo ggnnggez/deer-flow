@@ -2,7 +2,10 @@ import { describe, expect, it } from "@rstest/core";
 
 import {
   ANSICH_UNKNOWN_VALUE,
+  databaseHealthBadge,
   formatAnsichCount,
+  formatAnsichLag,
+  formatAnsichSequence,
   getDatabaseHealthPresentation,
 } from "@/core/ansich/presentation";
 import type { AnsichDatabaseHealth } from "@/core/ansich/types";
@@ -41,17 +44,91 @@ function reachable(
 
 describe("formatAnsichCount", () => {
   it("renders an unknown number as an explicit marker, never as zero", () => {
-    expect(formatAnsichCount(null)).toBe(ANSICH_UNKNOWN_VALUE);
-    expect(formatAnsichCount(undefined)).toBe(ANSICH_UNKNOWN_VALUE);
+    expect(formatAnsichCount(null, "en-US")).toBe(ANSICH_UNKNOWN_VALUE);
+    expect(formatAnsichCount(undefined, "en-US")).toBe(ANSICH_UNKNOWN_VALUE);
     expect(ANSICH_UNKNOWN_VALUE).not.toBe("0");
   });
 
   it("renders a real zero as zero", () => {
-    expect(formatAnsichCount(0)).toBe("0");
+    expect(formatAnsichCount(0, "en-US")).toBe("0");
   });
 
-  it("groups large counts", () => {
-    expect(formatAnsichCount(1234)).toBe((1234).toLocaleString());
+  it("groups a quantity by the app locale, not the browser's", () => {
+    // Pinned literally: `toLocaleString()` with no argument would follow
+    // whatever locale the browser happens to run in, so a zh-CN reader on a
+    // de-DE machine would get German separators inside an app that never
+    // offered German.
+    expect(formatAnsichCount(1234567, "en-US")).toBe("1,234,567");
+    expect(formatAnsichCount(1234567, "zh-CN")).toBe("1,234,567");
+  });
+
+  it("falls back to the default locale for one it does not offer", () => {
+    expect(formatAnsichCount(1234567, "de-DE")).toBe("1,234,567");
+  });
+});
+
+describe("formatAnsichSequence", () => {
+  it("renders a sequence mark ungrouped — it is a position, not a quantity", () => {
+    // An ingest sequence is compared against raw `ingest_seq` values in logs
+    // and API responses, which carry no separators.
+    expect(formatAnsichSequence(1234567)).toBe("1234567");
+  });
+
+  it("keeps unknown distinct from zero here too", () => {
+    expect(formatAnsichSequence(null)).toBe(ANSICH_UNKNOWN_VALUE);
+    expect(formatAnsichSequence(0)).toBe("0");
+  });
+});
+
+describe("formatAnsichLag", () => {
+  it("splits sub-second from second lag, the way the health line already does", () => {
+    expect(formatAnsichLag(450)).toBe("450ms");
+    expect(formatAnsichLag(1200)).toBe("1.2s");
+    expect(formatAnsichLag(0)).toBe("0ms");
+  });
+
+  it("renders unknown lag as the unknown marker", () => {
+    expect(formatAnsichLag(null)).toBe(ANSICH_UNKNOWN_VALUE);
+  });
+});
+
+describe("databaseHealthBadge", () => {
+  it("separates a store that needs attention from a healthy one", () => {
+    // A reachable store with durably failed jobs is not a green headline: the
+    // condition the projection_failure Alert exists for must be visible in the
+    // one badge an operator scans.
+    expect(
+      databaseHealthBadge(getDatabaseHealthPresentation(reachable())),
+    ).toBe("attention");
+  });
+
+  it("calls a reachable store with nothing owed healthy", () => {
+    expect(
+      databaseHealthBadge(
+        getDatabaseHealthPresentation(
+          reachable({
+            projectors: [
+              {
+                projector_name: "task-structural",
+                projector_version: "1",
+                pending: 0,
+                retry: 2,
+                processing: 1,
+                failed: 0,
+                complete_through: 88,
+              },
+            ],
+            failed_jobs: 0,
+          }),
+        ),
+      ),
+    ).toBe("healthy");
+  });
+
+  it("keeps an unreadable store its own state, distinct from both", () => {
+    expect(databaseHealthBadge(getDatabaseHealthPresentation(undefined))).toBe(
+      "unreadable",
+    );
   });
 });
 
@@ -186,6 +263,16 @@ describe("getDatabaseHealthPresentation", () => {
     expect(view.reachable).toBe(false);
     expect(view.failedJobs).toBeNull();
     expect(view.attention).toBe(true);
+  });
+
+  it("hands back an unreadable view nobody can mutate for the next reader", () => {
+    // The unreadable answer is one shared singleton, so a consumer that pushed
+    // into `projectors` would corrupt every later read.
+    const view = getDatabaseHealthPresentation(undefined);
+    expect(Object.isFrozen(view)).toBe(true);
+    expect(Object.isFrozen(view.projectors)).toBe(true);
+    expect(() => view.projectors.push({} as never)).toThrow();
+    expect(getDatabaseHealthPresentation(null).projectors).toEqual([]);
   });
 
   it("keeps a reachable store with nothing outstanding clean", () => {

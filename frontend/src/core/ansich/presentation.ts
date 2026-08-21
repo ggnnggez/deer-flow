@@ -557,11 +557,45 @@ export function topProducersByDropped(
  */
 export const ANSICH_UNKNOWN_VALUE = "—";
 
-/** Render a count, keeping unknown (`null`) visibly distinct from zero. */
-export function formatAnsichCount(value: number | null | undefined): string {
+/**
+ * Render a quantity, keeping unknown (`null`) visibly distinct from zero.
+ *
+ * The locale is the app's, passed in the way `formatAnsichTimestamp` already
+ * takes it — a bare `toLocaleString()` would group by whatever locale the
+ * browser runs in, which is not necessarily one this app offers.
+ */
+export function formatAnsichCount(
+  value: number | null | undefined,
+  locale: string,
+): string {
+  if (value === null || value === undefined) return ANSICH_UNKNOWN_VALUE;
+  return value.toLocaleString(locale === "zh-CN" ? "zh-CN" : "en-US");
+}
+
+/**
+ * Render an ingest-sequence mark: plain digits, never grouped.
+ *
+ * A sequence is a position in the stream, not a quantity — it gets compared
+ * against the raw `ingest_seq` in a log line or an API response, and thousands
+ * separators only make the reader strip them back out.
+ */
+export function formatAnsichSequence(value: number | null | undefined): string {
   return value === null || value === undefined
     ? ANSICH_UNKNOWN_VALUE
-    : value.toLocaleString();
+    : String(value);
+}
+
+/**
+ * The one lag rendering for every Ansich surface (health line, System details
+ * drawer, Observability panel). Sub-second lag stays in milliseconds because
+ * that is the range where the exact number matters; past a second the reader
+ * wants the magnitude. Two views one click apart must not disagree about what
+ * the same `lag_ms` says.
+ */
+export function formatAnsichLag(lagMs: number | null | undefined): string {
+  if (lagMs === null || lagMs === undefined) return ANSICH_UNKNOWN_VALUE;
+  if (lagMs < 1000) return `${lagMs}ms`;
+  return `${(lagMs / 1000).toFixed(1)}s`;
 }
 
 /** One projector's row in the Observability health panel. */
@@ -607,6 +641,11 @@ export interface AnsichDatabaseHealthPresentation {
   attention: boolean;
 }
 
+/**
+ * The single unreadable answer, handed to every caller by reference and frozen
+ * so one consumer cannot mutate the object — or its `projectors` array — into
+ * something the next reader receives.
+ */
 const UNREADABLE_DATABASE_HEALTH: AnsichDatabaseHealthPresentation = {
   reachable: false,
   projectors: [],
@@ -617,6 +656,8 @@ const UNREADABLE_DATABASE_HEALTH: AnsichDatabaseHealthPresentation = {
   outstanding: null,
   attention: true,
 };
+Object.freeze(UNREADABLE_DATABASE_HEALTH.projectors);
+Object.freeze(UNREADABLE_DATABASE_HEALTH);
 
 /**
  * Project the additive `database` block into what the panel renders.
@@ -672,6 +713,24 @@ export function getDatabaseHealthPresentation(
       (database.failed_jobs ?? 0) > 0 ||
       projectors.some((row) => row.attention),
   };
+}
+
+/**
+ * The three states the panel's headline badge can be in.
+ *
+ * `healthy` and `attention` are both reachable stores, and keeping them apart is
+ * the point: a store that answers while three jobs have durably failed — the
+ * exact condition `projection_failure` opens an Alert for — must not present as
+ * a green "reachable" headline just because the connection worked. `unreadable`
+ * is its own third state, not a worse `attention`: nothing is known there.
+ */
+export type AnsichDatabaseHealthBadge = "healthy" | "attention" | "unreadable";
+
+export function databaseHealthBadge(
+  database: AnsichDatabaseHealthPresentation,
+): AnsichDatabaseHealthBadge {
+  if (!database.reachable) return "unreadable";
+  return database.attention ? "attention" : "healthy";
 }
 
 export function formatDuration(milliseconds: number | null): string {

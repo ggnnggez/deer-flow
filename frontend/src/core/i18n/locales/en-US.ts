@@ -565,8 +565,11 @@ export const enUS: Translations = {
       title: "Observability health",
       description:
         "What the projection store itself reports, read live across every worker. The numbers below are the store's answer; the collector's own view of this process is shown separately at the bottom.",
-      reachable: "Storage reachable",
-      unreachable: "Storage unreachable",
+      badge: {
+        healthy: "Storage reachable",
+        attention: "Jobs failing",
+        unreadable: "Storage unreachable",
+      },
       unreachableNote:
         "The projection store could not be read, so none of its numbers are known — they are shown as “—”, never as zero. The collector's own process numbers below are still current.",
       projectors: "Projectors",

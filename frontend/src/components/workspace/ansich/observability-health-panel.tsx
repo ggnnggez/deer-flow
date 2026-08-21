@@ -1,29 +1,37 @@
 "use client";
 
-import { AlertTriangleIcon, CircleHelpIcon, DatabaseIcon } from "lucide-react";
+import { AlertTriangleIcon, DatabaseIcon } from "lucide-react";
 
 import { Badge } from "@/components/ui/badge";
 import { Skeleton } from "@/components/ui/skeleton";
 import {
-  Tooltip,
-  TooltipContent,
-  TooltipTrigger,
-} from "@/components/ui/tooltip";
-import {
-  ANSICH_UNKNOWN_VALUE,
+  databaseHealthBadge,
   formatAnsichCount,
+  formatAnsichLag,
+  formatAnsichSequence,
   getDatabaseHealthPresentation,
+  type AnsichDatabaseHealthBadge,
   type AnsichProjectorRow,
 } from "@/core/ansich/presentation";
 import type { AnsichHealthResponse } from "@/core/ansich/types";
 import { useI18n } from "@/core/i18n/hooks";
 import { cn } from "@/lib/utils";
 
-function formatLag(lagMs: number | null): string {
-  if (lagMs === null) return ANSICH_UNKNOWN_VALUE;
-  if (lagMs < 1000) return `${lagMs} ms`;
-  return `${(lagMs / 1000).toFixed(1)} s`;
-}
+import { AnsichMetricHelp } from "./metric-help";
+
+/**
+ * Three visually distinct headline states. A reachable store with durably
+ * failed jobs gets the destructive tone, not the emerald one: connecting
+ * successfully is not a clean bill of health. Unreadable stays amber — nothing
+ * is known there, which is a different claim from "something is failing".
+ */
+const BADGE_STYLES: Record<AnsichDatabaseHealthBadge, string> = {
+  healthy:
+    "border-emerald-500/40 bg-emerald-500/10 text-emerald-700 dark:text-emerald-300",
+  attention: "border-red-500/40 bg-red-500/10 text-red-700 dark:text-red-300",
+  unreadable:
+    "border-amber-500/40 bg-amber-500/10 text-amber-700 dark:text-amber-300",
+};
 
 /**
  * Operations' database/projection view (RB11②).
@@ -51,7 +59,7 @@ export function AnsichObservabilityHealthPanel({
   health: AnsichHealthResponse | undefined;
   isPending: boolean;
 }) {
-  const { t } = useI18n();
+  const { t, locale } = useI18n();
   const copy = t.ansich.observabilityHealth;
 
   if (isPending || !health) {
@@ -70,6 +78,7 @@ export function AnsichObservabilityHealthPanel({
   }
 
   const database = getDatabaseHealthPresentation(health.database);
+  const badge = databaseHealthBadge(database);
 
   return (
     <section
@@ -84,15 +93,8 @@ export function AnsichObservabilityHealthPanel({
           <DatabaseIcon className="size-4" aria-hidden />
           {copy.title}
         </h2>
-        <Badge
-          variant="outline"
-          className={cn(
-            database.reachable
-              ? "border-emerald-500/40 bg-emerald-500/10 text-emerald-700 dark:text-emerald-300"
-              : "border-amber-500/40 bg-amber-500/10 text-amber-700 dark:text-amber-300",
-          )}
-        >
-          {database.reachable ? copy.reachable : copy.unreachable}
+        <Badge variant="outline" className={cn(BADGE_STYLES[badge])}>
+          {copy.badge[badge]}
         </Badge>
       </div>
       <p className="text-muted-foreground text-sm">{copy.description}</p>
@@ -110,13 +112,13 @@ export function AnsichObservabilityHealthPanel({
       <div className="grid gap-3 rounded-lg border p-4 sm:grid-cols-2 lg:grid-cols-4">
         <Metric
           label={copy.databaseLag}
-          value={formatLag(database.lagMs)}
+          value={formatAnsichLag(database.lagMs)}
           description={copy.metricDescriptions.databaseLag}
           unknown={database.lagMs === null}
         />
         <Metric
           label={copy.databaseFailedJobs}
-          value={formatAnsichCount(database.failedJobs)}
+          value={formatAnsichCount(database.failedJobs, locale)}
           description={copy.metricDescriptions.databaseFailedJobs}
           unknown={database.failedJobs === null}
           tone={
@@ -127,13 +129,13 @@ export function AnsichObservabilityHealthPanel({
         />
         <Metric
           label={copy.settledThrough}
-          value={formatAnsichCount(database.settledThrough)}
+          value={formatAnsichSequence(database.settledThrough)}
           description={copy.metricDescriptions.settledThrough}
           unknown={database.settledThrough === null}
         />
         <Metric
           label={copy.outstanding}
-          value={formatAnsichCount(database.outstanding)}
+          value={formatAnsichCount(database.outstanding, locale)}
           description={copy.metricDescriptions.outstanding}
           unknown={database.outstanding === null}
         />
@@ -142,7 +144,7 @@ export function AnsichObservabilityHealthPanel({
       <div className="rounded-lg border">
         <div className="flex flex-wrap items-center gap-2 border-b px-4 py-3">
           <h3 className="text-sm font-medium">{copy.projectors}</h3>
-          <MetricHelp description={copy.metricDescriptions.projectors} />
+          <AnsichMetricHelp description={copy.metricDescriptions.projectors} />
         </div>
         {database.projectors.length === 0 ? (
           <p className="text-muted-foreground p-4 text-sm">
@@ -161,7 +163,7 @@ export function AnsichObservabilityHealthPanel({
                   <th className="px-4 py-2 font-medium">
                     <span className="flex items-center gap-1">
                       {copy.settledThrough}
-                      <MetricHelp
+                      <AnsichMetricHelp
                         description={copy.metricDescriptions.settledThrough}
                       />
                     </span>
@@ -170,7 +172,7 @@ export function AnsichObservabilityHealthPanel({
               </thead>
               <tbody>
                 {database.projectors.map((row) => (
-                  <ProjectorRow key={row.key} row={row} />
+                  <ProjectorRow key={row.key} row={row} locale={locale} />
                 ))}
               </tbody>
             </table>
@@ -193,17 +195,17 @@ export function AnsichObservabilityHealthPanel({
         />
         <Metric
           label={copy.processFailedJobs}
-          value={formatAnsichCount(health.failed_jobs)}
+          value={formatAnsichCount(health.failed_jobs, locale)}
           description={copy.metricDescriptions.processFailedJobs}
         />
         <Metric
           label={copy.processLag}
-          value={formatLag(health.lag_ms)}
+          value={formatAnsichLag(health.lag_ms)}
           description={copy.metricDescriptions.processLag}
         />
         <Metric
           label={copy.staleCompletions}
-          value={formatAnsichCount(database.staleCompletions)}
+          value={formatAnsichCount(database.staleCompletions, locale)}
           description={copy.metricDescriptions.staleCompletions}
           unknown={database.staleCompletions === null}
         />
@@ -212,7 +214,13 @@ export function AnsichObservabilityHealthPanel({
   );
 }
 
-function ProjectorRow({ row }: { row: AnsichProjectorRow }) {
+function ProjectorRow({
+  row,
+  locale,
+}: {
+  row: AnsichProjectorRow;
+  locale: string;
+}) {
   return (
     <tr className="border-t">
       <td className="px-4 py-2">
@@ -222,13 +230,13 @@ function ProjectorRow({ row }: { row: AnsichProjectorRow }) {
         </div>
       </td>
       <td className="px-4 py-2 font-mono tabular-nums">
-        {formatAnsichCount(row.pending)}
+        {formatAnsichCount(row.pending, locale)}
       </td>
       <td className="px-4 py-2 font-mono tabular-nums">
-        {formatAnsichCount(row.retry)}
+        {formatAnsichCount(row.retry, locale)}
       </td>
       <td className="px-4 py-2 font-mono tabular-nums">
-        {formatAnsichCount(row.processing)}
+        {formatAnsichCount(row.processing, locale)}
       </td>
       <td
         className={cn(
@@ -236,10 +244,10 @@ function ProjectorRow({ row }: { row: AnsichProjectorRow }) {
           row.attention && "text-destructive font-medium",
         )}
       >
-        {formatAnsichCount(row.failed)}
+        {formatAnsichCount(row.failed, locale)}
       </td>
       <td className="px-4 py-2 font-mono tabular-nums">
-        {formatAnsichCount(row.completeThrough)}
+        {formatAnsichSequence(row.completeThrough)}
       </td>
     </tr>
   );
@@ -262,7 +270,7 @@ function Metric({
     <div className="flex flex-col gap-0.5 text-sm">
       <span className="text-muted-foreground flex items-center gap-1 text-xs">
         {label}
-        <MetricHelp description={description} />
+        <AnsichMetricHelp description={description} />
       </span>
       <span
         className={cn(
@@ -274,22 +282,5 @@ function Metric({
         {value}
       </span>
     </div>
-  );
-}
-
-function MetricHelp({ description }: { description: string }) {
-  return (
-    <Tooltip>
-      <TooltipTrigger asChild>
-        <button
-          type="button"
-          aria-label={description}
-          className="hover:text-foreground focus-visible:ring-ring rounded-sm outline-none focus-visible:ring-2"
-        >
-          <CircleHelpIcon className="size-3.5" aria-hidden />
-        </button>
-      </TooltipTrigger>
-      <TooltipContent className="max-w-72">{description}</TooltipContent>
-    </Tooltip>
   );
 }

@@ -19,6 +19,7 @@ import {
 } from "@/core/ansich/health-dismissal";
 import { useAnsichFailedJobs } from "@/core/ansich/hooks";
 import {
+  formatAnsichLag,
   resolveProjectionHealthDisplay,
   systemProjectionScope,
   taskFailedJobCount,
@@ -40,11 +41,6 @@ import { AnsichSystemHealthDrawer } from "./system-health-drawer";
  * as `50+`, never as an exact total the response cannot support.
  */
 const TASK_FAILED_JOB_LIMIT = 50;
-
-function formatLag(lagMs: number): string {
-  if (lagMs < 1000) return `${lagMs}ms`;
-  return `${(lagMs / 1000).toFixed(1)}s`;
-}
 
 export interface AnsichProjectionHealthState {
   /** Null until projection health has loaded for this page. */
@@ -263,7 +259,7 @@ export function AnsichProjectionHealthBanner({
               </span>
             ) : null}
             <span>
-              {t.ansich.lag} {formatLag(health.lag_ms)}
+              {t.ansich.lag} {formatAnsichLag(health.lag_ms)}
             </span>
           </div>
           <div className="ms-auto flex items-center gap-1">
@@ -318,7 +314,7 @@ export function AnsichProjectionHealthBanner({
           </span>
           <span aria-hidden>·</span>
           <span className="tabular-nums">
-            {t.ansich.lag} {formatLag(health.lag_ms)}
+            {t.ansich.lag} {formatAnsichLag(health.lag_ms)}
           </span>
           <Button
             variant="ghost"

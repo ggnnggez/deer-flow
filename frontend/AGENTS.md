@@ -225,6 +225,22 @@ as progress — it is a continuity mark that one stuck job holds down however fa
 past it the projectors have otherwise run, so it reads lower than the old
 per-worker watermark whenever anything is outstanding. The store-wide mark shown is
 the lowest per-projector mark, and unknown when any projector's own is unknown.
+The headline badge has **three** states, not two (`databaseHealthBadge`): a
+reachable store with durably failed jobs is `attention` in the destructive tone,
+never a green "reachable" — connecting successfully is not a clean bill of health,
+and that is the very condition `projection_failure` alerts on; `unreadable` keeps
+its own amber tone because nothing known is a different claim from something
+failing.
+
+Ansich display formatting lives in `core/ansich/presentation.ts` and is shared, not
+per-component: `formatAnsichLag` is the one lag rendering for the health line, the
+drawer and the panel (sub-second in `ms`, past a second in `s` — two views one
+click apart must not disagree about the same `lag_ms`); `formatAnsichCount` groups
+a quantity using the **app** locale passed in, the way `formatAnsichTimestamp`
+already takes it, never a bare `toLocaleString()` that would follow the browser's;
+and `formatAnsichSequence` renders an ingest-sequence mark ungrouped, because a
+position in the stream gets compared against the raw `ingest_seq` in a log line.
+`AnsichMetricHelp` is the single help-trigger component behind every metric label.
 
 Phase 7's Agent Release tab reads the Task's immutable `executed_by` binding
 separately from the normal Task polling query. It renders component hashes,

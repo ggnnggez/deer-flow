@@ -1,6 +1,5 @@
 "use client";
 
-import { CircleHelpIcon } from "lucide-react";
 import { useState } from "react";
 
 import {
@@ -11,12 +10,8 @@ import {
   SheetTitle,
 } from "@/components/ui/sheet";
 import {
-  Tooltip,
-  TooltipContent,
-  TooltipTrigger,
-} from "@/components/ui/tooltip";
-import {
   countLostObservations,
+  formatAnsichLag,
   formatAnsichTimestamp,
   shortId,
   topProducersByDropped,
@@ -25,6 +20,7 @@ import type { AnsichHealth } from "@/core/ansich/types";
 import { useI18n } from "@/core/i18n/hooks";
 
 import { AnsichFailedJobsDialog } from "./failed-jobs-dialog";
+import { AnsichMetricHelp } from "./metric-help";
 
 export function formatBytes(bytes: number): string {
   if (bytes < 1024) return `${bytes} B`;
@@ -107,13 +103,13 @@ export function AnsichSystemHealthDrawer({
             />
             <HealthMetric
               label={t.ansich.lag}
-              value={`${health.lag_ms} ms`}
+              value={formatAnsichLag(health.lag_ms)}
               description={t.ansich.systemMetricDescriptions.lag}
             />
             <div className="flex flex-col gap-0.5 text-sm">
               <span className="text-muted-foreground flex items-center gap-1 text-xs">
                 {t.ansich.failedJobs}
-                <MetricHelp
+                <AnsichMetricHelp
                   description={t.ansich.systemMetricDescriptions.failedJobs}
                 />
               </span>
@@ -212,7 +208,7 @@ export function AnsichSystemHealthDrawer({
           <div className="px-4 pt-5 pb-6">
             <div className="text-muted-foreground flex items-center gap-1 text-xs font-medium uppercase">
               {t.ansich.producers}
-              <MetricHelp
+              <AnsichMetricHelp
                 description={t.ansich.systemMetricDescriptions.producers}
               />
             </div>
@@ -315,26 +311,9 @@ function HealthMetric({
     <div className="flex flex-col gap-0.5 text-sm">
       <span className="text-muted-foreground flex items-center gap-1 text-xs">
         {label}
-        {description ? <MetricHelp description={description} /> : null}
+        {description ? <AnsichMetricHelp description={description} /> : null}
       </span>
       <span className="font-mono font-medium tabular-nums">{value}</span>
     </div>
-  );
-}
-
-function MetricHelp({ description }: { description: string }) {
-  return (
-    <Tooltip>
-      <TooltipTrigger asChild>
-        <button
-          type="button"
-          aria-label={description}
-          className="hover:text-foreground focus-visible:ring-ring rounded-sm outline-none focus-visible:ring-2"
-        >
-          <CircleHelpIcon className="size-3.5" aria-hidden />
-        </button>
-      </TooltipTrigger>
-      <TooltipContent className="max-w-72">{description}</TooltipContent>
-    </Tooltip>
   );
 }

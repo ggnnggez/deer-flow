@@ -548,8 +548,11 @@ export const zhCN: Translations = {
       title: "可观测性健康",
       description:
         "投影存储自身的口径，跨全部 worker 实时读取。下面这些数字来自存储；本进程采集器自己的视角单独列在底部。",
-      reachable: "存储可达",
-      unreachable: "存储不可达",
+      badge: {
+        healthy: "存储可达",
+        attention: "有任务失败",
+        unreadable: "存储不可达",
+      },
       unreachableNote:
         "投影存储读不到，因此其中每个数字都是未知——一律显示为“—”，绝不写成 0。下方采集器自身的进程数字仍然有效。",
       projectors: "投影器",
