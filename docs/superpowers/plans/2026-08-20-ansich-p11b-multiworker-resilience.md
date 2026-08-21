@@ -108,3 +108,11 @@
 ## Self-Review 记录
 
 - §3 覆盖:lease CAS(T1/T2)、poison→projection_failure(T8)、observability_degradation(T7/T8)、进程主体映射(T7,RB1)、SKIP LOCKED 修正(RB4;ORDER BY job_id 拒绝有记录)。§4:多级水位(RB6 读时计算,偏离有记录)、lag 语义(RB7 索引友好式)、known/unknown(RB2 落盘使 unreported 桶可清)、task 交集(RB8 盖章修复)、failed⇒failed 拒绝有记录。§9:health 合并(T10)、面板(T11)。债项:RB9 八条各有任务与回归。域声明:每条 RB 带域;两处 spec 字面偏离在 RB7 内裁决并入 T12 记录。类型一致:`lease_generation`/`retry`/`DatabaseHealth`/`ANSICH_BOOTSTRAP_TASK_ID`/`observability.lost` 名称在产出任务定义、后续任务逐字引用。无占位符;每任务锚点来自档案(HEAD b2ea0e48 核实)。
+
+## 勘误(2026-08-22,批终审后的一次修复波追加)
+
+本计划文件是**历史文物**:它记录的是开工前的判断,不随实现更新。下面两处在实施中被证否或被收窄,原文**不改写**,在此指向落地后的正确说法,免得从计划出发的读者被带回一个已经被推翻的理由。
+
+1. **RB6② / RB7 里「`0027` 的 `ix_ansich_projection_jobs_projector_status (projector_name, status)` 支撑健康页的分组计数」这句话,经实测是错的。** T10 在 PostgreSQL 16、120 万作业行上用 `EXPLAIN (ANALYZE)` 量过:GROUP BY 的键序既不影响执行计划也不影响索引选择(分组键对规划器是一个无序集合,它可以自行重排),**真正让那条语句有界的只有 `status IN (未结算)` 这个谓词**——加谓词前是 ~200ms 的并行顺扫,加谓词后是 ~0.1ms 的索引扫,而服务它的是**状态在前**的 `ix_ansich_projection_jobs_claim`,不是 `0027` 那个 projector-first 索引。`0027` 索引确实有两个真实消费者,但都不是健康页:`_assess_projection_failures` 的按组取证查询(`status='failed' AND projector_name=? AND projector_version=?`)与 `_reconcile_spawn_usage` 的在飞闸门(`projector_name='task-usage' AND status='processing'`)——用 drop 索引对照跑验证过。更正已经落在 `models.py`(索引定义处)、`backend/AGENTS.md`(含「本文件此前那句话是错的」的明说)与 `0027` 迁移的 docstring 里,并由 `d93e7ee4` 一并带上 `0027` docstring 里另一处错误的 CAS 描述(它当时写成按 `(lease_owner, lease_generation)` 比较;实际落地的 CAS 是 `job_id` + `lease_generation`)。计划里这句话请按「已被 T10 的实测推翻」读。
+
+2. **「可重放的依赖等待仍留在 `pending`」这句话,现在只对**从未被尝试过的**作业成立。** 一次依赖等待归还的是**它自己**那一次 attempt,不是此前硬错误已经花掉的那些。实现按**递减后的 attempt 计数**判定:归零 ⇒ `pending`(什么都没试过),仍大于零 ⇒ 留在 `retry`(此前硬错误重臂过)。原文那句 "stays" 是对的,`pending` 那半边的取值条件被写窄了。此点由批终审 F2 定位——原实现无条件写 `pending`,会把一个活着的 retry 循环降级进「从未尝试」桶,而那正是 T10 四桶健康拆分与面板文案所依赖的区分;修复与回归钉子(`test_lease_cas.py::test_a_dependency_wait_gives_its_attempt_back_without_demoting_a_retry_row`)在同一次修复波里落地。

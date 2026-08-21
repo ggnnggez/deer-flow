@@ -78,7 +78,11 @@ Replay 流程：
 
 不同 resolver/projector version 结果可并存；Current Belief/read model 通过 active version config 选择。切换 active version 应是显式管理动作并审计，不能部署代码后静默改变历史解释。
 
-> **归属：P11-C**，未开工。前置提醒：F10-26（`rebuild_projections()` 可能在依赖延迟的 job 尚未结算时就宣告完成）必须先结清，否则「同一 Observation 集重放两次 digest 相同」这条完成条件本身就不成立。
+> **归属：P11-C**，未开工。
+>
+> **前置提醒（2026-08-22 更正，P11-B 终审 F7）：F10-26 已在 P11-B 结清，但结清的方式把这条前置的责任交给了本节的作者，不是解除了它。** 注册表里 F10-26 现在是 ✅，读者不要就此认为「重放两次 digest 相同」这条完成条件已经有保障了：选定的语义是**显式报告、不等待**——`rebuild_projections()` 返回 `RebuildOutcome(replayed, unsettled)`，`unsettled > 0` 表示这一趟返回时仍有作业没结算（依赖延迟的作业在 250ms 退避里，认领也可能被接管）。等待被否决的理由写在 F10-26 条目里（它同时持维护锁与调用方的 `_projection_lock`）。**因此完整性搬到了调用方**：本节要的确定性重放必须自己循环调用直到 `unsettled == 0`，或者先落一个 `rebuild_until_settled` 包装器（见 `task-3-report.md` §6）。
+>
+> **同一条形状在 `retry_failed_projections` 上没有修**：它仍然返回一个裸 `int`、没有 docstring、也没有 `RebuildOutcome` 那一半的"这趟还欠多少"信息（`service.py::retry_failed_projections`）。凡是把 retry 当成"重试完了"的完成条件都有同样的谎报窗口。
 
 ## 6. Retention 与删除
 
@@ -100,6 +104,8 @@ owner/thread 删除是强删除：按 Scope 找到 Tasks，删除 Observation、
 cleanup 使用小 batch、可恢复 cursor 和 DB lease，避免长事务锁住 Run 写入。SQLite/PostgreSQL 均测试。
 
 > **归属：P11-C**，未开工。**与 A 批回执语义的耦合（必读）**：RA6 的第 3/4 档是从「库里还有没有这条 observation / 它的 job」反推回执的，因此删除一条 observation 或它的 job，会让一条**曾经活过**的行的回执答案翻成 `failed`——retention 删除必须把这条语义算进去（见 F10-25 条目末尾）。
+>
+> **与 B 批单调发布守卫的耦合（必读，2026-08-22 记，P11-B 终审 F7）**：活动 Task 读模型带一道单调发布守卫（裁决 PB7），基准是全库连续性标记 `complete_through`（`sql.py::_is_staler_publish`）。守卫的正确性依赖「这个标记只会上升」，而它成立**只是因为今天没有任何路径会插入一条 `ingest_seq` 低于当前标记的未结算作业**——唯一会把它拉低的动作是 `rebuild_projections()`，而 rebuild 顺带把这些读模型行整个删掉，于是基准被清成 NULL、守卫不会被冻住。**retention 侧任何"补插"形状都会破坏这个前提**：给已删/已过期区间重新建作业、按低 `ingest_seq` 回填、或任何让 `min(未结算 ingest_seq)` 下降而**不**删读模型行的动作，都会让基准永久高于此后每一轮 tick 的标记，活动 Task 读模型从此不再更新（还会静默保留已停止 Task 的行），直到一次 rebuild。要么避免这种形状，要么在同一事务里删掉受影响的读模型行。
 
 ## 7. Raw payload read 审计
 
@@ -123,6 +129,8 @@ Gateway 关闭顺序：停止新 record → stop heartbeat/assessor timers → t
 - 验证 active projector/resolver version 存在。
 
 > **归属：P11-C**，但**已被 A 批部分预支**：A 批给 writer 的 drain 加了 `stop_drain_timeout_ms`，且它界定的是**这次尝试本身**（通过取消），所以一个卡死的存储调用扛不住 shutdown——**这只对 writer 成立**。projector join 仍是无条件、无上界的（它不持有任何行），本节要求的「每步有独立 timeout 与 health/log 结果、总时间不超过 Gateway graceful shutdown 预算」整体仍未落地。另外两处 A 批留下的诚实边界：一个自我 shield 或同步阻塞事件循环的 backend 依然能卡住 `stop()`；预算**内**完成的排空即使记了丢失也只体现在计数器上、不发警告。
+>
+> **B 批新增的一条（2026-08-22 记，P11-B 终审 F7）：`stop()` 不排空「未上报的进程级丢失桶」。** B 批给那个桶配了主体和 kind（host `Scope` + `observability.lost`），行**落库成功才出桶**，排空发生在 `AnsichService._drain_unreported_global_ranges` 的两个周期调用点上。`stop()` 的关停序列只排 writer、只 join projector loop，**从不调用它**——所以关停前最后一段窗口里记下的丢失范围只活在内存里，进程一走就没了，`observability_degradation` 生产者也就永远看不到它。`service.py::_drain_unreported_global_ranges` 里那句「e.g. batch C's shutdown drain」的防御性注释指的就是本节：本节要加的排空步骤是**它的第一个真实调用者**，而那个 `live` 守卫（还在增长的区间不上报）正是为它准备的。
 
 ## 9. API 与运维 UI
 
