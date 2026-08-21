@@ -11,13 +11,22 @@ Two additive columns and one index, no behaviour change on their own:
   back out of ``lease_owner``. That is an ABA — the field returned to a value
   it already held, through a state the stale writer must not write into — and
   an owner-only ``WHERE lease_owner = :me`` would let the stale attempt commit
-  over the fresh claim. A CAS therefore has to compare
-  ``(lease_owner, lease_generation)`` together. The claim/complete paths are
-  not touched here; adopting the column is a separate change.
+  over the fresh claim. The generation is what tells the two claims apart, so
+  the CAS keys on it: every later write for a job carries
+  ``WHERE job_id = :id AND lease_generation = :claimed``. The claim/complete
+  paths are not touched here; adopting the column is a separate change.
 - ``ix_ansich_projection_jobs_projector_status (projector_name, status)`` —
-  supports the per-projector status-split counts the health merge reads. That
-  read groups the jobs table by ``(projector_name, status)``, which without
-  this index is a full scan of every job row ever written.
+  authored for the health merge's per-projector status-split counts, which is
+  **not** what it turned out to serve, and the name now records an intent
+  rather than a fact. Measured with ``EXPLAIN (ANALYZE)`` on PostgreSQL 16
+  afterwards: a GROUP BY over ``(projector_name, status)`` uses no index at all
+  (grouping keys are an unordered set the planner may reorder), and what
+  actually bounds those counts is their ``status IN (unsettled)`` predicate,
+  served by the status-leading ``ix_ansich_projection_jobs_claim``. This index's
+  real consumers are the two reads that name a projector *and* a status:
+  ``sql.py::_assess_projection_failures``' per-group evidence query and
+  ``sql.py::_reconcile_spawn_usage``'s in-flight gate. Kept for those; dropping
+  it changes no health plan.
 
 Both columns land ``NOT NULL DEFAULT 0``: a column added without a default
 cannot be made ``NOT NULL`` over rows that predate it, so every existing job

@@ -129,6 +129,15 @@ and `0027`'s two `lease_generation` columns plus its `(projector_name, status)`
 index on a real server. It is **not** a Postgres run of the whole suite:
 everything outside `tests/integration/` still runs on SQLite only.
 
+**Where that tier actually runs, stated plainly:** on a developer's own
+PostgreSQL, never in CI — nothing in CI sets `DEER_FLOW_TEST_POSTGRES_URL`, so
+CI executes the self-skip. Its P11-B acceptance was a local PostgreSQL 16.2
+cluster `initdb`-ed by the `pgserver` wheel (the Docker daemon was unavailable
+in that WSL2 environment), 19 passed on five consecutive rounds. So every claim
+this tier proves is a claim proven **on a developer machine at a point in
+time**, and a change that breaks it will not be caught by a push: run it
+yourself when touching leases, claims, rollups or maintenance.
+
 Two facts the two-worker tier established that are worth knowing before touching
 this area. (1) `_maintenance_lock` used to issue its `pg_advisory_unlock` on a
 `Session`, whose `rollback()` returns the connection to the pool — so on any
@@ -1165,8 +1174,9 @@ the first slice of Phase 11: spec §2 plus F10-7; see
 `ansich/docs/plans/README.md`). This batch hardens the *write* side of
 collection — lifecycle, per-producer accounting, the writer's failure handling,
 the terminal barrier, the evaluation receipt and shutdown — and touches nothing
-about leases, watermarks, replay or retention. Zero migrations; head stays
-`0026_ansich_environment`.
+about leases, watermarks, replay or retention. Zero migrations — the head was
+`0026_ansich_environment` throughout that batch, and P11-B's `0027` (below) has
+been the head since.
 
 *Lifecycle.* `packages/ansich/ansich/lifecycle.py::derive_status` is a pure,
 memoryless function over `LifecycleInputs`: seven states (`starting`,
@@ -1393,6 +1403,70 @@ exclusion, a real advisory-lock exclusion and READ COMMITTED lost updates are
 all out of its reach — is proven by the opt-in two-worker Postgres tier,
 `tests/integration/test_postgres_multiworker.py`.
 
+Two things in this slice depart from a plan or spec literal and are recorded
+rather than quietly done. **(1) `ORDER BY job_id` is rejected** (spec §3's claim
+transaction spells it out). The claim orders by `(observation.ingest_seq,
+projector priority, projector_name)` and keeps doing so: that order is the
+documented within-Observation projection precedence, and claiming by `job_id`
+would replace a semantic order with an insertion order — the determinism the
+spec text is after is already supplied by the existing three keys. **(2)
+`rebuild`'s re-pend is made safe by the generation bump, not by the maintenance
+lock** (plan ruling RB5③ expected the lock to be what stops a re-pend from
+re-arming another worker's in-flight row). The lock only excludes another
+*operator*; a worker that claimed a job *before* the rebuild started is still
+running inside it, so the re-pend raises every generation and the stale
+completion fails its CAS. The lock and the CAS are complementary here, and the
+CAS is the half that carries this property.
+
+**P11-B rollup serialization and the spawn-usage reconcile** (F10-6, F10-20,
+F10-19). Every read-modify-write rollup in `sql.py` now goes through one
+idiom, and it is the idiom to follow for any new aggregate. **Lock the target
+row, then read the inputs** — `_lock_rollup_targets(session, statement)` is a
+call the reading code has to make *first* rather than a flag on the read, so
+"locked after reading" cannot be written by accident. Sibling jobs that two
+leased workers claim concurrently (`skip_locked` hands them out) otherwise
+read-modify-write the same aggregate under READ COMMITTED and one overwrites a
+value that excluded the other — a lost update a single-loop replay never
+reproduces. The four converted sites are `_refresh_behavior_belief`,
+`_refresh_active_task_read_model`, `_project_budget` and
+`_refresh_usage_summary`, joining the reference implementation
+`_recompute_release_quality_stats` (whose shape they copy). **The first writer
+is the half a lock cannot do**: `FOR UPDATE` cannot lock a row that does not
+exist, so each site pairs the lock with `_insert_ignoring_conflict`
+(`INSERT … ON CONFLICT DO NOTHING`, returning whether *this* caller won) and
+the loser re-reads the winner's row — now lockable — and converges on it. Two
+residuals are named rather than papered over: `_resolve_current_assessment`'s
+own first write still collides as one retryable assessor attempt (bounded,
+self-healing, F10-6's entry says so), and the LLM-attempt projector's two
+Observations still collide on `ansich_llm_attempts_pkey` (F10-31 — a fifth
+lock-then-read conversion, not a one-liner). **Multi-row rollups also lock in a
+deterministic order**: the usage fan-out, the spawn backfill and the
+environment per-metric update all sort their targets before taking locks,
+because two processes walking a `set` or a `dict` in native order deadlock on a
+real server (the tier demonstrated the abort). The deadlock-freedom argument is
+a serializing prefix — both usage fan-outs take a contribution row before the
+summary row while walking aggregates ascending — and it is written at
+`_backfill_spawn_usage`.
+
+What a row lock structurally cannot do is stop a peer from INSERTing a *new
+input*: row locks bound an existing row's writers, not the membership of a set.
+That is why F10-19 (a late spawn edge racing a sum-type usage contribution)
+needed a reconciliation instead. Projecting a spawn edge now enqueues a
+`task-spawn-reconcile@1` job in the edge's own transaction; when it is claimed,
+`_reconcile_spawn_usage` re-runs the fan-out over the complete closure, and
+double counting is impossible because `_store_usage_contribution` is idempotent
+(`ON CONFLICT DO NOTHING` per `(aggregate, source, dimension, source_obs_id)`
+for sum types, a high-water CAS for `wall_time_ms`). It first waits — as a
+replay-safe dependency, giving its attempt back — on any *live* `task-usage`
+lease under the spawned subtree, which is sound because a claim commits
+`processing` in its own transaction before the work starts (an invariant pinned
+by `tests/ansich/test_spawn_usage_reconciliation.py`; merging the claim into the
+work transaction would silently disarm the gate). **The honest statement is not
+"no window":** an expired lease is deliberately not waited on, so a usage
+transaction that outlives its own lease with nobody re-claiming it can still
+commit an ancestor-less contribution after the pass has finished. That residual
+is registered (F10-19, controller ruling PB8), not built around.
+
 **P11-B host `Scope` bootstrap and `observability.lost`** (spec §3; the subject
 P11-A's process-wide loss was waiting for). A SQL-backed `AnsichService.start()`
 records one `scope.snapshotted` for the host it runs on — `scope_kind="host"`,
@@ -1617,6 +1691,19 @@ is what makes it usable as a "nothing below here is owed" statement. It is
 derived rather than stored (a deviation from spec §4's "maintain a projector
 watermark", recorded here): a stored copy of a number this cheap to derive is a
 copy that drifts.
+
+**Spec §4's other literal — "no pending but failed ⇒ status `failed`" — is
+rejected, deliberately.** Failing projection jobs keep reading as `degraded`,
+which is what `lifecycle.derive_status` has always answered for
+`failed_jobs > 0`. Adopting the literal would make `failed` reachable from a
+condition P11-A's 17-edge `LEGAL_TRANSITIONS` closure does not contain, and that
+clamp's *complement* — the edges pinned as illegal — is a merge gate; widening
+the graph to satisfy a status label would spend a proven invariant on wording.
+The intent behind the literal (a failed job must not be masked by an otherwise
+quiet system) is carried by three surfaces that did not exist when it was
+written: the authoritative `database.failed_jobs`, the `degraded` status itself,
+and the `projection_failure` Alert whose whole condition is a durably failed
+job.
 
 **What bounds these reads is the `status IN (unsettled)` predicate, and only
 that.** Both statements exist as named functions
@@ -2098,7 +2185,8 @@ This invokes `alembic revision --autogenerate` against the live ORM models. Revi
 - `migrations/versions/0023_ansich_evaluations.py` — Phase 10 rebuildable evaluation query index and `(release, cohort, dimension)` release quality statistics
 - `migrations/versions/0024_ansich_wall_time_watermarks.py` — data-only collapse of historical per-tick `wall_time_ms` usage contributions into one high-water row per `(aggregate, source)`
 - `migrations/versions/0025_ansich_assessor_watermarks.py` — durable per-`(subject, assessor, version)` mark of the highest evidence watermark an assessor has successfully settled, so scope-safety can re-judge only the ToolCalls a new watermark window names
-- `migrations/versions/0027_ansich_lease_generation.py` — `lease_generation` on both job tables (a per-job claim counter, because the process-lifetime `lease_owner` uuid makes an owner-only CAS an ABA) plus `ix_ansich_projection_jobs_projector_status` for the health merge's per-projector status-split counts
+- `migrations/versions/0026_ansich_environment.py` — environment-observability read models: per-Scope coverage, one current-state row per `(scope_id, environment_scope, metric)` with its trend counter, and at most one per-`tool_call_id` sample
+- `migrations/versions/0027_ansich_lease_generation.py` — `lease_generation` on both job tables (a per-job claim counter, because the process-lifetime `lease_owner` uuid makes an owner-only CAS an ABA) plus `ix_ansich_projection_jobs_projector_status`, whose name records the intent it was authored with (the health merge's per-projector status counts) and not what it turned out to serve: those counts filter on `status` alone and are served by the status-leading claim index, while this one's two real consumers are `_assess_projection_failures`' per-group evidence query and `_reconcile_spawn_usage`'s in-flight gate — see the health-merge paragraph above
 - `persistence/bootstrap.py` — `bootstrap_schema(engine, backend=...)`, the three-branch decision + locking
 - Tests: `tests/test_persistence_bootstrap.py` (branches), `tests/test_persistence_bootstrap_concurrency.py` (concurrency), `tests/test_persistence_bootstrap_regression.py` (issue #3682), `tests/test_persistence_migrations_env.py` (filter), `tests/blocking_io/test_persistence_bootstrap.py` (asyncio.to_thread anchor)
 

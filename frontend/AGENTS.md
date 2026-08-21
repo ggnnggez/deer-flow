@@ -232,6 +232,15 @@ and that is the very condition `projection_failure` alerts on; `unreadable` keep
 its own amber tone because nothing known is a different claim from something
 failing.
 
+**Known issue on that page (pre-existing, not introduced by the lens, and
+deliberately left alone):** the Operations page renders the selected lens's query
+error *instead of* the whole `<Tabs>` block — including the `TabsList` — so while
+the selected lens's fetch is failing there is no tab bar to switch away with, and
+the page only comes back when the poll recovers. The health query is simply the
+fourth endpoint that can now trigger it. Fixing it means rendering the error
+*inside* the tab panel and keeping the trigger row mounted, which is a change to
+shared page structure rather than to this lens.
+
 Ansich display formatting lives in `core/ansich/presentation.ts` and is shared, not
 per-component: `formatAnsichLag` is the one lag rendering for the health line, the
 drawer and the panel (sub-second in `ms`, past a second in `s` — two views one

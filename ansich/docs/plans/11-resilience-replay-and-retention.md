@@ -39,7 +39,11 @@ SQLite 遵守现有单 Gateway worker 约束，只运行一个 projector loop，
 
 poison job 写 `ansich_projection_errors`，产生 `projection_failure` Alert 并把 affected Task read model 标 failed；Collector/lost-range 事实产生 `observability_degradation` Alert。两类生产者必须先定义 process-wide/unknown scope 到 Alert subject 的稳定映射，再复用 Phase 6 episode 状态机去重与恢复；不阻塞其他 Task 或后续 ingest sequence。
 
-> **归属：P11-B**，未开工。这里的 process-wide subject 映射同时是 A 批留下的前置：A 批已经把 `task_id=None` 的丢失范围诚实记进未上报桶（health 字段 `unreported_global_lost_range_count`），但**写不出去**，因为没有可用的 subject。
+> **实现状态：已由 P11-B 批落地**（2026-08-20..22，`cc80a262`..`e275372c`；迁移 `0027_ansich_lease_generation`）。逐条语义见 [README.md](README.md) 的「Phase 11-B 多 worker 投影韧性与健康面」条目与 `backend/AGENTS.md` 的三段 “P11-B …”。必须随本节一起读的四点：
+> 1. **`ORDER BY job_id` 被拒绝，属记录在案的偏离**。认领仍按 `(observation.ingest_seq, projector 优先级, projector_name)`——那是文档化的「同一条 Observation 内的投影优先序」，本节字面要的确定性已由这三个键给到；按 `job_id` 认领等于用插入序换掉一个语义序。
+> 2. **「lease owner/version compare」实现为 `lease_generation` 代际 CAS**，不是 owner 比较：`lease_owner` 是每进程一个 `uuid4`，租约过期后同一 worker 重认领会读回自己的 id，owner-only 的 CAS 看不见这个 ABA。
+> 3. **「projector 幂等保证旧 worker 晚提交不会双写」只对投影侧成立**。assessor 的评估还推进 `ansich_assessor_watermarks`，幂等修不了一个「已判过什么」的声明，所以被丢弃的完成让整条评估事务回滚（裁决 PB4）。
+> 4. **两个 Alert 生产者的主体映射是 host `Scope`**，由启动期 bootstrap 观测铸造（哨兵 `ANSICH_BOOTSTRAP_TASK_ID`），与环境观测的 host Scope 收敛到同一实体；A 批那个「写不出去的未上报桶」由新 kind `observability.lost` 落盘，**行落库成功才出桶**。`projection_failure` 只覆盖投影作业（assessor 作业没有 `obs_id`，边界登记在 F10-18）。
 
 ## 4. Watermark、lag 与 lost range
 
@@ -55,7 +59,10 @@ poison job 写 `ansich_projection_errors`，产生 `projection_failure` Alert �
 
 `lag_ms` 使用最新待投影 Observation 的 recorded_at 与当前时间；无 pending 但有 failed 时 status 仍 failed。health endpoint 合并 app.state 进程数据和数据库数据；DB 查询失败时仍返回 process-local 结果和 `database.status=unreachable`。
 
-> **归属：P11-B**，未开工。A 批只动了这里的第一项（process-local collector health：七态生命周期、per-producer 账目、writer 块、未上报的进程级范围计数）；DB writer watermark、projector watermark、health 的 DB 合并与 lost range 的跨进程口径全部未动。
+> **实现状态：已由 P11-B 批落地**（同上）。A 批已经落了第一项（process-local collector health）；B 批补上 per-projector 的 `(pending, retry, processing, failed)` 计数、`complete_through`、`lag_ms` 与 health 的 DB 合并，并让活动 Task 读模型改盖**全库**的连续性标记而不是本进程的水位。两处必须随本节一起读的偏离：
+> 1. **projector watermark 读时计算、不落存储列**（记录在案的偏离）。语义是每 `(projector_name, projector_version)` 上未结算作业的 `min(ingest_seq) - 1`，即**连续性**标记而非最大值——一条 durably failed 的作业把它按住，这正是「这条线以下没有欠账」这句话成立的原因；一份便宜到可以随时算出来的数字，存一份副本只会漂移。`lag_ms` 取「未结算作业里 `MIN(ingest_seq)` 那一行的 `recorded_at` 与现在之差」（`recorded_at` 无索引，按它排序或过滤就是全表扫描），即本节 §7.2 的替代式。
+> 2. **「无 pending 但有 failed 时 status 仍 failed」被拒绝**（记录在案的偏离）。失败作业继续读作 `degraded`，因为采纳字面会让 `failed` 从 A 批 17 边 `LEGAL_TRANSITIONS` 闭包之外的条件可达，而那个闭包的**补集**是被钉住的合并门禁。字面背后的意图（失败不被掩盖）由三处承载：权威的 `database.failed_jobs`、`degraded` 状态本身，以及以「有 durably failed 作业」为全部条件的 `projection_failure` 告警。
+> 另记：health 的 DB 合并发生在**路由层**，`get_health()` 一字未动（同步、与 `record_batch` 共享一把锁、零 IO）；DB 不可达时 `database.status="unreachable"` 且块内每个数字是 `None`——**`None` 是未知，不是零**。
 
 ## 5. Versioned replay
 
@@ -123,7 +130,7 @@ Gateway 关闭顺序：停止新 record → stop heartbeat/assessor timers → t
 
 Operations 页面增加 Observability Health 面板。degraded/failed 时 Task 列表顶部显示全局 banner；每个 Task 仍显示自身关联状态。提供 failed job 详情和 projector/version，但 v1 UI 不直接提供“跳过 job”破坏性按钮。Replay 通过受控 CLI 运行。
 
-> **归属：P11-B**，未开工。A 批只让既有的 health 契约与前端跟上了写侧的新事实（七态、per-producer 与 writer 块、未上报的进程级范围计数，`starting`/`shutting_down` 渲染为静默阶段行而不是绿色的健康断言）；本节要求的 `/api/ansich/health` 扩展（component status、projector watermarks、retention last run、active versions）与 Observability Health 面板本身仍未动。
+> **实现状态：本节的 B 批部分已落地**（同上）。`/api/ansich/health` 的 additive `database` 块带上了 per-projector 的作业分桶、`complete_through`、`lag_ms` 与权威的 `failed_jobs`；Operations 页新增第四个透镜 “Observability”（`AnsichObservabilityHealthPanel`），它与 System 详情抽屉的分界是硬的——抽屉是**本 worker** 的进程/采集墙，面板是**全库**的答案，两个 failed-job 数从不合并、从不共用标签。degraded/failed 的全局 banner 与 per-Task 状态自 A 批起就在；failed job 详情与 projector/version 由既有的 `GET /operations/failed-jobs*` 提供，v1 仍不提供「跳过 job」的破坏性按钮。**本节仍欠的**：`retention last run` 与 `active versions` 属 C 批（§5/§6 未开工），受控 CLI 的 replay 同理。
 
 ## 10. TDD 与故障注入
 

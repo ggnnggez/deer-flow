@@ -150,13 +150,15 @@ Budget 是 policy limit，Usage 是事实贡献，breach 是判断，三者不�
 
 持久化的待执行工作项，记录 observation/watermark、projector、attempt、状态和 last error。依赖未到达时可以有界重试；超过等待上限进入 failed，operator 可诊断并重试。failed job 会使 health 进入 degraded，但不回滚 Agent 业务执行。
 
+多 worker 下（Phase 11-B）再加两条：作业状态区分 `retry`（重臂过、attempt 已花掉）与 `pending`（从未尝试，或一次把 attempt 还回去的依赖等待）；每次认领抬高该行的 `lease_generation`，之后每一次写都按这个代际做 compare-and-set，被接管的旧 owner 的写**静默作废**。健康面按 projector 报的 `complete_through` 是**连续性**标记——该 projector 未结算作业的 `min(ingest_seq) - 1`，不是最大值：一条 durably failed 的作业会把它按住，因此它读作「这条线以下没有欠账」，而不是「投影跑到哪了」。
+
 ## 7. Scope、Authorization 与 Effect
 
 这组三个概念从 Phase 9 开始形成 Safety Audit 数据链，三者必须分开建模。
 
 ### Scope
 
-一个稳定的归属、执行或资源边界。v1 scope kind 包括 `owner`、`thread`、`workspace`、`sandbox`、`authorization`、`external_origin`、`host`。Task 可以同时位于多个 Scope；`within_scope` relation 的 role 说明关系含义，例如 owner、conversation、execution workspace、auth context 或 `host_environment`。`host` kind 用 hostname 的 stable ref hash 规范化身份（不把敏感绝对路径/凭证当 ID）；单机部署下是一个固定 Scope，供环境观测的宿主共享信号（磁盘余量、PSI）挂载，Phase 11 预留的 `observability_degradation`/`projection_failure` process-subject 映射与本节共享同一个 `host` Scope 机制，不另造。
+一个稳定的归属、执行或资源边界。v1 scope kind 包括 `owner`、`thread`、`workspace`、`sandbox`、`authorization`、`external_origin`、`host`。Task 可以同时位于多个 Scope；`within_scope` relation 的 role 说明关系含义，例如 owner、conversation、execution workspace、auth context 或 `host_environment`。`host` kind 用 hostname 的 stable ref hash 规范化身份（不把敏感绝对路径/凭证当 ID）；单机部署下是一个固定 Scope，供环境观测的宿主共享信号（磁盘余量、PSI）挂载，Phase 11-B 已把 `observability_degradation`/`projection_failure` 两类 process-subject Alert 落在**同一个** `host` Scope 上，不另造：该 Scope 由 SQL 后端 `start()` 时的一条 bootstrap `scope.snapshotted` 铸造（`source_event_id` 与 producer 身份都固定，因此跨重启、跨 worker 幂等），其 Observation 的 `task_id` 是文档化的哨兵 `ANSICH_BOOTSTRAP_TASK_ID`，意思是「这条 Observation 没有 Task 实体」——凡是外键绑 Task 的机器都必须躲开这类行。
 
 - 路径和外部标识先规范化为受控 label 与 stable ref hash，不把 tenant credential 或敏感绝对路径当 ID。
 - child Task 继承 Scope 必须有 relation evidence，不能只在读取时隐式猜测。
