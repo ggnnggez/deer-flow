@@ -42,6 +42,7 @@ from support.ansich_settle import only_test_driven_assessments
 from app.gateway.auth.models import User
 from app.gateway.routers import ansich as ansich_router
 from deerflow.ansich import create_sql_ansich_service
+from deerflow.ansich.persistence import sql as sql_module
 from deerflow.ansich.persistence.models import (
     AnsichAlertEvidenceRow,
     AnsichAlertRow,
@@ -199,6 +200,26 @@ async def _alerts(session_factory, alert_type: str) -> list[AnsichAlertRow]:
                 )
             ).scalars()
         )
+
+
+async def _loss_assertions(session_factory) -> list[AnsichBeliefAssertionRow]:
+    async with session_factory() as session:
+        return list(
+            (
+                await session.execute(
+                    select(AnsichBeliefAssertionRow)
+                    .where(
+                        AnsichBeliefAssertionRow.subject_id == _SCOPE_ID,
+                        AnsichBeliefAssertionRow.assessor_name == "observability-loss",
+                    )
+                    .order_by(AnsichBeliefAssertionRow.assertion_id)
+                )
+            ).scalars()
+        )
+
+
+def _truncation_warnings(caplog: pytest.LogCaptureFixture) -> list[logging.LogRecord]:
+    return [record for record in caplog.records if getattr(record, "event", None) == "ansich.observability_loss.scan_truncated"]
 
 
 async def _failed_projector_names(session_factory) -> set[str]:
@@ -828,6 +849,133 @@ async def test_a_truncated_loss_scan_says_so_and_can_miss_a_quiet_producer(tmp_p
     # ...and the signal that makes the miss detectable.
     assert assertions
     assert all(row.value_json["scan_truncated"] is True for row in assertions)
+
+
+@pytest.mark.anyio
+async def test_a_truncation_flip_alone_appends_no_assertion(tmp_path, monkeypatch):
+    """`scan_truncated` is not a verdict, so flipping it must change nothing.
+
+    Truncation moves with load, not with the condition. If it took part in the
+    transition-only comparison, every crossing of the cap and back would append
+    an Assertion and rewrite the Alert row for every producer with **no** change
+    of verdict — and it would do that in exactly the sustained-loss regime the
+    cap exists to survive.
+
+    The two passes are constructed to differ in nothing else: twelve rows with
+    the scan capped at eleven (truncated), then the same twelve uncapped. The
+    evidence cap is ten either way, so both passes select the same newest ten
+    references and the same `as_of`; only the flag differs.
+    """
+
+    engine, session_factory, service = await _started_service(tmp_path, "process-health-flip.db")
+    try:
+        for index in range(12):
+            service.record(
+                _lost_range(
+                    occurred_at=_T0 + timedelta(seconds=index),
+                    first_sequence=1 + index,
+                    last_sequence=2 + index,
+                    producer_name="flip-probe",
+                    producer_instance_id="worker-f",
+                    suffix=f"flip-{index}",
+                )
+            )
+        await service.flush_task(ANSICH_BOOTSTRAP_TASK_ID)
+
+        monkeypatch.setattr(sql_module, "_OBSERVABILITY_LOSS_SCAN_LIMIT", 11)
+        await service.assess_operations(now=_T0 + timedelta(seconds=20))
+        truncated_assertions = await _loss_assertions(session_factory)
+        truncated_alert = (await _alerts(session_factory, "observability_degradation"))[0]
+        truncated_updated_at = truncated_alert.updated_at
+
+        monkeypatch.setattr(sql_module, "_OBSERVABILITY_LOSS_SCAN_LIMIT", 500)
+        await service.assess_operations(now=_T0 + timedelta(seconds=21))
+        after_assertions = await _loss_assertions(session_factory)
+        after_alert = (await _alerts(session_factory, "observability_degradation"))[0]
+    finally:
+        await service.stop()
+        await engine.dispose()
+
+    assert len(truncated_assertions) == 1
+    assert truncated_assertions[0].value_json["scan_truncated"] is True
+    # The flip appends nothing and rewrites nothing.
+    assert [row.assertion_id for row in after_assertions] == [row.assertion_id for row in truncated_assertions]
+    assert after_alert.entity_id == truncated_alert.entity_id
+    assert after_alert.updated_at == truncated_updated_at
+    assert after_alert.episode == 1
+
+
+@pytest.mark.anyio
+async def test_the_truncation_warning_is_rate_limited_and_fail_open(tmp_path, caplog: pytest.LogCaptureFixture):
+    """A sustained condition assessed at 1 Hz must not log at 1 Hz.
+
+    And it must not raise: this warning is emitted *inside* the
+    `assess_operations` transaction, so a raising handler would abort the whole
+    tick — heartbeat, dwell, budget, environment and both producers — over a
+    diagnostic about a diagnostic.
+    """
+
+    engine, session_factory, service = await _started_service(tmp_path, "process-health-warn.db")
+    backend = service._backend
+    try:
+        for index in range(12):
+            service.record(
+                _lost_range(
+                    occurred_at=_T0 + timedelta(seconds=index),
+                    first_sequence=1 + index,
+                    last_sequence=2 + index,
+                    producer_name="warn-probe",
+                    producer_instance_id="worker-w",
+                    suffix=f"warn-{index}",
+                )
+            )
+        await service.flush_task(ANSICH_BOOTSTRAP_TASK_ID)
+
+        with caplog.at_level(logging.WARNING, logger="deerflow.ansich.persistence.sql"):
+            with pytest.MonkeyPatch.context() as patch:
+                patch.setattr(sql_module, "_OBSERVABILITY_LOSS_SCAN_LIMIT", 11)
+                # Two truncated ticks inside one suppression window.
+                await service.assess_operations(now=_T0 + timedelta(seconds=20))
+                await service.assess_operations(now=_T0 + timedelta(seconds=21))
+                first_window = _truncation_warnings(caplog)
+
+                # Step past the window without sleeping through it.
+                backend._last_loss_scan_warning_at = time.monotonic() - 3600.0
+                await service.assess_operations(now=_T0 + timedelta(seconds=22))
+                second_window = _truncation_warnings(caplog)
+
+                # A raising handler must cost the message, never the tick — and
+                # the occurrence must still be counted.
+                backend._last_loss_scan_warning_at = time.monotonic() - 3600.0
+
+                def _explode(*_args, **_kwargs):
+                    raise RuntimeError("log handler is down")
+
+                patch.setattr(sql_module.logger, "warning", _explode)
+                await service.assess_operations(now=_T0 + timedelta(seconds=23))
+                suppressed_after_failure = backend._suppressed_loss_scan_warning_count
+                stamp_after_failure = backend._last_loss_scan_warning_at
+
+        alerts = await _alerts(session_factory, "observability_degradation")
+    finally:
+        await service.stop()
+        await engine.dispose()
+
+    assert len(first_window) == 1
+    assert first_window[0].suppressed_scan_truncated_warning_count == 0
+    assert first_window[0].scanned_row_count == 11
+    assert first_window[0].in_window_row_count == 12
+    # The second tick is counted, not repeated.
+    assert len(second_window) == 2
+    assert second_window[1].suppressed_scan_truncated_warning_count == 1
+
+    # The failed emit did not lose the occurrence, and did not buy itself a
+    # quiet window either.
+    assert suppressed_after_failure == 1
+    assert stamp_after_failure is not None
+    # The tick itself completed: the episode is still there and still open.
+    assert len(alerts) == 1
+    assert alerts[0].resolved_at is None
 
 
 @pytest.mark.anyio

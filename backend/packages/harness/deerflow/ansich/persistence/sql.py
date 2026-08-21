@@ -4,6 +4,7 @@ import hashlib
 import json
 import logging
 import socket
+import time
 from collections.abc import AsyncIterator, Sequence
 from contextlib import asynccontextmanager
 from datetime import UTC, datetime, timedelta
@@ -153,6 +154,7 @@ from ansich.operations import (
 from ansich.operator import OperatorActionView, TaskActionTarget
 from ansich.process_health import (
     MAX_PROCESS_ALERT_EVIDENCE,
+    NON_VERDICT_VALUE_KEYS,
     OBSERVABILITY_LOSS_ASSESSOR,
     PROJECTION_HEALTH_ASSESSOR,
     assess_observability_degradation,
@@ -944,6 +946,28 @@ _OBSERVABILITY_LOSS_SCAN_LIMIT = 500
 #: row. Attributing the range to a reserved, obviously-not-a-producer name keeps
 #: the loss visible instead of dropping it, without fabricating a real producer.
 _UNREADABLE_LOSS_PRODUCER = "<unreadable>"
+#: The truncation WARNING's own suppression window, on the same discipline as
+#: ``AnsichService._report_assessment_failure`` and ``_warn_batch_loss``: a
+#: separate window per incident family, and whatever it suppresses is counted so
+#: the next line says how much it stands for. A truncated scan is by
+#: construction a *sustained* condition — the cap bites because loss is
+#: ongoing — and this pass runs once a second, so an unconditional line per tick
+#: is exactly the flood the assessment-failure reporter forbids.
+_OBSERVABILITY_LOSS_WARNING_INTERVAL_SECONDS = 60.0
+
+
+def _verdict_value(value: object) -> dict[str, object]:
+    """One Assertion value reduced to the part a transition is judged on.
+
+    ``NON_VERDICT_VALUE_KEYS`` says why these keys are dropped: they describe how
+    much the pass could see, not what it concluded. No environment rule emits any
+    of them, so this is an identity function on that whole family and the shared
+    transition-only persist keeps its previous behaviour there exactly.
+    """
+
+    if not isinstance(value, dict):
+        return {}
+    return {key: item for key, item in value.items() if key not in NON_VERDICT_VALUE_KEYS}
 
 
 def _durably_failed_projection_job():
@@ -1026,6 +1050,8 @@ class SqlAnsichBackend:
         self._stale_completion_count = 0
         self._latest_recorded_at: datetime | None = None
         self._latest_projected_at: datetime | None = None
+        self._last_loss_scan_warning_at: float | None = None
+        self._suppressed_loss_scan_warning_count = 0
         self._context_metrics = {
             "snapshot_count": 0,
             "snapshot_item_count": 0,
@@ -6097,17 +6123,9 @@ class SqlAnsichBackend:
         in_window_count = await session.scalar(select(func.count()).select_from(AnsichObservationRow).where(*in_window)) or 0
         scan_truncated = in_window_count > len(rows)
         if scan_truncated:
-            logger.warning(
-                "Ansich observability-loss scan truncated: read=%d in_window=%d window_seconds=%d",
-                len(rows),
-                in_window_count,
-                _OBSERVABILITY_LOSS_WINDOW_SECONDS,
-                extra={
-                    "event": "ansich.observability_loss.scan_truncated",
-                    "scanned_row_count": len(rows),
-                    "in_window_row_count": in_window_count,
-                    "window_seconds": _OBSERVABILITY_LOSS_WINDOW_SECONDS,
-                },
+            self._warn_loss_scan_truncated(
+                scanned_row_count=len(rows),
+                in_window_row_count=in_window_count,
             )
         by_producer: dict[tuple[str, str], list[tuple[str, datetime]]] = {}
         for obs_id, occurred_at, payload in rows:
@@ -6172,6 +6190,62 @@ class SqlAnsichBackend:
             asserted_at=asserted_at,
         )
 
+    def _warn_loss_scan_truncated(
+        self,
+        *,
+        scanned_row_count: int,
+        in_window_row_count: int,
+    ) -> None:
+        """Say the loss scan hit its cap, at most once per window, never raising.
+
+        Two disciplines, both borrowed rather than invented, and both load-bearing
+        here for reasons this call site makes sharper than its neighbours.
+
+        **Rate limit.** A truncated scan is a *sustained* condition by
+        construction — the cap bites precisely because loss is ongoing — and the
+        pass that calls this runs once a second. An unconditional line per tick
+        is the flood ``_report_assessment_failure`` exists to forbid, so the same
+        60s window applies, with the suppressed count carried into the next line
+        so the limit hides frequency and never the fact.
+
+        **Fail-open.** This runs *inside* the ``assess_operations`` transaction,
+        so a raising log handler here would not merely lose a message: it would
+        abort the whole tick — heartbeat, dwell, budget, environment and both
+        process-subject producers — over a diagnostic about a diagnostic. Every
+        logging call is therefore guarded, exactly as ``_emit_drop_warning`` is.
+
+        One edge the guard has to get right: an emit that raises must not lose
+        the occurrence. It is counted as suppressed and the window stamp is left
+        alone, so the very next truncated tick tries again immediately instead of
+        the failure silently buying sixty seconds of quiet.
+        """
+
+        warning_at = time.monotonic()
+        if self._last_loss_scan_warning_at is not None and warning_at - self._last_loss_scan_warning_at < _OBSERVABILITY_LOSS_WARNING_INTERVAL_SECONDS:
+            self._suppressed_loss_scan_warning_count += 1
+            return
+        suppressed = self._suppressed_loss_scan_warning_count
+        try:
+            logger.warning(
+                "Ansich observability-loss scan truncated: read=%d in_window=%d window_seconds=%d suppressed_scan_truncated_warnings=%d",
+                scanned_row_count,
+                in_window_row_count,
+                _OBSERVABILITY_LOSS_WINDOW_SECONDS,
+                suppressed,
+                extra={
+                    "event": "ansich.observability_loss.scan_truncated",
+                    "scanned_row_count": scanned_row_count,
+                    "in_window_row_count": in_window_row_count,
+                    "window_seconds": _OBSERVABILITY_LOSS_WINDOW_SECONDS,
+                    "suppressed_scan_truncated_warning_count": suppressed,
+                },
+            )
+        except Exception:
+            self._suppressed_loss_scan_warning_count = suppressed + 1
+            return
+        self._last_loss_scan_warning_at = warning_at
+        self._suppressed_loss_scan_warning_count = 0
+
     async def _persist_and_reconcile_process_health(
         self,
         session: AsyncSession,
@@ -6229,6 +6303,13 @@ class SqlAnsichBackend:
         (``projection-health@1``, ``observability-loss@1``), all of which are
         re-evaluated once a second against evidence that moves continuously
         while the category does not.
+
+        ``NON_VERDICT_VALUE_KEYS`` joins ``as_of`` and the evidence on the
+        excluded side of that comparison, for the identical reason: those keys
+        state how complete the pass's own evidence was, which moves with load
+        rather than with the condition. The retained Assertion therefore
+        describes the pass that established the state — the same property this
+        method already claims for the Observation it keeps pointing at.
         """
 
         latest = await session.scalar(
@@ -6246,7 +6327,7 @@ class SqlAnsichBackend:
             )
             .limit(1)
         )
-        if latest is not None and latest.value_json == assessment.value:
+        if latest is not None and _verdict_value(latest.value_json) == _verdict_value(assessment.value):
             return latest, False
         assertion = AnsichBeliefAssertionRow(
             assertion_id=new_id(),

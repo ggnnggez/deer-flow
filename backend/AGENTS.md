@@ -1469,7 +1469,25 @@ artefact of the cap. Newest-first is still the right direction, so the pass
 makes the miss *detectable* rather than fixing it: an unbounded `COUNT` runs
 beside the capped scan on the same predicate, and when it exceeds what was read
 every Assertion that pass writes carries `scan_truncated: true` and the pass
-logs a WARNING (`ansich.observability_loss.scan_truncated`). A lost row whose
+logs a WARNING (`ansich.observability_loss.scan_truncated`). That WARNING obeys
+the same discipline as everything else in this file that reports a recurring
+incident, and it has to: truncation is *sustained* by construction and the pass
+runs at 1 Hz, so `_warn_loss_scan_truncated` rate-limits it to one per
+`_OBSERVABILITY_LOSS_WARNING_INTERVAL_SECONDS` with the suppressed count carried
+into the next line, and every logging call is fail-open — it is emitted *inside*
+the `assess_operations` transaction, where a raising handler would abort the
+whole tick over a diagnostic about a diagnostic. An emit that raises still
+counts the occurrence as suppressed and leaves the window stamp alone, so the
+next truncated tick retries immediately rather than the failure buying itself
+sixty seconds of quiet. `scan_truncated` itself rides in the Assertion value but
+sits in `NON_VERDICT_VALUE_KEYS`, which
+`_persist_transition_only_assessment` strips before comparing: it describes how
+much the pass could see, not what it concluded, so including it would append an
+Assertion and rewrite the Alert row per producer on every crossing of the cap
+and back, with no verdict change — in exactly the sustained-loss regime the cap
+exists to survive. It joins `as_of` and the evidence Observation on the excluded
+side for the same reason, and the retained Assertion means the same thing there:
+it describes the pass that *established* the state. A lost row whose
 payload cannot be read inline (externalization, or a missing `ansich_payloads`
 row) is charged to the reserved `_UNREADABLE_LOSS_PRODUCER` identity, so the
 loss stays visible without inventing a producer. Both

@@ -48,6 +48,23 @@ OBSERVABILITY_LOSS_ASSESSOR = NamedVersion(name="observability-loss", version="1
 #: the newest are the ones that describe the condition as it is now.
 MAX_PROCESS_ALERT_EVIDENCE = 10
 
+#: Assessment-value keys that describe how much the pass could *see*, not what
+#: it concluded. They travel in the value because they belong to the Assertion —
+#: an Assertion that cannot say how complete its own evidence was is claiming
+#: more certainty than it has — but they are excluded from the transition-only
+#: comparison, which asks a narrower question: has the *verdict* changed?
+#:
+#: ``scan_truncated`` moves with load, not with the condition. Including it in
+#: the compare would append an Assertion and rewrite the Alert row for every
+#: producer each time the scan crossed its cap and back, with no change of
+#: verdict at all — and it would do that in exactly the sustained-loss regime
+#: the cap exists to survive. That is the same reason ``as_of`` and the evidence
+#: Observation are already excluded there, and the retained Assertion keeps the
+#: same meaning it does for them: it describes the pass that *established* the
+#: state. Whether the scan is truncated right now is the rate-limited WARNING's
+#: job, not a retained Assertion's.
+NON_VERDICT_VALUE_KEYS = frozenset({"scan_truncated"})
+
 
 def _bounded(prefix: str, key: str, limit: int) -> str:
     candidate = f"{prefix}:{key}"
