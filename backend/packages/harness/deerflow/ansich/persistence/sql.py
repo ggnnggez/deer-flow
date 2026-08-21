@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+import socket
 from collections.abc import AsyncIterator, Sequence
 from contextlib import asynccontextmanager
 from datetime import UTC, datetime, timedelta
@@ -150,6 +151,13 @@ from ansich.operations import (
     assess_heartbeat,
 )
 from ansich.operator import OperatorActionView, TaskActionTarget
+from ansich.process_health import (
+    MAX_PROCESS_ALERT_EVIDENCE,
+    OBSERVABILITY_LOSS_ASSESSOR,
+    PROJECTION_HEALTH_ASSESSOR,
+    assess_observability_degradation,
+    assess_projection_failure,
+)
 from ansich.quality import ReleaseQualityDimensionView, ReleaseQualityView
 from ansich.release import (
     AgentRelease,
@@ -161,7 +169,7 @@ from ansich.release import (
     validate_agent_release,
 )
 from ansich.release.canonical import canonical_json_bytes
-from ansich.safety import AuthorizationPermission, AuthorizationSnapshot, ScopeDescriptor
+from ansich.safety import AuthorizationPermission, AuthorizationSnapshot, ScopeDescriptor, host_scope_id
 from ansich.task_tree import TaskSpawnView, TaskTreeDirection
 from ansich.tool import ContentDerivationSourceRole, ToolTransformKind
 from ansich.usage import (
@@ -897,6 +905,46 @@ def _content_blob_key(content_type: str, body: bytes) -> str:
 #: request-driven — there is no startup sweep, so a stranded row is judged only by
 #: an operator who actually wants that action to happen now.
 _STALE_REQUESTED_TAKEOVER_AFTER = timedelta(minutes=5)
+#: How recent an ``observability.lost`` row has to be for its producer to still
+#: count as degraded (RB3③). It is a rule constant rather than an
+#: ``AnsichConfig`` knob because it is the *definition* of the condition, not a
+#: tuning of it: loss rows are append-only forever, so without a horizon the
+#: Alert would open once and never resolve. Fifteen minutes is long enough that
+#: one burst of loss keeps a single episode open across many of the 1 Hz
+#: assessment ticks instead of flapping, and short enough that an operator who
+#: fixed the outage sees it close inside one coffee break. It is hashed into the
+#: rule's config identity, so changing it is visible in the Assertions it
+#: produces.
+_OBSERVABILITY_LOSS_WINDOW_SECONDS = 900
+#: Bound on how many ``observability.lost`` rows one assessment tick reads. The
+#: rows in a fifteen-minute window are unbounded under a sustained outage, and
+#: this pass runs once a second. The newest rows are the ones that decide the
+#: verdict, so the cap costs only this: a producer whose *only* loss in the
+#: window is older than the newest ``_OBSERVABILITY_LOSS_SCAN_LIMIT`` rows reads
+#: as recovered early. That producer is by construction quiet while a louder one
+#: is still losing, and the loud one is the one an operator needs to see.
+_OBSERVABILITY_LOSS_SCAN_LIMIT = 500
+#: The producer identity charged to a lost range whose payload could not be read
+#: back inline. ``observability.lost`` payloads are four small fields, so this is
+#: reachable only through payload externalization or a missing ``ansich_payloads``
+#: row. Attributing the range to a reserved, obviously-not-a-producer name keeps
+#: the loss visible instead of dropping it, without fabricating a real producer.
+_UNREADABLE_LOSS_PRODUCER = "<unreadable>"
+
+
+def _durably_failed_projection_job():
+    """The one predicate the projection-failure pass is defined by.
+
+    Written once and reused by both halves — the group query and the per-group
+    evidence query — because they have to agree. A ``retry`` row is deliberately
+    excluded: the attempt was spent and the job re-armed, so it is work in
+    flight rather than a failure, and alerting on it would raise an Alert about
+    the very act of retrying. If only one half were widened the other would
+    quietly swallow the difference (a group with no evidence is skipped), so the
+    predicate is not allowed to exist in two places.
+    """
+
+    return AnsichProjectionJobRow.status == "failed"
 
 
 class SqlAnsichBackend:
@@ -925,8 +973,16 @@ class SqlAnsichBackend:
         tool_frequency_threshold: int = 30,
         environment_sample_interval_seconds: int = 10,
         environment_thresholds: EnvironmentThresholds | None = None,
+        # The host whose ``Scope`` this backend's process-subject Alert
+        # producers file against (RB3). It has to be the same answer
+        # ``AnsichService`` gives, because the service is what mints the Scope
+        # and the producers are what write under it; ``create_sql_ansich_service``
+        # passes one value to both, and both fall back to the same
+        # ``socket.gethostname()`` when nothing is injected.
+        hostname: str | None = None,
     ) -> None:
         self._session_factory = session_factory
+        self._hostname = hostname or socket.gethostname()
         self._projector_lease_seconds = projector_lease_seconds
         self._projector_max_attempts = projector_max_attempts
         self._projector_dependency_timeout = timedelta(seconds=projector_dependency_timeout_seconds)
@@ -5605,6 +5661,12 @@ class SqlAnsichBackend:
                 global_loss=global_loss,
             )
             changed += await self._assess_environment(session, asserted_at)
+            # The two process-subject rules (RB3). They live here, beside
+            # `_assess_environment`, and not on an assessor job, because the
+            # assessor-job and watermark tables are FK-bound to `ansich_tasks`
+            # and both of these subject a Scope.
+            changed += await self._assess_projection_failures(session, asserted_at)
+            changed += await self._assess_observability_degradation(session, asserted_at)
         await self._refresh_active_task_read_model(
             now=asserted_at,
             lost_ranges=lost_ranges,
@@ -5738,7 +5800,7 @@ class SqlAnsichBackend:
                 continue
             reconciled: list[tuple[Assessment, str]] = []
             for assessment in assessments:
-                assertion, did_change = await self._persist_environment_assessment(
+                assertion, did_change = await self._persist_transition_only_assessment(
                     session,
                     assessment,
                 )
@@ -5755,12 +5817,335 @@ class SqlAnsichBackend:
             )
         return changed
 
-    async def _persist_environment_assessment(
+    async def _existing_host_scope_id(self, session: AsyncSession) -> str | None:
+        """This process's host ``Scope`` id, but only when the entity is there.
+
+        **The handle rule (backend/AGENTS.md, RB1③), and it is the whole reason
+        this helper exists.** The two ways to name the host Scope are not
+        interchangeable. ``AnsichService.host_scope_id`` means "*this process's*
+        bootstrap mint succeeded", which under multiple Gateway workers sharing
+        one database is not the same statement as "the entity exists" — a worker
+        whose own mint failed would read ``None`` for a Scope its neighbour
+        minted, and a worker that minted it holds a truth about its own past,
+        not about the row. So a producer computes the id purely
+        (:func:`ansich.safety.host_scope_id`) and then *asks the database*
+        whether the Scope is there.
+
+        Absent means skip, not create: an Alert subjected to an unminted Scope
+        would violate ``ansich_alerts.subject_id``'s foreign key, and minting one
+        here would put a second writer on a row the collector's bootstrap owns.
+        This mirrors ``_assess_environment``'s candidate-empty idiom — return 0
+        and let the next tick, after the mint lands, do the work (RB1④).
+        """
+
+        scope_id = host_scope_id(self._hostname)
+        scope = await session.get(AnsichScopeRow, scope_id)
+        return None if scope is None else scope_id
+
+    async def _current_process_health_groups(
+        self,
+        session: AsyncSession,
+        *,
+        scope_id: str,
+        assessor: NamedVersion,
+        active_value: str,
+    ) -> list[dict[str, object]]:
+        """The Assertion values this rule currently calls unhealthy.
+
+        This is how a *recovered* group is found. ``reconcile_alert_conditions``
+        resolves an unresolved episode whose stable key is no longer reported,
+        but only inside a ``(subject, rule, alert_type)`` scope some condition
+        still names — so when the last failing group recovers there would be no
+        condition at all, no evaluated scope, and the episode would be stranded
+        open. The producers therefore report an explicit inactive condition for
+        every group they last called unhealthy.
+
+        The identity comes from the current *Belief* rather than from the open
+        Alert row, because the Alert only stores the stable condition key and
+        that key is bounded — a long projector or producer identity degrades to
+        a digest and cannot be inverted. The Assertion value carries the
+        readable parts, and the Assertion is written in the same transaction as
+        the episode it opened, so the two never disagree.
+        """
+
+        rows = (
+            await session.execute(
+                select(AnsichBeliefAssertionRow.value_json)
+                .join(
+                    AnsichCurrentBeliefRow,
+                    AnsichCurrentBeliefRow.assertion_id == AnsichBeliefAssertionRow.assertion_id,
+                )
+                .where(
+                    AnsichCurrentBeliefRow.subject_id == scope_id,
+                    AnsichBeliefAssertionRow.assessor_name == assessor.name,
+                    AnsichBeliefAssertionRow.assessor_version == assessor.version,
+                )
+            )
+        ).scalars()
+        return [value for value in rows if isinstance(value, dict) and value.get("value") == active_value]
+
+    async def _assess_projection_failures(
+        self,
+        session: AsyncSession,
+        asserted_at: datetime,
+    ) -> int:
+        """Alert on durably failed projection jobs, grouped by projector.
+
+        One condition per ``(projector_name, projector_version)`` group, all of
+        them handed to ``reconcile_alert_conditions`` in **one** call, because
+        that function's contract is a complete key set per
+        ``(subject, rule, alert_type)`` scope: reconciling projector by
+        projector would make each projector resolve the others' episodes
+        (RB3④). An empty key set is a legal call meaning everything recovered.
+
+        Only ``status == 'failed'`` counts. A job in ``retry`` has been re-armed
+        and is going to be attempted again — it is work in flight, not a
+        failure, and treating it as one would raise an Alert the very act of
+        retrying was meant to clear.
+
+        **Assessor jobs are out of scope, deliberately.** See
+        :func:`ansich.process_health.assess_projection_failure` for why: the
+        evidence chain is the failed job's own ``obs_id`` and only projection
+        jobs have one. A durably failed assessor job still reaches an operator
+        through the shared failed-job count and ``GET /operations/failed-jobs``.
+        """
+
+        scope_id = await self._existing_host_scope_id(session)
+        if scope_id is None:
+            return 0
+        failing_groups = [
+            (name, version)
+            for name, version in (
+                await session.execute(
+                    select(
+                        AnsichProjectionJobRow.projector_name,
+                        AnsichProjectionJobRow.projector_version,
+                    )
+                    .where(_durably_failed_projection_job())
+                    .group_by(
+                        AnsichProjectionJobRow.projector_name,
+                        AnsichProjectionJobRow.projector_version,
+                    )
+                    .order_by(
+                        AnsichProjectionJobRow.projector_name,
+                        AnsichProjectionJobRow.projector_version,
+                    )
+                )
+            ).all()
+        ]
+        assessments: list[Assessment] = []
+        for projector_name, projector_version in failing_groups:
+            evidence = (
+                await session.execute(
+                    select(
+                        AnsichObservationRow.obs_id,
+                        AnsichObservationRow.occurred_at,
+                    )
+                    .join(
+                        AnsichProjectionJobRow,
+                        AnsichProjectionJobRow.obs_id == AnsichObservationRow.obs_id,
+                    )
+                    .where(
+                        _durably_failed_projection_job(),
+                        AnsichProjectionJobRow.projector_name == projector_name,
+                        AnsichProjectionJobRow.projector_version == projector_version,
+                    )
+                    # Newest first, then reversed below: the cap keeps the most
+                    # recent references, and the stored order stays ascending so
+                    # an operator reads the group's evidence forwards.
+                    .order_by(AnsichObservationRow.ingest_seq.desc())
+                    .limit(MAX_PROCESS_ALERT_EVIDENCE)
+                )
+            ).all()
+            if not evidence:
+                # A failed job whose Observation is gone cannot back an episode
+                # (`_persist_alert_episode` requires evidence), and reporting a
+                # condition with no evidence would raise inside the periodic
+                # pass. CASCADE makes this practically unreachable; skipping is
+                # the fail-quiet direction.
+                continue
+            assessments.append(
+                assess_projection_failure(
+                    scope_id=scope_id,
+                    projector_name=projector_name,
+                    projector_version=projector_version,
+                    failing=True,
+                    as_of=max(_as_utc(occurred_at) for _, occurred_at in evidence),
+                    now=asserted_at,
+                    evidence_obs_ids=tuple(obs_id for obs_id, _ in reversed(evidence)),
+                )
+            )
+        failing_keys = {(name, version) for name, version in failing_groups}
+        for value in await self._current_process_health_groups(
+            session,
+            scope_id=scope_id,
+            assessor=PROJECTION_HEALTH_ASSESSOR,
+            active_value="failing",
+        ):
+            projector_name = str(value.get("projector_name", ""))
+            projector_version = str(value.get("projector_version", ""))
+            if not projector_name or not projector_version:
+                continue
+            if (projector_name, projector_version) in failing_keys:
+                continue
+            assessments.append(
+                assess_projection_failure(
+                    scope_id=scope_id,
+                    projector_name=projector_name,
+                    projector_version=projector_version,
+                    failing=False,
+                    as_of=asserted_at,
+                    now=asserted_at,
+                )
+            )
+        return await self._persist_and_reconcile_process_health(
+            session,
+            scope_id=scope_id,
+            assessments=assessments,
+            asserted_at=asserted_at,
+        )
+
+    async def _assess_observability_degradation(
+        self,
+        session: AsyncSession,
+        asserted_at: datetime,
+    ) -> int:
+        """Alert on Observations this process is *currently* losing.
+
+        Evidence is the ``observability.lost`` rows themselves (RB3③) — the kind
+        is registered in no projector, so the Observation stream is the read
+        model, queried through the ``(kind, occurred_at)`` index. Keys are the
+        losing producer's identity out of the payload, and every key goes into
+        one ``reconcile_alert_conditions`` call for the same exhaustiveness
+        reason as the projection-failure pass.
+
+        "Currently" is a window, and
+        :func:`ansich.process_health.assess_observability_degradation` argues
+        why it has to be: these rows are append-only, so any rule shaped as "has
+        this producer ever lost anything" produces an episode that can never
+        resolve and never recur.
+        """
+
+        scope_id = await self._existing_host_scope_id(session)
+        if scope_id is None:
+            return 0
+        horizon = asserted_at - timedelta(seconds=_OBSERVABILITY_LOSS_WINDOW_SECONDS)
+        rows = (
+            await session.execute(
+                select(
+                    AnsichObservationRow.obs_id,
+                    AnsichObservationRow.occurred_at,
+                    AnsichObservationRow.payload_json,
+                )
+                .where(
+                    AnsichObservationRow.kind == "observability.lost",
+                    AnsichObservationRow.subject_id == scope_id,
+                    AnsichObservationRow.occurred_at >= horizon,
+                )
+                .order_by(AnsichObservationRow.ingest_seq.desc())
+                .limit(_OBSERVABILITY_LOSS_SCAN_LIMIT)
+            )
+        ).all()
+        by_producer: dict[tuple[str, str], list[tuple[str, datetime]]] = {}
+        for obs_id, occurred_at, payload in rows:
+            if isinstance(payload, dict):
+                producer_name = str(payload.get("producer_name") or _UNREADABLE_LOSS_PRODUCER)
+                producer_instance_id = str(payload.get("producer_instance_id") or _UNREADABLE_LOSS_PRODUCER)
+            else:
+                producer_name = _UNREADABLE_LOSS_PRODUCER
+                producer_instance_id = _UNREADABLE_LOSS_PRODUCER
+            by_producer.setdefault((producer_name, producer_instance_id), []).append((obs_id, _as_utc(occurred_at)))
+        assessments: list[Assessment] = []
+        for (producer_name, producer_instance_id), entries in sorted(by_producer.items()):
+            # `entries` is newest-first; the cap keeps the newest and the stored
+            # order is ascending, same discipline as the projection pass.
+            capped = list(reversed(entries[:MAX_PROCESS_ALERT_EVIDENCE]))
+            assessments.append(
+                assess_observability_degradation(
+                    scope_id=scope_id,
+                    producer_name=producer_name,
+                    producer_instance_id=producer_instance_id,
+                    degraded=True,
+                    window_seconds=_OBSERVABILITY_LOSS_WINDOW_SECONDS,
+                    # The newest loss in the window, so `as_of` stops moving as
+                    # soon as the loss does; using `asserted_at` would advance
+                    # the episode every tick and hide when the loss stopped.
+                    as_of=max(occurred_at for _, occurred_at in entries),
+                    now=asserted_at,
+                    evidence_obs_ids=tuple(obs_id for obs_id, _ in capped),
+                )
+            )
+        for value in await self._current_process_health_groups(
+            session,
+            scope_id=scope_id,
+            assessor=OBSERVABILITY_LOSS_ASSESSOR,
+            active_value="degraded",
+        ):
+            producer_name = str(value.get("producer_name", ""))
+            producer_instance_id = str(value.get("producer_instance_id", ""))
+            if not producer_name or not producer_instance_id:
+                continue
+            if (producer_name, producer_instance_id) in by_producer:
+                continue
+            assessments.append(
+                assess_observability_degradation(
+                    scope_id=scope_id,
+                    producer_name=producer_name,
+                    producer_instance_id=producer_instance_id,
+                    degraded=False,
+                    window_seconds=_OBSERVABILITY_LOSS_WINDOW_SECONDS,
+                    as_of=asserted_at,
+                    now=asserted_at,
+                )
+            )
+        return await self._persist_and_reconcile_process_health(
+            session,
+            scope_id=scope_id,
+            assessments=assessments,
+            asserted_at=asserted_at,
+        )
+
+    async def _persist_and_reconcile_process_health(
+        self,
+        session: AsyncSession,
+        *,
+        scope_id: str,
+        assessments: Sequence[Assessment],
+        asserted_at: datetime,
+    ) -> int:
+        """Persist one process-subject rule's whole result, then reconcile once.
+
+        ``possibly_affected_task_ids`` stays ``None``: a failing projector or a
+        losing producer is a property of the process, and naming whichever Tasks
+        happened to be running would read as attribution the evidence does not
+        support.
+        """
+
+        if not assessments:
+            return 0
+        changed = 0
+        reconciled: list[tuple[Assessment, str]] = []
+        for assessment in assessments:
+            assertion, did_change = await self._persist_transition_only_assessment(
+                session,
+                assessment,
+            )
+            changed += int(did_change)
+            reconciled.append((assessment, assertion.assertion_id))
+        await self._reconcile_alerts_for_assessments(
+            session,
+            subject_id=scope_id,
+            assessments=reconciled,
+            now=asserted_at,
+        )
+        return changed
+
+    async def _persist_transition_only_assessment(
         self,
         session: AsyncSession,
         assessment: Assessment,
     ) -> tuple[AnsichBeliefAssertionRow, bool]:
-        """Append an environment Assertion only when the category transitions.
+        """Append a periodic Scope Assertion only when the category transitions.
 
         This mirrors the heartbeat block's unchanged-skip rather than
         ``_persist_assessment``'s, with one deliberate difference: neither
@@ -5771,6 +6156,12 @@ class SqlAnsichBackend:
         pointing at the Observation that first established the state, which is
         exactly what it asserts; the current numbers live in the environment
         read-model rows.
+
+        Shared by every rule with that shape — ``environment-pressure@1``,
+        ``environment-leak@1``, and the two process-subject rules
+        (``projection-health@1``, ``observability-loss@1``), all of which are
+        re-evaluated once a second against evidence that moves continuously
+        while the category does not.
         """
 
         latest = await session.scalar(

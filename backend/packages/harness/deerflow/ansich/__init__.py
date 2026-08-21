@@ -127,6 +127,9 @@ def create_sql_ansich_service(
             tool_frequency_threshold=tool_frequency_threshold,
             environment_sample_interval_seconds=environment_sample_interval_seconds,
             environment_thresholds=environment_thresholds,
+            # One hostname, two consumers: the service mints the host Scope and
+            # the backend's process-subject Alert producers write under it.
+            hostname=hostname,
         ),
         queue_capacity=queue_capacity,
         queue_byte_capacity=queue_byte_capacity,

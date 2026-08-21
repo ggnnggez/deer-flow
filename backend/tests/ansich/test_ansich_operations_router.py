@@ -371,9 +371,17 @@ async def test_alert_endpoints_list_detail_and_enforce_workflow_version(
                     "task": task_id,
                 },
             )
-            deferred_type_filter = await client.get(
+            # `projection_failure` was a deferred type until P11-B gave it a
+            # producer; it is now admitted, and this Task's own subject has no
+            # such episode, so the page is legitimately empty. An actually
+            # unknown type is what must still be rejected.
+            process_type_filter = await client.get(
                 "/api/ansich/operations/alerts",
                 params={"type": "projection_failure"},
+            )
+            unknown_type_filter = await client.get(
+                "/api/ansich/operations/alerts",
+                params={"type": "not_a_real_alert_type"},
             )
             alert_id = listed.json()["items"][0]["alert_id"]
             detail = await client.get(f"/api/ansich/operations/alerts/{alert_id}")
@@ -402,7 +410,9 @@ async def test_alert_endpoints_list_detail_and_enforce_workflow_version(
 
     assert listed.status_code == 200
     assert listed.json()["next_cursor"] is None
-    assert deferred_type_filter.status_code == 422
+    assert process_type_filter.status_code == 200
+    assert process_type_filter.json()["items"] == []
+    assert unknown_type_filter.status_code == 422
     assert detail.status_code == 200
     assert detail.json()["alert"]["source_belief"]["field_name"] == ("tool_frequency:web_search")
     assert task_detail.status_code == 200

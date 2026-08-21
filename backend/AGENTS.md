@@ -758,9 +758,9 @@ Phase 6's public Alert filter exposes only types with producers: budget
 warning/exceeded, exact repetition, Tool frequency, heartbeat missing, and long
 dwell. Phase 7 adds the provider-model `configuration_drift` producer to that
 filter. The domain values `observability_degradation` and `projection_failure`
-remain reserved for Phase 11, where process-wide health/lost-range facts first
-receive an explicit Alert-subject mapping; until then projection health is the
-only operator surface for those failures.
+were reserved here and receive their producers — and their explicit
+Alert-subject mapping, the host `Scope` — in P11-B; see the process-subject
+Alert paragraph below.
 
 Alert list/detail and acknowledge/dismiss routes are admin-only;
 acknowledge/dismiss require the current `workflow_version`. Task interrupt and
@@ -1396,6 +1396,90 @@ the kind is registered in **no** projector: the evidence a process-wide Alert
 needs is that the row exists. That is a one-way door — `rebuild_projections()`
 re-pends the jobs that exist, so a projector added later would silently skip
 every row written before it was registered.
+
+**P11-B process-subject Alerts** (spec §3; the two `AlertType` values reserved
+since Phase 6 finally get producers). `projection_failure` and
+`observability_degradation` are the first Alerts whose subject is not a Task —
+both subject the host `Scope`. Their rules are pure functions in
+`packages/ansich/ansich/process_health.py` (`projection-health@1`,
+`observability-loss@1`); the queries and the persistence live in
+`sql.py::_assess_projection_failures` / `::_assess_observability_degradation`,
+which run in the periodic `assess_operations` pass **beside**
+`_assess_environment` and never on an assessor job: both
+`ansich_assessor_jobs.subject_id` and `ansich_assessor_watermarks` are FK-bound
+to `ansich_tasks`, so a Scope subject cannot go near that machine. Both
+Assertions are appended transition-only through the shared
+`_persist_transition_only_assessment` (renamed from
+`_persist_environment_assessment`, same behaviour), and both reconcile through
+one `reconcile_alert_conditions` call carrying the **complete** key set for
+their `(subject, rule, alert_type)` scope — `projection_failure` keyed by
+`(projector_name, projector_version)`, `observability_degradation` by the
+losing producer's `(name, instance_id)`. Reconciling group by group would make
+each group resolve its siblings' episodes.
+
+Both producers obey **the handle rule**: they compute the id with the pure
+`ansich.safety.host_scope_id(hostname)` and then ask the database whether the
+Scope entity is there (`_existing_host_scope_id`), never
+`AnsichService.host_scope_id` — that property means "*this process's* mint
+succeeded", which under multiple workers sharing one database is not the same
+statement as "the entity exists". Absent means return 0 and let a later tick do
+the work, the same candidate-empty idiom `_assess_environment` uses; it must not
+mint, because the collector's bootstrap owns that row and an Alert subjected to
+an unminted Scope violates `ansich_alerts.subject_id`'s foreign key. The
+backend takes its own `hostname` argument so `create_sql_ansich_service` can
+hand one value to both the service (which mints) and the backend (which writes
+under the mint).
+
+`projection_failure` counts `status = 'failed'` **only** — a job in `retry` was
+re-armed and is work in flight, so alerting on it would raise an Alert about the
+act of retrying — and is deliberately scoped to *projection* jobs: the evidence
+chain is the failed job's own `obs_id`, and only `ansich_projection_jobs` has
+that column. A durably failed **assessor** job therefore produces no Alert and
+reaches an operator only through the shared failed-job count and
+`GET /operations/failed-jobs` (registered in `F10-18`). Its verdict is
+categorical (`failing` / `ok`); the failing-job *count* lives in the failed-job
+diagnostics, because folding it into the Assertion value would append a Belief
+per retry instead of one per transition. Severity is `warning`: the raw
+Observation is intact and `retry_failed_projections` recovers it.
+
+`observability_degradation` reads the immutable `observability.lost` stream
+directly (the kind is registered in no projector, so the rows *are* the read
+model) through the `(kind, occurred_at)` index. Its condition is a **recency**
+property — degraded while a lost range was recorded within
+`_OBSERVABILITY_LOSS_WINDOW_SECONDS` (900) of now — and that is forced, not
+chosen for convenience: the rows are append-only forever, so "has this producer
+ever lost anything" is a question whose answer only becomes yes, and an episode
+built on it could never resolve and never recur. The window is hashed into the
+rule's config identity. Severity is `critical`: unlike a failed projection,
+charged loss has no retry that brings it back. The honest cost is stated in the
+rule's docstring — a producer that lost data once and then went quiet reads as
+recovered a window later, even though the data is still gone; the *loss* stays
+permanent in the stream and in the collector's accounting, while the *Alert*
+tracks a condition an operator can act on. Both passes bound what they read:
+evidence is capped at `MAX_PROCESS_ALERT_EVIDENCE` (10, newest kept, stored
+ascending) and the loss scan at `_OBSERVABILITY_LOSS_SCAN_LIMIT` (500). Both
+Assertion `field_name`s and Alert `stable_condition_key`s degrade to a digest
+rather than truncating when an identity exceeds its column, so two long
+identities never merge into one Alert. `possibly_affected_task_ids` stays
+`None` for both: a failing projector is a property of the process, and naming
+whichever Tasks happened to be running would read as attribution.
+
+Both types join the router's alert-type allowlist
+(`app/gateway/routers/ansich.py::list_alerts`). Frontend wiring (`types.ts`,
+locales, the exhaustive presentation switch) is separate. Tests:
+`tests/ansich/test_process_health_alerts.py` — open/confirm/resolve/recurrence
+for both types driven by real failed jobs and real `observability.lost` rows,
+the exhaustive-key-set contract proved by a partial recovery, the
+Scope-absent skip, the assessor-job boundary pin, the `retry`-status exclusion,
+the evidence cap, and the router allowlist.
+
+What this slice did **not** establish: several Gateway workers on one host all
+subject the *same* host Scope and each runs its own 1 Hz assessment, so two
+workers opening the same episode concurrently collide on
+`uq_ansich_alert_episode`. That is loud (the projector loop logs and retries on
+the next tick) rather than corrupting, and it is the pre-existing exposure any
+`host`-Scope environment Alert already carries; serializing Scope-subject
+reconciliation is not part of this slice.
 
 **Workspace change review**: `packages/harness/deerflow/workspace_changes/`
 captures a pre-run and post-run snapshot of the thread-owned `workspace` and

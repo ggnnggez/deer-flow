@@ -517,6 +517,11 @@ async def list_alerts(
         "unverified_effect",
         "environment_pressure",
         "environment_leak_suspected",
+        # Phase 11 (RB3): the two process-subject types. Both are produced by
+        # the periodic operations pass against the host Scope, so an operator
+        # filtering by them gets process health rather than one Task's.
+        "projection_failure",
+        "observability_degradation",
     ]
     | None = Query(default=None, alias="type"),
     workflow_state: Literal[

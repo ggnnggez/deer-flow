@@ -465,6 +465,38 @@ def alert_conditions_from_assessment(
                 severity=pressure_severity,
             ),
         )
+    if assessment.field_name.startswith("projection_failure:"):
+        # RB3④. The stable key rides in the value rather than being parsed back
+        # out of the field name: the field name is bounded to the Assertion
+        # column's 64 characters and degrades to a digest for a long projector
+        # identity, so it is not always invertible. The producer that built the
+        # Assessment knows the readable key and says so.
+        return (
+            _condition(
+                assessment,
+                source_assertion_id=source_assertion_id,
+                alert_type="projection_failure",
+                stable_condition_key=str(assessment.value.get("condition_key", "unknown")),
+                active=value == "failing",
+                # A durably failed projection leaves the raw Observation intact
+                # and is recoverable by `retry_failed_projections`, so it is a
+                # warning: the read model is incomplete, not the ledger.
+                severity="warning",
+            ),
+        )
+    if assessment.field_name.startswith("observability_degradation:"):
+        return (
+            _condition(
+                assessment,
+                source_assertion_id=source_assertion_id,
+                alert_type="observability_degradation",
+                stable_condition_key=str(assessment.value.get("condition_key", "unknown")),
+                active=value == "degraded",
+                # Loss is irrecoverable — there is no retry that brings a
+                # charged range back — so this one outranks a failed projection.
+                severity="critical",
+            ),
+        )
     if assessment.field_name == "environment_leak:fd_open":
         return (
             _condition(
