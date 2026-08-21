@@ -161,6 +161,7 @@ def assess_observability_degradation(
     as_of: datetime,
     now: datetime,
     evidence_obs_ids: tuple[str, ...] = (),
+    scan_truncated: bool = False,
 ) -> Assessment:
     """Judge whether one producer is *currently* losing Observations.
 
@@ -186,6 +187,13 @@ def assess_observability_degradation(
     ``observability.lost`` stream and in the collector's own accounting; the
     *Alert* is about a condition an operator can act on, and "it stopped" is a
     real change of condition.
+
+    ``scan_truncated`` says the caller could not read every lost row inside the
+    window — its scan hit a cap — so the key set it derived may be *incomplete*
+    and some degraded producer may be missing from this pass entirely. It rides
+    in the value rather than only in a log because it is a statement about how
+    much this Assertion could see, and an Assertion that cannot say that is
+    claiming more certainty than it has.
     """
 
     if window_seconds < 1:
@@ -200,6 +208,7 @@ def assess_observability_degradation(
             "group_key": key,
             "producer_name": producer_name,
             "producer_instance_id": producer_instance_id,
+            "scan_truncated": scan_truncated,
         },
         as_of=as_of,
         asserted_at=now,

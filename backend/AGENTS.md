@@ -1457,29 +1457,67 @@ recovered a window later, even though the data is still gone; the *loss* stays
 permanent in the stream and in the collector's accounting, while the *Alert*
 tracks a condition an operator can act on. Both passes bound what they read:
 evidence is capped at `MAX_PROCESS_ALERT_EVIDENCE` (10, newest kept, stored
-ascending) and the loss scan at `_OBSERVABILITY_LOSS_SCAN_LIMIT` (500). Both
+ascending) and the loss scan at `_OBSERVABILITY_LOSS_SCAN_LIMIT` (500). **The
+scan cap's cost is a silent never-alert, not an early recovery**: the scan takes
+the newest rows, so a producer whose only in-window losses sit beyond the newest
+500 never enters the key set, no episode ever opens for it, and it stays
+invisible on every tick while a noisier producer keeps the scan full (one quiet
+producer behind six hundred noisy rows is simply not reported); a producer that
+oscillates in and out of the visible window additionally has its episode
+resolved and re-opened each time, inflating the recurrence number into an
+artefact of the cap. Newest-first is still the right direction, so the pass
+makes the miss *detectable* rather than fixing it: an unbounded `COUNT` runs
+beside the capped scan on the same predicate, and when it exceeds what was read
+every Assertion that pass writes carries `scan_truncated: true` and the pass
+logs a WARNING (`ansich.observability_loss.scan_truncated`). A lost row whose
+payload cannot be read inline (externalization, or a missing `ansich_payloads`
+row) is charged to the reserved `_UNREADABLE_LOSS_PRODUCER` identity, so the
+loss stays visible without inventing a producer. Both
 Assertion `field_name`s and Alert `stable_condition_key`s degrade to a digest
 rather than truncating when an identity exceeds its column, so two long
 identities never merge into one Alert. `possibly_affected_task_ids` stays
 `None` for both: a failing projector is a property of the process, and naming
 whichever Tasks happened to be running would read as attribution.
 
+Recovery — the inactive condition that lets an episode close — is deliberately
+**version-agnostic** and asymmetric with writing. `_current_process_health_groups`
+filters the standing Belief on the assessor *name* only, because an `alert_key`
+is `(alert_type, subject, rule.name, stable_condition_key)` and carries no
+version: a v1-era episode and a v2 condition for one group are the same episode
+line, so a v2 pass resolving a v1-era episode is correct. Filtering on version
+would strand every open episode the moment a rule was bumped at an all-healthy
+moment. Writing keeps its version (a claim about who judged); recovery is a
+claim about what is no longer true.
+
 Both types join the router's alert-type allowlist
 (`app/gateway/routers/ansich.py::list_alerts`). Frontend wiring (`types.ts`,
-locales, the exhaustive presentation switch) is separate. Tests:
+locales, the exhaustive presentation switch) is separate — and in the interim
+the **unfiltered** alert list already returns both types, so a process-subject
+Alert reaches the existing UI with a blank type label until that wiring lands.
+Tests:
 `tests/ansich/test_process_health_alerts.py` — open/confirm/resolve/recurrence
 for both types driven by real failed jobs and real `observability.lost` rows,
 the exhaustive-key-set contract proved by a partial recovery, the
 Scope-absent skip, the assessor-job boundary pin, the `retry`-status exclusion,
-the evidence cap, and the router allowlist.
+the evidence cap, the truncation signal and the producer it misses, the
+unreadable-payload identity, version-agnostic recovery, the assessment-tick
+failure reporting, and the router allowlist.
 
 What this slice did **not** establish: several Gateway workers on one host all
 subject the *same* host Scope and each runs its own 1 Hz assessment, so two
 workers opening the same episode concurrently collide on
-`uq_ansich_alert_episode`. That is loud (the projector loop logs and retries on
-the next tick) rather than corrupting, and it is the pre-existing exposure any
-`host`-Scope environment Alert already carries; serializing Scope-subject
-reconciliation is not part of this slice.
+`uq_ansich_alert_episode`. That collision is **not** corrupting and it is the
+pre-existing exposure any `host`-Scope environment Alert already carries — but
+it is not cheap either, and the earlier claim that it was merely "loud" was
+wrong twice over. `_projector_loop` swallowed the exception in silence until
+this slice added `AnsichService._report_assessment_failure` (DEBUG with the
+traceback every time, WARNING rate-limited to one per
+`_ASSESSMENT_WARNING_INTERVAL_SECONDS` with the suppressed count carried
+forward, both fail-open) — and the blast radius is the whole
+`assess_operations` transaction, so one collision discards that tick's
+heartbeat, dwell, budget and environment work along with both producers'.
+The next tick redoes it a second later; serializing Scope-subject reconciliation
+is not part of this slice.
 
 **Workspace change review**: `packages/harness/deerflow/workspace_changes/`
 captures a pre-run and post-run snapshot of the thread-owned `workspace` and

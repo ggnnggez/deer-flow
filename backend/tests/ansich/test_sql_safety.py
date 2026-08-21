@@ -1175,15 +1175,29 @@ async def test_externalized_scope_authorization_and_effect_payloads_read_back(tm
         )
         await service.flush_task(task_id)
 
+        # Pin the claim path too, not just the read path: `_project_pending`
+        # swallows projection exceptions, so a claim-time envelope validator
+        # that rejects an externalized payload loses the projection in
+        # silence. `scope.snapshotted` is the probe because it waits on no
+        # ToolCall - its row is either here or the claim dropped it.
+        #
+        # `flush_task` bounds *writes*, not projections, so the row has to be
+        # waited for rather than read on the next line: the projector claims on
+        # its own poll interval and a loaded machine loses that race often
+        # enough to matter (measured at roughly one run in five). The wait is
+        # bounded, so a claim that genuinely drops the projection still fails
+        # here - it just fails for the reason the test is about instead of for
+        # scheduling.
+        projected_scope_state = None
+        deadline = anyio.current_time() + 15.0
+        while projected_scope_state is None and anyio.current_time() < deadline:
+            async with session_factory() as session:
+                projected_scope = await session.get(AnsichScopeRow, scope.scope_id)
+            projected_scope_state = None if projected_scope is None else (projected_scope.scope_kind, projected_scope.created_obs_id)
+            if projected_scope_state is None:
+                await anyio.sleep(0.01)
         async with session_factory() as session:
             stored_rows = list((await session.execute(select(AnsichObservationRow).where(AnsichObservationRow.obs_id.in_(externalized_obs_ids)))).scalars())
-            # Pin the claim path too, not just the read path: `_project_pending`
-            # swallows projection exceptions, so a claim-time envelope validator
-            # that rejects an externalized payload loses the projection in
-            # silence. `scope.snapshotted` is the probe because it waits on no
-            # ToolCall - its row is either here or the claim dropped it.
-            projected_scope = await session.get(AnsichScopeRow, scope.scope_id)
-            projected_scope_state = None if projected_scope is None else (projected_scope.scope_kind, projected_scope.created_obs_id)
         stored_payload_state = {row.obs_id: (row.payload_json, row.payload_ref_id is not None) for row in stored_rows}
 
         timeline = await service.list_timeline(task_id, limit=50)
@@ -1995,7 +2009,7 @@ _UNAVAILABLE_AT = datetime(2099, 1, 1, tzinfo=UTC)
 _AVAILABLE_AT = datetime(2026, 1, 1, tzinfo=UTC)
 
 
-async def _await_scope_safety_job(session_factory, watermark: int, *, timeout: float = 10.0) -> None:
+async def _await_scope_safety_job(session_factory, watermark: int, *, timeout: float = 30.0) -> None:
     """Wait until the scope-safety job at ``watermark`` has been minted.
 
     The projector's dependency retry is a 250ms backoff, not a completion
@@ -2003,6 +2017,15 @@ async def _await_scope_safety_job(session_factory, watermark: int, *, timeout: f
     exact shape F10-10 keeps re-diagnosing. The condition itself is
     deterministic (the durable job row either exists or does not); only its
     arrival time is not, so poll the row and keep the wait a lower bound.
+
+    The bound is 30s because that is this suite's own ``busy_timeout``
+    (``tests/ansich/conftest.py``): a single legally-waiting SQLite claim may
+    block for that long, so a 10s bound was *shorter than one permitted wait*
+    and turned contention into a red test rather than a slow one (measured on a
+    loaded machine at roughly two runs in twelve, and worse before this batch).
+    A genuinely dropped projection still fails here -- it just costs the longer
+    wall clock to say so, which is the right trade for a condition that is
+    deterministic in everything but arrival time.
     """
 
     deadline = anyio.current_time() + timeout

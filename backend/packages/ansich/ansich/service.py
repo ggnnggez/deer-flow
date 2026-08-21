@@ -56,6 +56,11 @@ from ansich.usage import AggregationScope, TaskUsageBreakdownView, TaskUsageByMo
 
 logger = logging.getLogger(__name__)
 _DROP_WARNING_INTERVAL_SECONDS = 60.0
+# The same discipline as `_DROP_WARNING_INTERVAL_SECONDS`, on its own window on
+# purpose: a periodic-assessment failure and a dropped batch are different
+# incidents, and sharing one window would let either silence the other. What is
+# suppressed is counted, so the next line says how much it stands for.
+_ASSESSMENT_WARNING_INTERVAL_SECONDS = 60.0
 _PRODUCER_ACCOUNT_LIMIT = 256
 # How many charged Observation ids the receipt path can still name. Loss is
 # already accounted permanently in `dropped_count` and `_lost_ranges`; this set
@@ -257,6 +262,8 @@ class AnsichService:
         self._lost_observation_ids: OrderedDict[str, None] = OrderedDict()
         self._last_drop_warning_at: float | None = None
         self._suppressed_drop_warning_count = 0
+        self._last_assessment_warning_at: float | None = None
+        self._suppressed_assessment_warning_count = 0
         self._loop: asyncio.AbstractEventLoop | None = None
         self._wake_event: asyncio.Event | None = None
         self._stop_event: asyncio.Event | None = None
@@ -1891,6 +1898,68 @@ class AnsichService:
             )
         return tuple(batch_ranges)
 
+    def _report_assessment_failure(self, error: BaseException) -> None:
+        """Say a periodic assessment tick failed — always quietly, sometimes loudly.
+
+        ``_projector_loop`` must swallow this exception: the tick is periodic and
+        the next one is a second away, so letting it kill the loop would trade a
+        missed assessment for a collector that never assesses or projects again.
+        But swallowing it *silently* — which is what this was until now — means a
+        persistently failing assessment is indistinguishable from a healthy one,
+        and the blast radius is not small: ``assess_operations`` runs heartbeat,
+        dwell, budget, environment and both process-subject producers inside one
+        transaction, so a single failure discards **every** family's work for
+        that tick.
+
+        So: a DEBUG line with the traceback on every failure, because an
+        operator debugging a specific tick needs the exception itself; and a
+        WARNING at most once per ``_ASSESSMENT_WARNING_INTERVAL_SECONDS``,
+        because at a 1 Hz cadence a per-tick warning turns a real incident into
+        an unreadable flood. The suppressed count rides the next warning, so the
+        rate limit hides frequency, never the fact.
+
+        Reporting a failure must not become a second failure: every logging call
+        here is fail-open, exactly as ``_emit_drop_warning`` is.
+        """
+
+        detected_at = datetime.now(UTC).isoformat()
+        try:
+            logger.debug(
+                "Ansich periodic assessment tick failed: %s",
+                error,
+                exc_info=error,
+                extra={
+                    "event": "ansich.assessment.tick_failed",
+                    "detected_at": detected_at,
+                    "error_type": type(error).__name__,
+                },
+            )
+        except Exception:
+            pass
+        warning_at = time.monotonic()
+        if self._last_assessment_warning_at is not None and warning_at - self._last_assessment_warning_at < _ASSESSMENT_WARNING_INTERVAL_SECONDS:
+            self._suppressed_assessment_warning_count += 1
+            return
+        suppressed = self._suppressed_assessment_warning_count
+        try:
+            logger.warning(
+                "Ansich periodic assessment tick failed: error_type=%s detected_at=%s suppressed_assessment_warnings=%d",
+                type(error).__name__,
+                detected_at,
+                suppressed,
+                extra={
+                    "event": "ansich.assessment.tick_failed",
+                    "detected_at": detected_at,
+                    "error_type": type(error).__name__,
+                    "error_message": str(error),
+                    "suppressed_assessment_warning_count": suppressed,
+                },
+            )
+        except Exception:
+            return
+        self._last_assessment_warning_at = warning_at
+        self._suppressed_assessment_warning_count = 0
+
     def _warn_batch_loss(
         self,
         *,
@@ -2208,8 +2277,8 @@ class AnsichService:
             if current_time >= next_assessment:
                 try:
                     await self.assess_operations()
-                except Exception:
-                    pass
+                except Exception as error:
+                    self._report_assessment_failure(error)
                 next_assessment = current_time + self._operations_assessment_interval_seconds
             if processed > 0:
                 continue
@@ -2228,8 +2297,8 @@ class AnsichService:
             pass
         try:
             await self.assess_operations()
-        except Exception:
-            pass
+        except Exception as error:
+            self._report_assessment_failure(error)
 
     async def _flush_batch(self) -> FlushResult:
         """Place one queued batch, retrying a refused write on a bounded backoff.

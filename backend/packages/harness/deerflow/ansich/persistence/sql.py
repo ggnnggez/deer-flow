@@ -918,11 +918,25 @@ _STALE_REQUESTED_TAKEOVER_AFTER = timedelta(minutes=5)
 _OBSERVABILITY_LOSS_WINDOW_SECONDS = 900
 #: Bound on how many ``observability.lost`` rows one assessment tick reads. The
 #: rows in a fifteen-minute window are unbounded under a sustained outage, and
-#: this pass runs once a second. The newest rows are the ones that decide the
-#: verdict, so the cap costs only this: a producer whose *only* loss in the
-#: window is older than the newest ``_OBSERVABILITY_LOSS_SCAN_LIMIT`` rows reads
-#: as recovered early. That producer is by construction quiet while a louder one
-#: is still losing, and the loud one is the one an operator needs to see.
+#: this pass runs once a second, so the scan has to have a ceiling.
+#:
+#: **What the cap actually costs, stated plainly: a silent never-alert.** The
+#: scan takes the newest rows, so a producer whose only in-window losses sit
+#: *beyond* the newest ``_OBSERVABILITY_LOSS_SCAN_LIMIT`` rows is not merely
+#: resolved early — it never enters the key set at all, so no episode ever opens
+#: for it and it stays invisible on every tick while a noisier producer keeps
+#: the scan full. One quiet producer behind six hundred noisy rows is simply not
+#: reported. A second cost rides along: a producer that oscillates in and out of
+#: the visible newest-N has its episode resolved and re-opened each time, which
+#: inflates the recurrence number into an artefact of the cap rather than a
+#: count of real outages.
+#:
+#: Newest-first is still the right direction — the newest rows are the ones that
+#: describe the present, and the alternative (oldest-first) would pin the alert
+#: to an outage that may be over. What the cap must not do is hide that it bit,
+#: so the pass also runs an unbounded ``COUNT`` over the same predicate and
+#: marks the resulting Assertions ``scan_truncated`` when the count exceeds what
+#: it read.
 _OBSERVABILITY_LOSS_SCAN_LIMIT = 500
 #: The producer identity charged to a lost range whose payload could not be read
 #: back inline. ``observability.lost`` payloads are four small fields, so this is
@@ -5866,6 +5880,20 @@ class SqlAnsichBackend:
         a digest and cannot be inverted. The Assertion value carries the
         readable parts, and the Assertion is written in the same transaction as
         the episode it opened, so the two never disagree.
+
+        **Recovery is version-agnostic, and deliberately asymmetric with
+        writing.** The filter is on the assessor *name* only. An `alert_key` is
+        `(alert_type, subject, rule.name, stable_condition_key)` — it carries no
+        version — so a v1-era episode and a v2 condition for the same group are
+        the *same* episode line, and a v2 pass resolving a v1-era episode is
+        correct rather than a leak. Filtering on version here would strand
+        every open episode the moment a rule was bumped at an all-healthy
+        moment: v1 said "failing", v2 never sees that Belief, no condition is
+        reported, and the episode stays open forever with nothing left that
+        could close it. Writing keeps its version (a v2 Assertion is a v2
+        Assertion), because that is a claim about who judged; recovery is a
+        claim about what is no longer true, and the group is the group whoever
+        last judged it.
         """
 
         rows = (
@@ -5878,7 +5906,6 @@ class SqlAnsichBackend:
                 .where(
                     AnsichCurrentBeliefRow.subject_id == scope_id,
                     AnsichBeliefAssertionRow.assessor_name == assessor.name,
-                    AnsichBeliefAssertionRow.assessor_version == assessor.version,
                 )
             )
         ).scalars()
@@ -6014,22 +6041,39 @@ class SqlAnsichBackend:
 
         Evidence is the ``observability.lost`` rows themselves (RB3③) — the kind
         is registered in no projector, so the Observation stream is the read
-        model, queried through the ``(kind, occurred_at)`` index. Keys are the
-        losing producer's identity out of the payload, and every key goes into
-        one ``reconcile_alert_conditions`` call for the same exhaustiveness
-        reason as the projection-failure pass.
+        model. Both halves of the read — the capped scan and the unbounded
+        ``COUNT`` beside it — filter on exactly the same
+        ``(kind, subject, occurred_at >= horizon)`` predicate and both order or
+        range on ``occurred_at``, so both ride the ``(kind, occurred_at)``
+        index's leading columns; the ``subject_id`` term is a residual filter on
+        either half. Keys are the losing producer's identity out of the payload,
+        and every key goes into one ``reconcile_alert_conditions`` call for the
+        same exhaustiveness reason as the projection-failure pass.
 
         "Currently" is a window, and
         :func:`ansich.process_health.assess_observability_degradation` argues
         why it has to be: these rows are append-only, so any rule shaped as "has
         this producer ever lost anything" produces an episode that can never
         resolve and never recur.
+
+        The ``COUNT`` exists because the scan's cap can *silently* drop a whole
+        producer (see ``_OBSERVABILITY_LOSS_SCAN_LIMIT``): a quiet producer
+        behind enough noisy rows never enters the key set and no episode ever
+        opens for it. Nothing here can fix that without an unbounded read, but
+        the count makes it *detectable* — every Assertion this pass writes says
+        ``scan_truncated`` when the window held more rows than it read, and the
+        pass logs the two numbers.
         """
 
         scope_id = await self._existing_host_scope_id(session)
         if scope_id is None:
             return 0
         horizon = asserted_at - timedelta(seconds=_OBSERVABILITY_LOSS_WINDOW_SECONDS)
+        in_window = (
+            AnsichObservationRow.kind == "observability.lost",
+            AnsichObservationRow.subject_id == scope_id,
+            AnsichObservationRow.occurred_at >= horizon,
+        )
         rows = (
             await session.execute(
                 select(
@@ -6037,15 +6081,34 @@ class SqlAnsichBackend:
                     AnsichObservationRow.occurred_at,
                     AnsichObservationRow.payload_json,
                 )
-                .where(
-                    AnsichObservationRow.kind == "observability.lost",
-                    AnsichObservationRow.subject_id == scope_id,
-                    AnsichObservationRow.occurred_at >= horizon,
+                .where(*in_window)
+                # By `occurred_at`, which is the index's second column and the
+                # thing the window itself is defined over. `ingest_seq` would
+                # order the same rows the same way in practice and read nothing
+                # the index offers; the tiebreaker keeps it deterministic when
+                # two rows share a timestamp.
+                .order_by(
+                    AnsichObservationRow.occurred_at.desc(),
+                    AnsichObservationRow.ingest_seq.desc(),
                 )
-                .order_by(AnsichObservationRow.ingest_seq.desc())
                 .limit(_OBSERVABILITY_LOSS_SCAN_LIMIT)
             )
         ).all()
+        in_window_count = await session.scalar(select(func.count()).select_from(AnsichObservationRow).where(*in_window)) or 0
+        scan_truncated = in_window_count > len(rows)
+        if scan_truncated:
+            logger.warning(
+                "Ansich observability-loss scan truncated: read=%d in_window=%d window_seconds=%d",
+                len(rows),
+                in_window_count,
+                _OBSERVABILITY_LOSS_WINDOW_SECONDS,
+                extra={
+                    "event": "ansich.observability_loss.scan_truncated",
+                    "scanned_row_count": len(rows),
+                    "in_window_row_count": in_window_count,
+                    "window_seconds": _OBSERVABILITY_LOSS_WINDOW_SECONDS,
+                },
+            )
         by_producer: dict[tuple[str, str], list[tuple[str, datetime]]] = {}
         for obs_id, occurred_at, payload in rows:
             if isinstance(payload, dict):
@@ -6073,6 +6136,7 @@ class SqlAnsichBackend:
                     as_of=max(occurred_at for _, occurred_at in entries),
                     now=asserted_at,
                     evidence_obs_ids=tuple(obs_id for obs_id, _ in capped),
+                    scan_truncated=scan_truncated,
                 )
             )
         for value in await self._current_process_health_groups(
@@ -6096,6 +6160,9 @@ class SqlAnsichBackend:
                     window_seconds=_OBSERVABILITY_LOSS_WINDOW_SECONDS,
                     as_of=asserted_at,
                     now=asserted_at,
+                    # A recovery verdict is only as trustworthy as the scan that
+                    # found no rows for this key, so it carries the same mark.
+                    scan_truncated=scan_truncated,
                 )
             )
         return await self._persist_and_reconcile_process_health(

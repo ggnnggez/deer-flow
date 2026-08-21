@@ -16,6 +16,7 @@ service and no database, the same split ``test_environment_assessor.py`` uses.
 from __future__ import annotations
 
 import asyncio
+import logging
 import time
 from datetime import UTC, datetime, timedelta
 from uuid import uuid4
@@ -48,11 +49,15 @@ from deerflow.ansich.persistence.models import (
     AnsichAssessorJobRow,
     AnsichBeliefAssertionRow,
     AnsichCurrentBeliefRow,
+    AnsichObservationRow,
+    AnsichPayloadRow,
     AnsichProjectionJobRow,
     AnsichScopeRow,
 )
 from deerflow.ansich.persistence.sql import (
+    _OBSERVABILITY_LOSS_SCAN_LIMIT,
     _OBSERVABILITY_LOSS_WINDOW_SECONDS,
+    _UNREADABLE_LOSS_PRODUCER,
     SqlAnsichBackend,
 )
 from deerflow.persistence.base import Base
@@ -60,6 +65,13 @@ from deerflow.persistence.base import Base
 _HOSTNAME = "ansich-process-health-test-host"
 _SCOPE_ID = host_scope_id(_HOSTNAME)
 _T0 = datetime(2026, 8, 21, 10, 0, tzinfo=UTC)
+#: A projection job's claim predicate is `available_at <= datetime.now(UTC)`, so
+#: a test that parks a row out of the projector's reach must do it against the
+#: *real* clock, not against `_T0`. `_T0 + 1 day` reads as unreachable today and
+#: becomes reachable tomorrow — a fixture that fails on a date rather than on a
+#: change. This constant is absolute and far enough out that no wall clock this
+#: suite runs under reaches it.
+_UNREACHABLE_AVAILABLE_AT = datetime(2099, 1, 1, tzinfo=UTC)
 
 
 def _admin_user() -> User:
@@ -369,7 +381,7 @@ async def test_retry_status_jobs_are_not_projection_failures(tmp_path):
                 .where(AnsichProjectionJobRow.status == "failed")
                 .values(
                     status="retry",
-                    available_at=_T0 + timedelta(days=1),
+                    available_at=_UNREACHABLE_AVAILABLE_AT,
                 )
             )
 
@@ -696,6 +708,182 @@ async def test_observability_degradation_keys_by_losing_producer(tmp_path):
 
 
 @pytest.mark.anyio
+async def test_a_lost_row_with_an_unreadable_payload_keeps_the_loss_visible(tmp_path):
+    """An externalized or missing payload groups under the reserved identity.
+
+    ``observability.lost`` carries four small fields, so this is reachable only
+    through payload externalization or an ``ansich_payloads`` row that has gone
+    missing — but the loss is the one thing that must not disappear because its
+    label did. It is charged to a reserved, obviously-not-a-producer name rather
+    than dropped (invisible loss) or attributed to the envelope's own producer
+    (which is the collector *reporting* the loss, not the one that suffered it).
+    """
+
+    engine, session_factory, service = await _started_service(tmp_path, "process-health-unreadable.db")
+    try:
+        unreadable = _lost_range(
+            occurred_at=_T0,
+            first_sequence=1,
+            last_sequence=2,
+            producer_name="a-real-producer",
+            producer_instance_id="worker-a",
+            suffix="unreadable",
+        )
+        service.record(unreadable)
+        await service.flush_task(ANSICH_BOOTSTRAP_TASK_ID)
+        # Simulate the externalized shape the reader sees: `payload_json IS NULL`
+        # beside a `payload_ref_id`. The CHECK constraint requires exactly one of
+        # the two, so the payload row has to exist for the update to be legal.
+        payload_id = new_id()
+        async with session_factory() as session, session.begin():
+            session.add(
+                AnsichPayloadRow(
+                    payload_id=payload_id,
+                    content_type="application/json",
+                    encoding="utf-8",
+                    compression="none",
+                    byte_size=2,
+                    sha256="0" * 64,
+                    body=b"{}",
+                )
+            )
+            await session.flush()
+            await session.execute(update(AnsichObservationRow).where(AnsichObservationRow.obs_id == unreadable.obs_id).values(payload_json=None, payload_ref_id=payload_id))
+
+        await service.assess_operations(now=_T0 + timedelta(seconds=1))
+        alerts = await _alerts(session_factory, "observability_degradation")
+    finally:
+        await service.stop()
+        await engine.dispose()
+
+    assert len(alerts) == 1
+    assert alerts[0].stable_condition_key == observability_loss_condition_key(
+        _UNREADABLE_LOSS_PRODUCER,
+        _UNREADABLE_LOSS_PRODUCER,
+    )
+    assert alerts[0].resolved_at is None
+
+
+@pytest.mark.anyio
+async def test_a_truncated_loss_scan_says_so_and_can_miss_a_quiet_producer(tmp_path):
+    """The scan cap's real cost is a silent never-alert, so it must not be silent.
+
+    One quiet producer with a single in-window loss, then enough noise to fill
+    the scan past its cap. The quiet producer is **not merely resolved early —
+    it never enters the key set at all**, so no episode ever opens for it and it
+    stays invisible on every tick while the noise continues. That is the honest
+    statement of what the cap costs, and it is why the pass runs an unbounded
+    ``COUNT`` beside the capped scan: the Assertions it writes carry
+    ``scan_truncated``, so the gap is at least detectable rather than silent.
+    """
+
+    engine, session_factory, service = await _started_service(tmp_path, "process-health-truncated.db")
+    noisy_count = _OBSERVABILITY_LOSS_SCAN_LIMIT + 100
+    try:
+        # Oldest row in the window, and the only one this producer ever loses.
+        service.record(
+            _lost_range(
+                occurred_at=_T0,
+                first_sequence=1,
+                last_sequence=1,
+                producer_name="quiet-probe",
+                producer_instance_id="worker-q",
+                suffix="quiet",
+            )
+        )
+        for index in range(noisy_count):
+            service.record(
+                _lost_range(
+                    occurred_at=_T0 + timedelta(seconds=1 + index),
+                    first_sequence=1 + index,
+                    last_sequence=2 + index,
+                    producer_name="noisy-probe",
+                    producer_instance_id="worker-n",
+                    suffix=f"noisy-{index}",
+                )
+            )
+        await service.flush_task(ANSICH_BOOTSTRAP_TASK_ID)
+
+        await service.assess_operations(now=_T0 + timedelta(seconds=noisy_count + 2))
+        alerts = await _alerts(session_factory, "observability_degradation")
+        async with session_factory() as session:
+            assertions = list(
+                (
+                    await session.execute(
+                        select(AnsichBeliefAssertionRow).where(
+                            AnsichBeliefAssertionRow.subject_id == _SCOPE_ID,
+                            AnsichBeliefAssertionRow.assessor_name == "observability-loss",
+                        )
+                    )
+                ).scalars()
+            )
+    finally:
+        await service.stop()
+        await engine.dispose()
+
+    keys = {row.stable_condition_key for row in alerts}
+    # The miss, stated as an assertion rather than left implicit.
+    assert observability_loss_condition_key("noisy-probe", "worker-n") in keys
+    assert observability_loss_condition_key("quiet-probe", "worker-q") not in keys
+    # ...and the signal that makes the miss detectable.
+    assert assertions
+    assert all(row.value_json["scan_truncated"] is True for row in assertions)
+
+
+@pytest.mark.anyio
+async def test_recovery_resolves_an_episode_opened_by_an_earlier_rule_version(tmp_path):
+    """A rule-version bump must not strand the episodes the old version opened.
+
+    ``alert_key`` is ``(alert_type, subject, rule.name, stable_condition_key)``
+    and carries **no** version, so a v1-era episode and a v2 condition for the
+    same group are one episode line. If the recovery query filtered on the
+    current version, bumping the rule at an all-healthy moment would leave every
+    open v1 episode with nothing left in the system that could ever close it.
+    """
+
+    engine, session_factory, service = await _started_service(tmp_path, "process-health-version.db")
+    try:
+        service.record(
+            _lost_range(
+                occurred_at=_T0,
+                first_sequence=1,
+                last_sequence=2,
+                producer_name="version-probe",
+                producer_instance_id="worker-a",
+                suffix="version",
+            )
+        )
+        await service.flush_task(ANSICH_BOOTSTRAP_TASK_ID)
+        await service.assess_operations(now=_T0 + timedelta(seconds=1))
+        opened = await _alerts(session_factory, "observability_degradation")
+
+        # Rewrite the standing Belief as if an earlier rule version had made it.
+        # The episode stays exactly as v1 left it.
+        async with session_factory() as session, session.begin():
+            await session.execute(
+                update(AnsichBeliefAssertionRow)
+                .where(
+                    AnsichBeliefAssertionRow.subject_id == _SCOPE_ID,
+                    AnsichBeliefAssertionRow.assessor_name == "observability-loss",
+                )
+                .values(assessor_version="0", source_version="0")
+            )
+
+        # The loss stops; the current version's pass must still resolve it.
+        await service.assess_operations(now=_T0 + timedelta(seconds=_OBSERVABILITY_LOSS_WINDOW_SECONDS + 1))
+        resolved = await _alerts(session_factory, "observability_degradation")
+    finally:
+        await service.stop()
+        await engine.dispose()
+
+    assert len(opened) == 1
+    assert opened[0].resolved_at is None
+    assert len(resolved) == 1
+    assert resolved[0].entity_id == opened[0].entity_id
+    assert resolved[0].resolved_at is not None
+
+
+@pytest.mark.anyio
 async def test_process_health_beliefs_are_transition_only(tmp_path):
     """The Scope's Belief carries the categorical state, once per transition."""
 
@@ -783,6 +971,85 @@ async def test_alert_list_filter_admits_both_process_alert_types(tmp_path):
     assert [item["alert_type"] for item in degradation.json()["items"]] == ["observability_degradation"]
 
     assert unknown.status_code == 422
+
+
+# --- assessment-tick failure reporting --------------------------------------
+#
+# `_projector_loop` must swallow an `assess_operations` exception, but the blast
+# radius makes swallowing it *silently* untenable: one transaction runs
+# heartbeat, dwell, budget, environment and both producers above, so a single
+# failure discards every family's work for that tick. These pin that a failing
+# tick is always reported at DEBUG and is reported at WARNING without flooding.
+
+
+def _tick_failure_records(caplog: pytest.LogCaptureFixture, level: int) -> list[logging.LogRecord]:
+    return [record for record in caplog.records if getattr(record, "event", None) == "ansich.assessment.tick_failed" and record.levelno == level]
+
+
+@pytest.mark.anyio
+async def test_a_failing_assessment_tick_is_never_silent(tmp_path, caplog: pytest.LogCaptureFixture):
+    """DEBUG with the traceback every time; WARNING at most once per window."""
+
+    engine, session_factory, service = await _started_service(tmp_path, "process-health-tick-log.db")
+    try:
+        with caplog.at_level(logging.DEBUG, logger="ansich.service"):
+            service._report_assessment_failure(RuntimeError("first failure"))
+            service._report_assessment_failure(RuntimeError("second failure"))
+            first_debug = _tick_failure_records(caplog, logging.DEBUG)
+            first_warnings = _tick_failure_records(caplog, logging.WARNING)
+
+            # Step past the rate-limit window without sleeping through it.
+            service._last_assessment_warning_at = time.monotonic() - 3600.0
+            service._report_assessment_failure(RuntimeError("third failure"))
+            later_warnings = _tick_failure_records(caplog, logging.WARNING)
+    finally:
+        await service.stop()
+        await engine.dispose()
+
+    # Every failure is reported at DEBUG, with the exception itself attached.
+    assert len(first_debug) == 2
+    assert all(record.exc_info is not None for record in first_debug)
+    # The second failure inside the window is counted, not repeated.
+    assert len(first_warnings) == 1
+    assert first_warnings[0].suppressed_assessment_warning_count == 0
+    assert len(later_warnings) == 2
+    assert later_warnings[1].suppressed_assessment_warning_count == 1
+
+
+@pytest.mark.anyio
+async def test_the_projector_loop_routes_a_failing_tick_to_the_reporter(tmp_path):
+    """The loop still swallows the exception, but no longer swallows the fact."""
+
+    engine = create_async_engine(f"sqlite+aiosqlite:///{tmp_path / 'process-health-tick-loop.db'}")
+    session_factory = async_sessionmaker(engine, expire_on_commit=False)
+    async with engine.begin() as connection:
+        await connection.run_sync(Base.metadata.create_all)
+    service = create_sql_ansich_service(
+        session_factory,
+        hostname=_HOSTNAME,
+        operations_assessment_interval_ms=20,
+    )
+    reported: list[BaseException] = []
+    service._report_assessment_failure = reported.append  # type: ignore[method-assign]
+
+    async def _always_fails(**_kwargs) -> int:
+        raise RuntimeError("assessment tick exploded")
+
+    service.assess_operations = _always_fails  # type: ignore[method-assign]
+    await service.start()
+    try:
+        deadline = time.monotonic() + 20.0
+        while len(reported) < 2:
+            assert time.monotonic() < deadline, "timed out waiting for two reported assessment failures"
+            await asyncio.sleep(0.01)
+        # The loop is still alive and still projecting, which is the whole
+        # reason the exception is swallowed in the first place.
+        assert service._running
+    finally:
+        await service.stop()
+        await engine.dispose()
+
+    assert all(isinstance(error, RuntimeError) for error in reported)
 
 
 # --- pure rules -------------------------------------------------------------
