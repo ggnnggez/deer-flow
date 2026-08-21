@@ -43,15 +43,18 @@ from datetime import UTC, datetime, timedelta
 
 import pytest
 from ansich import AnsichService, ObservationEnvelope, Producer, new_id
-from sqlalchemy import select
+from sqlalchemy import delete, func, select, update
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 from support.ansich_settle import only_test_driven_assessments
 
 from deerflow.ansich import create_sql_ansich_service
 from deerflow.ansich.persistence import sql as ansich_sql
 from deerflow.ansich.persistence.models import (
+    AnsichObservationRow,
+    AnsichProjectionErrorRow,
     AnsichProjectionJobRow,
     AnsichTaskAncestryRow,
+    AnsichTaskSpawnRow,
     AnsichTaskUsageRow,
     AnsichUsageContributionRow,
 )
@@ -60,6 +63,12 @@ from deerflow.persistence.base import Base
 _OCCURRED_AT = datetime(2026, 8, 1, 9, 0, tzinfo=UTC)
 _PRODUCER = Producer(name="spawn-reconcile-test", version="1", instance_id="test")
 _RECONCILE_PROJECTOR = ansich_sql._SPAWN_RECONCILE_PROJECTOR[0]
+
+
+def _as_utc(value: datetime) -> datetime:
+    """SQLite hands timestamps back naive; every comparison here is in UTC."""
+
+    return value if value.tzinfo is not None else value.replace(tzinfo=UTC)
 
 
 class _SpawnFixture:
@@ -639,3 +648,223 @@ async def test_a_root_task_creation_leaves_no_reconciliation_job(tmp_path):
 
     assert before is None
     assert after == [fixture.spawn_observation.obs_id]
+
+
+@pytest.mark.anyio
+async def test_rebuild_mints_a_reconciliation_for_an_edge_that_has_none(tmp_path):
+    """The pre-fix-edge recovery path, and the precondition it rests on.
+
+    An ``ansich_task_spawns`` row written before F10-19's fix existed carries no
+    reconciliation job, and ``_project_task_spawn``'s early return would not
+    mint one for it either. The claim that ``rebuild_projections()`` recovers
+    those edges is true for a reason worth pinning: rebuild DELETES the spawn
+    and ancestry tables before replaying, so the replayed projection finds no
+    existing edge and takes the full path. Narrowing that delete list would make
+    the early return reachable on replay and leave such an edge
+    reconciliation-less forever, with nothing else to notice.
+
+    The job row is deleted here rather than a database being aged, which is the
+    same state: an edge whose reconciliation does not exist.
+    """
+
+    async with _spawn_fixture(tmp_path, "spawn-rebuild-mint") as fixture:
+        spawn = await fixture.record_spawn()
+        async with fixture.session_factory() as session, session.begin():
+            await session.execute(delete(AnsichProjectionJobRow).where(AnsichProjectionJobRow.projector_name == _RECONCILE_PROJECTOR))
+        async with fixture.session_factory() as session:
+            before = list((await session.execute(select(AnsichProjectionJobRow.obs_id).where(AnsichProjectionJobRow.projector_name == _RECONCILE_PROJECTOR))).scalars())
+            # The precondition, read as state rather than asserted about code.
+            spawn_rows_before_rebuild = await session.scalar(select(func.count()).select_from(AnsichTaskSpawnRow))
+
+        outcome = await fixture.service.rebuild_projections()
+
+        async with fixture.session_factory() as session:
+            after = list((await session.execute(select(AnsichProjectionJobRow.obs_id, AnsichProjectionJobRow.status).where(AnsichProjectionJobRow.projector_name == _RECONCILE_PROJECTOR))).scalars())
+            minted = list(
+                (
+                    await session.execute(
+                        select(
+                            AnsichProjectionJobRow.obs_id,
+                            AnsichProjectionJobRow.status,
+                        ).where(AnsichProjectionJobRow.projector_name == _RECONCILE_PROJECTOR)
+                    )
+                ).all()
+            )
+        root_usage = await fixture.service.get_task_usage(fixture.root_id)
+
+    assert spawn_rows_before_rebuild == 1
+    assert before == []
+    assert outcome.unsettled == 0
+    assert minted == [(spawn.obs_id, "completed")], after
+    assert {item.dimension: item.value for item in root_usage.inclusive}["steps"] == 2
+
+
+# --------------------------------------------------------------------------
+# The in-flight gate, and the claim invariant it rests on
+# --------------------------------------------------------------------------
+
+
+async def _dress_a_usage_job_as_processing(fixture: _SpawnFixture, *, lease_expires_at: datetime) -> str:
+    """Give one of the child's real ``task-usage`` jobs a ``processing`` claim.
+
+    Nothing on SQLite can hold a second worker's transaction open across this
+    one, so the *state that worker's claim leaves behind* is what gets staged:
+    a committed ``processing`` row with a lease. That is exactly what the gate
+    reads, and it is a real job for a real usage Observation of a real
+    descendant, not a synthetic row.
+    """
+
+    async with fixture.session_factory() as session, session.begin():
+        job_id = await session.scalar(
+            select(AnsichProjectionJobRow.job_id)
+            .join(
+                AnsichObservationRow,
+                AnsichObservationRow.obs_id == AnsichProjectionJobRow.obs_id,
+            )
+            .where(
+                AnsichProjectionJobRow.projector_name == "task-usage",
+                AnsichObservationRow.task_id == fixture.child_id,
+            )
+            .limit(1)
+        )
+        assert job_id is not None, "the fixture must give the child real usage jobs"
+        await session.execute(update(AnsichProjectionJobRow).where(AnsichProjectionJobRow.job_id == job_id).values(status="processing", lease_owner="peer-worker", lease_expires_at=lease_expires_at))
+    return job_id
+
+
+async def _re_arm_the_reconciliation(fixture: _SpawnFixture) -> str:
+    """Put the (already completed) reconciliation job back on the queue.
+
+    ``attempts`` is reset to zero so "the attempt came back" is readable as a
+    value rather than as a delta, and ``lease_generation`` is deliberately left
+    alone — it is monotonic for the row's lifetime, exactly as an operator retry
+    leaves it.
+    """
+
+    async with fixture.session_factory() as session, session.begin():
+        job_id = await session.scalar(select(AnsichProjectionJobRow.job_id).where(AnsichProjectionJobRow.projector_name == _RECONCILE_PROJECTOR).limit(1))
+        assert job_id is not None, "the spawn must have left a reconciliation job"
+        await session.execute(
+            update(AnsichProjectionJobRow)
+            .where(AnsichProjectionJobRow.job_id == job_id)
+            .values(
+                status="pending",
+                attempts=0,
+                available_at=datetime.now(UTC) - timedelta(seconds=1),
+                dependency_pending_since=None,
+                lease_owner=None,
+                lease_expires_at=None,
+                last_error=None,
+            )
+        )
+    return job_id
+
+
+@pytest.mark.anyio
+async def test_a_live_usage_claim_defers_the_reconciliation_without_charging_it(tmp_path):
+    """The gate's wait branch: deferred, attempt returned, no error row.
+
+    A live-leased ``task-usage`` claim is a fan-out that already read the
+    pre-edge ancestry and has not committed, so re-fanning now would read past
+    it exactly as the backfill did. The wait is a replay-safe dependency, which
+    is a specific contract and not merely "it raises": the attempt goes back,
+    the status stays ``pending`` (never ``retry``, which would claim an attempt
+    was spent), and no durable error row is written.
+    """
+
+    async with _spawn_fixture(tmp_path, "spawn-gate-live") as fixture:
+        await fixture.record_spawn()
+        backend = fixture.backend
+        # The service's own projector loop would keep re-claiming the re-armed
+        # job behind the assertions; this test owns the claim schedule.
+        await fixture.service.stop()
+        await _dress_a_usage_job_as_processing(fixture, lease_expires_at=datetime.now(UTC) + timedelta(seconds=60))
+        reconcile_job_id = await _re_arm_the_reconciliation(fixture)
+
+        await backend.project_pending()
+
+        async with fixture.session_factory() as session:
+            job = await session.get(AnsichProjectionJobRow, reconcile_job_id)
+            state = (job.status, job.attempts, job.dependency_pending_since is not None, job.lease_owner)
+            available_at = _as_utc(job.available_at)
+            last_error = job.last_error
+            error_rows = list((await session.execute(select(AnsichProjectionErrorRow.error_id).where(AnsichProjectionErrorRow.job_id == reconcile_job_id))).scalars())
+
+    assert state == ("pending", 0, True, None), "a dependency wait returns its attempt and keeps `pending`"
+    assert available_at > datetime.now(UTC) - timedelta(seconds=1)
+    assert "waiting for an in-flight usage projection" in (last_error or "")
+    assert error_rows == [], "a replay-safe wait is not a durable failure"
+
+
+@pytest.mark.anyio
+async def test_an_expired_usage_claim_does_not_defer_the_reconciliation(tmp_path, monkeypatch):
+    """The gate's other branch, and the honest edge of its domain.
+
+    Waiting on an expired lease would be an unbounded wait on a worker that may
+    be gone, and would not close the window anyway — see the DOMAIN note in
+    ``_reconcile_spawn_usage``. So the pass proceeds, and the repair it owes the
+    ancestor lands. Called directly rather than through ``project_pending``
+    because an expired ``processing`` row is itself claimable: the loop would
+    re-run that usage projection first and repair the ancestor by that route,
+    which would prove nothing about this branch.
+    """
+
+    async with _spawn_fixture(tmp_path, "spawn-gate-expired") as fixture:
+        _hide_the_descendants_from_the_spawn_transaction(monkeypatch)
+        spawn = await fixture.record_spawn()
+        backend = fixture.backend
+        await fixture.service.stop()
+        await _dress_a_usage_job_as_processing(fixture, lease_expires_at=datetime.now(UTC) - timedelta(seconds=60))
+
+        async with fixture.session_factory() as session, session.begin():
+            await backend._reconcile_spawn_usage(session, spawn)
+
+        root_usage = await fixture.service.get_task_usage(fixture.root_id)
+
+    assert {item.dimension: item.value for item in root_usage.inclusive}["steps"] == 2
+    assert {item.dimension: item.value for item in root_usage.inclusive}["total_tokens"] == 41
+
+
+@pytest.mark.anyio
+async def test_a_claim_is_committed_before_its_projection_work_begins(tmp_path, monkeypatch):
+    """The invariant the whole gate rests on, pinned where it can be seen.
+
+    ``_reconcile_spawn_usage`` reads job rows to decide whether a peer's usage
+    fan-out is in flight. That is only informative because the claim commits
+    ``processing`` in its **own** transaction before the work starts, and the
+    completion commits with the projection — so "no live claim" really does mean
+    "every such contribution is already durable". Merge the claim into the work
+    transaction and the gate still runs, still finds nothing, and silently stops
+    covering anything.
+
+    A **separate session** is what makes this observable: it can only see
+    committed rows, so reading ``processing`` with a live lease from inside the
+    work is the claim's durability, not its intent.
+    """
+
+    async with _spawn_fixture(tmp_path, "spawn-claim-invariant") as fixture:
+        observed: list[tuple[str, bool]] = []
+        original = ansich_sql.SqlAnsichBackend._project_usage
+
+        async def observing(self, session, observation, *, ingest_seq):
+            if not observed:
+                async with self._session_factory() as probe:
+                    row = (
+                        await probe.execute(
+                            select(
+                                AnsichProjectionJobRow.status,
+                                AnsichProjectionJobRow.lease_expires_at,
+                            ).where(
+                                AnsichProjectionJobRow.obs_id == observation.obs_id,
+                                AnsichProjectionJobRow.projector_name == "task-usage",
+                            )
+                        )
+                    ).first()
+                observed.append((row.status, _as_utc(row.lease_expires_at) > datetime.now(UTC)))
+            return await original(self, session, observation, ingest_seq=ingest_seq)
+
+        monkeypatch.setattr(ansich_sql.SqlAnsichBackend, "_project_usage", observing)
+        fixture.service.record(_step_started(fixture.child_id, new_id(), 9, _OCCURRED_AT + timedelta(seconds=20)))
+        await fixture.service.flush_task(fixture.child_id)
+
+    assert observed == [("processing", True)], "a projection's own claim must already be durable when its work starts"

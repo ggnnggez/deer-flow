@@ -7575,8 +7575,18 @@ class SqlAnsichBackend:
             # established by an earlier run of this projection, which left one
             # behind in the same transaction. The one case that leaves an edge
             # without one is a row written before F10-19's fix existed, and
-            # those spawns are long settled; a `rebuild_projections()` replays
-            # this projection and mints one for them if it is ever wanted.
+            # those spawns are long settled; a `rebuild_projections()` mints one
+            # for them if it is ever wanted.
+            #
+            # That last sentence has a precondition worth stating, because it is
+            # not this early return being skipped on merit: `rebuild` DELETES
+            # `AnsichTaskSpawnRow` and `AnsichTaskAncestryRow` before replaying,
+            # so the replayed projection finds no existing row and takes the
+            # full path below. Were the delete list ever narrowed to keep the
+            # spawn tables, this branch would be reached on replay and a pre-fix
+            # edge would stay reconciliation-less forever. Pinned by
+            # `test_spawn_usage_reconciliation.py::
+            # test_rebuild_mints_a_reconciliation_for_an_edge_that_has_none`.
             return
 
         if (
@@ -7638,18 +7648,34 @@ class SqlAnsichBackend:
     async def _enqueue_spawn_usage_reconcile(session: AsyncSession, obs_id: str) -> None:
         """Promise one post-commit re-fan of this spawn's descendants (F10-19).
 
-        **Why a follow-up job and not this transaction's tail.** A tail would be
-        a second read with the *same* visibility as the edge write, which is
-        what ``_backfill_spawn_usage`` already is — it would re-read exactly the
-        rows the first read saw and close nothing. The window is defined by a
-        contribution that commits *after* that read, so the only trigger point
-        that can see it is one whose transaction starts after this one commits.
-        A job is that trigger, and being a row committed atomically with the
-        edge it also survives a crash in between: an edge can never become
-        durable without its reconciliation being durable too. The cost is one
-        extra job per established spawn edge (not per ``task.created``), which
-        rides the existing lease/CAS/attempt/failed-job machinery rather than
-        adding any of its own.
+        **Why a follow-up job and not this transaction's tail.** The window is
+        defined by a contribution that commits *after* the backfill's read, and
+        a tail cannot cover all of that on either dialect:
+
+        * On SQLite a tail sees exactly what the first read saw — one writer,
+          and the reading transaction's snapshot is fixed — so it re-reads the
+          same rows and closes nothing at all.
+        * On PostgreSQL READ COMMITTED each statement takes a *fresh* snapshot,
+          so a tail genuinely would pick up contributions committed between the
+          two reads. That is a **proper subset** of the window: it still cannot
+          see a contribution that commits after this transaction itself commits,
+          which is the rest of it. Do not read the SQLite sentence as the
+          general case — the dialects differ here and only the job covers both.
+
+        A transaction that starts after this one commits is the only trigger
+        that spans the whole window on either dialect, and a job is that
+        trigger. Being a row committed atomically with the edge it also survives
+        a crash in between — an edge can never become durable without its
+        reconciliation being durable too — which no tail provides on any
+        dialect. The cost is one extra job per established spawn edge (not per
+        ``task.created``), which rides the existing lease/CAS/attempt/failed-job
+        machinery rather than adding any of its own.
+
+        One consequence to know at the call site: the job counts toward
+        ``has_pending_for_task``, so ``flush_task`` on the spawned Task now
+        settles it before returning. That is deliberate (the barrier should not
+        report a Task settled while its reconciliation is still queued), and it
+        is the one way this change is visible to terminal-flush budgets.
 
         Idempotent on ``(obs_id, projector_name, projector_version)``: a replay
         of this projection — a re-claim after a lease expiry, or ``rebuild``'s
@@ -7734,15 +7760,34 @@ class SqlAnsichBackend:
         # A `_project_usage` that is *still running* would defeat this pass the
         # same way it defeated the backfill: its fan-out already read the
         # pre-edge ancestry and its contribution is not committed yet, so the
-        # read below cannot see it. Its job says so — a claim commits
-        # ``processing`` in its own transaction before the work starts, and the
-        # completion commits with the projection — so waiting for the live
-        # claims to clear is what turns this from a narrower window into none.
-        # Only a *live* lease is waited on: an expired one is re-claimable, and
-        # the re-claim redoes the fan-out against the now-visible edge, which
-        # delivers the ancestor rows without this pass. The wait gives its
-        # attempt back and is bounded by ``projector_dependency_timeout_seconds``
-        # like every other replay-safe dependency.
+        # read below cannot see it. Its job says so -- a claim commits
+        # `processing` in its own transaction before the work starts, and the
+        # completion commits with the projection -- so waiting for the live
+        # claims to clear narrows the window by exactly the set of in-flight
+        # usage projections. That invariant is load-bearing and is pinned by
+        # `test_spawn_usage_reconciliation.py::
+        # test_a_claim_is_committed_before_its_projection_work_begins`; merging
+        # the claim into the work transaction silently disarms this gate.
+        #
+        # DOMAIN (what this gate does NOT cover). Only a *live* lease is waited
+        # on, and an expired one is NOT self-healing in general. Lease expiry
+        # does not invalidate anything by itself: `_complete_projection_job`'s
+        # compare-and-set is on `lease_generation`, which only a *re-claim*
+        # raises. A usage transaction that outlives its own lease with nobody
+        # re-claiming it therefore still commits its contribution and still
+        # settles its job -- landing an ancestor-less row after this pass has
+        # already finished. So the honest statement is not "no window": it is
+        # that the reconciliation turns "any interleaving loses the
+        # contribution permanently" into "only a usage transaction that
+        # outlives its lease does". Waiting on expired leases too would trade
+        # that residual for an unbounded wait on a worker that may be gone, and
+        # would still not cover it (the expired-lease worker can commit at any
+        # later moment). The real-interleaving proof of the remaining window
+        # belongs to T9's PostgreSQL two-worker scenario list.
+        #
+        # The wait gives its attempt back and is bounded by
+        # `projector_dependency_timeout_seconds` like every other replay-safe
+        # dependency.
         in_flight = await session.scalar(
             select(AnsichProjectionJobRow.job_id)
             .join(

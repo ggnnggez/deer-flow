@@ -37,7 +37,7 @@
 | F10-27 | 装配不对称:`create_embedded_ansich_service` 的无存储分支漏传三个 knob;`operations_assessment_interval_ms` 至今没有 `AnsichConfig` 字段,生产恒为 1000ms | ⬜ 未修复 | — | — |
 | F10-28 | 健康线的两处 UI 级留观:中性线态(phase/unknown)的**渲染层**零覆盖(图标三元式曾在本批被反转过);task 作用域在系统 phase 期间仍称「本任务数据完整」 | ⬜ 未修复 | — | — |
 | F10-29 | 环境外部化载荷类:externalized 的 `environment.sampled` 读不回(契约分支无守卫直接抛)、认领不了(先 envelope 后 hydrate 的顺序使投影作业 durable failed)、history 读者守卫跳过(其"从不外部化"注释已撤回)——同一危害类三实例 | ⬜ 未修复 | — | — |
-| F10-30 | settle-budget flake 家族(与 F10-10 分开记):三条 `terminal_flush_timeout_ms=100` 构造的测试在 24-hog 争用下 3/3 全红且两侧一致——flush 预算输给负载,行退回队列/作业未建;F10-10 的节奏门禁管不了 flush 预算 | ⬜ 未修复(测试侧) | — | — |
+| F10-30 | settle-budget flake 家族(与 F10-10 分开记):`test_sql_safety.py` 里全部 settle 依赖读断言的等价类,三种构造、同一机理——flush 预算输给负载,行退回队列/作业未建;F10-10 的节奏门禁管不了 flush 预算。**不限于重负载**:成员 1/5 在安静机单独跑也翻红(T6 记),故按用例名而非行号认领 | ⬜ 未修复(测试侧) | — | — |
 
 留观标记:F10-10 的第 4 条证据(`test_step_attempt_and_context_are_queryable_after_projection`)**未证实**——只做了排除法,没拿到原始失败文本。若它再轮换红,**先抓失败文本再修**,不要按已有的三条诊断类推。另:F10-10 的门禁只被 Task 8 的验收负载证明过(`e53cefbc` 记录了这条边界),Task 9 的更重负载下仍有 2 条已上门禁的测试翻红,详见该条的「后续观察」。
 
@@ -392,11 +392,11 @@
 
 - 状态:⬜ 未修复(测试侧;生产行为是 fail-open 预算语义,非 bug)。来源:P11-B 批 T2-T4 的争用复测逐步识别,T4 修复轮定名;成员 4 由 T5 复审补登。
 - 成员 1-3(全部 `terminal_flush_timeout_ms=100` 构造、24-hog 争用下全红——成员 1/2 两侧各 3/3 且文本一致,成员 3 一侧 3/3、另一侧存档 2 轮):
-  1. `test_externalized_scope_authorization_and_effect_payloads_read_back`(:1195,`stored_payload_state == {}`——flush 预算内没写完);
+  1. `test_externalized_scope_authorization_and_effect_payloads_read_back`(:1195,`stored_payload_state == {}`——flush 预算内没写完)。**T6 修复轮把这条成员的两处描述都改宽了,两处都重要**:(a) 症状不止 :1195 那一条断言——T6 的验收里红在**下一行** :1196(`projected_scope_state is None`,scope 投影根本没落地),同一构造、同一机理,断言位置不同而已,所以不要按行号认这条成员;(b) **它在安静机、单独跑、无并发负载下也会红**——T6 单独重跑该用例 3 次即红 1 次(`task-6-evidence/f10-30-member-1-rerun-alone.txt`)。「24-hog 争用下才红」这个前提对成员 1 **不成立**,合并门禁不能靠「单独跑绿」来判定它。**并且它与本批任何改动无关**:同一用例在**批 BASE `ade44649`**(把 `sql.py` 单独 checkout 回去、其余不动)跑 6 次仍红 1 次,证据同文件。
   2. `test_scope_safety_dependency_wait_crosses_deadline_into_failed_job_and_retry`(:514,`NoneType.job_id`——作业未建);
   3. `test_scope_safety_waits_for_subject_entity_then_self_heals`(同型)。成员 3 在 T5 的第一轮验收里(`tests/ansich` 与 bootstrap 组**并行**跑)再次翻红一次,单独重跑立即绿,安静机全量两轮全绿——按本条记账,未改判。
   4. `test_late_scope_evidence_reassesses_only_its_own_tool_call`(`test_sql_safety.py:1535`,T5 复审者的一次运行:`converged_after` 读到 `(8, 8, …)` 而非期望的 `(4, 4, …)`(`converged_before` 正常),即已收敛的 tool_call 被重估了一遍——正是 phase-9-review-followups.md:72 记录的**修复前**形状「从 4 涨到 8」;单独跑 3/3 绿)。**构造与前三条不同,必须一并记**:它不设 `terminal_flush_timeout_ms=100`(用默认终端预算),而是把 `flush_interval_ms`/`projector_poll_interval_ms` 都压到 60s,于是整个 settle 完全由 `flush_task()` 那一次预算承担、投影没有第二次轮询兜底——预算输给负载时两条证据落在**不同的 watermark 区间**,第二次触发就会连带重估已收敛的 subject。所以症状不是「读到空态」而是「读到多判了一轮」,机理仍是同一条:settle 预算输给负载。
 - 为什么不是 F10-10:成员 2/3/4 **已上** `only_test_driven_assessments` 门禁(四条里只有成员 1 没有)、成员 4 还已把周期压到 60s——该门禁管评估**节奏**,管不了 **flush 预算**输给负载;P11-A 的屏障语义(超时退回队首)使测试在重排队中读到空态或半态。两族必须分开记,否则会把「加大门禁」的错误结论套到这一族上——成员 4 尤其是反例:F10-10 的两种手段它都已经用尽。
-  5. `test_a_truncated_late_evaluation_cannot_leave_a_belief_regressed`(T5 复审者的另一次运行:`no scope-safety job at watermark 6 after 10.0s`——**第三种构造**:`terminal_flush_timeout_ms=2000` + 门禁 + 5ms 轮询 + 自带 10s 显式 settle 等待,仍超时;单独跑 3/3 绿)。
-- 方向(经五名成员修正):这不是一份可枚举的成员清单,而是 `test_sql_safety.py` 里**所有 settle 依赖读断言**的等价类——三种构造、三种症状、同一机理(settle 预算输给负载)。修法应是一个**共享的确定性 settle helper**(对 flush/重排队/作业落地路径按持久行轮询,替代各测试自造的预算与等待),而非逐条加长各自的预算;成员 4 另需保证两条证据在**同一** watermark 区间内落地再断言。普通负载下极少翻红,合并门禁仍以安静机全绿为准。
+  5. `test_a_truncated_late_evaluation_cannot_leave_a_belief_regressed`(T5 复审者的另一次运行:`no scope-safety job at watermark 6 after 10.0s`——**第三种构造**:`terminal_flush_timeout_ms=2000` + 门禁 + 5ms 轮询 + 自带 10s 显式 settle 等待,仍超时;单独跑 3/3 绿)。T6 修复轮在安静机上**单独跑 `test_sql_safety.py` 整个文件**时它又红了一次(1 failed, 18 passed),同样无并发负载——与成员 1 一起把这条家族的「只在重负载下出现」前提证伪。
+- 方向(经五名成员修正):这不是一份可枚举的成员清单,而是 `test_sql_safety.py` 里**所有 settle 依赖读断言**的等价类——三种构造、三种症状、同一机理(settle 预算输给负载)。修法应是一个**共享的确定性 settle helper**(对 flush/重排队/作业落地路径按持久行轮询,替代各测试自造的预算与等待),而非逐条加长各自的预算;成员 4 另需保证两条证据在**同一** watermark 区间内落地再断言。~~普通负载下极少翻红,合并门禁仍以安静机全绿为准。~~ **该收尾句已由 T6 撤回**:成员 1 与成员 5 都在安静机、无并发负载下翻红过(前者单独跑 3 次即红 1 次,且在批 BASE 上同样红),所以「安静机全绿」既不是这一族的稳定属性、也不能当作合并判据。在共享 settle helper 落地之前,合并门禁对本族的正确姿势是:**认用例名(而不是行号)、单独重跑、并在 BASE 上对照**,红一次不阻断,但每次都要按本条记账。
 - 归属:下一次测试卫生波;F10-10 留观的兄弟条目。

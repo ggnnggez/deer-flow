@@ -56,6 +56,8 @@ from deerflow.ansich.persistence.models import (
     AnsichBeliefAssertionRow,
     AnsichCurrentBeliefRow,
     AnsichEntityRow,
+    AnsichProjectionJobRow,
+    AnsichProjectorVersionRow,
     AnsichTaskAncestryRow,
     AnsichTaskBudgetRow,
     AnsichTaskUsageRow,
@@ -801,6 +803,29 @@ _FIRST_WRITE_UPSERTS = (
         {"entity_id": "obs", "task_id": "task", "dimension": "total_tokens"},
         ["entity_id"],
         AnsichTaskBudgetRow.entity_id,
+    ),
+    # F10-19's two sites (`_enqueue_spawn_usage_reconcile`). They are not
+    # rollups, but this table's claim is "every call site", not "every rollup
+    # call site" -- leaving them out would make that sentence false, and these
+    # two are the only ones whose conflict target is a composite primary key
+    # and a named unique constraint rather than a single-column key.
+    (
+        AnsichProjectorVersionRow,
+        {"projector_name": "task-spawn-reconcile", "projector_version": "1"},
+        ["projector_name", "projector_version"],
+        AnsichProjectorVersionRow.projector_name,
+    ),
+    (
+        AnsichProjectionJobRow,
+        {
+            "job_id": "job",
+            "obs_id": "obs",
+            "projector_name": "task-spawn-reconcile",
+            "projector_version": "1",
+            "status": "pending",
+        },
+        ["obs_id", "projector_name", "projector_version"],
+        AnsichProjectionJobRow.job_id,
     ),
 )
 
