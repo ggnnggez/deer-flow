@@ -781,6 +781,7 @@ async def test_a_live_usage_claim_defers_the_reconciliation_without_charging_it(
         await _dress_a_usage_job_as_processing(fixture, lease_expires_at=datetime.now(UTC) + timedelta(seconds=60))
         reconcile_job_id = await _re_arm_the_reconciliation(fixture)
 
+        before_projection = datetime.now(UTC)
         await backend.project_pending()
 
         async with fixture.session_factory() as session:
@@ -791,7 +792,9 @@ async def test_a_live_usage_claim_defers_the_reconciliation_without_charging_it(
             error_rows = list((await session.execute(select(AnsichProjectionErrorRow.error_id).where(AnsichProjectionErrorRow.job_id == reconcile_job_id))).scalars())
 
     assert state == ("pending", 0, True, None), "a dependency wait returns its attempt and keeps `pending`"
-    assert available_at > datetime.now(UTC) - timedelta(seconds=1)
+    # The 250ms dependency backoff: available_at must land strictly after the
+    # moment the projection pass began, not merely "recently".
+    assert available_at > before_projection
     assert "waiting for an in-flight usage projection" in (last_error or "")
     assert error_rows == [], "a replay-safe wait is not a durable failure"
 
