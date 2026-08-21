@@ -120,8 +120,8 @@ function LineageResult({ result }: { result: TraceResult }) {
                 key={`${edge.derived_block_id}:${edge.source_block_id}:${edge.transform_kind}`}
                 className="text-muted-foreground rounded border border-dashed px-2 py-1"
               >
-                {shortId(edge.derived_block_id)} → {shortId(edge.source_block_id)} ·{" "}
-                {edge.transform_kind}
+                {shortId(edge.derived_block_id)} →{" "}
+                {shortId(edge.source_block_id)} · {edge.transform_kind}
               </div>
             ))}
           </div>
@@ -154,7 +154,10 @@ function LineageResult({ result }: { result: TraceResult }) {
                   className="border-t"
                 >
                   <td className="p-2">#{item.step_seq}</td>
-                  <td className="p-2 font-mono" title={item.descendant_block_id}>
+                  <td
+                    className="p-2 font-mono"
+                    title={item.descendant_block_id}
+                  >
                     {shortId(item.descendant_block_id)}
                   </td>
                   <td className="p-2">#{item.snapshot_ordinal}</td>
@@ -189,7 +192,8 @@ function LineageResult({ result }: { result: TraceResult }) {
                     <LineageProducer node={node} />
                   </td>
                   <td className="p-2">
-                    {node.token_estimate} {t.ansich.tokens} · {node.byte_size} bytes
+                    {node.token_estimate} {t.ansich.tokens} · {node.byte_size}{" "}
+                    bytes
                   </td>
                 </tr>
               ))}
@@ -214,7 +218,10 @@ function LineageNode({ node }: { node: AnsichLineageNode }) {
         )}
       </div>
       <div className="font-medium">{node.kind}</div>
-      <code className="text-muted-foreground block truncate" title={node.block_id}>
+      <code
+        className="text-muted-foreground block truncate"
+        title={node.block_id}
+      >
         {node.block_id}
       </code>
       <div className="text-muted-foreground">

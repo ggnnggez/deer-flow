@@ -49,13 +49,15 @@ export function AnsichScopeEffectsPanel({
         </CardHeader>
         <CardContent className="flex flex-wrap gap-2">
           {scopes.length === 0 ? (
-            <p className="text-muted-foreground text-sm">
-              {t.ansich.noScopes}
-            </p>
+            <p className="text-muted-foreground text-sm">{t.ansich.noScopes}</p>
           ) : (
             scopes.map((scope) => (
-              <Badge key={`${scope.scope_id}:${scope.relation_role}`} variant="outline">
-                {scope.scope_kind}: {scope.display_label} · {scope.relation_role}
+              <Badge
+                key={`${scope.scope_id}:${scope.relation_role}`}
+                variant="outline"
+              >
+                {scope.scope_kind}: {scope.display_label} ·{" "}
+                {scope.relation_role}
               </Badge>
             ))
           )}
@@ -81,7 +83,8 @@ export function AnsichScopeEffectsPanel({
 }
 
 function EffectList({ effects }: { effects: AnsichToolEffect[] }) {
-  if (effects.length === 0) return <span className="text-muted-foreground">—</span>;
+  if (effects.length === 0)
+    return <span className="text-muted-foreground">—</span>;
   return (
     <div className="space-y-1">
       {effects.map((effect) => (
@@ -107,7 +110,11 @@ function ToolSafetyChain({
     true,
     polling,
   );
-  const effectsQuery = useAnsichToolEffects(toolCall.tool_call_id, true, polling);
+  const effectsQuery = useAnsichToolEffects(
+    toolCall.tool_call_id,
+    true,
+    polling,
+  );
   if (authorizationQuery.isPending || effectsQuery.isPending) {
     return <Skeleton className="h-32 w-full" />;
   }
@@ -153,7 +160,9 @@ function ToolSafetyChain({
         {(effects?.coverage ?? "unknown") === "unknown" && (
           <Alert>
             <AlertTriangleIcon />
-            <AlertDescription>{t.ansich.unknownEffectCoverage}</AlertDescription>
+            <AlertDescription>
+              {t.ansich.unknownEffectCoverage}
+            </AlertDescription>
           </Alert>
         )}
       </CardContent>

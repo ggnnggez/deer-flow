@@ -36,9 +36,9 @@ describe("environment presentation", () => {
   });
 
   it("renders pressure belief states across the four-state family", () => {
-    expect(environmentBeliefBadge("environment_pressure:fd_open", "ok")).toEqual(
-      { label: "正常", tone: "positive" },
-    );
+    expect(
+      environmentBeliefBadge("environment_pressure:fd_open", "ok"),
+    ).toEqual({ label: "正常", tone: "positive" });
     expect(
       environmentBeliefBadge("environment_pressure:fd_open", "warning"),
     ).toEqual({ label: "预警", tone: "warning" });
@@ -48,22 +48,29 @@ describe("environment presentation", () => {
   });
 
   it("renders an unassessed/unknown belief as explicit 未知, never blank or positive", () => {
-    const badge = environmentBeliefBadge("environment_pressure:fd_open", "unknown");
+    const badge = environmentBeliefBadge(
+      "environment_pressure:fd_open",
+      "unknown",
+    );
     expect(badge.label).toBe("未知");
     expect(badge.tone).not.toBe("positive");
   });
 
   it("renders leak beliefs on their own none/suspected/unknown scale", () => {
-    expect(environmentBeliefBadge("environment_leak:fd_open", "none")).toEqual(
-      { label: "正常", tone: "positive" },
-    );
+    expect(environmentBeliefBadge("environment_leak:fd_open", "none")).toEqual({
+      label: "正常",
+      tone: "positive",
+    });
     const suspected = environmentBeliefBadge(
       "environment_leak:fd_open",
       "suspected",
     );
     expect(suspected.label).toBe("严重");
     expect(suspected.tone).toBe("critical");
-    const unknown = environmentBeliefBadge("environment_leak:fd_open", "unknown");
+    const unknown = environmentBeliefBadge(
+      "environment_leak:fd_open",
+      "unknown",
+    );
     expect(unknown.label).toBe("未知");
     expect(unknown.tone).toBe("neutral");
   });

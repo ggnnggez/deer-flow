@@ -51,7 +51,9 @@ export function AnsichTaskHero({
           </div>
           <div className="text-muted-foreground flex flex-wrap items-center gap-x-3 gap-y-1 text-xs">
             {childCount ? (
-              <span>{t.ansich.childTasksCount(childCount.toLocaleString())}</span>
+              <span>
+                {t.ansich.childTasksCount(childCount.toLocaleString())}
+              </span>
             ) : null}
             {durationMs !== null ? (
               <span className="tabular-nums">{formatDuration(durationMs)}</span>

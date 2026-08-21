@@ -50,7 +50,9 @@ export function AnsichTaskTreePanel({
     const depthDifference =
       (depths.get(left.task.task_id) ?? 0) -
       (depths.get(right.task.task_id) ?? 0);
-    return depthDifference || left.task.task_id.localeCompare(right.task.task_id);
+    return (
+      depthDifference || left.task.task_id.localeCompare(right.task.task_id)
+    );
   });
 
   return (
@@ -116,7 +118,10 @@ function TaskTreeRow({
     >
       <div className="min-w-0 flex-1">
         <div className="flex flex-wrap items-center gap-2">
-          <span className="truncate font-mono text-xs" title={node.task.task_id}>
+          <span
+            className="truncate font-mono text-xs"
+            title={node.task.task_id}
+          >
             {node.task.task_id}
           </span>
           <AnsichStatusBadge value={node.task.control.value} />
@@ -127,8 +132,8 @@ function TaskTreeRow({
           </Badge>
         </div>
         <div className="text-muted-foreground mt-1 truncate text-xs">
-          {effectiveModel} · {t.ansich.localUsage}: {local.total_tokens ?? "?"} ·{" "}
-          {t.ansich.inclusiveUsage}: {inclusive.total_tokens ?? "?"}
+          {effectiveModel} · {t.ansich.localUsage}: {local.total_tokens ?? "?"}{" "}
+          · {t.ansich.inclusiveUsage}: {inclusive.total_tokens ?? "?"}
         </div>
         <div className="text-muted-foreground mt-1 truncate text-xs">
           {node.current_step

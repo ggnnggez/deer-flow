@@ -61,10 +61,7 @@ export function AnsichSignalBadge({
     return (
       <Badge
         variant="outline"
-        className={cn(
-          "text-muted-foreground border-dashed gap-1",
-          className,
-        )}
+        className={cn("text-muted-foreground gap-1 border-dashed", className)}
       >
         <CircleHelpIcon className="size-3" />
         {t.ansich.evidenceInsufficient}
