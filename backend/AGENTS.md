@@ -1632,7 +1632,8 @@ here depends on it, and an earlier claim in this file that it did was wrong.
 `ix_ansich_projection_jobs_projector_status` (migration `0027`) serves the reads
 that name a projector *and* a status — `_assess_projection_failures`' per-group
 evidence query (`status='failed' AND projector_name=? AND projector_version=?`)
-— not the health merge; dropping it changes no health plan. Because the counts
+and `_reconcile_spawn_usage`'s in-flight gate (`projector_name='task-usage' AND
+status='processing'`) — not the health merge; dropping it changes no health plan. Because the counts
 read no longer sees settled work, the row set is named by
 `ansich_projector_versions` instead (`_projector_registry_statement`), whose key
 set is exactly "projectors that have ever had a job", so a fully caught-up
@@ -1651,7 +1652,8 @@ Over-claiming is the intolerable direction: the publish guard below reads a mark
 it can never reach again as "every later tick is staler" and stops updating the
 read model until the offending job settles, which a replay-safe dependency may
 delay by `projector_dependency_timeout_seconds`. For the same reason the row set
-is the **union** of all three job-table reads, not the counts read alone.
+is the **union** of the registry read and both job-table reads, not the counts
+read alone.
 
 The same query set stamps the active-Task read model.
 `_refresh_active_task_read_model` used to copy `get_projection_metrics()` —
@@ -1681,9 +1683,11 @@ One honest residual, on the deploy that lands this change only: rows written by
 the previous code carry the *old* stamp (that worker's highest projected
 `ingest_seq`), which sits at or above the new continuity mark. While any job is
 durably `failed`, such a row's basis stays above every new tick's and the row is
-skipped — visibly, once per tick, at DEBUG. Retrying the failed job or running a
-rebuild (the documented operator remedies for a failed job, and a rebuild deletes
-these rows) clears it.
+skipped — for a still-running Task visibly, once per tick, at DEBUG; for a Task
+that has since stopped the guarded sweep keeps the row *silently*, and it keeps
+reading as `running` until cleared. Retrying the failed job or running a rebuild
+(the documented operator remedies for a failed job, and a rebuild deletes these
+rows) clears it.
 
 Two debts close with this slice. **F10-24**: both writers of a
 `budget_health:<dimension>:<scope>` Assertion — `_assess_budget_rows` on terminal
