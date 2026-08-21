@@ -1044,7 +1044,7 @@ async def test_failed_assessor_jobs_degrade_health_and_can_be_retried(
     assert error_count == len(failed_jobs)
     assert failed_health.status == "degraded"
     assert failed_health.failed_jobs == len(failed_jobs)
-    assert retried == len(failed_jobs)
+    assert retried.re_armed == len(failed_jobs)
     assert recovered_statuses
     assert all(status == "completed" for status in recovered_statuses)
     assert recovered_health.failed_jobs == 0

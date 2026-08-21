@@ -202,7 +202,7 @@ async def test_failed_job_detail_history_survives_retry_and_matches_error_table(
         retried = await service.retry_failed_projections(task_id=task_id)
         after_retry = await service.list_failed_jobs(task_id=task_id)
 
-        assert retried == 2
+        assert retried.re_armed == 2
         assert after_retry == []
         # The append-only error table is untouched by retry — history for
         # the now-recovered job is still queryable by job_id.

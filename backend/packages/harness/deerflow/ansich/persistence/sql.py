@@ -32,6 +32,7 @@ from ansich import (
     PossibleExposureItemView,
     Producer,
     RebuildOutcome,
+    RetryOutcome,
     StepView,
     TaskScopesView,
     TaskScopeView,
@@ -1930,7 +1931,7 @@ class SqlAnsichBackend:
                     unsettled=await self._unsettled_job_count(),
                 )
 
-    async def retry_failed_projections(self, *, task_id: str | None = None) -> int:
+    async def retry_failed_projections(self, *, task_id: str | None = None) -> RetryOutcome:
         """Requeue failed durable jobs and settle them without deleting projections.
 
         A single-operator maintenance operation like ``rebuild_projections``, and
@@ -1949,15 +1950,22 @@ class SqlAnsichBackend:
         again -- and it needs no bump either, because a failed row has no
         in-flight writer to invalidate.
 
-        The return value is the number of rows the re-arm actually changed, so
-        it can never over-report work that a concurrent state change had already
-        taken off the failed list.
+        ``re_armed`` is the number of rows the re-arm actually changed, so it can
+        never over-report work that a concurrent state change had already taken
+        off the failed list. ``unsettled`` is the other half of the same honesty
+        the rebuild reports (F10-26): a re-arm count says rows went back in the
+        queue, never that anything settled, so the pass re-reads the whole
+        backlog once its own replay is done. That read is deliberately *after*
+        the re-arm and the drain -- a job that was re-armed and walked straight
+        back into a dependency wait is work still owed, and a count taken before
+        the re-arm would have missed it while a durably failed row was still
+        excluded as settled-badly.
         """
 
         async with self._maintenance_lock():
             return await self._retry_failed_projections_locked(task_id=task_id)
 
-    async def _retry_failed_projections_locked(self, *, task_id: str | None) -> int:
+    async def _retry_failed_projections_locked(self, *, task_id: str | None) -> RetryOutcome:
         re_armed = 0
         async with self._session_factory() as session, session.begin():
             failed_job_ids = select(AnsichProjectionJobRow.job_id).where(AnsichProjectionJobRow.status == "failed")
@@ -2010,14 +2018,17 @@ class SqlAnsichBackend:
                 )
                 re_armed += int(assessor_result.rowcount or 0)
         if re_armed == 0:
-            return 0
+            # Nothing to replay -- but "nothing re-armed" is not "nothing
+            # owed", and the caller's question is about the store rather than
+            # about this call, so the backlog is still read.
+            return RetryOutcome(re_armed=0, unsettled=await self._unsettled_job_count())
 
         while await self.project_pending(limit=200):
             pass
         await self.assess_operations()
         await self._refresh_failed_job_count()
         await self._refresh_context_metrics()
-        return re_armed
+        return RetryOutcome(re_armed=re_armed, unsettled=await self._unsettled_job_count())
 
     async def list_failed_jobs(
         self,

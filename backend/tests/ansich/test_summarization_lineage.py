@@ -141,7 +141,10 @@ async def test_partial_list_content_trim_records_an_incomplete_compression_inven
     await service.flush_task(task_id)
     compression = await service.get_context_compression(frozen.compression_id)
     compression_list = await service.list_context_compressions(task_id)
-    rebuild = await service.rebuild_projections()
+    # A bounded completeness loop, not one round: ``rebuild_projections()``
+    # reports rather than waits (F10-26), so under load a single pass can
+    # legitimately return with dependency-deferred jobs still unsettled.
+    rebuild = await service.rebuild_until_settled()
     rebuilt_compression = await service.get_context_compression(frozen.compression_id)
     rebuilt_compression_list = await service.list_context_compressions(task_id)
     observations = await service.list_observations(task_id)
@@ -246,7 +249,7 @@ async def test_sql_compression_query_reads_typed_ordered_memberships(tmp_path) -
 
     try:
         compression = await service.get_context_compression(compression_id)
-        rebuild = await service.rebuild_projections()
+        rebuild = await service.rebuild_until_settled()
         rebuilt_compression = await service.get_context_compression(compression_id)
     finally:
         await service.stop()

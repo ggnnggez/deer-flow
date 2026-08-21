@@ -784,11 +784,49 @@ class RebuildOutcome(BaseModel):
     new ones it does not. So it is a lower bound on completeness taken at a
     known point, not a live gauge -- re-running the rebuild is what confirms an
     empty backlog.
+
+    ``AnsichService.rebuild_until_settled`` is that re-running, written once so
+    every caller that needs completeness rather than a report shares one bounded
+    loop instead of open-coding its own.
     """
 
     model_config = ConfigDict(frozen=True)
 
     replayed: int
+    unsettled: int
+
+
+class RetryOutcome(BaseModel):
+    """What one ``retry_failed_projections()`` pass actually accomplished.
+
+    ``re_armed`` is the number of durably failed jobs the call put back in the
+    queue -- rows the re-arm really changed, so a job a concurrent state change
+    had already taken off the failed list is never counted.
+
+    ``unsettled`` is the same honest half :class:`RebuildOutcome` carries, and
+    it exists for the same reason: **a re-arm count is not a completion
+    claim**. A re-armed job is claimed and projected afterwards, by whichever
+    worker's loop gets to it, so "3 rows re-armed" says nothing about whether
+    any of them has since settled -- and it says nothing at all about work that
+    was already owed for other reasons. This number is every projection or
+    assessor job still ``pending``/``retry``/``processing`` when the pass
+    returns, read *after* the re-arm and after the replay it drives, so a job
+    that was re-armed and immediately walked back into a dependency wait is
+    counted rather than mistaken for a repair. ``failed`` rows are deliberately
+    not counted, exactly as in ``RebuildOutcome``: they are settled, badly, and
+    already surfaced through the failed-job count.
+
+    It carries the same lower-bound caveat too. It is a count taken at one known
+    point -- the end of this pass -- while other workers stay free to claim,
+    settle and mint jobs, and the maintenance lock is released the moment the
+    pass returns. So it is a bound on what was owed at a moment, not a live
+    gauge, and a caller that needs "the failures are gone" re-reads the
+    failed-job count rather than reading completion off either number here.
+    """
+
+    model_config = ConfigDict(frozen=True)
+
+    re_armed: int
     unsettled: int
 
 

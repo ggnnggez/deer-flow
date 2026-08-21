@@ -1225,7 +1225,10 @@ async def test_rebuild_reproduces_index_rows_stats_and_current_beliefs(tmp_path)
         await service.flush_task(second_task)
         before = await _projection_snapshot(session_factory)
 
-        rebuild = await service.rebuild_projections()
+        # A bounded completeness loop, not one round: ``rebuild_projections()``
+        # reports rather than waits (F10-26), so under load a single pass can
+        # legitimately return with dependency-deferred jobs still unsettled.
+        rebuild = await service.rebuild_until_settled()
         after = await _projection_snapshot(session_factory)
 
         async with session_factory() as session:

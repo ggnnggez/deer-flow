@@ -570,7 +570,7 @@ async def test_scope_safety_dependency_wait_crosses_deadline_into_failed_job_and
         await service.stop()
         await engine.dispose()
 
-    assert retried >= 1
+    assert retried.re_armed >= 1
     assert recovered_statuses
     assert set(recovered_statuses) == {"completed"}
     assert belief is not None
@@ -755,7 +755,10 @@ async def test_sql_projects_scopes_authorization_and_effects_as_typed_rows(
                     )
                 ).scalars()
             )
-        rebuild = await service.rebuild_projections()
+        # A bounded completeness loop, not one round: ``rebuild_projections()``
+        # reports rather than waits (F10-26), so under load a single pass can
+        # legitimately return with dependency-deferred jobs still unsettled.
+        rebuild = await service.rebuild_until_settled()
         rebuilt_scopes = await service.get_task_scopes(task_id)
         rebuilt_authorization = await service.get_tool_authorization(tool_call_id)
         rebuilt_effects = await service.get_tool_effects(tool_call_id)

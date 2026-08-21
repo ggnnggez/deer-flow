@@ -28,6 +28,7 @@ from ansich.contracts import (
     ProducerHealth,
     RebuildOutcome,
     RecordReceipt,
+    RetryOutcome,
     TaskLifecycleScope,
     TaskView,
     WriterHealth,
@@ -92,6 +93,20 @@ def _as_rebuild_outcome(result: object) -> RebuildOutcome:
     if isinstance(result, RebuildOutcome):
         return result
     return RebuildOutcome(replayed=int(result), unsettled=0)  # type: ignore[arg-type]
+
+
+def _as_retry_outcome(result: object) -> RetryOutcome:
+    """Normalize a backend's retry answer onto the reporting contract.
+
+    The same courtesy ``_as_rebuild_outcome`` extends, for the same reason: a
+    backend that still answers with a bare count predates this contract and has
+    no job table to be behind on, so ``unsettled=0`` is its true answer rather
+    than an assumed one.
+    """
+
+    if isinstance(result, RetryOutcome):
+        return result
+    return RetryOutcome(re_armed=int(result), unsettled=0)  # type: ignore[arg-type]
 
 
 def _serialized_observation_size(observation: ObservationEnvelope) -> int:
@@ -1670,30 +1685,76 @@ class AnsichService:
             await self._assess_operations_unlocked()
             return rebuilt
 
-    async def retry_failed_projections(self, *, task_id: str | None = None) -> int:
-        """Re-arm durably failed projection jobs; return how many were re-armed.
+    async def rebuild_until_settled(self, *, max_rounds: int = 5) -> RebuildOutcome:
+        """Rebuild repeatedly until nothing is owed, or the budget runs out.
 
-        **The return value is a re-arm count, not a completion claim**, and it
+        ``rebuild_projections()`` reports rather than waits (F10-26): it holds
+        the cross-worker maintenance lock *and* this service's
+        ``_projection_lock`` for its whole duration, so waiting out a
+        dependency-deferred job inside one call would stall an operator and a
+        projector loop for an interval the rebuild does not control. Spec §5
+        moved completeness onto the caller instead, and this is that caller's
+        tool -- written once so a replay command, a test and an operator path
+        cannot each invent a slightly different loop.
+
+        **Each round is a separate call, and that is the whole point.** Both
+        locks are released between rounds, which is what lets the deferred job
+        become claimable and another worker's in-flight claim finish; a loop
+        that waited *inside* one call would have neither. A rebuild is
+        idempotent, so re-running one costs work, never correctness.
+
+        The exit condition is ``unsettled == 0``, deliberately not "a round
+        replayed nothing": every round replays the whole store, so a replay
+        count is never a completion claim, and treating a zero as one is the
+        F10-26 mistake in a new costume.
+
+        Returns **the last round's outcome**, not a sum -- rounds replay the
+        same jobs, so adding them up would count work twice, and it is the
+        final round that describes the store as it now stands. Exhausting
+        ``max_rounds`` is **reported, not raised**: the outcome simply comes
+        back with ``unsettled`` still non-zero and the caller decides what an
+        incomplete rebuild means for it. Callers check ``.unsettled == 0``
+        themselves; nothing here interprets it for them.
+
+        ``max_rounds`` below 1 still runs one round, because the return value
+        *is* one round's outcome and there is no honest one to synthesize
+        without having rebuilt.
+        """
+
+        outcome = await self.rebuild_projections()
+        for _ in range(max_rounds - 1):
+            if outcome.unsettled == 0:
+                return outcome
+            outcome = await self.rebuild_projections()
+        return outcome
+
+    async def retry_failed_projections(self, *, task_id: str | None = None) -> RetryOutcome:
+        """Re-arm durably failed jobs, and say what the re-arm left behind.
+
+        **``re_armed`` is a re-arm count, not a completion claim**, and it
         carries the same drain-exit ambiguity F10-26 named on the rebuild half:
         a re-armed job is claimed and projected *afterwards*, by whichever
-        worker's loop gets to it, so this call returning ``3`` says three rows
+        worker's loop gets to it, so this call reporting ``3`` says three rows
         were put back in the queue and nothing about whether any of them has
-        since settled. The rebuild half was given ``RebuildOutcome(replayed,
-        unsettled)`` so a caller could tell those apart; this half was left as a
-        bare ``int`` and **still owes that shape**. Until it has one, a caller
-        that needs "the failures are gone" must re-read the failed-job count
-        rather than trust this number. Carried to batch C in spec
-        ``11-resilience-replay-and-retention.md`` §5.
+        since settled. That is why the result also carries ``unsettled``, the
+        same shape and the same lower-bound honesty ``RebuildOutcome`` has: see
+        :class:`~ansich.contracts.RetryOutcome`. A backend that answers with a
+        bare count predates that contract and is taken at its word
+        (``unsettled=0``) -- it has no job table to be behind on.
+
+        A caller that needs "the failures are gone" still re-reads the
+        failed-job count: ``unsettled`` counts work owed, and a job that fails
+        again after being re-armed leaves it rather than entering it.
         """
 
         retry_failed = getattr(self._backend, "retry_failed_projections", None)
         if not callable(retry_failed):
-            return 0
+            return RetryOutcome(re_armed=0, unsettled=0)
         projection_lock = self._projection_lock
         if projection_lock is None:
-            return int(await retry_failed(task_id=task_id))
+            return _as_retry_outcome(await retry_failed(task_id=task_id))
         async with projection_lock:
-            return int(await retry_failed(task_id=task_id))
+            return _as_retry_outcome(await retry_failed(task_id=task_id))
 
     async def list_failed_jobs(
         self,

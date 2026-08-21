@@ -17,7 +17,10 @@ import {
   useAnsichFailedJobs,
   useAnsichRetryFailedJobs,
 } from "@/core/ansich/hooks";
-import { formatAnsichTimestamp } from "@/core/ansich/presentation";
+import {
+  formatAnsichCount,
+  formatAnsichTimestamp,
+} from "@/core/ansich/presentation";
 import type { AnsichFailedJob } from "@/core/ansich/types";
 import { useI18n } from "@/core/i18n/hooks";
 
@@ -37,8 +40,19 @@ export function AnsichFailedJobsDialog({
   const jobs = jobsQuery.data?.items ?? [];
   const failingTaskIds = Array.from(new Set(jobs.map((job) => job.task_id)));
 
+  const retryOutcome = retryMutation.isPending ? null : retryMutation.data;
+
   return (
-    <Dialog open={open} onOpenChange={onOpenChange}>
+    <Dialog
+      open={open}
+      onOpenChange={(next) => {
+        // The last retry's outcome describes one moment; carrying it into the
+        // next time this dialog is opened would present a stale count as a
+        // current one.
+        if (!next) retryMutation.reset();
+        onOpenChange(next);
+      }}
+    >
       <DialogContent className="max-h-[80vh] max-w-2xl overflow-y-auto">
         <DialogHeader>
           <DialogTitle>{t.ansich.failedJobsDialogTitle}</DialogTitle>
@@ -48,6 +62,19 @@ export function AnsichFailedJobsDialog({
               : t.ansich.failedJobsDialogDescriptionGlobal}
           </DialogDescription>
         </DialogHeader>
+        {retryOutcome ? (
+          <div className="rounded-lg border px-3 py-2">
+            <p className="text-sm font-medium">
+              {t.ansich.failedJobRetryOutcome(
+                formatAnsichCount(retryOutcome.retried, locale),
+                formatAnsichCount(retryOutcome.unsettled, locale),
+              )}
+            </p>
+            <p className="text-muted-foreground mt-1 text-xs">
+              {t.ansich.failedJobRetryOutcomeHint}
+            </p>
+          </div>
+        ) : null}
         {jobsQuery.isPending ? (
           <Skeleton className="h-32 w-full" />
         ) : jobs.length === 0 ? (

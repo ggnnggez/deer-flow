@@ -409,6 +409,8 @@ export interface Translations {
     failedJobKindLabel: Record<"projection" | "assessor", string>;
     failedJobAttempts: string;
     failedJobRetryTask: string;
+    failedJobRetryOutcome: (reArmed: string, unsettled: string) => string;
+    failedJobRetryOutcomeHint: string;
     queue: string;
     queueHighWatermark: string;
     queueBytes: string;

@@ -485,6 +485,10 @@ export const zhCN: Translations = {
     },
     failedJobAttempts: "尝试次数",
     failedJobRetryTask: "重试该 Task 全部失败 Job",
+    failedJobRetryOutcome: (reArmed, unsettled) =>
+      `已重新入队 ${reArmed}，仍未结算 ${unsettled}`,
+    failedJobRetryOutcomeHint:
+      "重新入队只是把 Job 放回队列，投影发生在之后。「仍未结算」是那一刻整库仍然欠着的 Job 数，包含本次重试没有触及的工作。",
     queue: "队列",
     queueHighWatermark: "队列最高水位",
     queueBytes: "队列字节",

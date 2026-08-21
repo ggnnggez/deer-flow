@@ -80,9 +80,9 @@ Replay 流程：
 
 > **归属：P11-C**，未开工。
 >
-> **前置提醒（2026-08-22 更正，P11-B 终审 F7）：F10-26 已在 P11-B 结清，但结清的方式把这条前置的责任交给了本节的作者，不是解除了它。** 注册表里 F10-26 现在是 ✅，读者不要就此认为「重放两次 digest 相同」这条完成条件已经有保障了：选定的语义是**显式报告、不等待**——`rebuild_projections()` 返回 `RebuildOutcome(replayed, unsettled)`，`unsettled > 0` 表示这一趟返回时仍有作业没结算（依赖延迟的作业在 250ms 退避里，认领也可能被接管）。等待被否决的理由写在 F10-26 条目里（它同时持维护锁与调用方的 `_projection_lock`）。**因此完整性搬到了调用方**：本节要的确定性重放必须自己循环调用直到 `unsettled == 0`，或者先落一个 `rebuild_until_settled` 包装器（见 `task-3-report.md` §6）。
+> **前置提醒（2026-08-22 更正，P11-B 终审 F7）：F10-26 已在 P11-B 结清，但结清的方式把这条前置的责任交给了本节的作者，不是解除了它。** 注册表里 F10-26 现在是 ✅，读者不要就此认为「重放两次 digest 相同」这条完成条件已经有保障了：选定的语义是**显式报告、不等待**——`rebuild_projections()` 返回 `RebuildOutcome(replayed, unsettled)`，`unsettled > 0` 表示这一趟返回时仍有作业没结算（依赖延迟的作业在 250ms 退避里，认领也可能被接管）。等待被否决的理由写在 F10-26 条目里（它同时持维护锁与调用方的 `_projection_lock`）。**因此完整性搬到了调用方**：本节要的确定性重放必须自己循环调用直到 `unsettled == 0`。这个循环已经落地为 `AnsichService.rebuild_until_settled(max_rounds=5)`（P11-C 第一批，`packages/ansich/ansich/service.py`）：它逐轮重新调用 `rebuild_projections()`（两把锁在轮次之间都释放，绝不在一次调用内部等待），退出条件是 `unsettled == 0` 而不是「某一轮没重放任何东西」，返回**最后一轮**的 outcome；预算耗尽是**如实报告、不抛异常**，由调用方自己判断 `.unsettled == 0`。本节的重放命令应当复用它，而不是另写一个循环。
 >
-> **同一条形状在 `retry_failed_projections` 上没有修**：它仍然返回一个裸 `int`、没有 docstring、也没有 `RebuildOutcome` 那一半的"这趟还欠多少"信息（`service.py::retry_failed_projections`）。凡是把 retry 当成"重试完了"的完成条件都有同样的谎报窗口。
+> **同一条形状在 `retry_failed_projections` 上已经补齐**（P11-C 第一批）。此前它返回一个裸 `int`，只有 `re_armed` 的语义而没有 `RebuildOutcome` 那一半的「这趟还欠多少」信息；它的 docstring 是有的，而且明确记着这笔债（说这个形状「仍然欠着」并把它带到 C 批）——现在这笔债由本批结清：它返回 `RetryOutcome(re_armed, unsettled)`，`unsettled` 在重新入队**与**其驱动的重放之后再读一次整库欠账，因此一个刚被重新入队、又立刻走回依赖等待的作业会被算进去，而不是被误读成已修复；`re_armed == 0` 的短路路径同样照读，因为「没重新入队任何行」不等于「没欠任何东西」。lower-bound 的告诫与 `RebuildOutcome` 完全一致（见 `ansich.contracts.RetryOutcome`）。凡是把 retry 当成「重试完了」的完成条件，仍然必须回读失败作业计数，而不是读这两个数里的任何一个。
 
 ## 6. Retention 与删除
 

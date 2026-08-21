@@ -366,7 +366,10 @@ async def test_rebuild_recreates_the_host_scope_from_the_durable_mint(tmp_path) 
             async with session_factory() as session:
                 assert await session.get(AnsichScopeRow, scope_id) is None
 
-            outcome = await service.rebuild_projections()
+            # A bounded completeness loop, not one round: ``rebuild_projections()``
+            # reports rather than waits (F10-26), so under load a single pass can
+            # legitimately return with dependency-deferred jobs still unsettled.
+            outcome = await service.rebuild_until_settled()
 
             assert outcome.unsettled == 0
             async with session_factory() as session:

@@ -19,12 +19,12 @@ from __future__ import annotations
 
 import contextlib
 from collections.abc import AsyncIterator
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
-from ansich import ObservationEnvelope, Producer, new_id
+from ansich import AnsichService, ObservationEnvelope, Producer, RebuildOutcome, RetryOutcome, new_id
 from ansich.assessment.scope_safety import SCOPE_SAFETY_ASSESSOR
 from sqlalchemy import func, select, update
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
@@ -98,6 +98,30 @@ def _task_created(task_id: str, *, source_id: str) -> ObservationEnvelope:
         source_id=source_id,
         occurred_at=_OCCURRED_AT,
         source_event_id=f"run:{source_id}:task:created",
+    )
+
+
+def _orphan_step(task_id: str, *, source_event_id: str) -> ObservationEnvelope:
+    """A Step whose Task was never observed: a replay-safe dependency wait.
+
+    Both of the Step's projectors (``task-step`` and ``task-usage``) wait on the
+    same missing Task, so one of these leaves *two* jobs outstanding -- and no
+    amount of replaying settles them until the Task's own Observation lands.
+    """
+
+    step_id = new_id()
+    return ObservationEnvelope(
+        kind="step.started",
+        occurred_at=_OCCURRED_AT,
+        task_id=task_id,
+        step_id=step_id,
+        subject_type="step",
+        subject_id=step_id,
+        producer=Producer(name="lease-cas-dependency-wait", version="1", instance_id="test"),
+        producer_seq=1,
+        source_event_id=source_event_id,
+        correlation_id=task_id,
+        payload={"step_seq": 1, "actor_kind": "lead_agent"},
     )
 
 
@@ -636,7 +660,10 @@ async def test_retry_reports_the_rows_it_re_armed_and_leaves_an_in_flight_job_al
 
         retried = await workers.a.retry_failed_projections()
 
-        assert retried == 1
+        assert retried == RetryOutcome(re_armed=1, unsettled=1)
+        # ``unsettled`` is the whole job space, not just what this call touched:
+        # B's claim is work still owed when the retry returns, and the caller
+        # asking "are the failures gone" needs to be told that.
         in_flight = await _projection_job(workers.a_sessions, b_claim[0])
         # Only ``failed`` rows are touched: a leased row keeps its owner and
         # its generation, so its worker's completion still wins.
@@ -838,25 +865,10 @@ async def test_rebuild_reports_the_dependency_pending_job_it_could_not_settle(tm
 
     async with _two_workers(tmp_path) as workers:
         task_id = new_id()
-        orphan_task_id, step_id = new_id(), new_id()
         await workers.a.persist_and_project(
             [
                 _task_created(task_id, source_id="run-rebuild-unsettled"),
-                # A Step whose Task was never observed: a replay-safe dependency
-                # wait that no amount of replaying can settle.
-                ObservationEnvelope(
-                    kind="step.started",
-                    occurred_at=_OCCURRED_AT,
-                    task_id=orphan_task_id,
-                    step_id=step_id,
-                    subject_type="step",
-                    subject_id=step_id,
-                    producer=Producer(name="lease-cas-rebuild-unsettled", version="1", instance_id="test"),
-                    producer_seq=1,
-                    source_event_id="lease-cas:rebuild-unsettled:step:started",
-                    correlation_id=orphan_task_id,
-                    payload={"step_seq": 1, "actor_kind": "lead_agent"},
-                ),
+                _orphan_step(new_id(), source_event_id="lease-cas:rebuild-unsettled:step:started"),
             ]
         )
         while await workers.a.project_pending(limit=10):
@@ -961,3 +973,151 @@ async def test_maintenance_lock_rolls_back_before_unlocking():
         pass
 
     assert _statement_index(statements, "ROLLBACK") < _statement_index(statements, "pg_advisory_unlock")
+
+
+@pytest.mark.anyio
+async def test_retry_counts_what_it_re_armed_and_re_reads_what_is_still_owed(tmp_path):
+    """``RetryOutcome.unsettled`` is read *after* the re-arm, not before it.
+
+    The two numbers answer different questions and the ordering is what makes
+    the second one worth anything. Before the retry both of the orphan Step's
+    jobs are ``failed`` -- durably, because the dependency deadline was set to
+    zero for their first wait -- and ``failed`` rows are settled, badly, so the
+    unsettled count is ``0``. The retry re-arms them, the drain hands each one
+    straight back into a dependency wait under a real deadline, and *that* is
+    the state the outcome reports. A count taken before the re-arm would have
+    said ``0`` and read as "the failures are gone".
+    """
+
+    async with _two_workers(tmp_path) as workers:
+        await workers.a.persist_and_project([_orphan_step(new_id(), source_event_id="lease-cas:retry-unsettled:step:started")])
+        # A zero deadline makes the very first dependency wait durable, which
+        # is the only thing this stanza is for; the real deadline is restored
+        # before the retry so the re-armed jobs wait rather than fail again.
+        workers.a._projector_dependency_timeout = timedelta(0)
+        while await workers.a.project_pending(limit=10):
+            pass
+        workers.a._projector_dependency_timeout = timedelta(seconds=300)
+
+        assert await workers.a._unsettled_job_count() == 0
+
+        retried = await workers.a.retry_failed_projections()
+
+        assert retried == RetryOutcome(re_armed=2, unsettled=2)
+        async with workers.a_sessions() as session:
+            statuses = sorted((await session.execute(select(AnsichProjectionJobRow.status))).scalars())
+        assert statuses == ["pending", "pending"]
+
+
+@pytest.mark.anyio
+async def test_retry_with_nothing_failed_still_reports_the_backlog_it_found(tmp_path):
+    """Nothing re-armed is not the same statement as nothing owed.
+
+    The re-arm short-circuits when it changed no rows -- there is no replay to
+    run -- but the caller's question ("are the failures gone?") is still about
+    the store, so the honest answer keeps reading the backlog rather than
+    reporting a zero it never looked for.
+    """
+
+    async with _two_workers(tmp_path) as workers:
+        await workers.a.persist_and_project([_orphan_step(new_id(), source_event_id="lease-cas:retry-empty:step:started")])
+        while await workers.a.project_pending(limit=10):
+            pass
+
+        retried = await workers.a.retry_failed_projections()
+
+        assert retried == RetryOutcome(re_armed=0, unsettled=2)
+
+
+@pytest.mark.anyio
+async def test_rebuild_until_settled_re_runs_the_rebuild_until_nothing_is_owed(tmp_path):
+    """The completeness loop F10-26 moved onto the caller (spec §5).
+
+    ``rebuild_projections()`` reports rather than waits, so a caller that needs
+    "the read model is complete" has to call again. Round one here loses the
+    Task's structural projection to one transient error, and the Step's own two
+    projectors then find no Task to hang off and park themselves inside the
+    250ms dependency backoff, invisible to the drain's exit condition. Round two
+    re-pends every job with ``available_at`` at now, projects the Task first
+    (lower ``ingest_seq``), and the Step's wait resolves.
+
+    The loop's own exit condition is ``unsettled == 0``, deliberately not "a
+    round replayed nothing": every round replays the whole store, so a replay
+    count is never a completion claim.
+    """
+
+    async with _two_workers(tmp_path) as workers:
+        task_id = new_id()
+        await workers.a.persist_and_project(
+            [
+                _task_created(task_id, source_id="run-until-settled"),
+                # This Step's Task *is* observed -- the dependency it waits on
+                # in round one is the projection, not the Observation.
+                _orphan_step(task_id, source_event_id="lease-cas:until-settled:step:started"),
+            ]
+        )
+        while await workers.a.project_pending(limit=10):
+            pass
+        structural = workers.a._project_structural
+        failures: list[int] = []
+
+        async def fail_the_first_structural_projection(*args, **kwargs):
+            if not failures:
+                failures.append(1)
+                raise RuntimeError("structural projector lost one round")
+            return await structural(*args, **kwargs)
+
+        workers.a._project_structural = fail_the_first_structural_projection  # type: ignore[method-assign]
+        service = AnsichService(workers.a)
+        rounds: list[RebuildOutcome] = []
+        original_rebuild = workers.a.rebuild_projections
+
+        async def recording_rebuild() -> RebuildOutcome:
+            outcome = await original_rebuild()
+            rounds.append(outcome)
+            return outcome
+
+        workers.a.rebuild_projections = recording_rebuild  # type: ignore[method-assign]
+
+        settled = await service.rebuild_until_settled()
+
+        assert len(rounds) == 2
+        assert rounds[0].unsettled > 0
+        # The last round's outcome, not a sum: each round replays the whole
+        # store from scratch, so summing would count the same jobs twice.
+        assert settled == rounds[-1]
+        assert settled.unsettled == 0
+        assert settled.replayed == 4
+        assert await service.list_steps(task_id)
+
+
+@pytest.mark.anyio
+async def test_rebuild_until_settled_reports_exhaustion_instead_of_raising(tmp_path):
+    """A budget that runs out is news, not an exception.
+
+    The dependency here never arrives, so no number of rounds converges. The
+    loop spends its budget and hands back the last round it ran with
+    ``unsettled`` still non-zero: the caller decides what an incomplete rebuild
+    means for it, and a maintenance endpoint that raised here would turn an
+    honest report into a 500.
+    """
+
+    async with _two_workers(tmp_path) as workers:
+        await workers.a.persist_and_project([_orphan_step(new_id(), source_event_id="lease-cas:exhausted:step:started")])
+        while await workers.a.project_pending(limit=10):
+            pass
+        service = AnsichService(workers.a)
+        rounds = 0
+        original_rebuild = workers.a.rebuild_projections
+
+        async def counted_rebuild() -> RebuildOutcome:
+            nonlocal rounds
+            rounds += 1
+            return await original_rebuild()
+
+        workers.a.rebuild_projections = counted_rebuild  # type: ignore[method-assign]
+
+        settled = await service.rebuild_until_settled(max_rounds=3)
+
+        assert rounds == 3
+        assert settled.unsettled == 2

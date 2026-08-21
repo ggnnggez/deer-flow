@@ -174,7 +174,15 @@ flight counts every outstanding row including a terminal flush write and is not
 a writer-backlog gauge, isolated drops names dropped rows without diagnosing
 whether the cause was a few unwritable rows or a longer outage, and account
 evictions counts eviction events rather than distinct producers lost. When
-`failed_jobs` is non-zero the metric is clickable and opens `AnsichFailedJobsDialog`, which lists currently-failing projection/assessor jobs (Task-scoped on the Task detail page, global with per-Task retry grouping on the Operations page) and lazily fetches each job's full attempt-error history on expand. Raw ContentBlock bodies are fetched
+`failed_jobs` is non-zero the metric is clickable and opens `AnsichFailedJobsDialog`, which lists currently-failing projection/assessor jobs (Task-scoped on the Task detail page, global with per-Task retry grouping on the Operations page) and lazily fetches each job's full attempt-error history on expand. A completed retry
+renders both halves of the backend's `RetryOutcome` — "re-armed N, still unsettled M" —
+never the re-arm count alone: a re-armed job is projected afterwards by whichever
+worker's loop gets to it, so `retried` has never been a completion claim. The
+accompanying hint says literally what `unsettled` is (every job the store owed at that
+moment, including work the retry did not touch) so the number is not read as "M of my N
+failed". The outcome is reset when the dialog closes, because it describes one moment and
+would otherwise be shown as current on the next open. This is additive: no alert type was
+invented for it and no exhaustive switch changed. Raw ContentBlock bodies are fetched
 lazily after an explicit admin click and must never be placed in the polling
 response or TanStack query cache pre-emptively. Tool raw and model-visible
 payloads use separate `no-store` API calls and separate buttons; never collapse

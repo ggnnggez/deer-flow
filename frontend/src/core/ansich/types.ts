@@ -304,7 +304,15 @@ export interface AnsichFailedJobDetailResponse {
 }
 
 export interface AnsichFailedJobsRetryResponse {
+  /** Rows the re-arm changed. A re-arm count, never a completion claim. */
   retried: number;
+  /**
+   * Jobs the store still owed when the retry returned — every projection or
+   * assessor job left pending/retry/processing, including work this retry did
+   * not touch. Read beside `retried`: a re-armed job is projected afterwards,
+   * so `retried` alone cannot say the failures are gone.
+   */
+  unsettled: number;
   projection_status: AnsichHealth;
 }
 

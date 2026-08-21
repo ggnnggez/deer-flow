@@ -1398,6 +1398,39 @@ that would have settled in 250ms destroys work. A rebuild is idempotent, so a
 caller that wants completeness calls again. `AnsichService.rebuild_projections`
 normalizes a backend that still answers with a bare int to `unsettled=0`.
 
+**P11-C writes that "calls again" down once.**
+`AnsichService.rebuild_until_settled(max_rounds=5)` is the bounded completeness
+loop every §5 replay caller shares instead of open-coding its own. Each round is
+a *separate* `rebuild_projections()` call — both locks are released between
+rounds, which is exactly what lets a dependency-deferred job become claimable
+and another worker's in-flight claim finish; a loop that waited *inside* one call
+would have neither, which is why the spec's completeness burden moved to the
+caller in the first place. Its exit condition is `unsettled == 0`, deliberately
+not "a round replayed nothing" (every round replays the whole store, so a replay
+count is never a completion claim — that is the F10-26 mistake in a new costume).
+It returns **the last round's outcome**, not a sum: rounds replay the same jobs,
+and it is the final round that describes the store as it now stands. Exhausting
+`max_rounds` is **reported, not raised** — the outcome comes back with
+`unsettled` still non-zero and the caller decides what an incomplete rebuild
+means for it; an operator endpoint that raised there would turn an honest report
+into a 500.
+
+`retry_failed_projections` owes and now pays the same shape: it answers with a
+`RetryOutcome(re_armed, unsettled)` instead of the bare `int` its own docstring
+recorded as a debt. `re_armed` is a re-arm count and never a completion claim (a
+re-armed job is projected *afterwards*, by whichever worker's loop gets to it);
+`unsettled` is read **after** the re-arm and after the replay it drives, so a job
+that was re-armed and walked straight back into a dependency wait is counted
+rather than mistaken for a repair, and the `re_armed == 0` short-circuit reads
+the backlog too, because "nothing re-armed" is not "nothing owed". Same
+lower-bound caveat as `RebuildOutcome`, and the same conclusion: a caller that
+needs "the failures are gone" re-reads the failed-job count rather than reading
+completion off either number. `_as_retry_outcome` extends bare-int backends the
+same courtesy `_as_rebuild_outcome` does. `POST /operations/failed-jobs/retry`
+carries both halves (`retried`, `unsettled`), and the frontend's failed-jobs
+dialog renders them together as "re-armed N, still unsettled M" with a literal
+note that the second number is the whole store's backlog, not this retry's.
+
 `tests/ansich/test_lease_cas.py` proves these as explicit interleaving scripts
 (two engines and two backends over one SQLite file, lease expiry injected as a
 past-dated timestamp rather than by moving a clock). What that substrate cannot

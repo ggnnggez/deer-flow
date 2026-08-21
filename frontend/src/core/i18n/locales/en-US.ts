@@ -501,6 +501,10 @@ export const enUS: Translations = {
     },
     failedJobAttempts: "Attempts",
     failedJobRetryTask: "Retry all failed jobs for this Task",
+    failedJobRetryOutcome: (reArmed, unsettled) =>
+      `Re-armed ${reArmed}, still unsettled ${unsettled}`,
+    failedJobRetryOutcomeHint:
+      'Re-arming puts a job back in the queue; it is projected afterwards. "Still unsettled" is every job the store owed at that moment, including work this retry did not touch.',
     queue: "Queue",
     queueHighWatermark: "Queue high-watermark",
     queueBytes: "Queue bytes",

@@ -544,7 +544,10 @@ async def test_ansich_service_records_and_projects_on_postgres() -> None:
             assert len(stats) == 1
             assert (stats[0].assessed_count, stats[0].pass_count) == (1, 1)
 
-            rebuild = await service.rebuild_projections()
+            # A bounded completeness loop, not one round: ``rebuild_projections()``
+            # reports rather than waits (F10-26), so under load a single pass can
+            # legitimately return with dependency-deferred jobs still unsettled.
+            rebuild = await service.rebuild_until_settled()
 
             assert rebuild.replayed > 0
             assert rebuild.unsettled == 0

@@ -1928,8 +1928,15 @@ async def retry_failed_jobs(
                 "projection_status": _projection_status(service),
             },
         ) from exc
+    # Both halves, because ``retried`` alone has always been a re-arm count and
+    # never a completion claim: a re-armed job is projected afterwards by
+    # whichever worker's loop gets to it. ``unsettled`` is what an operator has
+    # to read beside it before concluding the failures are gone -- see
+    # ``ansich.contracts.RetryOutcome`` for the lower-bound caveat that applies
+    # to it.
     return {
-        "retried": retried,
+        "retried": retried.re_armed,
+        "unsettled": retried.unsettled,
         "projection_status": _projection_status(service),
     }
 

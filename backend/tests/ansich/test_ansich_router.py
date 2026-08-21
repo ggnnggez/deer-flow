@@ -5,7 +5,7 @@ from uuid import uuid4
 
 import pytest
 from _router_auth_helpers import make_authed_test_app
-from ansich import AnsichService, ObservationEnvelope, Producer, new_id
+from ansich import AnsichService, ObservationEnvelope, Producer, RetryOutcome, new_id
 from ansich.release import AgentRuntimeDescriptor, build_agent_release
 from httpx import ASGITransport, AsyncClient
 from langchain.agents import create_agent
@@ -1036,6 +1036,43 @@ async def test_failed_jobs_endpoints_require_admin():
 
 
 @pytest.mark.anyio
+async def test_failed_jobs_retry_response_carries_both_halves_of_the_outcome():
+    """The route shape, pinned against a known ``RetryOutcome``.
+
+    ``retried`` was always a re-arm count and nothing more; ``unsettled`` is
+    what a caller has to read beside it before concluding the failures are
+    gone. Both are surfaced, and neither is derived from the other -- a retry
+    that re-armed three jobs and left two owed is a legal, honest answer.
+    """
+
+    service = AnsichService.in_memory()
+    await service.start()
+    calls: list[str | None] = []
+
+    async def retry(*, task_id: str | None = None) -> RetryOutcome:
+        calls.append(task_id)
+        return RetryOutcome(re_armed=3, unsettled=2)
+
+    service.retry_failed_projections = retry  # type: ignore[method-assign]
+    app = make_authed_test_app(user_factory=admin_user)
+    app.state.ansich_service = service
+    app.include_router(ansich_router.router)
+
+    try:
+        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+            response = await client.post("/api/ansich/operations/failed-jobs/retry?task=task-42")
+    finally:
+        await service.stop()
+
+    assert response.status_code == 200
+    body = response.json()
+    assert calls == ["task-42"]
+    assert body["retried"] == 3
+    assert body["unsettled"] == 2
+    assert set(body) == {"retried", "unsettled", "projection_status"}
+
+
+@pytest.mark.anyio
 async def test_failed_job_detail_404_for_unknown_job():
     service = AnsichService.in_memory()
     await service.start()
@@ -1132,6 +1169,10 @@ async def test_failed_jobs_list_detail_and_retry_over_http(tmp_path):
             retry_response = await client.post(f"/api/ansich/operations/failed-jobs/retry?task={task_id}")
             assert retry_response.status_code == 200
             assert retry_response.json()["retried"] == 2
+            # ``unsettled`` rides beside the re-arm count on every retry
+            # response; its value here is whatever the store owed at that
+            # moment, which a live projector loop is free to change.
+            assert isinstance(retry_response.json()["unsettled"], int)
 
             after_response = await client.get(f"/api/ansich/operations/failed-jobs?task={task_id}")
             assert after_response.json()["items"] == []

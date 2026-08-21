@@ -1224,7 +1224,7 @@ async def test_dependency_pending_job_eventually_fails_health_and_can_be_retried
     assert error_count == 1
     assert health_after_timeout.status == "degraded"
     assert health_after_timeout.failed_jobs == 2
-    assert retried == 2
+    assert retried.re_armed == 2
     assert [step.step_id for step in steps] == [step_id]
     assert health_after_retry.failed_jobs == 0
 
@@ -1290,7 +1290,7 @@ async def test_retry_failed_projection_restores_effective_step_context(tmp_path,
         await engine.dispose()
 
     assert context_before_retry is None
-    assert retried == 1
+    assert retried.re_armed == 1
     assert step_after_retry.effective_context_snapshot_id is not None
     assert context_after_retry is not None
     assert health.failed_jobs == 0

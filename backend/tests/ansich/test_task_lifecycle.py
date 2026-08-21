@@ -4,7 +4,7 @@ from datetime import UTC, datetime, timedelta
 
 import anyio
 import pytest
-from ansich import AnsichService, ObservationEnvelope, TaskView, new_id
+from ansich import AnsichService, ObservationEnvelope, RebuildOutcome, RetryOutcome, TaskView, new_id
 from ansich.memory import InMemoryAnsichBackend
 
 
@@ -724,6 +724,83 @@ async def test_rebuild_is_mutually_exclusive_with_background_projection():
         await service.stop()
 
     assert backend.project_pending_during_rebuild == 0
+
+
+class _BareCountBackend:
+    """A backend from before the outcome contracts: two bare ints and nothing else.
+
+    It really is "nothing else" on purpose -- no job table, no assessor jobs --
+    which is what makes ``unsettled=0`` its *true* answer rather than an
+    assumption the normalizers make on its behalf.
+    """
+
+    async def persist_and_project(self, observations: list[ObservationEnvelope]) -> int:
+        return len(observations)
+
+    async def project_pending(self, *, limit: int = 200) -> int:
+        return 0
+
+    async def rebuild_projections(self) -> int:
+        return 3
+
+    async def retry_failed_projections(self, *, task_id: str | None = None) -> int:
+        return 2
+
+    async def get_task(self, task_id: str) -> TaskView | None:
+        return None
+
+    async def get_task_by_source(self, source_kind: str, source_id: str) -> TaskView | None:
+        return None
+
+    async def list_tasks(self, **kwargs) -> list[TaskView]:
+        return []
+
+    async def list_observations(self, task_id: str) -> list[ObservationEnvelope]:
+        return []
+
+
+class _NoMaintenanceBackend:
+    """A backend with no maintenance surface at all: neither method exists."""
+
+    async def persist_and_project(self, observations: list[ObservationEnvelope]) -> int:
+        return len(observations)
+
+    async def project_pending(self, *, limit: int = 200) -> int:
+        return 0
+
+    async def get_task(self, task_id: str) -> TaskView | None:
+        return None
+
+    async def get_task_by_source(self, source_kind: str, source_id: str) -> TaskView | None:
+        return None
+
+    async def list_tasks(self, **kwargs) -> list[TaskView]:
+        return []
+
+    async def list_observations(self, task_id: str) -> list[ObservationEnvelope]:
+        return []
+
+
+@pytest.mark.anyio
+async def test_bare_int_backends_are_normalized_onto_both_outcome_contracts():
+    """A backend that predates the contracts is taken at its word, not guessed at."""
+
+    service = AnsichService(_BareCountBackend())
+
+    assert await service.rebuild_projections() == RebuildOutcome(replayed=3, unsettled=0)
+    assert await service.retry_failed_projections() == RetryOutcome(re_armed=2, unsettled=0)
+    # The loop reads the same ``unsettled == 0`` and stops after one round.
+    assert await service.rebuild_until_settled() == RebuildOutcome(replayed=3, unsettled=0)
+
+
+@pytest.mark.anyio
+async def test_a_backend_without_maintenance_methods_reports_zeroes_rather_than_raising():
+    """Fail-open, and honest: nothing to rebuild is nothing owed."""
+
+    service = AnsichService(_NoMaintenanceBackend())
+
+    assert await service.rebuild_projections() == RebuildOutcome(replayed=0, unsettled=0)
+    assert await service.retry_failed_projections() == RetryOutcome(re_armed=0, unsettled=0)
 
 
 @pytest.mark.anyio

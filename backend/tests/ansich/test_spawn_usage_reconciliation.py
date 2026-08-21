@@ -622,7 +622,10 @@ async def test_rebuild_re_derives_the_same_read_model_the_reconciliation_repaire
         repaired = await fixture.service.get_task_usage(fixture.root_id)
         repaired_contributions = await fixture.contribution_rows()
 
-        outcome = await fixture.service.rebuild_projections()
+        # A bounded completeness loop, not one round: ``rebuild_projections()``
+        # reports rather than waits (F10-26), so under load a single pass can
+        # legitimately return with dependency-deferred jobs still unsettled.
+        outcome = await fixture.service.rebuild_until_settled()
         rebuilt = await fixture.service.get_task_usage(fixture.root_id)
         rebuilt_contributions = await fixture.contribution_rows()
         async with fixture.session_factory() as session:
@@ -676,7 +679,7 @@ async def test_rebuild_mints_a_reconciliation_for_an_edge_that_has_none(tmp_path
             # The precondition, read as state rather than asserted about code.
             spawn_rows_before_rebuild = await session.scalar(select(func.count()).select_from(AnsichTaskSpawnRow))
 
-        outcome = await fixture.service.rebuild_projections()
+        outcome = await fixture.service.rebuild_until_settled()
 
         async with fixture.session_factory() as session:
             after = list((await session.execute(select(AnsichProjectionJobRow.obs_id, AnsichProjectionJobRow.status).where(AnsichProjectionJobRow.projector_name == _RECONCILE_PROJECTOR))).scalars())
