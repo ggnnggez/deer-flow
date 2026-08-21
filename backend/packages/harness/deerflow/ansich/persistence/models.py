@@ -114,11 +114,16 @@ class AnsichProjectionJobRow(Base):
     __table_args__ = (
         UniqueConstraint("obs_id", "projector_name", "projector_version", name="uq_ansich_projection_job_version"),
         Index("ix_ansich_projection_jobs_claim", "status", "available_at", "lease_expires_at"),
-        # Serves the reads that filter on a *named* projector plus a status:
-        # the projection-failure Alert producer's per-group evidence query
-        # (``sql.py::_assess_projection_failures``, ``status='failed' AND
-        # projector_name=? AND projector_version=?``), measured as an Index Scan
-        # on this index.
+        # Serves the reads that filter on a *named* projector plus a status.
+        # It has exactly two consumers, and dropping it would put both back on
+        # a scan:
+        #   * the projection-failure Alert producer's per-group evidence query
+        #     (``sql.py::_assess_projection_failures``, ``status='failed' AND
+        #     projector_name=? AND projector_version=?``), measured as an Index
+        #     Scan on this index;
+        #   * the spawn-usage reconciliation's in-flight gate
+        #     (``sql.py::_reconcile_spawn_usage``, ``projector_name='task-usage'
+        #     AND status='processing'``).
         #
         # It is deliberately **not** what bounds the health merge, despite the
         # name it was given in 0027: those statements filter on ``status`` alone

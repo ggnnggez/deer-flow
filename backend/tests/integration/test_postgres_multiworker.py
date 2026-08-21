@@ -767,6 +767,18 @@ async def test_the_maintenance_lock_is_released_after_a_mid_operation_dbapi_fail
         pinned: list[object] = []
         original_connect = AsyncEngine.connect
 
+        # NOT PARALLEL-SAFE WITHIN ONE PROCESS. The patch below replaces
+        # ``connect`` on the *class*, so it is process-global for as long as it
+        # is installed: every ``AsyncEngine`` in this interpreter — including
+        # any other test's, and the projector loops of both workers here — goes
+        # through it. It is filtered by identity (`self is worker_a.engine`) so
+        # it only *records* for this engine, and it is undone in a ``finally``,
+        # but a second test running concurrently in the same process would
+        # still execute this wrapper on its own connects. This tier must
+        # therefore not be run with an in-process parallel runner
+        # (``pytest-xdist``'s process workers are fine — each has its own
+        # interpreter); the class attribute is the only handle available,
+        # because ``AsyncEngine.connect`` is read-only per instance.
         def recording_connect(self, *args, **kwargs):  # type: ignore[no-untyped-def]
             connection = original_connect(self, *args, **kwargs)
             if self is worker_a.engine:

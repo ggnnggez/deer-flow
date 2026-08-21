@@ -1983,7 +1983,7 @@ test("operations observability lens reports the store's own projection ledger", 
   await page.goto("/workspace/ansich/operations");
   await page.getByRole("tab", { name: "Observability" }).click();
   const panel = page.getByRole("region", { name: "Observability health" });
-  // The store answered, but three jobs have durably failed — the exact
+  // The store answered, but 1,234 jobs have durably failed — the exact
   // condition projection_failure opens an Alert for. A green "reachable"
   // headline there would tell an operator scanning the badge that all is well.
   await expect(panel.getByText("Jobs failing")).toBeVisible();

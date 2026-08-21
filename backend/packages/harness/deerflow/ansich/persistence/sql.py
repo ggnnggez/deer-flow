@@ -1299,6 +1299,17 @@ class SqlAnsichBackend:
         if dialect_name != "postgresql":
             yield
             return
+        # Reachable, and by one specific binding shape rather than by paranoia:
+        # an ``AsyncSession`` bound to an ``AsyncConnection`` (rather than to an
+        # ``AsyncEngine``) answers ``bind.dialect.name`` perfectly well and has
+        # no ``connect`` at all, because a connection cannot hand out another
+        # one. Such a session factory would leave this lock with nothing it
+        # could pin the advisory lock to, so it fails closed for the same reason
+        # the unresolvable dialect above does -- a maintenance lock that
+        # degraded to a no-op would let two operators replay the same
+        # Observations with nothing in the logs to say so. Pinned by
+        # ``tests/ansich/test_lease_cas.py::
+        # test_maintenance_lock_refuses_a_bind_it_cannot_pin_a_connection_on``.
         connect = getattr(bind, "connect", None)
         if connect is None:
             raise RuntimeError("Ansich maintenance lock cannot pin a connection on this bind; refusing to run an unguarded rebuild/retry")

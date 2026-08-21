@@ -618,15 +618,19 @@ class _RecordingSession:
     mirrors both halves.
     """
 
-    def __init__(self, dialect_name: str | None, statements: list[tuple[str, object]], *, raise_on: str | None = None) -> None:
-        self.bind = (
-            None
-            if dialect_name is None
-            else SimpleNamespace(
+    def __init__(self, dialect_name: str | None, statements: list[tuple[str, object]], *, raise_on: str | None = None, connectable: bool = True) -> None:
+        if dialect_name is None:
+            self.bind = None
+        elif connectable:
+            self.bind = SimpleNamespace(
                 dialect=SimpleNamespace(name=dialect_name),
                 connect=lambda: _RecordingConnection(statements, raise_on=raise_on),
             )
-        )
+        else:
+            # The shape of an ``AsyncSession`` bound to an ``AsyncConnection``:
+            # the dialect resolves, but a connection cannot hand out another
+            # connection, so there is no ``connect`` to pin the lock to.
+            self.bind = SimpleNamespace(dialect=SimpleNamespace(name=dialect_name))
         self._statements = statements
 
     async def __aenter__(self) -> _RecordingSession:
@@ -694,6 +698,29 @@ async def test_maintenance_lock_refuses_to_run_when_the_dialect_is_unresolvable(
     backend = SqlAnsichBackend(lambda: _RecordingSession(None, statements))  # type: ignore[arg-type]
 
     with pytest.raises(RuntimeError, match="dialect"):
+        async with backend._maintenance_lock():
+            pass
+
+    assert statements == []
+
+
+@pytest.mark.anyio
+async def test_maintenance_lock_refuses_a_bind_it_cannot_pin_a_connection_on():
+    """The other fail-closed half: a resolvable dialect with no ``connect``.
+
+    Not a hypothetical shape — an ``AsyncSession`` bound to an
+    ``AsyncConnection`` answers ``bind.dialect.name`` and has no ``connect``
+    (a connection cannot hand out another connection). The advisory lock lives
+    on a pinned connection, so a bind that cannot produce one leaves nothing to
+    hold the lock; refusing is the same trade as the unresolvable dialect
+    above, and for the same reason: a maintenance lock that quietly degraded to
+    a no-op would let two operators replay the same Observations.
+    """
+
+    statements: list[tuple[str, object]] = []
+    backend = SqlAnsichBackend(lambda: _RecordingSession("postgresql", statements, connectable=False))  # type: ignore[arg-type]
+
+    with pytest.raises(RuntimeError, match="pin a connection"):
         async with backend._maintenance_lock():
             pass
 
