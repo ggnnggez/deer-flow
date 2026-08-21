@@ -76,6 +76,25 @@ def scope_entity_id(scope_kind: ScopeKind, external_ref_hash: str) -> str:
     return str(UUID(bytes=digest[:16], version=4))
 
 
+def host_scope_id(hostname: str) -> str:
+    """Return the ``host`` Scope entity id for one hostname.
+
+    RB1③. This is the whole convergence rule, written once: the id is a pure
+    function of the hostname, so the collector's bootstrap mint and the
+    environment probe's `host` declaration name the *same* Scope entity without
+    coordinating — `_project_scope_snapshot` sees the second one as a
+    same-identity redelivery rather than a conflict.
+
+    It is a pure computation on purpose. A caller that only needs to *address*
+    the host Scope (an Alert producer deciding whether the entity exists, the
+    collector deciding what to subject a process-wide loss to) needs no read and
+    no injected state; whether the entity is actually there stays a separate
+    question, and one that must be asked rather than assumed.
+    """
+
+    return scope_entity_id("host", scope_reference_hash("host", hostname))
+
+
 class _FrozenModel(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True, strict=True)
 

@@ -1351,6 +1351,47 @@ past-dated timestamp rather than by moving a clock). What that substrate cannot
 prove stays unproven: SQLite renders `skip_locked` empty, so claim-side
 exclusion and READ COMMITTED lost updates still need the opt-in Postgres tier.
 
+**P11-B host `Scope` bootstrap and `observability.lost`** (spec §3; the subject
+P11-A's process-wide loss was waiting for). A SQL-backed `AnsichService.start()`
+records one `scope.snapshotted` for the host it runs on — `scope_kind="host"`,
+`external_ref` the hostname, **no** `relation_role`, so the projector creates the
+Scope entity and returns before it would look for a Task to relate it to. Its
+`source_event_id` (`ansich:host-scope:{hostname}`, hostname bounded at 200 chars
+for the 256-char column) and its producer identity are both fixed, so the
+backend's producer dedupe absorbs every restart and every additional worker;
+`ansich.safety.host_scope_id()` makes the entity id a pure function of the
+hostname, so the environment probe's own `host` declaration converges on the
+same entity instead of minting a second one. The mint is written straight to the
+backend rather than through the queue (it is not the Agent's evidence and must
+not appear in the collector's own accounting), it is fail-open (a failure logs
+and leaves `AnsichService.host_scope_id` `None`), and it is replay-safe (the
+Observation is the record; `rebuild_projections()` re-creates the Scope).
+
+Bootstrap rows carry `ANSICH_BOOTSTRAP_TASK_ID` (`contracts.py`), a fixed
+documented UUID4 sentinel meaning **this Observation has no Task entity** —
+legal only because `ansich_observations.task_id` has no foreign key. Every
+Task-scoped machine that *does* have one must stay away from these rows:
+`sql.py::_assessors_for_observation` refuses the whole assessor family for the
+sentinel, because `ansich_assessor_jobs.subject_id` is FK-bound to `ansich_tasks`
+and the failed insert would take down the projection it rode in on.
+
+`observability.lost` v1 is the second kind of collection-loss report and does not
+touch `observability.degraded` (frozen, Task-subjected). It is subjected to the
+host Scope under the sentinel and carries the same payload shape (first/last
+sequence plus the losing producer's identity, `"unknown"` when the charged item
+never was an envelope). `_report_degradation_if_storage_recovered` writes it
+after the Task-scoped ranges: a bucket entry leaves
+`unreported_global_lost_range_count` only once its own row is durable, only the
+host Scope this process actually minted is used as the subject (an addressable id
+is not an existing entity), and only ranges the report cursor has already frozen
+are written — the newest range can still be extended in place, and reporting it
+early would count the same loss twice. Reporting is not un-charging:
+`dropped_count` and `lost_ranges` are unchanged by it. Like `observability.degraded`,
+the kind is registered in **no** projector: the evidence a process-wide Alert
+needs is that the row exists. That is a one-way door — `rebuild_projections()`
+re-pends the jobs that exist, so a projector added later would silently skip
+every row written before it was registered.
+
 **Workspace change review**: `packages/harness/deerflow/workspace_changes/`
 captures a pre-run and post-run snapshot of the thread-owned `workspace` and
 `outputs` directories. `runtime/runs/worker.py` performs the filesystem scan via

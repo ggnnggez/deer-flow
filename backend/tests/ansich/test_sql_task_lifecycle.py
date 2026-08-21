@@ -646,12 +646,19 @@ async def test_writer_deduplicates_observation_and_projects_owner_and_thread_sco
         service.record(observation)
         service.record(observation)
         await service.flush_task(task_id)
+        # Every count here is scoped to this Task's own Observation, because a
+        # SQL-backed collector also writes one bootstrap row at `start()` (the
+        # host `Scope` mint, RB1) with its own Scope and projection job. Counting
+        # whole tables would not only fold that row in, it would make these
+        # numbers depend on whether the projector had reached the mint's job
+        # yet — `flush_task` settles this Task's jobs and nothing else.
+        task_observations = select(AnsichObservationRow.obs_id).where(AnsichObservationRow.task_id == task_id)
         async with session_factory() as session:
-            observation_count = await session.scalar(select(func.count()).select_from(AnsichObservationRow))
-            job_count = await session.scalar(select(func.count()).select_from(AnsichProjectionJobRow))
-            scope_count = await session.scalar(select(func.count()).select_from(AnsichScopeRow))
-            relation_count = await session.scalar(select(func.count()).select_from(AnsichRelationRow))
-            stored = await session.scalar(select(AnsichObservationRow))
+            observation_count = await session.scalar(select(func.count()).select_from(AnsichObservationRow).where(AnsichObservationRow.task_id == task_id))
+            job_count = await session.scalar(select(func.count()).select_from(AnsichProjectionJobRow).where(AnsichProjectionJobRow.obs_id.in_(task_observations)))
+            scope_count = await session.scalar(select(func.count()).select_from(AnsichScopeRow).where(AnsichScopeRow.created_obs_id.in_(task_observations)))
+            relation_count = await session.scalar(select(func.count()).select_from(AnsichRelationRow).where(AnsichRelationRow.subject_id == task_id))
+            stored = await session.scalar(select(AnsichObservationRow).where(AnsichObservationRow.task_id == task_id))
     finally:
         await service.stop()
         await engine.dispose()
@@ -694,10 +701,15 @@ async def test_projection_failure_keeps_raw_observation_and_records_retry_eviden
         flush = await service.flush_task(task_id)
         task = await service.get_task(task_id)
         health = service.get_health()
+        # Task-scoped for the same reason as the dedupe test above: the
+        # bootstrap host-Scope mint is a second Observation with a job of its
+        # own, and its job's status at read time is a race this test is not
+        # about.
+        task_observations = select(AnsichObservationRow.obs_id).where(AnsichObservationRow.task_id == task_id)
         async with session_factory() as session:
-            observation_count = await session.scalar(select(func.count()).select_from(AnsichObservationRow))
+            observation_count = await session.scalar(select(func.count()).select_from(AnsichObservationRow).where(AnsichObservationRow.task_id == task_id))
             error_count = await session.scalar(select(func.count()).select_from(AnsichProjectionErrorRow))
-            statuses = list((await session.execute(select(AnsichProjectionJobRow.status))).scalars())
+            statuses = list((await session.execute(select(AnsichProjectionJobRow.status).where(AnsichProjectionJobRow.obs_id.in_(task_observations)))).scalars())
     finally:
         await service.stop()
         await engine.dispose()

@@ -84,8 +84,43 @@ ObservationKind = (
         "agent_release.resolved",
         "task.heartbeat",
         "observability.degraded",
+        # RB2. Process-wide collection loss: a range charged for something that
+        # never was an Observation, so it has no Task to be subjected to and
+        # `observability.degraded` (Task-subjected, frozen) cannot carry it. It
+        # is subjected to the host Scope instead, under
+        # `ANSICH_BOOTSTRAP_TASK_ID`.
+        #
+        # **Deliberately unprojected.** This kind is registered in no projector
+        # (`sql.py::_PROJECTOR_KINDS`): the evidence chain a process-wide Alert
+        # needs is that the row exists, which the Observation stream already
+        # provides, so a read model would only duplicate it. The consequence is
+        # a one-way door and is written here rather than discovered later —
+        # `rebuild_projections()` re-pends the jobs that *exist*, so a projector
+        # added for this kind tomorrow would silently start at the rows written
+        # after it was registered and skip every one before. Adding one means
+        # backfilling those rows deliberately, not just registering a name.
+        "observability.lost",
     ]
 )
+
+#: The ``task_id`` every **bootstrap** Observation carries.
+#:
+#: RB1②. ``ObservationEnvelope.task_id`` is required and UUID4-validated, but a
+#: process-level fact — the host ``Scope`` this process runs in, and the loss it
+#: charged for something that never was an Observation — belongs to no Task.
+#: This fixed UUID4 states that explicitly instead of minting a per-process id
+#: that would read like a real Task: an Observation under this id is a bootstrap
+#: record and **has no corresponding Task entity**. Storing it is legal because
+#: ``ansich_observations.task_id`` carries no foreign key.
+#:
+#: What must never happen under it: Task-scoped machinery. The assessor job and
+#: watermark tables are FK-bound to ``ansich_tasks`` (RB3①), so a Task-scoped
+#: job minted for this id would not even insert — see the guard at the assessor
+#: enqueue in ``sql.py``.
+#:
+#: The value is part of the contract, not an implementation detail: rows already
+#: written under it are found by it, so changing it orphans them.
+ANSICH_BOOTSTRAP_TASK_ID = "00000000-0000-4000-8000-000000000001"
 ControlValue = Literal["unknown", "created", "running", "completed", "failed", "interrupted"]
 TaskLifecycleScope = Literal["all", "active", "terminal"]
 
@@ -219,6 +254,35 @@ class ObservationEnvelope(BaseModel):
         if self.kind.startswith("task.") or self.kind == "observability.degraded":
             if self.subject_type != "task" or self.subject_id != self.task_id:
                 raise ValueError("task observation subject must identify task_id")
+        elif self.kind == "observability.lost":
+            # RB2②. The subject is the host Scope and the Task field is the
+            # bootstrap sentinel — both required, because this kind exists to
+            # carry loss that has no Task. A real `task_id` here would mean the
+            # loss did have one, and that loss is `observability.degraded`.
+            if self.subject_type != "scope":
+                raise ValueError("observability.lost subject_type must be scope")
+            if self.task_id != ANSICH_BOOTSTRAP_TASK_ID:
+                raise ValueError("observability.lost must carry the bootstrap Task sentinel")
+            # Guarded on `payload is not None`, and that guard is the point
+            # (F10-29). A payload over `inline_payload_max_bytes` is stored in
+            # `ansich_payloads` and reads back as `payload_json IS NULL` plus a
+            # `payload_ref_id`; `_observation_from_row` hands exactly that to
+            # this model. `environment.sampled` raises on it and is the open
+            # instance of the class — this branch must not join it.
+            if self.payload is not None:
+                first_sequence = self.payload.get("first_sequence")
+                last_sequence = self.payload.get("last_sequence")
+                for field_name, value in (
+                    ("first_sequence", first_sequence),
+                    ("last_sequence", last_sequence),
+                ):
+                    if not isinstance(value, int) or isinstance(value, bool) or value < 1:
+                        raise ValueError(f"observability.lost {field_name} must be a positive integer")
+                if last_sequence < first_sequence:  # type: ignore[operator]
+                    raise ValueError("observability.lost last_sequence must not precede first_sequence")
+                for field_name in ("producer_name", "producer_instance_id"):
+                    if not isinstance(self.payload.get(field_name), str) or not self.payload[field_name]:
+                        raise ValueError(f"observability.lost {field_name} must be non-empty")
         elif self.kind.startswith("step."):
             if self.step_id is None or self.subject_type != "step" or self.subject_id != self.step_id:
                 raise ValueError("step observation subject must identify step_id")
@@ -500,6 +564,58 @@ class ObservationEnvelope(BaseModel):
             source_event_id=source_event_id,
             correlation_id=run_id,
             payload=payload,
+        )
+
+    @classmethod
+    def observability_lost(
+        cls,
+        *,
+        host_scope_id: str,
+        occurred_at: datetime,
+        first_sequence: int,
+        last_sequence: int,
+        lost_producer_name: str,
+        lost_producer_instance_id: str,
+        source_event_id: str,
+        producer_seq: int = 1,
+        producer_name: str = "ansich-collector",
+        producer_version: str = "1",
+        producer_instance_id: str = "local",
+    ) -> Self:
+        """One process-wide lost range, reported against the host ``Scope``.
+
+        Two producer identities meet here and they are not the same thing. The
+        **envelope's** producer is the collector reporting the loss; the
+        ``lost_producer_*`` arguments are whoever's rows were charged, and they
+        live in the payload beside the range — the same shape
+        ``observability.degraded`` uses, so a reader of either kind reads one
+        payload.
+
+        ``correlation_id`` is the host Scope id: every bootstrap-subjected row
+        this process writes correlates on the Scope it is about, which is the
+        only durable identity available (there is no run and no Task).
+        """
+
+        return cls(
+            kind="observability.lost",
+            occurred_at=occurred_at,
+            task_id=ANSICH_BOOTSTRAP_TASK_ID,
+            subject_type="scope",
+            subject_id=host_scope_id,
+            producer=Producer(
+                name=producer_name,
+                version=producer_version,
+                instance_id=producer_instance_id,
+            ),
+            producer_seq=producer_seq,
+            source_event_id=source_event_id,
+            correlation_id=host_scope_id,
+            payload={
+                "first_sequence": first_sequence,
+                "last_sequence": last_sequence,
+                "producer_name": lost_producer_name,
+                "producer_instance_id": lost_producer_instance_id,
+            },
         )
 
     @classmethod

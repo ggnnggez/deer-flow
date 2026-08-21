@@ -107,6 +107,11 @@ def create_sql_ansich_service(
     tool_frequency_threshold: int = 30,
     environment_sample_interval_seconds: int = 10,
     environment_thresholds: EnvironmentThresholds | None = None,
+    # The host this collector files its process-wide facts under (RB1). Left
+    # unset in production, where `socket.gethostname()` is the answer; injected
+    # by tests that need the host-Scope identity to be a property of the test
+    # rather than of the machine running it.
+    hostname: str | None = None,
 ) -> AnsichService:
     return AnsichService(
         SqlAnsichBackend(
@@ -135,6 +140,7 @@ def create_sql_ansich_service(
         writer_backoff_max_ms=writer_backoff_max_ms,
         writer_item_max_attempts=writer_item_max_attempts,
         stop_drain_timeout_ms=stop_drain_timeout_ms,
+        hostname=hostname,
     )
 
 

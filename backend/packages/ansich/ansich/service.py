@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import socket
 import time
 from collections import OrderedDict, deque
 from collections.abc import Callable, Iterable
@@ -15,7 +16,7 @@ from ansich.backend import AnsichBackend
 from ansich.budget import BudgetHealthBelief, TaskBudgetsView
 from ansich.compression import ContextCompressionSummaryView, ContextCompressionView
 from ansich.context_state import ContextStateView
-from ansich.contracts import AnsichHealth, ControlValue, FlushResult, LostRange, ObservationEnvelope, Producer, ProducerHealth, RebuildOutcome, RecordReceipt, TaskLifecycleScope, TaskView, WriterHealth
+from ansich.contracts import ANSICH_BOOTSTRAP_TASK_ID, AnsichHealth, ControlValue, FlushResult, LostRange, ObservationEnvelope, Producer, ProducerHealth, RebuildOutcome, RecordReceipt, TaskLifecycleScope, TaskView, WriterHealth
 from ansich.environment import (
     EnvironmentHistoryView,
     TaskEnvironmentView,
@@ -33,6 +34,7 @@ from ansich.evaluation import (
     unassessed_quality_belief,
 )
 from ansich.heartbeat import TaskHeartbeatView
+from ansich.ids import new_id
 from ansich.jobs import FailedJobDetailView, FailedJobKind, FailedJobSummaryView
 from ansich.lifecycle import LifecycleInputs, derive_status
 from ansich.lineage import ContentLineageView, LineageDirection, PossibleExposureView, find_possible_exposures, traverse_content_lineage
@@ -41,7 +43,7 @@ from ansich.operations import ActiveStepView, ActiveTaskView, HeartbeatBelief
 from ansich.operator import OperatorActionView, TaskActionTarget
 from ansich.quality import ReleaseQualityView
 from ansich.release import AgentReleaseDetailView, AgentReleaseSummaryView, TaskAgentReleaseView
-from ansich.safety import TaskScopesView, ToolAuthorizationView, ToolEffectsView
+from ansich.safety import TaskScopesView, ToolAuthorizationView, ToolEffectsView, host_scope_id
 from ansich.step import ContentBlockPayloadView, ContentOccurrenceView, ContextSnapshotView, LlmAttemptView, StepView
 from ansich.task_tree import (
     TaskSpawnView,
@@ -115,6 +117,7 @@ class AnsichService:
         writer_backoff_max_ms: int = 5_000,
         writer_item_max_attempts: int = 2,
         stop_drain_timeout_ms: int = 10_000,
+        hostname: str | None = None,
         unavailable_reason: str | None = None,
     ) -> None:
         if queue_capacity < 1:
@@ -213,10 +216,36 @@ class AnsichService:
         # be counted as the same thing.
         self._lost_range_report_cursor = 0
         # Process-wide loss — a range with no Task to subject an
-        # `observability.degraded` Observation against. Nothing in this batch
-        # persists these (the subject design is P11-B's host-Scope work), so
-        # they are held here, counted in health, and never claimed as reported.
+        # `observability.degraded` Observation against. Held here and counted in
+        # health until `_drain_unreported_global_ranges` writes it as
+        # `observability.lost` against the host Scope (RB2③); an entry leaves
+        # this list only once its own row is durable, so the count never claims
+        # a report nothing made.
         self._unreported_global_ranges: list[LostRange] = []
+        # The host this process runs on, read once. It is the external ref of
+        # the `host` Scope minted at `start()` and therefore the identity every
+        # process-wide fact is filed under; reading it once means a hostname
+        # that changes underneath a running process cannot split one process's
+        # evidence across two Scopes.
+        self._hostname = hostname or socket.gethostname()
+        # Set only once the mint has actually been written (RB1). ``None`` is
+        # the honest answer everywhere else — a backend that does not project
+        # Scopes, a mint that failed — and it is what makes the process-wide
+        # loss drain skip rather than write rows against a subject that is not
+        # there.
+        self._host_scope_id: str | None = None
+        # This process's identity as the reporter of process-wide loss. It is a
+        # fresh id per process on purpose: the report's `source_event_id` is
+        # built from collector sequences, which restart at 1 with the process,
+        # so a fixed instance id would let a later process's genuine loss
+        # dedupe against an earlier one's report of different rows.
+        self._collector_instance_id = new_id()
+        # A real producer sequence for that reporter — advanced only when a
+        # report is durable, so a retried report re-uses its numbers instead of
+        # leaving a gap. Deliberately not `lost_range.last_sequence`: that is a
+        # *collector* sequence, and `observability.degraded` mixing the two
+        # numbering spaces is a known wart this kind does not inherit.
+        self._collector_producer_seq = 0
         # Lowest sequence ever charged as lost. A lost sequence is a permanent
         # hole: the contiguous persistence watermark can never pass it.
         self._lowest_lost_sequence: int | None = None
@@ -315,6 +344,7 @@ class AnsichService:
             self._writer_task = asyncio.create_task(self._writer_loop(), name="ansich-batch-writer")
             if callable(getattr(self._backend, "project_pending", None)):
                 self._projector_task = asyncio.create_task(self._projector_loop(), name="ansich-projector")
+            await self._mint_host_scope()
         except BaseException:
             # A start that never finished leaves the service exactly as stopped
             # as it was before the attempt: reporting `starting` forever would
@@ -323,6 +353,90 @@ class AnsichService:
             raise
         finally:
             self._starting = False
+
+    @property
+    def host_scope_id(self) -> str | None:
+        """The host ``Scope`` this process files its process-wide facts under.
+
+        ``None`` until the bootstrap mint has been written, and ``None`` forever
+        on a backend that does not project Scopes at all. It is deliberately not
+        "the id this hostname would have" — that is
+        :func:`ansich.safety.host_scope_id`, a pure computation any caller can
+        do — because the question a writer has to answer is whether the Scope is
+        *there*, and answering it with an address would produce rows subjected to
+        an entity nobody minted.
+        """
+
+        return self._host_scope_id
+
+    async def _mint_host_scope(self) -> None:
+        """Record this process's host ``Scope`` so process-wide facts have a subject.
+
+        RB1. Two things make this idempotent rather than a per-start write.
+        The ``source_event_id`` is deterministic (``ansich:host-scope:{host}``)
+        and the producer identity is fixed, so the backend's producer dedupe
+        absorbs every restart's mint after the first; and the Scope entity id is
+        a pure function of the hostname, so the environment probe's own `host`
+        declaration converges on the same entity instead of minting a second one
+        (RB1③).
+
+        The Observation is **Task-free**: it carries the bootstrap sentinel as
+        its ``task_id`` and no ``relation_role``, so ``_project_scope_snapshot``
+        creates the entity and the Scope row and returns before it would look
+        for a subject to relate it to.
+
+        It is written straight to the backend rather than recorded through the
+        queue. The queue's accounting is about the Agent's evidence — accepted,
+        dropped, charged to a producer — and a bootstrap write is none of those;
+        going through it would put this row in every health count and in the
+        loss ranges it exists to report.
+
+        **Fail-open, and it degrades to exactly one known state.** A mint that
+        cannot be written leaves ``host_scope_id`` ``None``, which leaves
+        process-wide loss in the unreported bucket and counted there (RB1⑤).
+        Nothing is lost by that: the bucket is honest by construction, and the
+        next start mints again. The other half of that guarantee lives in
+        storage — the Observation is durable, so a ``rebuild_projections()``
+        re-creates the Scope from it without a second mint.
+        """
+
+        # `scope.snapshotted` only becomes a Scope *entity* where something
+        # projects it; the in-memory backend keeps observations and projects
+        # Task control only. Minting there would set an id whose entity will
+        # never exist, and the drain would then write loss against a subject
+        # nobody can resolve — so on such a backend the bucket simply stays.
+        if not getattr(self._backend, "projects_scope_entities", False):
+            return
+        scope_id = host_scope_id(self._hostname)
+        observation = ObservationEnvelope.scope_snapshotted(
+            task_id=ANSICH_BOOTSTRAP_TASK_ID,
+            # No run and no Task to correlate on; the Scope this row is about is
+            # the only durable identity available, and it is the same value every
+            # other bootstrap row correlates on.
+            run_id=scope_id,
+            occurred_at=datetime.now(UTC),
+            scope_kind="host",
+            external_ref=self._hostname,
+            relation_role=None,
+            # Bounded because `ansich_observations.source_event_id` is 256 chars
+            # and a pathological hostname could otherwise overflow it. The cut is
+            # deterministic, so two starts on one host still dedupe.
+            source_event_id=f"ansich:host-scope:{self._hostname[:200]}",
+            producer_name="ansich-bootstrap",
+            producer_version="1",
+            # Fixed, unlike `_collector_instance_id`: cross-restart dedupe is the
+            # whole point here, and a per-process id would mint a row per start.
+            producer_instance_id="local",
+        )
+        try:
+            await self._backend.persist_and_project([observation])
+        except Exception:
+            logger.warning(
+                "ansich bootstrap: could not write the host Scope mint; process-wide loss stays in the unreported bucket",
+                exc_info=True,
+            )
+            return
+        self._host_scope_id = scope_id
 
     def record(self, observation: ObservationEnvelope) -> RecordReceipt:
         return self.record_batch((observation,))[0]
@@ -2637,18 +2751,24 @@ class AnsichService:
         RA8②. An ``observability.degraded`` Observation is subjected to the lost
         range's Task, so a **process-wide** range — one charged for something
         that never was an Observation, and so has no Task — cannot be written
-        at all. The cursor used to walk past those anyway, which marked as
-        reported ranges nothing had ever written; they are instead filed in
-        ``_unreported_global_ranges`` when they are charged, counted in health,
-        and left for P11-B's host-Scope subject work to report.
+        as one. Those are filed in ``_unreported_global_ranges`` when they are
+        charged, counted in health, and reported here in their own right, as
+        ``observability.lost`` subjected to this process's host ``Scope``
+        (RB2③). Two kinds because they are two facts: loss that had an owner and
+        loss that had none.
 
         The cursor advances only after storage accepted the write, so a refused
-        report is retried whole rather than skipped.
+        report is retried whole rather than skipped. The bucket obeys the same
+        rule one level down: an entry leaves it only once its own write landed.
         """
 
         with self._lock:
             ranges = tuple(self._lost_ranges[self._lost_range_report_cursor :])
         if not ranges:
+            # Not a return: the bucket can hold ranges from before the host
+            # Scope existed, or from a report that failed, and this pass is the
+            # only thing that ever offers them again.
+            await self._drain_unreported_global_ranges()
             return
         observations = [
             ObservationEnvelope(
@@ -2684,11 +2804,84 @@ class AnsichService:
                 return
         # The process-wide ranges in this window are already in the unreported
         # bucket, so advancing past them consumes nothing and claims nothing —
-        # it only stops the pass re-scanning ranges it can never write.
+        # it only stops the pass re-scanning ranges it can never write *as
+        # `observability.degraded`*. They are written below, as their own kind.
         with self._lock:
             self._lost_range_report_cursor += len(ranges)
         if observations and self._projector_wake_event is not None:
             self._projector_wake_event.set()
+        await self._drain_unreported_global_ranges()
+
+    async def _drain_unreported_global_ranges(self) -> None:
+        """Write the process-wide loss bucket into the stream, or leave it alone.
+
+        RB2③. Every range here was charged for something that never was an
+        Observation, so it has no Task and ``observability.degraded`` cannot
+        carry it. ``observability.lost`` can: it is subjected to this process's
+        host ``Scope``, which is why this drain is gated on that Scope having
+        actually been minted rather than merely being addressable. Without it
+        the honest move is to write nothing — the bucket keeps the ranges, and
+        ``unreported_global_lost_range_count`` keeps saying how many.
+
+        **What is drained is only what can no longer change.** ``_record_loss``
+        may still extend the newest range in place, and it stops doing so once
+        the reporting cursor has walked past it. This pass therefore drains
+        every bucket entry *except* that still-growing one: writing it now and
+        watching it grow afterwards would report the same first sequence twice,
+        once short and once long, which is the same double-count the cursor
+        exists to prevent one level up.
+
+        **An entry leaves the bucket only when its row is durable.** A refused
+        write returns with the bucket untouched, so the count stays honest and
+        the next successful Observation write offers the same ranges again.
+        """
+
+        scope_id = self._host_scope_id
+        if scope_id is None:
+            return
+        with self._lock:
+            live = self._lost_ranges[-1] if len(self._lost_ranges) > self._lost_range_report_cursor else None
+            drainable = tuple(lost_range for lost_range in self._unreported_global_ranges if lost_range is not live)
+            # Read, not advanced: the counter moves only once these rows are
+            # durable, so a retry re-emits the same producer sequences rather
+            # than leaving a gap that would read as the reporter losing rows.
+            first_producer_seq = self._collector_producer_seq + 1
+        if not drainable:
+            return
+        observations = [
+            ObservationEnvelope.observability_lost(
+                host_scope_id=scope_id,
+                occurred_at=datetime.now(UTC),
+                first_sequence=lost_range.first_sequence,
+                last_sequence=lost_range.last_sequence,
+                # A range with no Task usually has no producer either — it was
+                # charged for an item that never parsed as an envelope — so
+                # "unknown" is the honest value rather than an omission, and it
+                # matches what `observability.degraded` writes.
+                lost_producer_name=lost_range.producer_name or "unknown",
+                lost_producer_instance_id=lost_range.producer_instance_id or "unknown",
+                source_event_id=f"loss:global:{lost_range.first_sequence}:{lost_range.last_sequence}",
+                producer_seq=first_producer_seq + index,
+                producer_instance_id=self._collector_instance_id,
+            )
+            for index, lost_range in enumerate(drainable)
+        ]
+        try:
+            await self._backend.persist_and_project(observations)
+        except Exception:
+            return
+        with self._lock:
+            # By identity, not by value: `_record_loss` replaces a coalescing
+            # range with an extended *copy*, so an equal-looking entry is not
+            # necessarily the entry that was written. `drainable` holds a strong
+            # reference to every object here, so no id in this set can have been
+            # recycled onto a different range while the write was in flight.
+            reported = {id(lost_range) for lost_range in drainable}
+            self._unreported_global_ranges = [lost_range for lost_range in self._unreported_global_ranges if id(lost_range) not in reported]
+            self._collector_producer_seq = max(
+                self._collector_producer_seq,
+                first_producer_seq + len(drainable) - 1,
+            )
 
     async def _project_pending(self) -> int:
         project_pending = getattr(self._backend, "project_pending", None)

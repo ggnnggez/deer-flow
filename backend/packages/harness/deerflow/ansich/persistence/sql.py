@@ -104,6 +104,7 @@ from ansich.budget import (
 from ansich.compression import CompressionDisposition
 from ansich.context_state import context_state_hash, materialize_context_state
 from ansich.contracts import (
+    ANSICH_BOOTSTRAP_TASK_ID,
     ControlValue,
     LostRange,
     TaskLifecycleScope,
@@ -338,6 +339,12 @@ _PROJECTORS = (
     # edge must already be back.
     _SPAWN_RECONCILE_PROJECTOR,
 )
+#: Which Observation kinds each projector claims. A kind absent from every entry
+#: here is stored and never projected — ``observability.degraded`` and
+#: ``observability.lost`` are both deliberately in that position (RB2④): the
+#: evidence a process-wide Alert needs is that the row exists. Registering a
+#: projector for either one later is not a free addition; see the note on the
+#: kind in ``ansich/contracts.py`` for what it would silently skip.
 _PROJECTOR_KINDS = {
     "task-structural": frozenset((*_CONTROL_BY_KIND, "agent_release.resolved")),
     "task-control": frozenset(_CONTROL_BY_KIND),
@@ -505,6 +512,30 @@ def _assessors_after_projection(
     }:
         names.update(_ASSESSOR_VERSIONS)
     return tuple((name, _ASSESSOR_VERSIONS[name]) for name in sorted(names))
+
+
+def _assessors_for_observation(
+    projector_name: str,
+    observation: ObservationEnvelope,
+) -> tuple[tuple[str, str], ...]:
+    """Which assessors one projected Observation triggers — none for a bootstrap row.
+
+    RB1②/RB3①. Every assessor in this system is Task-scoped: its job row and its
+    watermark row are FK-bound to ``ansich_tasks``. A bootstrap Observation —
+    the host-Scope mint, and anything else written under
+    ``ANSICH_BOOTSTRAP_TASK_ID`` — has no Task by construction, so an assessor
+    job for it could not be inserted at all, and the failed insert would take
+    down the projection it rode in on rather than merely skipping an assessment.
+
+    So the family is refused here, at the one place that enqueues it, instead of
+    being left to raise inside a transaction that had real work in it. There is
+    nothing to assess either way: a subject with no Task has no Steps, no
+    ToolCalls, no budget and no heartbeat.
+    """
+
+    if observation.task_id == ANSICH_BOOTSTRAP_TASK_ID:
+        return ()
+    return _assessors_after_projection(projector_name, observation.kind)
 
 
 def _projector_priority_expression():
@@ -869,6 +900,16 @@ _STALE_REQUESTED_TAKEOVER_AFTER = timedelta(minutes=5)
 
 
 class SqlAnsichBackend:
+    #: This backend turns ``scope.snapshotted`` into a durable Scope *entity*
+    #: (``task-safety`` -> ``_project_scope_snapshot``), which is what makes the
+    #: collector's host-Scope bootstrap mint worth writing: an Observation
+    #: subjected to that Scope names something a reader can resolve. Declared
+    #: rather than inferred, because the property that matters is
+    #: "``scope.snapshotted`` is projected here", and no other capability the
+    #: service can duck-type implies it — the in-memory backend keeps
+    #: Observations and projects Task control only.
+    projects_scope_entities = True
+
     def __init__(
         self,
         session_factory: async_sessionmaker[AsyncSession],
@@ -1215,9 +1256,9 @@ class SqlAnsichBackend:
                         await self._reconcile_spawn_usage(session, observation)
                     else:
                         raise ValueError(f"unknown Ansich projector: {projector_name}")
-                    for assessor_name, assessor_version in _assessors_after_projection(
+                    for assessor_name, assessor_version in _assessors_for_observation(
                         projector_name,
-                        observation.kind,
+                        observation,
                     ):
                         existing_assessor_job = await session.scalar(
                             select(AnsichAssessorJobRow.job_id).where(
