@@ -114,9 +114,40 @@ schema — the smoke also drives the two constructs whose behaviour is
 Postgres-specific: the wall_time high-water upsert (`FOR UPDATE OF` over a
 two-table join, then delete-then-insert) and one scope-safety assessment pass, so
 `ansich_assessor_watermarks` is written there and not merely created by `0025`.
-It is **not** a Postgres run of the whole suite: everything outside
-`tests/integration/` still runs on SQLite only, so multi-worker behaviour
-(`SELECT … FOR UPDATE`, `skip_locked`, lost-update windows) remains unexercised.
+A second file, `tests/integration/test_postgres_multiworker.py`, is the
+two-worker tier: two engines (two pools, two `_lease_owner`s) over **one**
+database, driving the semantics SQLite structurally cannot express — claim
+exclusion under a real `skip_locked`, the completion CAS after a real lease
+takeover, `pg_advisory_lock` genuinely excluding a second operator (and being
+released after a mid-operation DBAPI failure), the F10-6/F10-20 lost update
+proven **red on the pre-fix unlocked read and green on the committed
+lock-then-read under the same interleaving**, the traversal ordering shown to be
+the difference between two workers completing and PostgreSQL aborting one as a
+deadlock, PB4's stale-assessor rollback, the spawn-usage reconcile gate against a
+live vs. expired lease, per-projector status counts agreeing from either worker,
+and `0027`'s two `lease_generation` columns plus its `(projector_name, status)`
+index on a real server. It is **not** a Postgres run of the whole suite:
+everything outside `tests/integration/` still runs on SQLite only.
+
+Two facts the two-worker tier established that are worth knowing before touching
+this area. (1) `_maintenance_lock` used to issue its `pg_advisory_unlock` on a
+`Session`, whose `rollback()` returns the connection to the pool — so on any
+pool holding more than one connection the unlock could land on a *different*
+backend, leaving the real holder's session-level lock held and every later
+rebuild/retry queued behind it until `database.command_timeout`. It now pins one
+`AsyncConnection` for the whole operation, matching what its docstring already
+claimed and what `persistence/bootstrap.py::_postgres_lock` already did; SQLite
+could never surface this, because `pg_advisory_unlock` is a no-op there.
+(2) Two workers projecting the two Observations of one LLM attempt
+(`llm.requested` / `llm.responded`) intermittently collide on
+`ansich_llm_attempts_pkey`: neither can lock an `attempt_id` row that does not
+exist yet, so both insert it. It is the same first-writer shape the four rollups
+closed with `INSERT … ON CONFLICT DO NOTHING`, at a call site outside that
+scope, and it is **not** corrupting — the loser re-arms to `retry` and the next
+claim converges on the same read model — so it costs one attempt, exactly like
+`_refresh_behavior_belief`'s already-documented first-writer `IntegrityError`.
+The tier tolerates it by *shape* (a deadlock, or any other error, still fails)
+rather than by count.
 
 The `detect-blocking-io` target parses `app/`, `packages/harness/deerflow/`,
 and `scripts/` with AST. By default it reports only blocking IO candidates that
@@ -1001,7 +1032,11 @@ real server — the smoke drives the wall_time high-water upsert and one
 scope-safety pass, so both statements this batch added run at least once on
 Postgres. What this batch did **not** establish: the suite outside
 `tests/integration/` still runs on SQLite, so every multi-worker claim above
-rests on code review plus the lock's presence, not on an executed concurrent test.
+rested on code review plus the lock's presence, not on an executed concurrent
+test. P11-B's two-worker tier
+(`tests/integration/test_postgres_multiworker.py`) closes that gap for the
+claim/completion/rollup/maintenance claims — see the `make test-postgres`
+paragraph near the top of this file.
 
 **Environment observability** (one slice, 2026-08-19, landed after the
 pre-Phase-11 hardening batch above and before Phase 11 itself; see
@@ -1306,11 +1341,16 @@ key) for its whole duration and a second operator **blocks** rather than being
 rejected — unbounded at the database, but bounded in practice by
 `database.command_timeout` (30s), past which asyncpg cancels the pending lock
 request and the call fails loudly, the same exposure the schema bootstrap's
-advisory lock already carries. A cancelled acquire is not proof that no lock was
+advisory lock already carries. The lock lives on **one pinned
+`AsyncConnection`**, not on a `Session`: an advisory lock belongs to the
+database session that took it, and `Session.rollback()` returns its connection
+to the pool, so the following unlock could be issued on a different backend
+entirely and leave the real holder's lock held (the two-worker tier caught
+exactly that). A cancelled acquire is not proof that no lock was
 taken (the grant can land while the reply is in flight), so the unlock runs on
 that path too, and the `finally` rolls back *before* unlocking — after a DBAPI
-failure the session is inactive and any further statement raises client-side, so
-an unlock issued first would never reach the server, while a session-level
+failure the connection is inactive and any further statement raises client-side,
+so an unlock issued first would never reach the server, while a session-level
 advisory lock survives the `ROLLBACK` itself. **The wait is not free for the
 waiting worker:**
 `AnsichService` holds its process-local `_projection_lock` around the backend
@@ -1348,8 +1388,10 @@ normalizes a backend that still answers with a bare int to `unsettled=0`.
 `tests/ansich/test_lease_cas.py` proves these as explicit interleaving scripts
 (two engines and two backends over one SQLite file, lease expiry injected as a
 past-dated timestamp rather than by moving a clock). What that substrate cannot
-prove stays unproven: SQLite renders `skip_locked` empty, so claim-side
-exclusion and READ COMMITTED lost updates still need the opt-in Postgres tier.
+prove — SQLite renders `skip_locked` empty, and it has one writer, so claim-side
+exclusion, a real advisory-lock exclusion and READ COMMITTED lost updates are
+all out of its reach — is proven by the opt-in two-worker Postgres tier,
+`tests/integration/test_postgres_multiworker.py`.
 
 **P11-B host `Scope` bootstrap and `observability.lost`** (spec §3; the subject
 P11-A's process-wide loss was waiting for). A SQL-backed `AnsichService.start()`

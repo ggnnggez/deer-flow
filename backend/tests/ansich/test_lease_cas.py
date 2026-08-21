@@ -574,20 +574,27 @@ async def test_retry_reports_the_rows_it_re_armed_and_leaves_an_in_flight_job_al
         assert statuses == ["completed", "processing"]
 
 
-class _RecordingSession:
-    """Minimal session stand-in that records the SQL a maintenance lock emits.
+class _RecordingConnection:
+    """Records the SQL the maintenance lock emits on its pinned connection.
+
+    A connection rather than a session because that is what the lock now holds:
+    an advisory lock belongs to the *database session* that took it, and a
+    SQLAlchemy ``Session`` returns its connection to the pool on ``rollback()``,
+    so the unlock could be issued on a different backend entirely. The real
+    proof of that is the opt-in tier's (``tests/integration/
+    test_postgres_multiworker.py``); what this stub still owns is the statement
+    *order*, which no server is needed to state.
 
     ``raise_on`` makes one statement fail after it has been recorded, which is
     how the cancelled-acquire path is driven: the statement really was sent, so
     the grant may have landed server-side while the reply was in flight.
     """
 
-    def __init__(self, dialect_name: str | None, statements: list[tuple[str, object]], *, raise_on: str | None = None) -> None:
-        self.bind = None if dialect_name is None else SimpleNamespace(dialect=SimpleNamespace(name=dialect_name))
+    def __init__(self, statements: list[tuple[str, object]], *, raise_on: str | None = None) -> None:
         self._statements = statements
         self._raise_on = raise_on
 
-    async def __aenter__(self) -> _RecordingSession:
+    async def __aenter__(self) -> _RecordingConnection:
         return self
 
     async def __aexit__(self, *_exc_info: object) -> None:
@@ -601,6 +608,38 @@ class _RecordingSession:
 
     async def rollback(self) -> None:
         self._statements.append(("ROLLBACK", None))
+
+
+class _RecordingSession:
+    """Session stand-in whose only job is to resolve the bind's dialect.
+
+    The lock reads the dialect through a session (that is the handle the
+    backend has) and then pins a connection off the same bind, so the stub
+    mirrors both halves.
+    """
+
+    def __init__(self, dialect_name: str | None, statements: list[tuple[str, object]], *, raise_on: str | None = None) -> None:
+        self.bind = (
+            None
+            if dialect_name is None
+            else SimpleNamespace(
+                dialect=SimpleNamespace(name=dialect_name),
+                connect=lambda: _RecordingConnection(statements, raise_on=raise_on),
+            )
+        )
+        self._statements = statements
+
+    async def __aenter__(self) -> _RecordingSession:
+        return self
+
+    async def __aexit__(self, *_exc_info: object) -> None:
+        return None
+
+    async def execute(self, statement: object, parameters: object = None) -> None:  # pragma: no cover - the lock no longer executes here
+        raise AssertionError("the maintenance lock must run its statements on the pinned connection, not on a session")
+
+    async def rollback(self) -> None:  # pragma: no cover - same
+        raise AssertionError("the maintenance lock must roll back its pinned connection, not a session")
 
 
 def _statement_index(statements: list[tuple[str, object]], needle: str) -> int:

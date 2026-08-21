@@ -1115,37 +1115,64 @@ class SqlAnsichBackend:
             bind = session.bind
             if bind is None:
                 raise RuntimeError("Ansich maintenance lock cannot resolve the session's dialect; refusing to run an unguarded rebuild/retry")
-            if bind.dialect.name != "postgresql":
-                yield
-                return
-            await session.execute(text("SET LOCAL idle_in_transaction_session_timeout = 0"))
+            dialect_name = bind.dialect.name
+        if dialect_name != "postgresql":
+            yield
+            return
+        connect = getattr(bind, "connect", None)
+        if connect is None:
+            raise RuntimeError("Ansich maintenance lock cannot pin a connection on this bind; refusing to run an unguarded rebuild/retry")
+        # A **connection**, not a session, and it is held for the whole
+        # operation. An advisory lock is scoped to the *database session* that
+        # took it, so the unlock has to reach that same backend -- and a
+        # SQLAlchemy ``Session`` cannot promise that. ``Session.rollback()``
+        # ends its transaction and returns the connection to the pool, so the
+        # ``execute`` that follows checks one out again and, on any pool that
+        # holds more than one connection (i.e. every real Gateway, and any
+        # process whose projector loop is doing work at the same time), that can
+        # be a *different* backend. The unlock then returns false against a
+        # session that never held the lock, the real holder keeps it until the
+        # connection is recycled, and every later rebuild/retry on every worker
+        # queues behind it until ``database.command_timeout`` kills them one by
+        # one. Found by the two-worker tier
+        # (``tests/integration/test_postgres_multiworker.py``), which is exactly
+        # the class of thing single-connection SQLite could never surface:
+        # ``pg_advisory_unlock`` is a no-op there, so nothing depended on which
+        # connection it landed on. ``AsyncConnection`` keeps the checkout for
+        # the life of the ``async with`` -- ``rollback()`` ends the transaction
+        # without releasing it -- which is the pinning the bootstrap advisory
+        # lock (``persistence/bootstrap.py::_postgres_lock``) already had.
+        async with connect() as connection:
+            await connection.execute(text("SET LOCAL idle_in_transaction_session_timeout = 0"))
             try:
-                await session.execute(
+                await connection.execute(
                     text("SELECT pg_advisory_lock(:key)"),
                     {"key": _PG_MAINTENANCE_LOCK_KEY},
                 )
                 yield
             finally:
                 # Rollback first, unlock second. After a DBAPI error the
-                # session is left in an inactive state and *every* further
+                # connection is left in an inactive state and *every* further
                 # ``execute`` raises ``PendingRollbackError`` before reaching
                 # the server -- so an unlock issued first would be swallowed by
                 # the handler below and the lock would be held until the
                 # connection closed. ``ROLLBACK`` makes the connection usable
                 # again, and a session-level ``pg_advisory_lock`` survives it
-                # (it is bound to the session, not the transaction), so the
-                # unlock still has something to release. The stub session in
-                # the tests cannot reproduce the inactive state; the real
-                # PostgreSQL proof belongs to the opt-in tier.
-                await session.rollback()
+                # (it is bound to the database session, not the transaction), so
+                # the unlock still has something to release. The recording stub
+                # in ``tests/ansich/test_lease_cas.py`` pins this ordering; that
+                # the unlock actually reaches the holder -- and that the lock is
+                # then genuinely free for a second operator -- is the opt-in
+                # PostgreSQL tier's.
+                await connection.rollback()
                 try:
-                    await session.execute(
+                    await connection.execute(
                         text("SELECT pg_advisory_unlock(:key)"),
                         {"key": _PG_MAINTENANCE_LOCK_KEY},
                     )
                 except Exception:  # noqa: BLE001
                     logger.warning(
-                        "ansich maintenance: pg_advisory_unlock raised; the session close will release it",
+                        "ansich maintenance: pg_advisory_unlock raised; the connection close will release it",
                         exc_info=True,
                     )
 
