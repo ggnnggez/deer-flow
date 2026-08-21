@@ -1146,7 +1146,11 @@ async def test_two_workers_fanning_over_overlapping_ancestors_both_complete() ->
         errors = await _projection_errors(worker_a)
         deadlocked = [item for item in errors if "deadlock" in item[3].lower()]
         assert not deadlocked, f"the ordered fan-out still deadlocked: {deadlocked}"
-        unexpected = [item for item in errors if item[2] != "IntegrityError" or "duplicate key value violates unique constraint" not in item[3]]
+        # Typed by CONSTRAINT IDENTITY, not just error class: only the known
+        # F10-31 first-writer race on the attempt row is tolerated. A duplicate
+        # on any OTHER constraint (a re-opened rollup conflict, an episode
+        # collision leaking here) must fail this test, not be absorbed.
+        unexpected = [item for item in errors if item[2] != "IntegrityError" or "ansich_llm_attempts_pkey" not in item[3]]
         assert not unexpected, f"unexpected projection errors under concurrent fan-out: {unexpected}"
 
         async with worker_b.sessions() as session:
@@ -1441,7 +1445,9 @@ async def test_per_projector_status_counts_agree_from_either_worker() -> None:
     The DB-merged health DTO lands after this task, so what is proven here is
     deliberately narrow: the per-``(projector_name, status)`` counts the merge
     reads are a property of the database, not of which worker asked -- including
-    while both workers are mid-load with their own open transactions. If this
+    at a mid-backlog point (both drives have returned and their sessions are
+    closed; this is a smoke over the raw count queries, not a read taken while
+    a transaction is still open). If this
     ever disagreed, the merged DTO would be worker-local fiction before it was
     ever assembled.
     """

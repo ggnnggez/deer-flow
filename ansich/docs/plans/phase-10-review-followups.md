@@ -38,6 +38,7 @@
 | F10-28 | 健康线的两处 UI 级留观:中性线态(phase/unknown)的**渲染层**零覆盖(图标三元式曾在本批被反转过);task 作用域在系统 phase 期间仍称「本任务数据完整」 | ⬜ 未修复 | — | — |
 | F10-29 | 环境外部化载荷类:externalized 的 `environment.sampled` 读不回(契约分支无守卫直接抛)、认领不了(先 envelope 后 hydrate 的顺序使投影作业 durable failed)、history 读者守卫跳过(其"从不外部化"注释已撤回)——同一危害类三实例 | ⬜ 未修复 | — | — |
 | F10-30 | settle-budget flake 家族(与 F10-10 分开记):`test_sql_safety.py` 里全部 settle 依赖读断言的等价类,三种构造、同一机理——flush 预算输给负载,行退回队列/作业未建;F10-10 的节奏门禁管不了 flush 预算。**不限于重负载**:成员 1/5 在安静机单独跑也翻红(T6 记),故按用例名而非行号认领(合并门禁的窄口见本条收尾) | ⬜ 未修复(测试侧;成员 5 已结案,成员 1 部分处理——见该条) | — | — |
+| F10-31 | LLM attempt 双观测的首写者 pkey 竞态:两 worker 各投影同一 attempt 的 request/response 观测,`ansich_llm_attempts_pkey` 碰撞——非破坏(输家整事务回滚→retry→收敛,和数正确),但需要第五处 lock-then-read 转换 | ⬜ 未修复 | — | — |
 
 留观标记:F10-10 的第 4 条证据(`test_step_attempt_and_context_are_queryable_after_projection`)**未证实**——只做了排除法,没拿到原始失败文本。若它再轮换红,**先抓失败文本再修**,不要按已有的三条诊断类推。另:F10-10 的门禁只被 Task 8 的验收负载证明过(`e53cefbc` 记录了这条边界),Task 9 的更重负载下仍有 2 条已上门禁的测试翻红,详见该条的「后续观察」。
 
@@ -406,3 +407,10 @@
 
   每一次放行都按本条记账:命令行、轮次、全文。
 - 归属:下一次测试卫生波;F10-10 留观的兄弟条目。
+
+## F10-31. LLM attempt 双观测的首写者 pkey 竞态
+
+- 状态:⬜ 未修复。来源:P11-B 批 T9 双 worker PG tier 的实测发现(评审确认机理与登记裁定)。
+- 位置:`backend/packages/harness/deerflow/ansich/persistence/sql.py` 的 attempt 投影站(~:9499-9516 区,按符号定位):`session.get(AnsichLlmAttemptRow, …)` → 构造 → `session.add`,随后按分支**变更**该 ORM 对象(`request_obs_id`/`response_obs_id` 与 `incomplete→requested`/`→success` 状态转移)。
+- 现状:同一 attempt 的 request 与 response 两条观测被两个 worker 并发投影时,首写者竞态在 `ansich_llm_attempts_pkey` 上碰撞。**非破坏**:输家的整个作业事务回滚→`retry`→下次认领读到赢家的行→收敛(tier 断言精确和数 24/36/60 与零未结算)。T9 的双 worker 用例按**约束名类型化容忍**这一形状(仅 `ansich_llm_attempts_pkey`;别的约束上的重复键仍然翻红)。
+- 方向:不是一行 `ON CONFLICT` 能了——需要 T5 形状的第五处 lock-then-read 转换:`_insert_ignoring_conflict` + 赢家行的 `FOR UPDATE` 重读 + 输家字段如何合成(两个 obs 指针与 status 转移的组合语义)要一并裁定。归 attempt 投影器的下一次触达,或 P11-C。
