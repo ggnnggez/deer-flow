@@ -1366,6 +1366,11 @@ backend rather than through the queue (it is not the Agent's evidence and must
 not appear in the collector's own accounting), it is fail-open (a failure logs
 and leaves `AnsichService.host_scope_id` `None`), and it is replay-safe (the
 Observation is the record; `rebuild_projections()` re-creates the Scope).
+The two handles are NOT interchangeable: `AnsichService.host_scope_id` means
+"*this process's* mint succeeded", which under multiple workers is not "the
+entity exists in the database" — the P11-B Alert producers (and any future
+process-subject consumer) must use the pure `ansich.safety.host_scope_id()`
+plus their own Scope-entity existence check, never the service property.
 
 Bootstrap rows carry `ANSICH_BOOTSTRAP_TASK_ID` (`contracts.py`), a fixed
 documented UUID4 sentinel meaning **this Observation has no Task entity** —

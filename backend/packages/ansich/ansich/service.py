@@ -2840,6 +2840,13 @@ class AnsichService:
         if scope_id is None:
             return
         with self._lock:
+            # Defensive against a FUTURE caller, not a live hazard: at both
+            # production call sites the report cursor sits at len(_lost_ranges)
+            # when this runs, so `live` is always None there and every bucket
+            # entry is drainable. The guard becomes load-bearing the moment a
+            # caller (e.g. batch C's shutdown drain) runs while a range can
+            # still grow — reporting a still-growing range would count the
+            # same loss twice once its extension is reported again.
             live = self._lost_ranges[-1] if len(self._lost_ranges) > self._lost_range_report_cursor else None
             drainable = tuple(lost_range for lost_range in self._unreported_global_ranges if lost_range is not live)
             # Read, not advanced: the counter moves only once these rows are
