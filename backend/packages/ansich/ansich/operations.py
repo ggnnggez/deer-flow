@@ -57,6 +57,31 @@ class ActiveToolView(BaseModel):
 
 
 class ActiveTaskView(BaseModel):
+    """One running Task as the active-task read model publishes it.
+
+    ``projection_watermark`` keeps a name older than its meaning, and the name is
+    the trap. It used to hold the *publishing worker's* highest projected
+    ``ingest_seq`` — always at least 1, or ``None`` before that worker had
+    projected anything. Since the health merge it holds the **store-wide
+    continuity mark**: the sequence below which no projector has anything owed
+    (``ProjectorHealth.complete_through``, minimised across projectors). Three
+    values, three distinct statements:
+
+    * ``None`` — the store holds no Observations at all. Nothing to be complete
+      through. The read model's monotonic publish guard reads this as "this tick
+      established no basis" and refuses to publish over a row that has one.
+    * ``0`` — legitimate and common: Observations exist, and the lowest unsettled
+      job sits on ``ingest_seq`` 1, so nothing at or below 1 is settled yet.
+      A durably failed job there makes it permanent, which is exactly the
+      incident an operator is reading this row during. Hence ``ge=0``, not
+      ``ge=1``: the bound that documented the old meaning made this state raise
+      out of every operations tick and froze the read model.
+    * ``n > 0`` — nothing at or below ``n`` is still owed by any projector.
+
+    It is a *continuity* mark, not progress: one hole holds it down however far
+    past that hole the projectors have run.
+    """
+
     model_config = ConfigDict(extra="forbid", frozen=True, strict=True)
 
     task_id: str
@@ -76,7 +101,9 @@ class ActiveTaskView(BaseModel):
     budget_health: tuple[BudgetHealthBelief, ...]
     duration_ms: int = Field(ge=0)
     observability_status: Literal["healthy", "degraded"]
-    projection_watermark: int | None = Field(default=None, ge=1)
+    #: Store-wide continuity mark; ``0`` is a value, ``None`` is unknown. See the
+    #: class docstring — the ``ge`` bound here is load-bearing, not decorative.
+    projection_watermark: int | None = Field(default=None, ge=0)
     projection_lag_ms: int = Field(ge=0)
     lost_ranges: tuple[LostRange, ...]
     last_evidence_at: datetime

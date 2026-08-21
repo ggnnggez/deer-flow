@@ -27,7 +27,7 @@ import pytest
 from ansich import ObservationEnvelope, Producer, new_id
 from ansich.assessment.scope_safety import SCOPE_SAFETY_ASSESSOR
 from sqlalchemy import func, select, update
-from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
+from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 
 from deerflow.ansich.persistence.models import (
     AnsichAssessorErrorRow,
@@ -501,6 +501,80 @@ async def test_dependency_wait_re_arms_to_pending_because_it_consumed_no_attempt
 
 
 @pytest.mark.anyio
+async def test_a_dependency_wait_gives_its_attempt_back_without_demoting_a_retry_row(tmp_path):
+    """The other half of the same rule: giving an attempt back is not forgetting one.
+
+    ``pending`` means "nothing has tried this yet" — the property T10's
+    four-bucket health split, its panel column and its panel copy are built on.
+    A dependency wait hands *its own* attempt back, which is why a fresh job
+    stays ``pending`` (the case above). It does not hand back the attempts a
+    hard error already spent, so a row that entered the claim as ``retry`` must
+    leave it as ``retry``: writing ``pending`` there moves a live retry loop
+    into the never-attempted bucket and makes three doc sites false.
+
+    The sequence is the reachable one: hard error → ``retry`` (attempts 1) →
+    re-claim (attempts 2) → the dependency is still not projected → attempts
+    back to 1, and one attempt has still been spent.
+    """
+
+    async with _two_workers(tmp_path) as workers:
+        task_id = new_id()
+        step_id = new_id()
+        # Same fixture as the test above: a Step whose Task was never projected,
+        # so the real projector raises the replay-safe dependency wait.
+        await workers.a.persist_and_project(
+            [
+                ObservationEnvelope(
+                    kind="step.started",
+                    occurred_at=_OCCURRED_AT,
+                    task_id=task_id,
+                    step_id=step_id,
+                    subject_type="step",
+                    subject_id=step_id,
+                    producer=Producer(name="lease-cas-dependency", version="1", instance_id="test"),
+                    producer_seq=1,
+                    source_event_id="lease-cas:retry-dependency:step:started",
+                    correlation_id=task_id,
+                    payload={"step_seq": 1, "actor_kind": "lead_agent"},
+                )
+            ]
+        )
+
+        project_step = workers.a._project_step
+        attempts: list[int] = []
+
+        async def explode_once(session, observation, *args, **kwargs):
+            attempts.append(1)
+            if len(attempts) == 1:
+                raise RuntimeError("first step attempt fails hard")
+            return await project_step(session, observation, *args, **kwargs)
+
+        workers.a._project_step = explode_once  # type: ignore[method-assign]
+
+        await workers.a.project_pending(limit=1)
+
+        async with workers.a_sessions() as session:
+            job_id = await session.scalar(select(AnsichProjectionJobRow.job_id).where(AnsichProjectionJobRow.projector_name == "task-step"))
+        assert job_id is not None
+        re_armed = await _projection_job(workers.a_sessions, job_id)
+        assert re_armed.status == "retry"
+        assert re_armed.attempts == 1
+        assert re_armed.dependency_pending_since is None
+
+        # Second claim: the hard error is spent, the dependency is still missing.
+        await _make_claimable_now(workers.a_sessions, job_id)
+        await workers.a.project_pending(limit=1)
+
+        waiting = await _projection_job(workers.a_sessions, job_id)
+        assert len(attempts) == 2
+        assert waiting.dependency_pending_since is not None
+        # The attempt came back...
+        assert waiting.attempts == 1
+        # ...but the row is still a re-armed one, not a never-attempted one.
+        assert waiting.status == "retry"
+
+
+@pytest.mark.anyio
 async def test_rebuild_re_pend_bumps_generations_so_an_in_flight_completion_cannot_settle_a_job(tmp_path):
     """Without the re-pend bump the replay would silently skip a job.
 
@@ -618,19 +692,14 @@ class _RecordingSession:
     mirrors both halves.
     """
 
-    def __init__(self, dialect_name: str | None, statements: list[tuple[str, object]], *, raise_on: str | None = None, connectable: bool = True) -> None:
+    def __init__(self, dialect_name: str | None, statements: list[tuple[str, object]], *, raise_on: str | None = None) -> None:
         if dialect_name is None:
             self.bind = None
-        elif connectable:
+        else:
             self.bind = SimpleNamespace(
                 dialect=SimpleNamespace(name=dialect_name),
                 connect=lambda: _RecordingConnection(statements, raise_on=raise_on),
             )
-        else:
-            # The shape of an ``AsyncSession`` bound to an ``AsyncConnection``:
-            # the dialect resolves, but a connection cannot hand out another
-            # connection, so there is no ``connect`` to pin the lock to.
-            self.bind = SimpleNamespace(dialect=SimpleNamespace(name=dialect_name))
         self._statements = statements
 
     async def __aenter__(self) -> _RecordingSession:
@@ -705,7 +774,7 @@ async def test_maintenance_lock_refuses_to_run_when_the_dialect_is_unresolvable(
 
 
 @pytest.mark.anyio
-async def test_maintenance_lock_refuses_a_bind_it_cannot_pin_a_connection_on():
+async def test_maintenance_lock_refuses_a_bind_it_cannot_pin_a_connection_on(tmp_path):
     """The other fail-closed half: a resolvable dialect with no ``connect``.
 
     Not a hypothetical shape — an ``AsyncSession`` bound to an
@@ -715,16 +784,34 @@ async def test_maintenance_lock_refuses_a_bind_it_cannot_pin_a_connection_on():
     hold the lock; refusing is the same trade as the unresolvable dialect
     above, and for the same reason: a maintenance lock that quietly degraded to
     a no-op would let two operators replay the same Observations.
+
+    **Driven by the real classes, not by a stub of them**, because the claim is
+    about a production shape and a stub can only encode what its author already
+    believed. Both facts the branch turns on are asserted directly off a real
+    ``AsyncSession(bind=AsyncConnection)``: the dialect *is* readable through
+    that bind, and ``connect`` *is* absent from it. The only thing substituted
+    is the dialect's ``name``, which is the one fact this SQLite tier cannot
+    supply — poked onto the throwaway engine's own dialect object, which is
+    disposed with it at the end of the test and is never used for a query.
     """
 
-    statements: list[tuple[str, object]] = []
-    backend = SqlAnsichBackend(lambda: _RecordingSession("postgresql", statements, connectable=False))  # type: ignore[arg-type]
+    engine = create_async_engine(f"sqlite+aiosqlite:///{tmp_path / 'maintenance-bind.db'}")
+    try:
+        async with engine.connect() as connection:
+            session = AsyncSession(bind=connection)
+            # The production shape, off the real objects.
+            assert session.bind is connection
+            assert session.bind.dialect.name == "sqlite"
+            assert getattr(session.bind, "connect", None) is None
 
-    with pytest.raises(RuntimeError, match="pin a connection"):
-        async with backend._maintenance_lock():
-            pass
+            connection.dialect.name = "postgresql"
+            backend = SqlAnsichBackend(lambda: session)  # type: ignore[arg-type]
 
-    assert statements == []
+            with pytest.raises(RuntimeError, match="pin a connection"):
+                async with backend._maintenance_lock():
+                    pass
+    finally:
+        await engine.dispose()
 
 
 @pytest.mark.anyio

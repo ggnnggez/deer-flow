@@ -1671,6 +1671,21 @@ class AnsichService:
             return rebuilt
 
     async def retry_failed_projections(self, *, task_id: str | None = None) -> int:
+        """Re-arm durably failed projection jobs; return how many were re-armed.
+
+        **The return value is a re-arm count, not a completion claim**, and it
+        carries the same drain-exit ambiguity F10-26 named on the rebuild half:
+        a re-armed job is claimed and projected *afterwards*, by whichever
+        worker's loop gets to it, so this call returning ``3`` says three rows
+        were put back in the queue and nothing about whether any of them has
+        since settled. The rebuild half was given ``RebuildOutcome(replayed,
+        unsettled)`` so a caller could tell those apart; this half was left as a
+        bare ``int`` and **still owes that shape**. Until it has one, a caller
+        that needs "the failures are gone" must re-read the failed-job count
+        rather than trust this number. Carried to batch C in spec
+        ``11-resilience-replay-and-retention.md`` §5.
+        """
+
         retry_failed = getattr(self._backend, "retry_failed_projections", None)
         if not callable(retry_failed):
             return 0
@@ -1719,6 +1734,19 @@ class AnsichService:
 
         The projector keeps joining unconditionally: it holds no rows of its
         own, so a slow projection delays shutdown without risking data.
+
+        **What this does NOT drain: the unreported process-loss bucket.** Loss
+        that cannot be attributed to a Task is filed in
+        ``_unreported_global_ranges`` and becomes durable only when
+        ``_drain_unreported_global_ranges`` writes it as an
+        ``observability.lost`` Observation, which happens on the periodic paths
+        only. Nothing here calls it, so loss charged in the last window before a
+        stop never becomes durable and the ``observability_degradation``
+        producer never sees it. Deliberate for this batch (the drain is an
+        unbounded backend write, and shutdown budgeting is batch C's subject —
+        spec ``11-resilience-replay-and-retention.md`` §8, where this is
+        recorded); the ``live``-range guard inside the drain exists precisely so
+        that a shutdown caller can be added safely.
         """
 
         if self._starting:

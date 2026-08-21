@@ -1339,8 +1339,11 @@ job and reads its own id back out — an ABA an owner-only CAS cannot see.
 
 A new job status `retry` separates re-armed work from never-attempted work: a
 hard error re-arms to `retry` because the attempt was spent, while a replay-safe
-dependency wait stays `pending` because it hands its attempt back and was never
-a retry. Both claim predicates and `has_pending_for_task` accept it, `processing`
+dependency wait hands its own attempt back and therefore leaves the row in
+whichever bucket it arrived in — `pending` for a job nothing had tried, `retry`
+for one an earlier hard error had already re-armed. The decremented attempt
+count is what decides, so a retry loop can never read as a fresh queue. Both
+claim predicates and `has_pending_for_task` accept it, `processing`
 is deliberately not renamed, and the evaluation receipt keeps reporting every
 still-claimable status as `pending`.
 
@@ -1440,13 +1443,31 @@ own first write still collides as one retryable assessor attempt (bounded,
 self-healing, F10-6's entry says so), and the LLM-attempt projector's two
 Observations still collide on `ansich_llm_attempts_pkey` (F10-31 — a fifth
 lock-then-read conversion, not a one-liner). **Multi-row rollups also lock in a
-deterministic order**: the usage fan-out, the spawn backfill and the
-environment per-metric update all sort their targets before taking locks,
-because two processes walking a `set` or a `dict` in native order deadlock on a
-real server (the tier demonstrated the abort). The deadlock-freedom argument is
-a serializing prefix — both usage fan-outs take a contribution row before the
-summary row while walking aggregates ascending — and it is written at
-`_backfill_spawn_usage`.
+deterministic order**: the usage fan-out, the spawn backfill (**both** axes —
+ancestors *and* the descendant contribution read, since one ancestor with two
+descendants takes two locked high-water rows), the environment per-metric
+update, the active-task read model's target set and its conflict fallback, and
+the two process-subject producers' Belief writes all sort their targets before
+taking locks, because two processes walking a `set`, a `dict` or an unordered
+`SELECT` in native order deadlock on a real server (the tier demonstrated the
+abort). The deadlock-freedom argument is a serializing prefix — both usage
+fan-outs take a contribution row before the summary row while walking aggregates
+ascending — and it is written at `_backfill_spawn_usage`; note it bounds the
+*dimension* axis by `MAX_TYPE_USAGE_DIMENSIONS` having one member, which is why
+the source axis needs its own `ORDER BY` rather than being covered by it. For
+the process-subject producers the sort belongs at the **write site**, not in
+either producer: the assessment list is two concatenated halves (failing groups,
+then recovered ones) whose *partition* differs between workers, so sorting each
+half separately would leave the inversion open.
+
+One ordering residual is deliberate and must not be misread as handled:
+`descendant_task_ids` (`_project_task_spawn` / `_reconcile_spawn_usage`) is
+deterministic but **not sorted** — the child id is prepended ahead of the ordered
+scalars. That is free today because the tuple is only an `IN` predicate and a
+filter over an already-ordered read; the first change that walks it taking locks
+(a per-descendant row lock is the obvious one — PB8 names it as the anchor that
+would close F10-19's residual) must sort it at both producers first. Both sites
+say so in code.
 
 What a row lock structurally cannot do is stop a peer from INSERTing a *new
 input*: row locks bound an existing row's writers, not the membership of a set.
@@ -1624,10 +1645,13 @@ moment. Writing keeps its version (a claim about who judged); recovery is a
 claim about what is no longer true.
 
 Both types join the router's alert-type allowlist
-(`app/gateway/routers/ansich.py::list_alerts`). Frontend wiring (`types.ts`,
-locales, the exhaustive presentation switch) is separate — and in the interim
-the **unfiltered** alert list already returns both types, so a process-subject
-Alert reaches the existing UI with a blank type label until that wiring lands.
+(`app/gateway/routers/ansich.py::list_alerts`). The frontend wiring landed in the
+same batch, so there is no blank-label interim left: both values are in
+`frontend/src/core/ansich/types.ts`, in `ANSICH_PRODUCED_ALERT_TYPES`, in both
+locales (`en-US.ts` / `zh-CN.ts` — "Projection failing" / "Observability loss"),
+and in the two `default:`-free exhaustive switches, so a new alert type is a
+compile error rather than a blank label. Any *further* type must be added in all
+six places at once for the same reason.
 Tests:
 `tests/ansich/test_process_health_alerts.py` — open/confirm/resolve/recurrence
 for both types driven by real failed jobs and real `observability.lost` rows,
@@ -1651,7 +1675,8 @@ forward, both fail-open) — and the blast radius is the whole
 `assess_operations` transaction, so one collision discards that tick's
 heartbeat, dwell, budget and environment work along with both producers'.
 The next tick redoes it a second later; serializing Scope-subject reconciliation
-is not part of this slice.
+is not part of this slice and is registered as **F10-33**, owned by P11-C
+(alongside F10-31, the other remaining first-writer/unique-constraint race).
 
 **P11-B health database merge and the read-model stamp** (spec §4/§9). Ansich
 health now answers with **two numbers of different standing**, and the wording
@@ -1750,7 +1775,23 @@ progress as if it were the system's. It now stamps the store-wide continuity mar
 (the lowest per-projector `complete_through`) and the database lag. Two things
 follow. First, the stamped watermark is a *continuity* number, so it is lower
 than the old one whenever anything is outstanding — that is the correction, not a
-regression. Second, the row carries a **monotonic publish guard** (controller
+regression. **It can legitimately be `0`**, and the column that carries it kept
+the old identifier `projection_watermark`: `ingest_seq` starts at 1, so a hole on
+the store's first Observation puts the mark at `min(unsettled) - 1 == 0`, and a
+durably failed job there makes it permanent. Zero and `None` are different
+statements on this field — `0` means "Observations exist and nothing at or below
+1 is settled yet", `None` means "the store holds no Observations at all", and the
+publish guard below treats only `None` as "no basis established" — so
+`ActiveTaskView.projection_watermark` is bounded `ge=0`. It carried `ge=1` from
+the field's pre-merge meaning (one worker's highest *projected* sequence) until
+that bound was found raising `ValidationError` out of every operations tick,
+freezing the read model during exactly the poison-job incident the
+`projection_failure` producer exists to report. Note where such a raise goes:
+`_projector_loop` routes an `assess_operations` failure through the rate-limited
+fail-open reporter, but `rebuild_projections` and `retry_failed_projections` call
+it unguarded, so the same raise leaves an operator's remedy endpoint as an error
+rather than being swallowed. Second, the row carries a **monotonic publish
+guard** (controller
 ruling PB7): every input of a tick is read in earlier, already-committed
 sessions, so the `FOR UPDATE` lock serialises the writers but not the compute,
 and a tick that started first can finish last. Inside the locked write, a tick
@@ -1764,9 +1805,20 @@ row — and deleting it resets the basis to NULL, disarming the guard for that
 Task. A staler tick therefore neither publishes over nor deletes a fresher row;
 the next tick that is not staler does both, so nothing leaks. The mark only rises
 while a row exists, and `rebuild_projections()` deletes these rows outright, so a
-rebuild's reset cannot freeze the guard shut.
+rebuild's reset cannot freeze the guard shut. **That last sentence is a
+precondition, not just an observation**: rebuild is today the *only* path that
+lowers `min(unsettled ingest_seq)`, and it clears the basis in the same breath. A
+future path that re-inserts a job below the current mark and leaves the read-model
+rows in place — retention re-projecting an expired range, a partial replay
+backfilled at a low sequence, an operator tool that re-enqueues by sequence —
+freezes the guard for good: every later tick reads as staler, the read model stops
+updating, and stopped Tasks' rows are kept silently. That constraint is written at
+`sql.py::_is_staler_publish` and carried to batch C in spec
+`11-resilience-replay-and-retention.md` §6.
 
-One honest residual, on the deploy that lands this change only: rows written by
+One honest residual (**F10-32**, and its premise has an expiry date — read the
+registry entry before deploying this branch), on the deploy that lands this
+change only: rows written by
 the previous code carry the *old* stamp (that worker's highest projected
 `ingest_seq`), which sits at or above the new continuity mark. While any job is
 durably `failed`, such a row's basis stays above every new tick's and the row is
@@ -1774,7 +1826,10 @@ skipped — for a still-running Task visibly, once per tick, at DEBUG; for a Tas
 that has since stopped the guarded sweep keeps the row *silently*, and it keeps
 reading as `running` until cleared. Retrying the failed job or running a rebuild
 (the documented operator remedies for a failed job, and a rebuild deletes these
-rows) clears it.
+rows) clears it. The premise that made this acceptable — no deployed population
+carries the old stamp, because every P11-B commit is unpushed — **fails silently
+at the first deploy of this branch, and no test goes red when it does**. F10-32
+records the three ways out and requires the choice to be made, not defaulted.
 
 Two debts close with this slice. **F10-24**: both writers of a
 `budget_health:<dimension>:<scope>` Assertion — `_assess_budget_rows` on terminal

@@ -496,6 +496,34 @@ def _record_contribution_writes(monkeypatch: pytest.MonkeyPatch) -> list[str]:
     return recorded
 
 
+def _record_contribution_sources(monkeypatch: pytest.MonkeyPatch) -> list[tuple[str, str, str, str]]:
+    """Record the whole key of each contribution write, not just its aggregate.
+
+    The aggregate axis is only half of the backfill's lock traversal. One
+    ancestor with two descendants that each carry a ``wall_time_ms`` self row
+    gets **two** locked high-water contribution rows, taken in the order the
+    descendant read handed them over.
+    """
+
+    recorded: list[tuple[str, str, str, str]] = []
+    original = ansich_sql.SqlAnsichBackend._store_usage_contribution.__func__
+
+    async def _patched(cls, session, *, aggregate_task_id, source_task_id, dimension, source_obs_id, **kwargs):
+        recorded.append((aggregate_task_id, source_task_id, dimension, source_obs_id))
+        return await original(
+            cls,
+            session,
+            aggregate_task_id=aggregate_task_id,
+            source_task_id=source_task_id,
+            dimension=dimension,
+            source_obs_id=source_obs_id,
+            **kwargs,
+        )
+
+    monkeypatch.setattr(ansich_sql.SqlAnsichBackend, "_store_usage_contribution", classmethod(_patched))
+    return recorded
+
+
 def _first_appearance(values: list[str]) -> list[str]:
     seen: list[str] = []
     for value in values:
@@ -640,6 +668,89 @@ async def test_spawn_backfill_takes_both_its_lock_traversals_in_a_worker_indepen
     assert all(scope == "inclusive" for _task, _dimension, scope in summaries), summaries
     pairs = [(target, dimension) for target, dimension, _scope in summaries]
     assert pairs == sorted(pairs), pairs
+
+
+@pytest.mark.anyio
+async def test_spawn_backfill_walks_its_descendant_sources_in_a_worker_independent_order(tmp_path, monkeypatch):
+    """The *source* axis of the same traversal, which the ancestor sort does not reach.
+
+    The written serializing-prefix invariant bounds the **dimension** axis
+    (``MAX_TYPE_USAGE_DIMENSIONS`` has exactly one member) and says nothing about
+    the source axis. A subtree with two descendants that each carry a
+    ``wall_time_ms`` self row gives one ancestor two locked high-water
+    contribution rows, in whatever order the unordered descendant read produced
+    — and since T6 this loop has a second, independent caller
+    (``_reconcile_spawn_usage``, from its own transaction), whose in-flight gate
+    waits only on ``task-usage`` leases under the *spawned* subtree, so a sibling
+    subtree's backfill under the same ancestor is not excluded.
+
+    Which half has the teeth, stated honestly: the **structural** assertion (the
+    read carries the ``ORDER BY``) is the one that was red before the fix. The
+    behavioural one (writes visited in sorted key order) was already green here,
+    because SQLite happened to return the two descendants' rows in ascending
+    source order — the same coincidence the sibling test above warns about, and
+    the reason this module pins statement shape rather than trusting an
+    observed order. It is kept as a clamp: it fails if a future edit reorders
+    the traversal after the read.
+    """
+
+    async with _representative_state(tmp_path, "rollup-backfill-sources") as (service, task_id, _budget):
+        lower, higher = sorted((new_id(), new_id()))
+        for ordinal, descendant_task_id in enumerate((higher, lower)):
+            service.record_batch(
+                (
+                    ObservationEnvelope.task_lifecycle(
+                        kind="task.created",
+                        task_id=descendant_task_id,
+                        source_kind="deerflow_run",
+                        source_id=f"run-backfill-source-{ordinal}",
+                        occurred_at=_OCCURRED_AT,
+                        source_event_id=f"run-backfill-source-{ordinal}:task:created",
+                    ),
+                    ObservationEnvelope.task_lifecycle(
+                        kind="task.started",
+                        task_id=descendant_task_id,
+                        source_kind="deerflow_run",
+                        source_id=f"run-backfill-source-{ordinal}",
+                        occurred_at=_OCCURRED_AT,
+                        source_event_id=f"run-backfill-source-{ordinal}:task:started",
+                    ),
+                    # `wall_time_ms` is the one max-type dimension, so only a
+                    # heartbeat-sourced contribution takes the locked path.
+                    ObservationEnvelope.task_heartbeat(
+                        task_id=descendant_task_id,
+                        run_id=f"run-backfill-source-{ordinal}",
+                        occurred_at=_OCCURRED_AT + timedelta(seconds=10),
+                        elapsed_ms=10_000 + ordinal,
+                        worker_id="worker-rollup",
+                        ownership_epoch="epoch-rollup",
+                        source_event_id=f"run-backfill-source-{ordinal}:task:heartbeat:1",
+                    ),
+                )
+            )
+            await service.flush_task(descendant_task_id)
+
+        backend = service._backend
+        await service.stop()
+        writes = _record_contribution_sources(monkeypatch)
+        with _record_statements() as statements:
+            async with backend._session_factory() as session, session.begin():
+                await backend._backfill_spawn_usage(
+                    session,
+                    ancestor_task_ids=("aaa-backfill-ancestor",),
+                    # Deliberately unsorted, the shape a caller can hand down.
+                    descendant_task_ids=(higher, lower),
+                    updated_at=_ASSESSED_AT,
+                )
+
+    high_water = [item for item in writes if item[2] == "wall_time_ms"]
+    assert {item[1] for item in high_water} == {lower, higher}, writes
+    keys = [(aggregate, source, dimension, obs_id) for aggregate, source, dimension, obs_id in writes]
+    assert keys == sorted(keys), writes
+
+    contribution_reads = [item for item in statements if item.touches("ansich_usage_contributions") and not item.for_update]
+    assert contribution_reads, [item.sql for item in statements]
+    assert any("order by ansich_usage_contributions.source_task_id" in item.sql for item in contribution_reads), [item.sql for item in contribution_reads]
 
 
 # --------------------------------------------------------------------------

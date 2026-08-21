@@ -418,8 +418,9 @@ _TOOL_TERMINAL_PRECEDENCE = {
 }
 #: Job statuses a claim may take over. ``retry`` is a re-armed job that already
 #: spent an attempt; ``pending`` stays reserved for work nothing has tried yet
-#: (including a replay-safe dependency wait, which consumes no attempt), and a
-#: ``processing`` row only becomes claimable once its lease has expired.
+#: (a replay-safe dependency wait consumes no attempt, so it leaves a job in
+#: whichever of the two it arrived in), and a ``processing`` row only becomes
+#: claimable once its lease has expired.
 _CLAIMABLE_JOB_STATUSES = ("pending", "retry")
 #: Job statuses that leave an Observation *owed* -- the set the continuity mark
 #: is taken over (RB6①). ``failed`` belongs in it: a durably failed job has been
@@ -860,6 +861,22 @@ def _is_staler_publish(published: int | None, incoming: int | None) -> bool:
     Equal marks are not stale -- two ticks that read the same world may both
     publish, and the ordinary value compare below decides whether anything
     changes.
+
+    **The precondition, for whoever writes the next batch.** This guard is only
+    livelock-free because the basis it compares can never move *down* while a
+    row exists. Today that holds by construction: the mark is
+    ``min(unsettled ingest_seq) - 1``, and the only action that lowers
+    ``min(unsettled ingest_seq)`` is ``rebuild_projections()``, which deletes
+    these read-model rows outright, so the basis is reset to ``NULL`` in the same
+    breath and nothing stays frozen. **Any future path that re-inserts a job
+    below the current mark without deleting the affected read-model rows breaks
+    it** -- retention re-projecting an expired range, a partial replay backfilled
+    at a low ``ingest_seq``, an operator tool that re-enqueues by sequence. The
+    consequence is not a wrong number but a stuck one: every later tick reads as
+    staler forever, the active-task read model stops updating, and rows for
+    stopped Tasks are kept *silently* by the guarded sweep. Either avoid that
+    shape or delete the affected rows in the same transaction. Recorded for
+    batch C in ``ansich/docs/plans/11-resilience-replay-and-retention.md`` §6.
     """
 
     if published is None:
@@ -2242,6 +2259,14 @@ class SqlAnsichBackend:
         health read to tell a queue from a retry loop. A dependency wait is the
         deliberate exception -- it gives its attempt back, so it is not a retry
         and stays ``pending``.
+
+        "Stays" is meant literally, and it is what the decremented attempt count
+        decides. The wait hands back *its own* attempt, not the ones a hard
+        error already spent: a row that entered this claim as ``retry`` leaves
+        with a spent attempt still on the clock and therefore stays ``retry``.
+        Writing ``pending`` unconditionally would move a live retry loop into the
+        never-attempted bucket -- the exact distinction the health split, its
+        panel column and its panel copy are built on.
         """
 
         async with self._session_factory() as session, session.begin():
@@ -2254,10 +2279,16 @@ class SqlAnsichBackend:
             if isinstance(exc, _ProjectionDependencyPending):
                 pending_since = now if job.dependency_pending_since is None else _as_utc(job.dependency_pending_since)
                 timed_out = now - pending_since >= self._projector_dependency_timeout
+                # The wait gives back the attempt it just took, and only that
+                # one. A remaining count above zero means an earlier hard error
+                # spent an attempt on this row, so it is a re-armed job waiting
+                # on a dependency -- still `retry`, never back to "nothing has
+                # tried this yet".
+                remaining_attempts = max(0, job.attempts - 1)
                 values = {
                     "dependency_pending_since": pending_since,
-                    "status": "failed" if timed_out else "pending",
-                    "attempts": max(0, job.attempts - 1),
+                    "status": "failed" if timed_out else ("pending" if remaining_attempts == 0 else "retry"),
+                    "attempts": remaining_attempts,
                     "available_at": now + timedelta(milliseconds=250),
                     "lease_owner": None,
                     "lease_expires_at": None,
@@ -2510,10 +2541,16 @@ class SqlAnsichBackend:
             if isinstance(exc, _ProjectionDependencyPending):
                 pending_since = now if job.dependency_pending_since is None else _as_utc(job.dependency_pending_since)
                 timed_out = now - pending_since >= self._projector_dependency_timeout
+                # The wait gives back the attempt it just took, and only that
+                # one. A remaining count above zero means an earlier hard error
+                # spent an attempt on this row, so it is a re-armed job waiting
+                # on a dependency -- still `retry`, never back to "nothing has
+                # tried this yet".
+                remaining_attempts = max(0, job.attempts - 1)
                 values = {
                     "dependency_pending_since": pending_since,
-                    "status": "failed" if timed_out else "pending",
-                    "attempts": max(0, job.attempts - 1),
+                    "status": "failed" if timed_out else ("pending" if remaining_attempts == 0 else "retry"),
+                    "attempts": remaining_attempts,
                     "available_at": now + timedelta(milliseconds=250),
                     "lease_owner": None,
                     "lease_expires_at": None,
@@ -6246,6 +6283,15 @@ class SqlAnsichBackend:
                     AnsichCurrentBeliefRow.subject_id == scope_id,
                     AnsichBeliefAssertionRow.assessor_name == assessor.name,
                 )
+                # Ordered for the same reason both producers order their failing
+                # sets: this list becomes half of a traversal that write-locks
+                # one `ansich_current_beliefs` row per entry, and `field_name` is
+                # that row's key. The total order over the whole traversal is
+                # re-established at the lock site
+                # (`_persist_and_reconcile_process_health`), because the split
+                # between the two halves is itself worker-dependent; ordering
+                # here is what keeps this half from being storage order.
+                .order_by(AnsichCurrentBeliefRow.field_name)
             )
         ).scalars()
         return [value for value in rows if isinstance(value, dict) and value.get("value") == active_value]
@@ -6579,7 +6625,21 @@ class SqlAnsichBackend:
             return 0
         changed = 0
         reconciled: list[tuple[Assessment, str]] = []
-        for assessment in assessments:
+        # Sorted by `field_name`, which is the second half of the
+        # `ansich_current_beliefs` primary key this loop write-locks (the first
+        # half is `scope_id`, the same for every row here). Unlike every
+        # Task-subject path, all Gateway workers on a host subject the SAME host
+        # Scope and tick at 1 Hz, so the contended row set is identical across
+        # workers -- the best case for an inversion, not the worst.
+        #
+        # The sort belongs HERE rather than in either producer, because the list
+        # arrives as two concatenated halves (this rule's failing groups, then
+        # the groups it last called unhealthy and now calls recovered) and the
+        # *partition* between them differs between workers: a group one worker
+        # still sees failing is one its peer may already see recovered. Sorting
+        # each half would leave that inversion open. Sorting at the site that
+        # takes the locks closes it whatever the halves contain.
+        for assessment in sorted(assessments, key=lambda item: item.field_name):
             assertion, did_change = await self._persist_transition_only_assessment(
                 session,
                 assessment,
@@ -7083,7 +7143,11 @@ class SqlAnsichBackend:
         lost_ranges: tuple[LostRange, ...],
     ) -> None:
         async with self._session_factory() as session:
-            running_task_ids = tuple((await session.execute(select(AnsichTaskSummaryRow.task_id).where(AnsichTaskSummaryRow.control_value == "running"))).scalars())
+            # Ordered at the source: this tuple decides the order `views` is
+            # built in, and `views` is walked below taking a single-row
+            # `FOR UPDATE` on every conflict. An unordered read would leave that
+            # fallback loop in storage order.
+            running_task_ids = tuple((await session.execute(select(AnsichTaskSummaryRow.task_id).where(AnsichTaskSummaryRow.control_value == "running").order_by(AnsichTaskSummaryRow.task_id))).scalars())
 
         views: list[ActiveTaskView] = []
         # Database-derived, not process-local (RB8). `get_projection_metrics()`
@@ -7227,10 +7291,23 @@ class SqlAnsichBackend:
             # THIS set in the same order — that is the whole claim, and it is
             # narrower than "these two ticks cannot deadlock": the DELETE below
             # takes locks on the complementary set in an order nothing here
-            # specifies, and two ticks with different `running_task_ids`
-            # snapshots can cross-hold across the two sets. That shape predates
-            # this change and is not made worse by it; ordering the FOR UPDATE
-            # set is what this lock owns.
+            # specifies, and two ticks whose snapshots disagree can cross-hold
+            # across the two sets. Ordering the FOR UPDATE set is what this lock
+            # owns.
+            #
+            # That disclaimer was first written for T5, when the only way two
+            # ticks' complementary sets could differ was a different
+            # `running_task_ids` snapshot. **It has been re-derived for the
+            # predicate as it now stands, and the honest statement is weaker:**
+            # T10 added `projection_watermark <= complete_through` to the sweep
+            # (the same basis PB7 guards the publish with), so two ticks holding
+            # the *same* `running_task_ids` can now delete different subsets --
+            # a second divergence source that did not exist before. The
+            # remaining shape is unchanged in kind and the blast radius is the
+            # documented one: a deadlock abort discards the tick, the next tick
+            # redoes it, nothing is corrupted. Closing it means ordering the
+            # DELETE's row set too, which means enumerating and locking it
+            # first -- a read this function deliberately does not take.
             #
             # The residual T5 left here -- every input above was read in
             # *earlier, already-committed* sessions, so this lock serializes the
@@ -7337,6 +7414,18 @@ class SqlAnsichBackend:
                     # part of it: publishing a mixture of two ticks' facts would
                     # be a state neither of them observed. The next tick
                     # republishes.
+                    #
+                    # F10-32 lives on this branch: a row stamped by the
+                    # pre-merge code carries the OLD meaning of this column (one
+                    # worker's highest projected `ingest_seq`), which sits at or
+                    # above every new tick's continuity mark while any job is
+                    # durably failed -- so such a row is skipped here forever,
+                    # and the guarded sweep keeps its stopped-Task counterpart
+                    # SILENTLY. That was accepted on the premise that no
+                    # deployed population carries the old stamp, a premise that
+                    # dies at this branch's first deploy. See the registry entry
+                    # (`ansich/docs/plans/phase-10-review-followups.md`): it must
+                    # be re-adjudicated before that deploy, not defaulted.
                     logger.debug(
                         "Ansich active-task read model publish skipped as stale for %s (row watermark %s, tick watermark %s)",
                         view.task_id,
@@ -8575,6 +8664,12 @@ class SqlAnsichBackend:
         # traversal. `ancestors` comes from an unordered select, so without
         # this the traversal order is storage order.
         ancestor_depths = sorted([(parent_task_id, 0), *[(row.ancestor_task_id, row.depth) for row in ancestors]])
+        # Deliberately NOT sorted, and the asymmetry is worth stating: the
+        # descendant tuple is only ever an `IN` predicate (and, in
+        # `_backfill_spawn_usage`, a filter over a read that carries its own
+        # ORDER BY), so nothing walks it taking locks and prepending the child
+        # costs nothing. A future per-descendant lock changes that and must sort
+        # here and in `_reconcile_spawn_usage`, whose docstring says the same.
         descendant_depths = [(child_task_id, 0), *[(row.descendant_task_id, row.depth) for row in descendants]]
         for ancestor_id, ancestor_depth in ancestor_depths:
             for descendant_id, descendant_depth in descendant_depths:
@@ -8694,10 +8789,21 @@ class SqlAnsichBackend:
 
         The ordering discipline is inherited rather than re-implemented: the
         traversal is ``_backfill_spawn_usage``'s own, which sorts its ancestors
-        before taking the high-water contribution locks and sorts ``changed``
-        before taking the summary locks. The two reads below are ordered for the
-        same reason, so the tuple handed down is a function of the ids and not
-        of storage order.
+        and its descendant contribution read before taking the high-water
+        contribution locks, and sorts ``changed`` before taking the summary
+        locks. The two reads below are ordered for the same reason, so the
+        tuples handed down are a function of the ids and not of storage order.
+
+        **``descendant_task_ids`` is deterministic but NOT sorted**, and a
+        future reader must not read the paragraph above as saying otherwise:
+        ``child_task_id`` is prepended ahead of the ordered scalars, exactly as
+        ``_project_task_spawn`` prepends it there. That is harmless today because
+        the tuple is only ever an ``IN`` predicate and a filter over an
+        already-ordered read -- nothing walks it taking locks. It stops being
+        harmless the moment something does (a per-descendant row lock is the
+        obvious candidate; controller ruling PB8 names it as the anchor that
+        would close the DOMAIN residual below), and that change must sort the
+        tuple at both producers first.
         """
 
         child_task_id = observation.task_id
@@ -8812,6 +8918,18 @@ class SqlAnsichBackend:
                     .where(
                         AnsichUsageContributionRow.aggregate_task_id == AnsichUsageContributionRow.source_task_id,
                         AnsichUsageContributionRow.source_task_id.in_(descendant_task_ids),
+                    )
+                    # The source axis of the lock traversal below. Sorting the
+                    # ancestors alone bounds only the outer loop: one ancestor
+                    # with two descendants that each carry a `wall_time_ms` self
+                    # row takes TWO locked high-water contribution rows, and
+                    # without this they are taken in storage order. The written
+                    # serializing-prefix invariant below bounds the dimension
+                    # axis, not this one.
+                    .order_by(
+                        AnsichUsageContributionRow.source_task_id,
+                        AnsichUsageContributionRow.dimension,
+                        AnsichUsageContributionRow.source_obs_id,
                     )
                 )
             ).all()

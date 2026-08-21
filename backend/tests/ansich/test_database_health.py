@@ -756,6 +756,98 @@ async def test_a_staler_operations_tick_does_not_delete_a_fresher_read_model_row
     assert after_fresh_tick is None
 
 
+@pytest.mark.anyio
+async def test_a_hole_on_the_first_observation_publishes_a_zero_mark_rather_than_raising(tmp_path):
+    """The `ingest_seq == 1` boundary of the continuity mark.
+
+    `ingest_seq` starts at 1, so `min(unsettled) - 1` is **0** whenever the
+    lowest unsettled job sits on the store's very first Observation — and a
+    durably failed job there makes that permanent. Zero is a legitimate value of
+    this field: it says "nothing is settled yet, and nothing below 1 is owed",
+    which is exactly what a continuity mark should say there. It is *not* the
+    same statement as `None`, which this field reserves for "the store holds no
+    Observations at all"; the publish guard reads `None` as "no basis" and would
+    treat a real basis of 0 as one if the two were folded together.
+
+    Before the fix `ActiveTaskView.projection_watermark` carried a `ge=1` bound
+    left over from the field's pre-T10 meaning (this worker's highest
+    *projected* sequence), so this state raised `ValidationError` out of
+    `assess_operations` on **every** tick and the active-task read model was
+    never published — during exactly the poison-job incident the
+    `projection_failure` producer exists to report.
+    """
+
+    engine = create_async_engine(f"sqlite+aiosqlite:///{tmp_path / 'health-zero-mark.db'}")
+    session_factory = async_sessionmaker(engine, expire_on_commit=False)
+    async with engine.begin() as connection:
+        await connection.run_sync(Base.metadata.create_all)
+    service = create_sql_ansich_service(session_factory, operations_assessment_interval_ms=60_000)
+    only_test_driven_assessments(service)
+    await service.start()
+    task_id = new_id()
+
+    try:
+        service.record_batch(
+            (
+                ObservationEnvelope.task_lifecycle(
+                    kind="task.created",
+                    task_id=task_id,
+                    source_kind="deerflow_run",
+                    source_id="run-health-zero",
+                    occurred_at=_OBSERVED_AT,
+                    source_event_id="run-health-zero:task:created",
+                ),
+                ObservationEnvelope.task_lifecycle(
+                    kind="task.started",
+                    task_id=task_id,
+                    source_kind="deerflow_run",
+                    source_id="run-health-zero",
+                    occurred_at=_OBSERVED_AT,
+                    source_event_id="run-health-zero:task:started",
+                ),
+            )
+        )
+        await service.flush_task(task_id)
+        backend = service._backend
+        async with session_factory() as session:
+            first_obs_id, first_ingest_seq, poisoned_projector = (
+                await session.execute(
+                    select(
+                        AnsichObservationRow.obs_id,
+                        AnsichObservationRow.ingest_seq,
+                        AnsichProjectionJobRow.projector_name,
+                    )
+                    .join(
+                        AnsichProjectionJobRow,
+                        AnsichProjectionJobRow.obs_id == AnsichObservationRow.obs_id,
+                    )
+                    .order_by(AnsichObservationRow.ingest_seq, AnsichProjectionJobRow.projector_name)
+                    .limit(1)
+                )
+            ).one()
+        # The poison job: the store's very first Observation, durably failed.
+        await _set_job_status(
+            session_factory,
+            obs_id=first_obs_id,
+            projector_name=poisoned_projector,
+            status="failed",
+        )
+        database_health = await backend.get_database_health()
+        # No raise: this is the assertion the fix is about.
+        await service.assess_operations(now=datetime.now(UTC))
+        async with session_factory() as session:
+            row = await session.scalar(select(AnsichActiveTaskReadModelRow).where(AnsichActiveTaskReadModelRow.task_id == task_id))
+            published_watermark = None if row is None else row.projection_watermark
+    finally:
+        await service.stop()
+        await engine.dispose()
+
+    assert first_ingest_seq == 1
+    assert _projector(database_health, poisoned_projector).complete_through == 0
+    assert row is not None
+    assert published_watermark == 0
+
+
 def test_an_unreachable_database_block_reports_unknown_rather_than_zero():
     """None-when-unknown is a batch invariant, and it is user-visible here.
 

@@ -979,6 +979,96 @@ async def test_the_truncation_warning_is_rate_limited_and_fail_open(tmp_path, ca
 
 
 @pytest.mark.anyio
+async def test_process_health_takes_its_belief_locks_in_a_worker_independent_order(tmp_path):
+    """The recovery half of both producers is a lock traversal, so it must be ordered.
+
+    Unlike every Task-subject path, all Gateway workers on one host subject the
+    **same** host Scope and tick at 1 Hz, so the contended row set is identical
+    across workers — the best possible case for an inversion rather than the
+    worst. ``_persist_and_reconcile_process_health`` walks its assessment list
+    issuing a flush and an ``ansich_current_beliefs`` write per assessment, so
+    row locks are taken in traversal order.
+
+    Both producers already sort their *failing* sets. The recovered set came off
+    an unordered ``SELECT`` and was appended after them, which leaves two holes:
+    storage order inside the recovered half, and — the one sorting only that
+    half would not close — a partition that differs between workers, since a
+    group one worker still calls failing is a group the other may already call
+    recovered. So the order that matters is the one at the lock site: the whole
+    list, sorted by the Belief ``field_name``, which *is* the locked row's key.
+
+    The construction is the partition, not the storage order, because the
+    partition is the half a per-half sort cannot reach — and on SQLite the
+    recovery read happens to come back off the ``(subject_id, field_name)``
+    primary key, so a storage-order fixture would satisfy a sorted assertion by
+    coincidence. Here ``zzz`` is still losing while ``aaa`` has recovered, so the
+    two halves concatenate as ``zzz, aaa``: unsorted whatever either half does
+    internally, and exactly the shape a peer worker inverts by disagreeing about
+    one group.
+    """
+
+    engine, session_factory, service = await _started_service(tmp_path, "process-health-lock-order.db")
+    still_losing = "zzz-producer"
+    recovering = "aaa-producer"
+    recorded: list[str] = []
+    try:
+        backend = service._backend
+        for index, producer_name in enumerate((still_losing, recovering), start=1):
+            service.record(
+                _lost_range(
+                    occurred_at=_T0,
+                    first_sequence=index,
+                    last_sequence=index,
+                    producer_name=producer_name,
+                    producer_instance_id="worker-a",
+                    suffix=f"lock-order-{index}",
+                )
+            )
+        await service.flush_task(ANSICH_BOOTSTRAP_TASK_ID)
+        await service.assess_operations(now=_T0 + timedelta(seconds=1))
+        opened = await _alerts(session_factory, "observability_degradation")
+
+        # A fresh loss for `zzz` only, inside the next tick's window, so the next
+        # pass reports it as failing while `aaa`'s only loss has aged out.
+        service.record(
+            _lost_range(
+                occurred_at=_T0 + timedelta(seconds=_OBSERVABILITY_LOSS_WINDOW_SECONDS),
+                first_sequence=3,
+                last_sequence=3,
+                producer_name=still_losing,
+                producer_instance_id="worker-a",
+                suffix="lock-order-3",
+            )
+        )
+        await service.flush_task(ANSICH_BOOTSTRAP_TASK_ID)
+
+        persist = backend._persist_transition_only_assessment
+
+        async def _recording_persist(session, assessment):
+            recorded.append(assessment.field_name)
+            return await persist(session, assessment)
+
+        backend._persist_transition_only_assessment = _recording_persist  # type: ignore[method-assign]
+
+        await service.assess_operations(now=_T0 + timedelta(seconds=_OBSERVABILITY_LOSS_WINDOW_SECONDS + 1))
+        after = await _alerts(session_factory, "observability_degradation")
+    finally:
+        await service.stop()
+        await engine.dispose()
+
+    assert len(opened) == 2
+    assert all(row.resolved_at is None for row in opened)
+    # The partition really did split: one resolved, one still open.
+    by_key = {row.stable_condition_key: row for row in after}
+    assert by_key[observability_loss_condition_key(recovering, "worker-a")].resolved_at is not None
+    assert by_key[observability_loss_condition_key(still_losing, "worker-a")].resolved_at is None
+
+    loss_fields = [field_name for field_name in recorded if field_name.startswith("observability_degradation")]
+    assert set(loss_fields) == {observability_loss_field_name(name, "worker-a") for name in (still_losing, recovering)}
+    assert loss_fields == sorted(loss_fields), recorded
+
+
+@pytest.mark.anyio
 async def test_recovery_resolves_an_episode_opened_by_an_earlier_rule_version(tmp_path):
     """A rule-version bump must not strand the episodes the old version opened.
 
