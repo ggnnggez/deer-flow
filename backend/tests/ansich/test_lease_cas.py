@@ -1003,9 +1003,18 @@ async def test_retry_counts_what_it_re_armed_and_re_reads_what_is_still_owed(tmp
 
         retried = await workers.a.retry_failed_projections()
 
-        assert retried == RetryOutcome(re_armed=2, unsettled=2)
+        # The re-arm count is exact: two ``failed`` rows existed and both were
+        # changed. ``unsettled`` is asserted as a floor -- it counts the whole
+        # store's backlog, so a job arriving from anywhere else may only raise
+        # it, and the claim being made is the ordering one (``0`` before the
+        # re-arm, non-zero after it), not a census.
+        assert retried.re_armed == 2
+        assert retried.unsettled >= 2
         async with workers.a_sessions() as session:
             statuses = sorted((await session.execute(select(AnsichProjectionJobRow.status))).scalars())
+        # Both re-armed jobs walked straight back into the dependency wait
+        # rather than settling or failing again -- that is the state the
+        # outcome above reported.
         assert statuses == ["pending", "pending"]
 
 
@@ -1035,15 +1044,25 @@ async def test_rebuild_until_settled_re_runs_the_rebuild_until_nothing_is_owed(t
 
     ``rebuild_projections()`` reports rather than waits, so a caller that needs
     "the read model is complete" has to call again. Round one here loses the
-    Task's structural projection to one transient error, and the Step's own two
-    projectors then find no Task to hang off and park themselves inside the
-    250ms dependency backoff, invisible to the drain's exit condition. Round two
-    re-pends every job with ``available_at`` at now, projects the Task first
-    (lower ``ingest_seq``), and the Step's wait resolves.
+    Task's structural projection, and the Step's own two projectors then find no
+    Task to hang off and park themselves inside the 250ms dependency backoff,
+    invisible to the drain's exit condition. Round two re-pends every job with
+    ``available_at`` at now, projects the Task first (lower ``ingest_seq``), and
+    the Step's wait resolves.
 
     The loop's own exit condition is ``unsettled == 0``, deliberately not "a
     round replayed nothing": every round replays the whole store, so a replay
     count is never a completion claim.
+
+    **Neither half of this bets on a clock.** The structural failure is keyed on
+    *which round is running* rather than on a call count, so round one cannot
+    converge however slowly its drain runs -- a per-call trip would let a drain
+    pass that outlives the 250ms park re-claim the recovered structural job and
+    settle everything inside round one, and the "more than one round" assertion
+    would then be red for a reason that has nothing to do with the loop. The
+    round count is asserted as a floor for the mirror-image reason: under load
+    round two may itself defer, and needing a third round is the loop working,
+    not failing.
     """
 
     async with _two_workers(tmp_path) as workers:
@@ -1058,35 +1077,37 @@ async def test_rebuild_until_settled_re_runs_the_rebuild_until_nothing_is_owed(t
         )
         while await workers.a.project_pending(limit=10):
             pass
-        structural = workers.a._project_structural
-        failures: list[int] = []
-
-        async def fail_the_first_structural_projection(*args, **kwargs):
-            if not failures:
-                failures.append(1)
-                raise RuntimeError("structural projector lost one round")
-            return await structural(*args, **kwargs)
-
-        workers.a._project_structural = fail_the_first_structural_projection  # type: ignore[method-assign]
         service = AnsichService(workers.a)
         rounds: list[RebuildOutcome] = []
+        structural = workers.a._project_structural
         original_rebuild = workers.a.rebuild_projections
+
+        async def fail_structural_for_the_whole_first_round(*args, **kwargs):
+            # ``rounds`` is appended to only after a round returns, so it is
+            # empty for exactly the duration of round one.
+            if not rounds:
+                raise RuntimeError("structural projector lost the whole first round")
+            return await structural(*args, **kwargs)
 
         async def recording_rebuild() -> RebuildOutcome:
             outcome = await original_rebuild()
             rounds.append(outcome)
             return outcome
 
+        workers.a._project_structural = fail_structural_for_the_whole_first_round  # type: ignore[method-assign]
         workers.a.rebuild_projections = recording_rebuild  # type: ignore[method-assign]
 
         settled = await service.rebuild_until_settled()
 
-        assert len(rounds) == 2
+        assert len(rounds) >= 2
         assert rounds[0].unsettled > 0
         # The last round's outcome, not a sum: each round replays the whole
         # store from scratch, so summing would count the same jobs twice.
         assert settled == rounds[-1]
         assert settled.unsettled == 0
+        # Four jobs, whichever round finally settles them -- every round
+        # replays the whole store, so this is a property of the store rather
+        # than of the round count.
         assert settled.replayed == 4
         assert await service.list_steps(task_id)
 
@@ -1100,6 +1121,12 @@ async def test_rebuild_until_settled_reports_exhaustion_instead_of_raising(tmp_p
     ``unsettled`` still non-zero: the caller decides what an incomplete rebuild
     means for it, and a maintenance endpoint that raised here would turn an
     honest report into a 500.
+
+    The round count is pinned **exactly** here, unlike its converging sibling,
+    and that is safe for the same reason the test works at all: the orphan
+    Step's Task is never observed, so no round can settle it however slowly the
+    drain runs. ``max_rounds`` is an exact budget, and spending all of it is the
+    behaviour under test.
     """
 
     async with _two_workers(tmp_path) as workers:

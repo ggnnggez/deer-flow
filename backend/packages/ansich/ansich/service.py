@@ -1719,6 +1719,20 @@ class AnsichService:
         ``max_rounds`` below 1 still runs one round, because the return value
         *is* one round's outcome and there is no honest one to synthesize
         without having rebuilt.
+
+        **A returned ``unsettled == 0`` is a strong signal, not proof, and the
+        caveat survives the loop.** ``RebuildOutcome.unsettled`` is counted at
+        the end of the *backend's* pass -- before ``rebuild_projections`` runs
+        its own final assessment sweep, which can settle assessor jobs that
+        number still counts and mint ones it does not -- so it is a lower bound
+        taken at a known point (see ``RebuildOutcome``'s final paragraph). The
+        loop absorbs that staleness for every round *except the last*, because
+        each further round re-reads the store; the last round's number has
+        nobody after it to check it. So this returns the best bound available,
+        not a settled-store guarantee, and a caller that reads it as one
+        reproduces the F10-26 mistake one level up. If a caller genuinely needs
+        proof rather than a bound, the honest move is another round -- calling
+        this again is idempotent and cheap on a settled store (one rebuild).
         """
 
         outcome = await self.rebuild_projections()

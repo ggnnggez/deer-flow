@@ -1415,6 +1415,18 @@ and it is the final round that describes the store as it now stands. Exhausting
 means for it; an operator endpoint that raised there would turn an honest report
 into a 500.
 
+**The lower-bound caveat survives the loop, and a §5 replay author has to read
+it that way.** `unsettled` is counted at the end of the *backend's* pass, before
+`AnsichService.rebuild_projections` runs its own final assessment sweep — so it
+is a bound taken at a known point, not a live gauge. The loop absorbs that
+staleness for every round *except the last*, because each further round re-reads
+the store; the last round's number has nobody after it to check it. A returned
+`unsettled == 0` is therefore a strong signal, not proof of a settled store, and
+reading it as proof reproduces the F10-26 mistake one level up — which is exactly
+what this loop exists to prevent. When proof is genuinely needed the honest move
+is another round: calling it again is idempotent and costs one rebuild on a
+settled store.
+
 `retry_failed_projections` owes and now pays the same shape: it answers with a
 `RetryOutcome(re_armed, unsettled)` instead of the bare `int` its own docstring
 recorded as a debt. `re_armed` is a re-arm count and never a completion claim (a
