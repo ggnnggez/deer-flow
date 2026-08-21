@@ -1,5 +1,6 @@
 import type {
   AnsichAlertType,
+  AnsichDatabaseHealth,
   AnsichHealth,
   AnsichLostRange,
   AnsichProducerHealth,
@@ -27,6 +28,12 @@ export function getAlertPresentationCategory(
     case "unverified_effect":
     case "environment_pressure":
     case "environment_leak_suspected":
+    // The process-subject pair (P11-B §3). They join the same category as the
+    // environment Alerts they sit beside: signals an operator acts on that are
+    // not a claim about how one Agent behaved. Neither is runaway behavior, and
+    // neither is a liveness rule about a Task.
+    case "projection_failure":
+    case "observability_degradation":
       return "operational";
     case "heartbeat_missing":
       return "liveness";
@@ -539,6 +546,131 @@ export function topProducersByDropped(
   return {
     rows: ordered.slice(0, kept),
     hiddenCount: Math.max(0, ordered.length - kept),
+  };
+}
+
+/**
+ * What an unknown number renders as. The database block's `null` means unknown
+ * and never zero, so it needs a mark of its own: rendering it as `0` would
+ * report "nothing is behind, nothing has failed" about a store nobody could
+ * read.
+ */
+export const ANSICH_UNKNOWN_VALUE = "—";
+
+/** Render a count, keeping unknown (`null`) visibly distinct from zero. */
+export function formatAnsichCount(value: number | null | undefined): string {
+  return value === null || value === undefined
+    ? ANSICH_UNKNOWN_VALUE
+    : value.toLocaleString();
+}
+
+/** One projector's row in the Observability health panel. */
+export interface AnsichProjectorRow {
+  /** `name@version` — stable across reads, unique per registered projector. */
+  key: string;
+  name: string;
+  version: string;
+  pending: number;
+  retry: number;
+  processing: number;
+  failed: number;
+  /** Every unsettled bucket summed. `retry` is owed work, so it counts here. */
+  outstanding: number;
+  /**
+   * The continuity mark: nothing at or below this ingest sequence is still owed
+   * by this projector. Not a maximum and not progress.
+   */
+  completeThrough: number | null;
+  /** A durably failed job — the one bucket an operator has to act on. */
+  attention: boolean;
+}
+
+export interface AnsichDatabaseHealthPresentation {
+  reachable: boolean;
+  projectors: AnsichProjectorRow[];
+  /** Age of the oldest unsettled job's Observation. */
+  lagMs: number | null;
+  /** Authoritative across every worker, unlike the process-local count. */
+  failedJobs: number | null;
+  /** This worker's own dropped writes after a lease takeover. */
+  staleCompletions: number | null;
+  /**
+   * The store-wide continuity mark: the lowest per-projector mark, because the
+   * store owes nothing below a sequence only if every projector owes nothing
+   * below it. Unknown when any projector's own mark is unknown, or when no
+   * projector has ever had a job.
+   */
+  settledThrough: number | null;
+  /** Total unsettled jobs across projectors; unknown when unreadable. */
+  outstanding: number | null;
+  /** Unreadable storage, or any durably failed job. */
+  attention: boolean;
+}
+
+const UNREADABLE_DATABASE_HEALTH: AnsichDatabaseHealthPresentation = {
+  reachable: false,
+  projectors: [],
+  lagMs: null,
+  failedJobs: null,
+  staleCompletions: null,
+  settledThrough: null,
+  outstanding: null,
+  attention: true,
+};
+
+/**
+ * Project the additive `database` block into what the panel renders.
+ *
+ * `status` gates everything: an `unreachable` block — or an absent one, from a
+ * backend that predates the merge — yields unknown for every number rather than
+ * a zero, whatever numbers the payload happened to carry. Unreadable is itself
+ * an incident, so it warrants attention on its own; it is never a clean store.
+ *
+ * Projector order is the backend's (registration order), not a ranking: the row
+ * that needs attention is marked, not moved, so an operator reading the panel
+ * twice sees the same table.
+ */
+export function getDatabaseHealthPresentation(
+  database: AnsichDatabaseHealth | null | undefined,
+): AnsichDatabaseHealthPresentation {
+  if (database?.status !== "reachable") {
+    return UNREADABLE_DATABASE_HEALTH;
+  }
+  const projectors = database.projectors.map((projector) => ({
+    key: `${projector.projector_name}@${projector.projector_version}`,
+    name: projector.projector_name,
+    version: projector.projector_version,
+    pending: projector.pending,
+    retry: projector.retry,
+    processing: projector.processing,
+    failed: projector.failed,
+    outstanding:
+      projector.pending +
+      projector.retry +
+      projector.processing +
+      projector.failed,
+    completeThrough: projector.complete_through,
+    attention: projector.failed > 0,
+  }));
+  const marks = projectors.map((row) => row.completeThrough);
+  const knownMarks = marks.filter((mark): mark is number => mark !== null);
+  // A projector whose own mark is unknown leaves the store-wide one unknown:
+  // taking the minimum of the rest would claim continuity nobody vouched for.
+  const settledThrough =
+    marks.length > 0 && knownMarks.length === marks.length
+      ? Math.min(...knownMarks)
+      : null;
+  return {
+    reachable: true,
+    projectors,
+    lagMs: database.lag_ms,
+    failedJobs: database.failed_jobs,
+    staleCompletions: database.stale_completion_count,
+    settledThrough,
+    outstanding: projectors.reduce((total, row) => total + row.outstanding, 0),
+    attention:
+      (database.failed_jobs ?? 0) > 0 ||
+      projectors.some((row) => row.attention),
   };
 }
 

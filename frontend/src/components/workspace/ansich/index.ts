@@ -14,6 +14,7 @@ export {
   useAnsichProjectionHealth,
 } from "./projection-health";
 export { AnsichSystemHealthDrawer } from "./system-health-drawer";
+export { AnsichObservabilityHealthPanel } from "./observability-health-panel";
 export { AnsichShortId } from "./short-id";
 export { AnsichTechnicalEvidence } from "./technical-evidence";
 export { AnsichSignalBadge } from "./signal-badge";

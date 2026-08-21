@@ -117,6 +117,8 @@ describe("Ansich presentation", () => {
       "unverified_effect",
       "environment_pressure",
       "environment_leak_suspected",
+      "projection_failure",
+      "observability_degradation",
     ]);
     expect(getAlertPresentationCategory("exact_repetition")).toBe("runaway");
     expect(getAlertPresentationCategory("budget_exceeded")).toBe("runaway");
@@ -139,6 +141,14 @@ describe("Ansich presentation", () => {
       "operational",
     );
     expect(getAlertPresentationCategory("environment_leak_suspected")).toBe(
+      "operational",
+    );
+    // The process-subject pair: they have labels and a category, so an operator
+    // never sees a blank type on an Alert the backend already returns.
+    expect(getAlertPresentationCategory("projection_failure")).toBe(
+      "operational",
+    );
+    expect(getAlertPresentationCategory("observability_degradation")).toBe(
       "operational",
     );
   });
@@ -1006,7 +1016,9 @@ describe("resolveProjectionHealthDisplay", () => {
     // `recovering` is an unfinished incident, so it never reaches the
     // no-attention branch at all.
     expect(recovering.attention).toBe(true);
-    expect(resolveProjectionHealthDisplay(recovering, null).line).toBe("banner");
+    expect(resolveProjectionHealthDisplay(recovering, null).line).toBe(
+      "banner",
+    );
   });
 
   it("clears the record on recovery so the next incident starts as a banner", () => {

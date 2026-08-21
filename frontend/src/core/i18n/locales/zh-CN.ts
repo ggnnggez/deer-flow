@@ -543,6 +543,51 @@ export const zhCN: Translations = {
       producerEvictions:
         "有界的采集器账目为容纳新出现的采集器而淘汰条目的次数。它统计的是淘汰事件，不是丢失了多少个不同的采集器——同一个采集器可能被反复淘汰并重新建立。",
     },
+    observabilityHealth: {
+      tab: "可观测性",
+      title: "可观测性健康",
+      description:
+        "投影存储自身的口径，跨全部 worker 实时读取。下面这些数字来自存储；本进程采集器自己的视角单独列在底部。",
+      reachable: "存储可达",
+      unreachable: "存储不可达",
+      unreachableNote:
+        "投影存储读不到，因此其中每个数字都是未知——一律显示为“—”，绝不写成 0。下方采集器自身的进程数字仍然有效。",
+      projectors: "投影器",
+      projector: "投影器",
+      projectorsEmpty: "尚未有投影器产生过任务。",
+      projectorsUnknown: "存储读不到时，投影器状态未知。",
+      pending: "待处理",
+      retry: "重试中",
+      processing: "处理中",
+      failed: "已失败",
+      settledThrough: "已结算至",
+      outstanding: "尚欠任务数",
+      databaseLag: "积压时长",
+      databaseFailedJobs: "失败任务（全部 worker）",
+      staleCompletions: "丢弃的过期写入",
+      processSection: "本 worker",
+      collectorStatus: "采集器状态",
+      processFailedJobs: "本机所见失败任务",
+      processLag: "采集器滞后",
+      metricDescriptions: {
+        databaseLag:
+          "最早一条仍然欠着的任务、按它等待的那条 Observation 计算出的年龄。它回答的是积压落后多远，而不是最近一次有数据到达是多久以前。",
+        databaseFailedJobs:
+          "已经持久放弃的任务数，跨全部 worker 从存储实时统计。这是权威口径；重试它们是非破坏性的，并保留其错误证据。",
+        settledThrough:
+          "在这个 ingest 序号以下已经不欠任何东西。它是连续性水位，不是进度：任何一处卡住的任务都会把它压低，无论投影器实际已经跑出多远——正是这一点才让“此线以下无欠账”成立。",
+        outstanding:
+          "仍然欠着的全部任务——从未尝试、已重新武装、正在处理、以及持久失败——按投影器求和。",
+        projectors:
+          "每个产生过任务的投影器一行，并按状态拆分其工作量。重新武装的工作单列，而不是与从未尝试的工作混在一起，因为它已经花掉过一次尝试且仍然欠着。",
+        staleCompletions:
+          "因任务已被其它 worker 接管而被本 worker 丢弃的写入。它是本进程自己的计数，不是全存储口径；接管者会得出同样的结果。",
+        collectorStatus: "本 worker 的采集器依据当前事实推导出的生命周期状态。",
+        processFailedJobs:
+          "本 worker 自己看到的失败任务数。它只是参考：其它 worker 的失败不在其中，请与上方的权威口径对照。",
+        processLag: "本进程内采集器自身的滞后，与存储侧积压落后多远是两回事。",
+      },
+    },
     snapshotRequests: "快照请求",
     snapshotItems: "快照条目",
     contextAndLineage: "上下文与谱系",
@@ -710,6 +755,8 @@ export const zhCN: Translations = {
       unverified_effect: "副作用未验证",
       environment_pressure: "环境压力",
       environment_leak_suspected: "疑似 fd 泄漏",
+      projection_failure: "投影失败",
+      observability_degradation: "可观测性丢失",
     },
     alertWorkflow: {
       open: "待处理",

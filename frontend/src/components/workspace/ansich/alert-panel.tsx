@@ -255,10 +255,10 @@ function AlertDetailDialog({
               </div>
 
               {/* 3. impact / current activity — the owning Task. Environment
-                  Alerts are Scope-subject (§2.2), not Task-subject, so
-                  subject_id is never a Task id here. */}
+                  and process-subject Alerts are Scope-subject (§2.2, P11-B §3),
+                  so subject_id is not a Task id for them. */}
               <div className="flex flex-wrap items-center gap-2">
-                {!isEnvironmentAlert(detail.alert.alert_type) ? (
+                {isTaskSubjectAlert(detail.alert.alert_type) ? (
                   <Button variant="outline" size="sm" asChild>
                     <Link
                       href={`/workspace/ansich/tasks/${encodeURIComponent(detail.alert.subject_id)}`}
@@ -497,15 +497,39 @@ function BeliefSection({
 }
 
 /**
- * Environment Alerts (`environment_pressure`/`environment_leak_suspected`)
- * are opened against a sandbox/host Scope, not a Task (environment-observability
- * design §2.2) — `subject_id` is a Scope id there, never a Task id.
+ * Whether this Alert's `subject_id` is a Task id, which is what decides whether
+ * the detail dialog may offer a link to a Task page.
+ *
+ * Two families are Scope-subject rather than Task-subject and must never get
+ * that link: environment Alerts, opened against a sandbox/host Scope
+ * (environment-observability design §2.2), and the process-subject pair, opened
+ * against the host Scope by the periodic operations pass (P11-B §3) — a failing
+ * projector is a property of the process, and naming a Task there would read as
+ * attribution.
+ *
+ * Written as an exhaustive switch on purpose: an Alert type added later has to
+ * declare what it subjects, instead of silently inheriting a Task link that
+ * would route an operator to a page that does not exist.
  */
-function isEnvironmentAlert(alertType: AnsichAlertType): boolean {
-  return (
-    alertType === "environment_pressure" ||
-    alertType === "environment_leak_suspected"
-  );
+function isTaskSubjectAlert(alertType: AnsichAlertType): boolean {
+  switch (alertType) {
+    case "budget_warning":
+    case "budget_exceeded":
+    case "exact_repetition":
+    case "tool_frequency":
+    case "heartbeat_missing":
+    case "long_dwell":
+    case "configuration_drift":
+    case "attempted_scope_violation":
+    case "realized_scope_violation":
+    case "unverified_effect":
+      return true;
+    case "environment_pressure":
+    case "environment_leak_suspected":
+    case "projection_failure":
+    case "observability_degradation":
+      return false;
+  }
 }
 
 function AlertSeverityBadge({

@@ -197,9 +197,34 @@ the pre-run checkpoint restore.
 The UI advertises only Alert types with live producers: budget
 warning/exceeded, exact repetition, Tool frequency, heartbeat missing, and long
 dwell; Phase 7 also exposes provider `configuration_drift`.
-`observability_degradation` and `projection_failure` remain Phase 11
-domain reservations and must not appear in frontend filter constants or locale
-copy before their producer and subject-mapping contracts exist.
+P11-B adds the two process-subject types, `projection_failure` and
+`observability_degradation`, whose producers and host-`Scope` subject mapping now
+exist; they carry real labels and a category, closing the interim window in which
+the unfiltered list already returned them under a blank type. Both are
+Scope-subject, so the Alert detail dialog offers no Task link for them — the
+subject decision is an exhaustive switch (`isTaskSubjectAlert`) precisely so a
+later type has to declare what it subjects instead of inheriting a link to a page
+that does not exist.
+
+Operations gains a fourth lens, "Observability" (`AnsichObservabilityHealthPanel`),
+reading `GET /api/ansich/health` through its own query — the one Ansich route that
+still answers while SQL storage is down. Its boundary with the System details
+drawer is a hard one and is written into both components' docstrings: the drawer
+is this worker's process/collection wall (queue, writer, producer ledger, its own
+advisory failed-job count), while the panel is the store's answer read live across
+every worker (per-projector job buckets, the continuity mark, the authoritative
+failed-job count). Under several Gateway workers the two legitimately disagree, so
+they are never merged and never share a label — "Failed jobs (all workers)" versus
+"Failed jobs seen here". The `database` block's `status` gates every other field:
+`unreachable` renders an explicit banner and every number as `—`, never as zero,
+and the presentation selector discards numbers such a block should not have
+carried; the process-side numbers stay visible underneath, mirroring the endpoint.
+`retry` is its own column beside `pending` because a re-armed job is work still
+owed, and `complete_through` is labelled "settled through" / 「已结算至」 and never
+as progress — it is a continuity mark that one stuck job holds down however far
+past it the projectors have otherwise run, so it reads lower than the old
+per-worker watermark whenever anything is outstanding. The store-wide mark shown is
+the lowest per-projector mark, and unknown when any projector's own is unknown.
 
 Phase 7's Agent Release tab reads the Task's immutable `executed_by` binding
 separately from the normal Task polling query. It renders component hashes,

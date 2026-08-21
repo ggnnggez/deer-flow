@@ -37,6 +37,7 @@ import type {
   AnsichTaskAgentReleaseResponse,
   AnsichTimelineResponse,
   AnsichHealth,
+  AnsichHealthResponse,
   AnsichToolCallResponse,
   AnsichToolResultPayloadResponse,
   AnsichTaskScopesResponse,
@@ -298,6 +299,24 @@ export async function dismissAnsichAlert(
   reason: string,
 ): Promise<AnsichAlertWorkflowResponse> {
   return changeAnsichAlertWorkflow(alertId, "dismiss", workflowVersion, reason);
+}
+
+/**
+ * The one Ansich read that answers while SQL storage is down: process health,
+ * plus the additive `database` block whose own `status` says whether the
+ * storage half could be read at all. Every other projection read 503s in that
+ * situation, which is why this endpoint gets its own query rather than reusing
+ * a `projection_status` carried on some other response.
+ */
+export async function fetchAnsichHealth(): Promise<AnsichHealthResponse> {
+  const response = await fetch(ansichUrl("/health"));
+  if (!response.ok) {
+    await throwAnsichApiError(
+      response,
+      `Failed to load Ansich health: ${response.statusText}`,
+    );
+  }
+  return response.json();
 }
 
 export async function fetchAnsichFailedJobs(

@@ -14,6 +14,7 @@ import {
   fetchAnsichAlerts,
   fetchAnsichFailedJobDetail,
   fetchAnsichFailedJobs,
+  fetchAnsichHealth,
   fetchAnsichReleaseQuality,
   fetchAnsichStepContext,
   fetchAnsichStepEvaluations,
@@ -158,6 +159,24 @@ export function useAnsichAlertWorkflow() {
         }),
       ]);
     },
+  });
+}
+
+/**
+ * Process plus database health for the Observability health panel.
+ *
+ * Polled at the idle cadence rather than the 5-second task cadence: this is one
+ * store-wide view, not a per-Task lens, and every read costs the Gateway a
+ * database round trip on top of the process block it always answers with.
+ */
+export function useAnsichHealth(enabled = true) {
+  return useQuery({
+    queryKey: ["ansich", "health"] as const,
+    queryFn: fetchAnsichHealth,
+    enabled,
+    retry: false,
+    refetchInterval: () => (pageIsVisible() ? IDLE_REFRESH_INTERVAL_MS : false),
+    refetchIntervalInBackground: false,
   });
 }
 

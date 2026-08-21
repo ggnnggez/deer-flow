@@ -42,6 +42,14 @@ export function formatBytes(bytes: number): string {
  * Full projection-health metric wall (IA §5.2): the complete queue, watermark,
  * snapshot and failed-job detail lives here behind an explicit "System details"
  * drawer instead of tiling every metric at page top.
+ *
+ * Everything here is the **process/collection wall**: one worker's queue, its
+ * writer, its producer ledger, and its own advisory failed-job count. The
+ * store's answer — per-projector job buckets, the continuity mark, the
+ * authoritative failed-job count read live across every worker — belongs to
+ * `AnsichObservabilityHealthPanel` (RB11③) and is deliberately not merged in
+ * here: under several Gateway workers the two views legitimately disagree, and
+ * one worker's private numbers must not be dressed up as the system's.
  */
 export function AnsichSystemHealthDrawer({
   health,

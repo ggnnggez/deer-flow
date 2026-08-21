@@ -448,6 +448,42 @@ export interface Translations {
       producers: string;
       producerEvictions: string;
     };
+    observabilityHealth: {
+      tab: string;
+      title: string;
+      description: string;
+      reachable: string;
+      unreachable: string;
+      unreachableNote: string;
+      projectors: string;
+      projector: string;
+      projectorsEmpty: string;
+      projectorsUnknown: string;
+      pending: string;
+      retry: string;
+      processing: string;
+      failed: string;
+      settledThrough: string;
+      outstanding: string;
+      databaseLag: string;
+      databaseFailedJobs: string;
+      staleCompletions: string;
+      processSection: string;
+      collectorStatus: string;
+      processFailedJobs: string;
+      processLag: string;
+      metricDescriptions: {
+        databaseLag: string;
+        databaseFailedJobs: string;
+        settledThrough: string;
+        outstanding: string;
+        projectors: string;
+        staleCompletions: string;
+        collectorStatus: string;
+        processFailedJobs: string;
+        processLag: string;
+      };
+    };
     snapshotRequests: string;
     snapshotItems: string;
     contextAndLineage: string;
@@ -610,6 +646,8 @@ export interface Translations {
       unverified_effect: string;
       environment_pressure: string;
       environment_leak_suspected: string;
+      projection_failure: string;
+      observability_degradation: string;
     };
     alertWorkflow: {
       open: string;

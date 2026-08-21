@@ -560,6 +560,54 @@ export const enUS: Translations = {
       producerEvictions:
         "Times the bounded producer ledger evicted an entry to make room for a newly seen producer. It counts eviction events, not how many distinct producers were lost — one producer can be evicted and re-created repeatedly.",
     },
+    observabilityHealth: {
+      tab: "Observability",
+      title: "Observability health",
+      description:
+        "What the projection store itself reports, read live across every worker. The numbers below are the store's answer; the collector's own view of this process is shown separately at the bottom.",
+      reachable: "Storage reachable",
+      unreachable: "Storage unreachable",
+      unreachableNote:
+        "The projection store could not be read, so none of its numbers are known — they are shown as “—”, never as zero. The collector's own process numbers below are still current.",
+      projectors: "Projectors",
+      projector: "Projector",
+      projectorsEmpty: "No projector has recorded a job yet.",
+      projectorsUnknown:
+        "Projector state is unknown while the store cannot be read.",
+      pending: "Pending",
+      retry: "Retry",
+      processing: "Processing",
+      failed: "Failed",
+      settledThrough: "Settled through",
+      outstanding: "Jobs outstanding",
+      databaseLag: "Backlog age",
+      databaseFailedJobs: "Failed jobs (all workers)",
+      staleCompletions: "Dropped stale writes",
+      processSection: "This worker",
+      collectorStatus: "Collector status",
+      processFailedJobs: "Failed jobs seen here",
+      processLag: "Collector lag",
+      metricDescriptions: {
+        databaseLag:
+          "How old the oldest job still owed is, measured from the Observation it is waiting on. It answers how far behind the backlog is, not how long ago anything last arrived.",
+        databaseFailedJobs:
+          "Jobs that have durably given up, counted live in the store across every worker. This is the authoritative count; retrying them is non-destructive and preserves their error evidence.",
+        settledThrough:
+          "The ingest sequence below which nothing is still owed. It is a continuity mark, not progress: one job stuck anywhere holds it down however far past that point the projectors have otherwise run, which is what makes “nothing below here is owed” true.",
+        outstanding:
+          "Every job still owed — never attempted, re-armed, being worked on, or durably failed — summed across projectors.",
+        projectors:
+          "One row per projector that has ever had a job, with its work split by state. Re-armed work is counted on its own instead of alongside work never attempted, because a re-armed job has already spent an attempt and is still owed.",
+        staleCompletions:
+          "Writes this worker dropped because another worker had already taken the job over. It is this process's own counter, not a store-wide number, and the new owner produces the same result.",
+        collectorStatus:
+          "The lifecycle state this worker's collector derives from its current facts.",
+        processFailedJobs:
+          "Failed jobs this worker has seen for itself. It is advisory: other workers' failures are not in it, so compare it with the authoritative count above.",
+        processLag:
+          "The collector's own lag inside this process, separate from how far behind the stored backlog is.",
+      },
+    },
     snapshotRequests: "Snapshot requests",
     snapshotItems: "Snapshot items",
     contextAndLineage: "Context & lineage",
@@ -735,6 +783,8 @@ export const enUS: Translations = {
       unverified_effect: "Unverified effect",
       environment_pressure: "Environment pressure",
       environment_leak_suspected: "Suspected FD leak",
+      projection_failure: "Projection failing",
+      observability_degradation: "Observability loss",
     },
     alertWorkflow: {
       open: "Open",

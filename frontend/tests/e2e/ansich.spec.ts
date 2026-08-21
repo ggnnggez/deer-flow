@@ -1922,3 +1922,280 @@ test("release compare separates observed quality from the structural diff", asyn
     expect(search).toContain(`right=${OTHER_RELEASE_ID}`);
   }
 });
+
+const DATABASE_HEALTH = {
+  status: "reachable",
+  projectors: [
+    {
+      projector_name: "task-structural",
+      projector_version: "1",
+      pending: 2,
+      retry: 4,
+      processing: 1,
+      failed: 0,
+      complete_through: 41,
+    },
+    {
+      projector_name: "task-usage",
+      projector_version: "1",
+      pending: 0,
+      retry: 0,
+      processing: 0,
+      failed: 3,
+      complete_through: 12,
+    },
+  ],
+  lag_ms: 1_200,
+  failed_jobs: 3,
+  stale_completion_count: 7,
+};
+
+test("operations observability lens reports the store's own projection ledger", async ({
+  page,
+}) => {
+  mockLangGraphAPI(page, { threads: [] });
+  await page.route("**/api/ansich/operations/active-tasks?*", (route) =>
+    route.fulfill({
+      status: 200,
+      contentType: "application/json",
+      body: JSON.stringify({
+        items: [ACTIVE_TASK],
+        next_cursor: null,
+        projection_status: HEALTH,
+      }),
+    }),
+  );
+  await page.route("**/api/ansich/health", (route) =>
+    route.fulfill({
+      status: 200,
+      contentType: "application/json",
+      body: JSON.stringify({
+        ...HEALTH,
+        failed_jobs: 1,
+        database: DATABASE_HEALTH,
+      }),
+    }),
+  );
+
+  await page.goto("/workspace/ansich/operations");
+  await page.getByRole("tab", { name: "Observability" }).click();
+  const panel = page.getByRole("region", { name: "Observability health" });
+  await expect(panel.getByText("Storage reachable")).toBeVisible();
+
+  // Every unsettled bucket is its own column, `retry` included: a re-armed job
+  // folded into "pending" would read as work nobody has started.
+  await expect(
+    panel.getByRole("columnheader", { name: "Retry" }),
+  ).toBeVisible();
+  const structural = panel
+    .getByRole("row")
+    .filter({ hasText: "task-structural" });
+  await expect(structural.getByRole("cell").nth(1)).toHaveText("2");
+  await expect(structural.getByRole("cell").nth(2)).toHaveText("4");
+  await expect(structural.getByRole("cell").nth(3)).toHaveText("1");
+  await expect(structural.getByRole("cell").nth(4)).toHaveText("0");
+  await expect(structural.getByRole("cell").nth(5)).toHaveText("41");
+  const usage = panel.getByRole("row").filter({ hasText: "task-usage" });
+  await expect(usage.getByRole("cell").nth(4)).toHaveText("3");
+
+  // The store-wide mark is the lowest continuity mark (12, not 41): one
+  // projector still owing work holds the whole store's mark down.
+  await expect(
+    panel
+      .locator("div")
+      .filter({ hasText: /^Settled through/ })
+      .last(),
+  ).toContainText("12");
+
+  // The two failed-job counts are different claims and never share a label.
+  await expect(
+    panel
+      .locator("div")
+      .filter({ hasText: /^Failed jobs \(all workers\)/ })
+      .last(),
+  ).toContainText("3");
+  await expect(
+    panel
+      .locator("div")
+      .filter({ hasText: /^Failed jobs seen here/ })
+      .last(),
+  ).toContainText("1");
+});
+
+test("observability lens renders an unreadable store as unknown, never as zero", async ({
+  page,
+}) => {
+  mockLangGraphAPI(page, { threads: [] });
+  await page.route("**/api/ansich/operations/active-tasks?*", (route) =>
+    route.fulfill({
+      status: 200,
+      contentType: "application/json",
+      body: JSON.stringify({
+        items: [ACTIVE_TASK],
+        next_cursor: null,
+        projection_status: HEALTH,
+      }),
+    }),
+  );
+  await page.route("**/api/ansich/health", (route) =>
+    route.fulfill({
+      status: 200,
+      contentType: "application/json",
+      body: JSON.stringify({
+        ...HEALTH,
+        status: "degraded",
+        failed_jobs: 2,
+        database: {
+          status: "unreachable",
+          projectors: [],
+          lag_ms: null,
+          failed_jobs: null,
+          stale_completion_count: null,
+        },
+      }),
+    }),
+  );
+
+  await page.goto("/workspace/ansich/operations");
+  await page.getByRole("tab", { name: "Observability" }).click();
+  const panel = page.getByRole("region", { name: "Observability health" });
+  await expect(panel.getByText("Storage unreachable")).toBeVisible();
+  await expect(
+    panel
+      .locator("div")
+      .filter({ hasText: /^Failed jobs \(all workers\)/ })
+      .last(),
+  ).toContainText("—");
+  await expect(
+    panel
+      .locator("div")
+      .filter({ hasText: /^Backlog age/ })
+      .last(),
+  ).toContainText("—");
+  await expect(panel.getByRole("table")).toHaveCount(0);
+
+  // The endpoint still answers with the process block when storage is down, and
+  // so does the panel.
+  await expect(
+    panel
+      .locator("div")
+      .filter({ hasText: /^Failed jobs seen here/ })
+      .last(),
+  ).toContainText("2");
+});
+
+test("process-subject alerts carry real labels and no Task link", async ({
+  page,
+}) => {
+  mockLangGraphAPI(page, { threads: [] });
+  const HOST_SCOPE_ID = "5f695124-12f7-48fd-bc4e-54058924d85a";
+  const processAlert = (
+    alertId: string,
+    alertType: string,
+    rule: string,
+    severity: string,
+  ) => ({
+    alert_id: alertId,
+    subject_id: HOST_SCOPE_ID,
+    alert_type: alertType,
+    episode: 1,
+    severity,
+    workflow_state: "open",
+    workflow_version: 1,
+    shadow: false,
+    opened_at: "2026-08-20T12:00:03Z",
+    as_of: "2026-08-20T12:00:03Z",
+    updated_at: "2026-08-20T12:00:03Z",
+    resolved_at: null,
+    rule: { name: rule, version: "1" },
+    rule_config_hash: "c".repeat(64),
+    stable_condition_key: `${rule}-key`,
+    source_assertion_id: `${alertId}-assertion`,
+    resolution_reason: null,
+    dismissal_reason: null,
+    evidence_count: 1,
+  });
+  const projectionAlert = processAlert(
+    "1a695124-12f7-48fd-bc4e-54058924d85a",
+    "projection_failure",
+    "projection-health",
+    "warning",
+  );
+  const lossAlert = processAlert(
+    "2a695124-12f7-48fd-bc4e-54058924d85a",
+    "observability_degradation",
+    "observability-loss",
+    "critical",
+  );
+  await page.route("**/api/ansich/operations/active-tasks?*", (route) =>
+    route.fulfill({
+      status: 200,
+      contentType: "application/json",
+      body: JSON.stringify({
+        items: [ACTIVE_TASK],
+        next_cursor: null,
+        projection_status: HEALTH,
+      }),
+    }),
+  );
+  await page.route("**/api/ansich/operations/alerts?*", (route) =>
+    route.fulfill({
+      status: 200,
+      contentType: "application/json",
+      body: JSON.stringify({
+        items: [projectionAlert, lossAlert],
+        next_cursor: null,
+        projection_status: HEALTH,
+      }),
+    }),
+  );
+  await page.route(
+    `**/api/ansich/operations/alerts/${projectionAlert.alert_id}`,
+    (route) =>
+      route.fulfill({
+        status: 200,
+        contentType: "application/json",
+        body: JSON.stringify({
+          alert: {
+            alert: projectionAlert,
+            source_belief: {
+              assertion_id: `${projectionAlert.alert_id}-assertion`,
+              subject_id: HOST_SCOPE_ID,
+              field_name: "projection_health:task-usage:1",
+              value: { value: "failing", scan_truncated: false },
+              as_of: "2026-08-20T12:00:03Z",
+              asserted_at: "2026-08-20T12:00:03Z",
+              assessor: { name: "projection-health", version: "1" },
+              config_hash: "c".repeat(64),
+              authority_class: "configured_rule",
+              fidelity_class: "rule",
+              confidence: null,
+              evidence_obs_ids: ["13bd27c7-51b1-4164-9380-b98c40c2bfe0"],
+            },
+            evidence: [],
+            current_beliefs: [],
+            workflow_history: [],
+            available_actions: ["acknowledge", "dismiss"],
+          },
+          projection_status: HEALTH,
+        }),
+      }),
+  );
+
+  await page.goto("/workspace/ansich/operations");
+  await page.getByRole("tab", { name: "Alerts" }).click();
+  // The interim gap this closes: both types already reach the list from the
+  // backend, and without a label the row renders blank.
+  await expect(page.getByText("Projection failing")).toBeVisible();
+  await expect(page.getByText("Observability loss")).toBeVisible();
+
+  await page.getByRole("button", { name: /Projection failing/ }).click();
+  const detail = page.getByRole("dialog", { name: "Alert details" });
+  await expect(detail.getByText("Projection failing")).toBeVisible();
+  // The subject is the host Scope, not a Task, so there is no Task link to
+  // follow — offering one would read as attribution.
+  await expect(detail.getByRole("link", { name: "Task" })).toHaveCount(0);
+  await expect(
+    detail.getByRole("button", { name: "Acknowledge" }),
+  ).toBeVisible();
+});

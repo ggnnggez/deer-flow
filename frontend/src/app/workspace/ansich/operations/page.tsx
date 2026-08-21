@@ -10,6 +10,7 @@ import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import {
   AnsichAlertPanel,
   AnsichHealthBadge,
+  AnsichObservabilityHealthPanel,
   AnsichProjectionHealthBanner,
   AnsichActiveTaskRow,
   AnsichTaskRow,
@@ -23,18 +24,20 @@ import {
 import {
   useAnsichActiveTasks,
   useAnsichAlerts,
+  useAnsichHealth,
   useAnsichTaskHistory,
 } from "@/core/ansich/hooks";
 import { useAuth } from "@/core/auth/AuthProvider";
 import { useI18n } from "@/core/i18n/hooks";
 
+type AnsichOperationsView = "active" | "history" | "alerts" | "observability";
+
 export default function AnsichOperationsPage() {
   const { t } = useI18n();
   const { user } = useAuth();
   const isAdmin = user?.system_role === "admin";
-  const [selectedView, setSelectedView] = useState<
-    "active" | "history" | "alerts"
-  >("active");
+  const [selectedView, setSelectedView] =
+    useState<AnsichOperationsView>("active");
   const activeTasksQuery = useAnsichActiveTasks(
     100,
     isAdmin && selectedView === "active",
@@ -47,6 +50,9 @@ export default function AnsichOperationsPage() {
     100,
     isAdmin && selectedView === "alerts",
   );
+  const healthQuery = useAnsichHealth(
+    isAdmin && selectedView === "observability",
+  );
   const historyPages = historyTasksQuery.data?.pages ?? [];
   const historyTasks = historyPages.flatMap((page) => page.items);
   const alertPages = alertsQuery.data?.pages ?? [];
@@ -56,13 +62,20 @@ export default function AnsichOperationsPage() {
       ? activeTasksQuery.data?.projection_status
       : selectedView === "history"
         ? historyPages.at(-1)?.projection_status
-        : alertPages.at(-1)?.projection_status;
+        : selectedView === "alerts"
+          ? alertPages.at(-1)?.projection_status
+          : // The health read carries the process block inline, so the banner
+            // above the Observability lens speaks from the same response the
+            // panel does.
+            healthQuery.data;
   const selectedError =
     selectedView === "active"
       ? activeTasksQuery.error
       : selectedView === "history"
         ? historyTasksQuery.error
-        : alertsQuery.error;
+        : selectedView === "alerts"
+          ? alertsQuery.error
+          : healthQuery.error;
   const projectionHealth = useAnsichProjectionHealth({
     health: selectedProjectionStatus,
     enabled: isAdmin,
@@ -129,7 +142,7 @@ export default function AnsichOperationsPage() {
               <Tabs
                 value={selectedView}
                 onValueChange={(value) =>
-                  setSelectedView(value as "active" | "history" | "alerts")
+                  setSelectedView(value as AnsichOperationsView)
                 }
                 className="space-y-4"
               >
@@ -141,6 +154,9 @@ export default function AnsichOperationsPage() {
                     {t.ansich.taskHistory}
                   </TabsTrigger>
                   <TabsTrigger value="alerts">{t.ansich.alerts}</TabsTrigger>
+                  <TabsTrigger value="observability">
+                    {t.ansich.observabilityHealth.tab}
+                  </TabsTrigger>
                 </TabsList>
                 <TabsContent value="active">
                   <section aria-labelledby="ansich-active-task-list-title">
@@ -214,6 +230,12 @@ export default function AnsichOperationsPage() {
                     hasNextPage={Boolean(alertsQuery.hasNextPage)}
                     isFetchingNextPage={alertsQuery.isFetchingNextPage}
                     onLoadMore={() => void alertsQuery.fetchNextPage()}
+                  />
+                </TabsContent>
+                <TabsContent value="observability">
+                  <AnsichObservabilityHealthPanel
+                    health={healthQuery.data}
+                    isPending={healthQuery.isPending}
                   />
                 </TabsContent>
               </Tabs>

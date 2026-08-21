@@ -207,6 +207,67 @@ export interface AnsichHealth {
   unreported_global_lost_range_count: number;
 }
 
+/**
+ * One projector's job ledger as the database holds it (P11-B §4).
+ *
+ * The four counts are the whole unsettled split, and `retry` is a bucket of its
+ * own: a job a hard error re-armed is work still owed, not work never started,
+ * so folding it into `pending` would make re-armed jobs disappear from this
+ * view while they are still outstanding.
+ *
+ * `complete_through` is a **continuity** mark, not progress. It is the last
+ * ingest sequence below which this projector owes nothing — one durably failed
+ * job holds it down no matter how far past that hole the projector has
+ * otherwise run, which is exactly what makes it readable as "nothing below here
+ * is owed". It is therefore lower than a per-worker progress number whenever
+ * anything is outstanding, and must never be labelled as progress. `null` only
+ * when the store holds no Observations at all.
+ */
+export interface AnsichProjectorHealth {
+  projector_name: string;
+  projector_version: string;
+  pending: number;
+  retry: number;
+  processing: number;
+  failed: number;
+  complete_through: number | null;
+}
+
+/**
+ * Database-side projection truth, merged into `GET /health` beside the process
+ * block (P11-B §4).
+ *
+ * `status` is the field every other one is conditional on: when it is
+ * `unreachable` the projector rows are empty and every number is `null`. `null`
+ * means unknown here and nowhere means zero — a block that could not be read
+ * must never render as "0ms behind, 0 failed jobs". The process block is still
+ * served in full either way, because `GET /health` stays the one Ansich route
+ * that answers while storage is down; the panel mirrors that by keeping the
+ * process-side numbers visible under an explicit unreachable banner.
+ *
+ * `failed_jobs` here is the **authoritative** count, read live from both job
+ * tables across every worker; `AnsichHealth.failed_jobs` keeps its name and its
+ * process-local, advisory meaning. `stale_completion_count` is the one field in
+ * this block that is not database truth at all: it is the reporting worker's
+ * own count of writes dropped because the job had been taken over.
+ */
+export interface AnsichDatabaseHealth {
+  status: "reachable" | "unreachable";
+  projectors: AnsichProjectorHealth[];
+  lag_ms: number | null;
+  failed_jobs: number | null;
+  stale_completion_count: number | null;
+}
+
+/**
+ * What `GET /api/ansich/health` answers: the process block every other Ansich
+ * response already carries as `projection_status`, plus the additive database
+ * block merged at the route.
+ */
+export interface AnsichHealthResponse extends AnsichHealth {
+  database: AnsichDatabaseHealth;
+}
+
 export type AnsichFailedJobKind = "projection" | "assessor";
 
 export interface AnsichFailedJob {
@@ -413,6 +474,12 @@ export interface AnsichActiveTaskListResponse {
   updated_at: string | null;
 }
 
+/**
+ * Every Alert type that has a producer behind it, which is exactly what the UI
+ * may advertise as a filter. The last two are the process-subject pair
+ * (P11-B §3): they are opened by the periodic operations pass against the host
+ * Scope rather than by anything one Task did.
+ */
 export const ANSICH_PRODUCED_ALERT_TYPES = [
   "budget_warning",
   "budget_exceeded",
@@ -426,6 +493,8 @@ export const ANSICH_PRODUCED_ALERT_TYPES = [
   "unverified_effect",
   "environment_pressure",
   "environment_leak_suspected",
+  "projection_failure",
+  "observability_degradation",
 ] as const;
 
 export type AnsichAlertType = (typeof ANSICH_PRODUCED_ALERT_TYPES)[number];
