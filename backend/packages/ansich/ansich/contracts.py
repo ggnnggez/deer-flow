@@ -267,9 +267,12 @@ class ObservationEnvelope(BaseModel):
             # (F10-8, and the shape F10-29 closed the class with). A payload
             # over `inline_payload_max_bytes` is stored in `ansich_payloads` and
             # reads back as `payload_json IS NULL` plus a `payload_ref_id`;
-            # `_observation_from_row` hands exactly that to this model. The
-            # `environment.sampled` branch below was the last one still raising
-            # on it and now guards too — no validating branch may join it again.
+            # `_observation_from_row` hands exactly that to this model. F10-29
+            # swept the rest of this validator to the same shape — the
+            # `environment.sampled` branch raised on the `None`, while
+            # `task.heartbeat` and `budget.configured` fabricated a `{}` and
+            # validated that — so every validating branch here now guards, and
+            # no new one may join them.
             if self.payload is not None:
                 first_sequence = self.payload.get("first_sequence")
                 last_sequence = self.payload.get("last_sequence")
@@ -369,8 +372,15 @@ class ObservationEnvelope(BaseModel):
                     raise ValueError("evaluation payload subject must match the Observation subject")
                 if evaluation.task_id != self.task_id:
                     raise ValueError("evaluation payload task must match the Observation task")
-        if self.kind == "task.heartbeat":
-            payload = self.payload or {}
+        if self.kind == "task.heartbeat" and self.payload is not None:
+            # Guarded like every other validating branch (F10-29). This one
+            # read `self.payload or {}` and then raised on the fabricated empty
+            # dict, so an externalized heartbeat could not be read back at all
+            # — `environment.sampled`'s shape exactly. It was unreachable only
+            # because a heartbeat payload is small, and "small enough not to
+            # cross the threshold" is the argument that had held for
+            # `environment.sampled` right up until it did not.
+            payload = self.payload
             elapsed_ms = payload.get("elapsed_ms")
             if not isinstance(elapsed_ms, int) or isinstance(elapsed_ms, bool) or elapsed_ms < 0:
                 raise ValueError("task.heartbeat elapsed_ms must be a non-negative integer")
@@ -381,8 +391,11 @@ class ObservationEnvelope(BaseModel):
             ):
                 if not isinstance(payload.get(field_name), str) or not payload[field_name]:
                     raise ValueError(f"task.heartbeat {field_name} must be non-empty")
-        if self.kind == "budget.configured":
-            payload = self.payload or {}
+        if self.kind == "budget.configured" and self.payload is not None:
+            # Same guard, same reason as `task.heartbeat` above (F10-29): the
+            # `or {}` fabricated a payload this envelope does not carry and
+            # validated it into a refusal.
+            payload = self.payload
             if payload.get("dimension") not in _USAGE_DIMENSIONS:
                 raise ValueError("budget.configured dimension is unsupported")
             if payload.get("aggregation_scope") not in {"local", "inclusive"}:

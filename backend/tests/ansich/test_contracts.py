@@ -143,6 +143,93 @@ def test_phase_five_observation_builders_reject_invalid_measurements() -> None:
         )
 
 
+def _externalized(kind: str, **fields) -> ObservationEnvelope:
+    """An envelope in the shape a stored, externalized row reads back as.
+
+    ``payload_json IS NULL`` plus a ``payload_ref_id`` is what
+    ``_observation_from_row`` hands the model for any payload that crossed
+    ``inline_payload_max_bytes``; the write-side builders always carry an
+    inline payload, so this is the only way to reproduce that shape.
+    """
+
+    task_id = fields.pop("task_id")
+    return ObservationEnvelope(
+        kind=kind,
+        occurred_at=datetime.now(UTC),
+        task_id=task_id,
+        subject_type="task",
+        subject_id=task_id,
+        producer=Producer(name="contracts-test", version="1", instance_id="local"),
+        source_event_id=f"run:externalized:{kind}",
+        correlation_id="run-externalized",
+        payload=None,
+        payload_ref_id=new_id(),
+        **fields,
+    )
+
+
+def test_an_externalized_heartbeat_payload_validates_on_read_back() -> None:
+    """F10-29's class, second sweep: ``task.heartbeat`` fabricated ``{}``.
+
+    This branch read ``self.payload or {}`` and then raised on the fabricated
+    empty dict, so an externalized heartbeat could not be read back at all —
+    ``environment.sampled``'s exact shape. It was unreachable only because the
+    payload is small, which is the argument that had held for
+    ``environment.sampled`` until an 800-metric sample crossed the threshold.
+    """
+
+    envelope = _externalized("task.heartbeat", task_id=new_id())
+
+    assert envelope.payload is None
+    assert envelope.payload_ref_id is not None
+
+
+def test_an_externalized_budget_payload_validates_on_read_back() -> None:
+    """Same class, same fabrication, at ``budget.configured``."""
+
+    envelope = _externalized("budget.configured", task_id=new_id())
+
+    assert envelope.payload is None
+    assert envelope.payload_ref_id is not None
+
+
+def test_an_inline_heartbeat_or_budget_payload_is_still_validated_in_full() -> None:
+    """The guard skips validation on ``None``; it does not relax it otherwise.
+
+    Guarding a branch whose whole body was reachable through a fabricated
+    ``{}`` is only safe if the present-payload path is untouched, so both
+    kinds' own rules are re-pinned here on an inline payload.
+    """
+
+    task_id = new_id()
+
+    with pytest.raises(ValidationError, match="elapsed_ms"):
+        ObservationEnvelope(
+            kind="task.heartbeat",
+            occurred_at=datetime.now(UTC),
+            task_id=task_id,
+            subject_type="task",
+            subject_id=task_id,
+            producer=Producer(name="contracts-test", version="1", instance_id="local"),
+            source_event_id="run:inline:heartbeat",
+            correlation_id="run-inline",
+            payload={"worker_id": "worker-a", "producer_instance_id": "local", "ownership_epoch": "worker-a"},
+        )
+
+    with pytest.raises(ValidationError, match="dimension"):
+        ObservationEnvelope(
+            kind="budget.configured",
+            occurred_at=datetime.now(UTC),
+            task_id=task_id,
+            subject_type="task",
+            subject_id=task_id,
+            producer=Producer(name="contracts-test", version="1", instance_id="local"),
+            source_event_id="run:inline:budget",
+            correlation_id="run-inline",
+            payload={"dimension": "not_a_dimension"},
+        )
+
+
 def test_phase_six_operator_observations_use_alert_and_task_subjects() -> None:
     task_id = new_id()
     alert_id = new_id()

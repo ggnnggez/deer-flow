@@ -2974,6 +2974,13 @@ class SqlAnsichBackend:
         empty dict, for the same reason the claim path raises: an empty payload
         would validate into a *different* verdict, so silence would fabricate a
         conclusion instead of reporting that the evidence cannot be read.
+
+        The decode failure says "observation payload", and that wording is the
+        deliberate one: the claim's own copy of this read used to say
+        "projection payload", but what failed to decode is an Observation's
+        stored payload — the projector is only one of this helper's four
+        callers, and the assessor and the environment-history reader would have
+        been misdescribed by it.
         """
 
         if row.payload_json is not None:
@@ -5784,7 +5791,7 @@ class SqlAnsichBackend:
         """
 
         window_start = datetime.now(UTC) - timedelta(minutes=window_minutes)
-        payloads: list[tuple[AnsichObservationRow, dict]] = []
+        points: list[EnvironmentHistoryPoint] = []
         async with self._session_factory() as session:
             rows = list(
                 (
@@ -5813,29 +5820,34 @@ class SqlAnsichBackend:
             # same way every other hydrating reader does; a payload row that has
             # gone missing raises there rather than degrading, which keeps this
             # read from reporting an unreadable sample as an unreported metric.
+            #
+            # The filtering stays *inside* this loop rather than running over a
+            # materialized list afterwards: a Scope emitting externalized
+            # samples at heartbeat cadence across a 24h window would otherwise
+            # hold every decoded payload at once, including the ones belonging
+            # to another `environment_scope` or never reporting this metric.
+            # One point is kept per surviving row, and each payload is dropped
+            # as soon as it has been read.
             for row in rows:
-                payloads.append((row, await self._hydrated_observation_payload(session, row)))
-
-        points: list[EnvironmentHistoryPoint] = []
-        for row, payload in payloads:
-            if payload.get("environment_scope") != environment_scope:
-                continue
-            metrics = payload.get("metrics")
-            if not isinstance(metrics, dict):
-                continue
-            reading = metrics.get(metric)
-            if not isinstance(reading, dict):
-                continue
-            value = _as_non_negative_int(reading.get("value"))
-            if value is None:
-                continue
-            points.append(
-                EnvironmentHistoryPoint(
-                    occurred_at=_as_utc(row.occurred_at),
-                    value=value,
-                    limit=_as_non_negative_int(reading.get("limit")),
+                payload = await self._hydrated_observation_payload(session, row)
+                if payload.get("environment_scope") != environment_scope:
+                    continue
+                metrics = payload.get("metrics")
+                if not isinstance(metrics, dict):
+                    continue
+                reading = metrics.get(metric)
+                if not isinstance(reading, dict):
+                    continue
+                value = _as_non_negative_int(reading.get("value"))
+                if value is None:
+                    continue
+                points.append(
+                    EnvironmentHistoryPoint(
+                        occurred_at=_as_utc(row.occurred_at),
+                        value=value,
+                        limit=_as_non_negative_int(reading.get("limit")),
+                    )
                 )
-            )
 
         truncated = len(points) > max_points
         if truncated:

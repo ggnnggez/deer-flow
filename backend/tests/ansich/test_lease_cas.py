@@ -1210,10 +1210,15 @@ async def test_an_externalized_environment_sample_is_hydrated_before_its_envelop
     The old order built the envelope from the raw row and hydrated afterwards,
     which handed ``ObservationEnvelope`` a ``None`` payload for an externalized
     ``environment.sampled`` and raised inside the claim transaction. That was
-    worse than a durably failed job: the raise rolled the claim back, so no
-    attempt was ever charged, the job stayed claimable forever, and every later
-    claim hit the same row again (``_projector_loop`` does not guard
-    ``_project_pending``, so the loop died with it) -- "写得进、读不出、作业永不落地".
+    worse than a durably failed job, and worse quietly: the raise rolled the
+    claim back, so no attempt was ever charged and the job could never reach
+    ``failed``; ``AnsichService._project_pending`` catches every exception and
+    reports it to the loop as "0 processed", so the projector loop survived and
+    simply re-claimed the same row forever. And the claim orders by
+    ``ingest_seq``, so once that row was the lowest claimable one **every**
+    projection stalled behind it, process-wide and for every Task, while health
+    answered ``reachable`` with ``failed_jobs=0`` and no ``projection_failure``
+    Alert could fire -- "写得进、读不出、作业永不落地", silently.
 
     Hydrating first also means the envelope is validated **against the payload
     the projector will actually read**, once, instead of being validated empty

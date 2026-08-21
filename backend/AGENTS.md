@@ -526,16 +526,32 @@ just a storage one. **A reader that does not need the payload does not hydrate**
 and that is a separate rule from the one above: `_observation_from_row` (the
 cheap public reads — `list_observations`, `list_timeline`, alert evidence)
 returns the envelope exactly as the row stores it, so an externalized row reads
-back as `payload=None` plus its `payload_ref_id`. Every validating branch in
-`contracts.py` is therefore guarded on `payload is not None`; `environment.sampled`
-was the last one still raising on it unconditionally, which made an externalized
-environment sample unreadable through all of those routes, and F10-29 closed
-that along with the claim order and the history reader's guard-and-skip (the
-skip had silently dropped large samples out of the trend series). Guarding
-concedes nothing, because the envelope already requires exactly one of
-`payload` / `payload_ref_id` for every kind: a `None` payload on a stored row
-therefore *means* externalized, and a genuinely payload-less sample is still
-refused by that check rather than by the branch.
+back as `payload=None` plus its `payload_ref_id`. **Every validating branch in
+`contracts.py` is therefore guarded on `payload is not None`, and that is now
+literally true of all of them** — F10-29 swept the class rather than closing one
+instance: `environment.sampled` raised outright on the `None`, while
+`task.heartbeat` and `budget.configured` did the other version of the same
+thing, `self.payload or {}` followed by validation of the fabricated empty dict.
+All three made an externalized Observation of those kinds unreadable through
+every route above; the last two were unreachable only because their payloads are
+small, which is exactly the argument that had held for `environment.sampled`
+until an 800-metric sample crossed the threshold. The same batch fixed the claim
+order and the history reader's guard-and-skip (that skip had silently dropped
+large samples out of the trend series). Guarding concedes nothing, because the
+envelope already requires exactly one of `payload` / `payload_ref_id` for every
+kind: a `None` payload on a stored row therefore *means* externalized, and a
+genuinely payload-less Observation is still refused by that check rather than by
+any branch. **What a claim-time raise costs, stated correctly**, because
+hydrating first means an externalized payload is now validated there: it is not
+a durably failed job and it does not kill the projector loop.
+`AnsichService._project_pending` catches everything and reports "0 processed",
+and the raise rolls its own claim back, so no attempt is charged and the row can
+never reach `failed`. The claim orders by `ingest_seq`, so a poisoned row that
+is the lowest claimable one stalls **all** projection, process-wide, for every
+Task — while health answers `reachable` with `failed_jobs=0` and no
+`projection_failure` Alert can fire, because that producer counts only
+`status='failed'`. A poison-at-claim is therefore a silent permanent stall, not
+a loud one, and that is the shape to look for when projection stops moving.
 Task-summary assertion pointers are nullable with `ON DELETE SET NULL`, so a
 missing derived assertion preserves the paginated Task row and marks it
 degraded instead of violating the FK or deleting the summary. Persisted
