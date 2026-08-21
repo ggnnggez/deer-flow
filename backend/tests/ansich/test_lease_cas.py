@@ -18,6 +18,7 @@ past under any clock rather than by moving a fake clock forward.
 from __future__ import annotations
 
 import contextlib
+import json
 from collections.abc import AsyncIterator
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -26,12 +27,16 @@ from types import SimpleNamespace
 import pytest
 from ansich import AnsichService, ObservationEnvelope, Producer, RebuildOutcome, RetryOutcome, new_id
 from ansich.assessment.scope_safety import SCOPE_SAFETY_ASSESSOR
+from ansich.safety import scope_entity_id, scope_reference_hash
+from pydantic import ValidationError
 from sqlalchemy import func, select, update
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 
 from deerflow.ansich.persistence.models import (
     AnsichAssessorErrorRow,
     AnsichAssessorJobRow,
+    AnsichObservationRow,
+    AnsichPayloadRow,
     AnsichProjectionErrorRow,
     AnsichProjectionJobRow,
 )
@@ -1148,3 +1153,156 @@ async def test_rebuild_until_settled_reports_exhaustion_instead_of_raising(tmp_p
 
         assert rounds == 3
         assert settled.unsettled == 2
+
+
+_ENVIRONMENT_SCOPE_REF = "local:thread-lease-cas-env"
+_ENVIRONMENT_SCOPE_ID = scope_entity_id("sandbox", scope_reference_hash("sandbox", _ENVIRONMENT_SCOPE_REF))
+
+
+def _scope_snapshotted(task_id: str, *, source_id: str) -> ObservationEnvelope:
+    return ObservationEnvelope.scope_snapshotted(
+        task_id=task_id,
+        run_id=source_id,
+        occurred_at=_OCCURRED_AT,
+        scope_kind="sandbox",
+        external_ref=_ENVIRONMENT_SCOPE_REF,
+        relation_role="sandbox_boundary",
+        source_event_id=f"run:{source_id}:scope:{_ENVIRONMENT_SCOPE_ID}",
+    )
+
+
+def _externalized_environment_sample(task_id: str, *, source_id: str) -> ObservationEnvelope:
+    """An ``environment.sampled`` large enough to be stored out of line.
+
+    Nothing here lowers ``inline_payload_max_bytes``: both backends run at the
+    production default (65536), and a Scope reporting several hundred metric
+    readings crosses it on its own. The metric names are long but canonical
+    (``^[a-z][a-z0-9_]{0,63}$``), so the size comes from a legal payload rather
+    than from junk the contract would refuse.
+    """
+
+    metrics = {f"fd_open_shard_{index:04d}_" + "e" * 40: {"value": 100 + index, "limit": 1024} for index in range(800)}
+    return ObservationEnvelope.environment_sampled(
+        task_id=task_id,
+        run_id=source_id,
+        occurred_at=_OCCURRED_AT + timedelta(seconds=10),
+        scope_id=_ENVIRONMENT_SCOPE_ID,
+        payload={
+            "environment_scope": "container",
+            "coverage": "continuous",
+            "provider": "local",
+            "metrics": metrics,
+            "window": {
+                "started_at": _OCCURRED_AT.isoformat(),
+                "ended_at": (_OCCURRED_AT + timedelta(seconds=10)).isoformat(),
+                "sample_count": 1,
+            },
+        },
+        source_event_id=f"run:{source_id}:env:{_ENVIRONMENT_SCOPE_ID}:1",
+        producer_name="deerflow-environment-probe",
+    )
+
+
+@pytest.mark.anyio
+async def test_an_externalized_environment_sample_is_hydrated_before_its_envelope_is_built(tmp_path):
+    """F10-29 ②: the claim hydrates the payload, then builds the envelope once.
+
+    The old order built the envelope from the raw row and hydrated afterwards,
+    which handed ``ObservationEnvelope`` a ``None`` payload for an externalized
+    ``environment.sampled`` and raised inside the claim transaction. That was
+    worse than a durably failed job: the raise rolled the claim back, so no
+    attempt was ever charged, the job stayed claimable forever, and every later
+    claim hit the same row again (``_projector_loop`` does not guard
+    ``_project_pending``, so the loop died with it) -- "写得进、读不出、作业永不落地".
+
+    Hydrating first also means the envelope is validated **against the payload
+    the projector will actually read**, once, instead of being validated empty
+    and then patched by a ``model_copy`` that re-runs no validator at all.
+    """
+
+    async with _two_workers(tmp_path) as workers:
+        task_id = new_id()
+        source_id = "run-f10-29-claim"
+        sample = _externalized_environment_sample(task_id, source_id=source_id)
+        await workers.a.persist_and_project(
+            [
+                _task_created(task_id, source_id=source_id),
+                _scope_snapshotted(task_id, source_id=source_id),
+                sample,
+            ]
+        )
+
+        claims: list[tuple] = []
+        original_claim = workers.a._claim_projection_job
+
+        async def recording_claim():
+            claim = await original_claim()
+            if claim is not None:
+                claims.append(claim)
+            return claim
+
+        workers.a._claim_projection_job = recording_claim  # type: ignore[method-assign]
+        await workers.a.project_pending(limit=50)
+
+        environment_claims = [claim for claim in claims if claim[1] == "environment-projector"]
+        assert len(environment_claims) == 1
+        job_id, _, claimed, _, _, _ = environment_claims[0]
+
+        # The claimed envelope carries the payload itself, read back inside the
+        # claim transaction, and no longer advertises the ref it came from.
+        assert claimed.payload_ref_id is None
+        assert claimed.payload is not None
+        assert claimed.payload["metrics"] == sample.payload["metrics"]
+
+        settled = await _projection_job(workers.a_sessions, job_id)
+        assert settled.status == "completed"
+
+        async with workers.a_sessions() as session:
+            stored = await session.scalar(select(AnsichObservationRow).where(AnsichObservationRow.obs_id == sample.obs_id))
+        # The precondition the whole scenario rests on: the row really is
+        # externalized, so the claim genuinely had nothing inline to read.
+        assert (stored.payload_json, stored.payload_ref_id is not None) == (None, True)
+        assert await _row_count(workers.a_sessions, AnsichProjectionErrorRow) == 0
+
+
+@pytest.mark.anyio
+async def test_the_claim_validates_the_hydrated_payload_instead_of_patching_it_in(tmp_path):
+    """The other half of F10-29 ②'s reorder: hydrate, *then* validate.
+
+    Building the envelope from the raw row and ``model_copy``-ing the hydrated
+    payload in afterwards re-runs no validator, so the contract gate the write
+    path passed applied to an empty payload and the payload the projector
+    actually read reached it unchecked. Hydrating first makes the single
+    validation the envelope already performs cover the payload in it.
+
+    The row is minted through the normal write path and its stored payload is
+    then rewritten, because that is the only shape this is reachable in: a
+    payload that no longer satisfies the contract its Observation was written
+    under. ``inline_payload_max_bytes=16`` is what forces externalization here
+    — this test is about the claim's order, not about the threshold.
+    """
+
+    other_scope_id = scope_entity_id("sandbox", scope_reference_hash("sandbox", "local:thread-lease-cas-other"))
+
+    async with _two_workers(tmp_path, inline_payload_max_bytes=16) as workers:
+        task_id = new_id()
+        source_id = "run-f10-29-claim-validation"
+        scope_observation = _scope_snapshotted(task_id, source_id=source_id)
+        await workers.a.persist_and_project(
+            [
+                _task_created(task_id, source_id=source_id),
+                scope_observation,
+            ]
+        )
+
+        async with workers.a_sessions() as session, session.begin():
+            row = await session.scalar(select(AnsichObservationRow).where(AnsichObservationRow.obs_id == scope_observation.obs_id))
+            assert row.payload_json is None and row.payload_ref_id is not None
+            stored_payload = await session.get(AnsichPayloadRow, row.payload_ref_id)
+            body = json.loads(stored_payload.body.decode(stored_payload.encoding))
+            body["scope"]["scope_id"] = other_scope_id
+            stored_payload.body = json.dumps(body, ensure_ascii=False, separators=(",", ":"), sort_keys=True).encode("utf-8")
+
+        with pytest.raises(ValidationError, match="subject must identify payload scope"):
+            while await workers.a._claim_projection_job() is not None:
+                pass

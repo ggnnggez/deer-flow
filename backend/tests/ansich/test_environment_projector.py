@@ -24,6 +24,7 @@ from deerflow.ansich import create_sql_ansich_service
 from deerflow.ansich.persistence.models import (
     AnsichEnvironmentCoverageRow,
     AnsichEnvironmentStateRow,
+    AnsichObservationRow,
     AnsichProjectionErrorRow,
     AnsichProjectionJobRow,
     AnsichRelationRow,
@@ -672,3 +673,93 @@ async def test_rebuild_projections_reconstructs_identical_environment_rows(tmp_p
     assert before["coverage"] and before["state"] and before["samples"]
     assert after == before
     assert errors == 0
+
+
+def _oversized_metrics(count: int = 800) -> dict[str, dict[str, int | None]]:
+    """Metrics whose canonical JSON puts one sample over 65536 bytes.
+
+    Nothing here lowers ``inline_payload_max_bytes``: the threshold is the
+    production default, and the point of F10-29 is that nothing exempts
+    ``environment.sampled`` from it. Environment payloads are *usually* small,
+    which is why all three instances of the class stayed unnoticed -- but a
+    Scope reporting a few hundred per-metric readings crosses the line, and
+    from there the sample is stored in ``ansich_payloads`` with
+    ``payload_json IS NULL`` like any other externalized payload.
+    """
+
+    # Long but canonical metric names (`^[a-z][a-z0-9_]{0,63}$`), so the size
+    # comes from the payload's own legal shape rather than from junk.
+    padding = "_" + "e" * 40
+    return {f"fd_open_shard_{index:04d}{padding}": {"value": 100 + index, "limit": 1024} for index in range(count)}
+
+
+@pytest.mark.anyio
+async def test_an_externalized_environment_sample_projects_reads_back_and_keeps_its_history(tmp_path) -> None:
+    """F10-29: the whole reader class, on one row nothing exempted from the threshold.
+
+    Red before the fix in three separate places: the claim built the envelope
+    *before* hydrating, so ``environment-projector@1`` could not even claim the
+    job; ``list_observations`` handed the contract a ``None`` payload it raised
+    on unconditionally; and the history reader guard-and-skipped the row, so
+    the sample dropped out of the trend series without a trace.
+    """
+
+    task_id, run_id = new_id(), "env-externalized-run"
+    metrics = _oversized_metrics()
+    probe_metric = sorted(metrics)[0]
+    occurred_at = datetime.now(UTC) - timedelta(seconds=5)
+    sample = _environment_sampled(
+        task_id,
+        run_id,
+        tick=1,
+        occurred_at=occurred_at,
+        metrics=metrics,
+    )
+
+    async with _environment_service(tmp_path, "ansich-env-externalized.db") as (
+        service,
+        session_factory,
+    ):
+        service.record_batch((_task_created(task_id, run_id), _scope_snapshotted(task_id, run_id), sample))
+        await service.flush_task(task_id)
+        statuses = await _environment_job_statuses(session_factory)
+
+        async with session_factory() as session:
+            stored = await session.scalar(select(AnsichObservationRow).where(AnsichObservationRow.obs_id == sample.obs_id))
+            stored_state = (stored.payload_json, stored.payload_ref_id is not None)
+            state_row_count = await session.scalar(select(func.count()).select_from(AnsichEnvironmentStateRow).where(AnsichEnvironmentStateRow.scope_id == _SCOPE_ID))
+            coverage = await session.get(AnsichEnvironmentCoverageRow, (_SCOPE_ID, "container"))
+            projected = await session.get(AnsichEnvironmentStateRow, (_SCOPE_ID, "container", probe_metric))
+            errors = await session.scalar(select(func.count()).select_from(AnsichProjectionErrorRow))
+
+        observations = await service.list_observations(task_id)
+        history = await service.get_environment_history(
+            _SCOPE_ID,
+            environment_scope="container",
+            metric=probe_metric,
+            window_minutes=60,
+            max_points=100,
+        )
+
+    # The row really is externalized -- this is the precondition every leg below
+    # depends on, so it is asserted rather than inferred from the byte count.
+    assert stored_state == (None, True)
+
+    # (b) claim + project: the job lands instead of failing on its own claim.
+    assert statuses == ("completed",)
+    assert errors == 0
+    assert coverage is not None and coverage.coverage == "continuous"
+    assert projected is not None
+    assert (projected.latest_value, projected.limit_value) == (metrics[probe_metric]["value"], 1024)
+    assert state_row_count == len(metrics)
+
+    # (a) public read-back: the envelope validates, carrying the ref rather than
+    # a hydrated payload (this read is deliberately cheap and does not hydrate).
+    read_back = [item for item in observations if item.kind == "environment.sampled"]
+    assert [item.obs_id for item in read_back] == [sample.obs_id]
+    assert read_back[0].payload is None
+    assert read_back[0].payload_ref_id is not None
+
+    # (c) history: the point is present with full content, not silently dropped.
+    assert history.truncated is False
+    assert [(point.value, point.limit) for point in history.points] == [(metrics[probe_metric]["value"], 1024)]

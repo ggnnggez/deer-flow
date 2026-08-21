@@ -37,7 +37,7 @@
 | F10-27 | 装配不对称:`create_embedded_ansich_service` 的无存储分支漏传三个 knob;`operations_assessment_interval_ms` 至今没有 `AnsichConfig` 字段,生产恒为 1000ms | ✅ 已修复(两半) | 2026-08-21 | `c7ce07a8` / `625a056c` |
 | F10-28 | 健康线的两处 UI 级留观:中性线态(phase/unknown)的**渲染层**零覆盖(图标三元式曾在本批被反转过);task 作用域在系统 phase 期间仍称「本任务数据完整」 | ⬜ 未修复 | — | — |
 | F10-29 | 环境外部化载荷类:externalized 的 `environment.sampled` 读不回(契约分支无守卫直接抛)、认领不了(先 envelope 后 hydrate 的顺序使投影作业 durable failed)、history 读者守卫跳过(其"从不外部化"注释已撤回)——同一危害类三实例 | ⬜ 未修复 | — | — |
-| F10-30 | settle-budget flake 家族(与 F10-10 分开记):`tests/ansich/` 里全部「settle 之后紧接着读投影结果」的断言的等价类(最初以为只在 `test_sql_safety.py` 里,成员 6/7/8/9 证否;共十名成员,第十名由 P11-C Task 1 补登),多种构造、同一机理——flush 预算输给负载,行退回队列/作业未建;F10-10 的节奏门禁管不了 flush 预算。**不限于重负载**:成员 1/5 在安静机单独跑也翻红(T6 记),故按用例名而非行号认领(合并门禁的窄口见本条收尾) | ⬜ 未修复(测试侧;十名成员,成员 5 已结案、成员 1 部分处理——见该条) | — | — |
+| F10-30 | settle-budget flake 家族(与 F10-10 分开记):`tests/ansich/` 里全部「settle 之后紧接着读投影结果」的断言的等价类(最初以为只在 `test_sql_safety.py` 里,成员 6/7/8/9 证否;共十一名成员,第十、十一名由 P11-C 的 Task 1 / Task 2 补登),多种构造、同一机理——flush 预算输给负载,行退回队列/作业未建;F10-10 的节奏门禁管不了 flush 预算。**不限于重负载**:成员 1/5 在安静机单独跑也翻红(T6 记),故按用例名而非行号认领(合并门禁的窄口见本条收尾) | ⬜ 未修复(测试侧;十一名成员,成员 5 已结案、成员 1 部分处理——见该条) | — | — |
 | F10-31 | LLM attempt 双观测的首写者 pkey 竞态:两 worker 各投影同一 attempt 的 request/response 观测,`ansich_llm_attempts_pkey` 碰撞——非破坏(输家整事务回滚→retry→收敛,和数正确),但需要第五处 lock-then-read 转换 | ⬜ 未修复 | — | — |
 | F10-32 | 活动 Task 读模型的「旧盖章」楔子:`c7ce07a8` 之前写下的行带旧语义水位,遇 durably failed 作业时被单调发布守卫永久跳过(已停 Task 那半边**静默**)。接受它的前提是「没有已部署群体」,而该前提**在此分支首次部署时失效** | ⬜ 未修复(带前提,须在首次部署前重判) | — | — |
 | F10-33 | 多 worker 下同一 host-Scope episode 并发碰撞 `uq_ansich_alert_episode`,一次碰撞丢掉**整轮** `assess_operations`(heartbeat/dwell/budget/environment 与两个生产者一起)——不腐蚀、下一轮自愈、已限速可见 | ⬜ 未修复 | — | — |
@@ -435,7 +435,7 @@
 
 ## F10-30. settle-budget flake 家族(与 F10-10 明确分开)
 
-- 状态:⬜ 未修复(测试侧;生产行为是 fail-open 预算语义,非 bug)。**成员 5 已由 T8 结案(上界写错,非本机理),成员 1 由 T8 部分处理(:1196 半边有条件了,:1195 半边没有)**;成员 2/3/4 未动;成员 6/7/8/9 于 P11-B 收尾与终审时补登(见下),**这四条都在 `test_sql_safety.py` 之外**;成员 10 由 P11-C Task 1 的全量目击补登,它**回到了 `test_sql_safety.py` 里**(见该成员条目)。来源:P11-B 批 T2-T4 的争用复测逐步识别,T4 修复轮定名;成员 4 由 T5 复审补登;成员 6/7 由 T10 复审目击、T12 登记,成员 8 由 T12 自己的全量目击,成员 9 由批终审全量目击、终审后的修复波登记;成员 10 由 P11-C 批 Task 1 的全量目击与同批登记。
+- 状态:⬜ 未修复(测试侧;生产行为是 fail-open 预算语义,非 bug)。**成员 5 已由 T8 结案(上界写错,非本机理),成员 1 由 T8 部分处理(:1196 半边有条件了,:1195 半边没有)**;成员 2/3/4 未动;成员 6/7/8/9 于 P11-B 收尾与终审时补登(见下),**这四条都在 `test_sql_safety.py` 之外**;成员 10 由 P11-C Task 1 的全量目击补登,它**回到了 `test_sql_safety.py` 里**(见该成员条目);成员 11 由 P11-C Task 2 的全量目击补登,与成员 10 同文件、同构造(自造 sleep 当 settle 预算)。来源:P11-B 批 T2-T4 的争用复测逐步识别,T4 修复轮定名;成员 4 由 T5 复审补登;成员 6/7 由 T10 复审目击、T12 登记,成员 8 由 T12 自己的全量目击,成员 9 由批终审全量目击、终审后的修复波登记;成员 10 由 P11-C 批 Task 1 的全量目击与同批登记;成员 11 由 P11-C 批 Task 2 的全量目击与同批登记。
 - 成员 1-3(全部 `terminal_flush_timeout_ms=100` 构造、24-hog 争用下全红——成员 1/2 两侧各 3/3 且文本一致,成员 3 一侧 3/3、另一侧存档 2 轮):
   1. `test_externalized_scope_authorization_and_effect_payloads_read_back`(:1195,`stored_payload_state == {}`——flush 预算内没写完)。**T6 修复轮把这条成员的两处描述都改宽了,两处都重要**:(a) 症状不止 :1195 那一条断言——T6 的验收里红在**下一行** :1196(`projected_scope_state is None`,scope 投影根本没落地),同一构造、同一机理,断言位置不同而已,所以不要按行号认这条成员;(b) **它在安静机、单独跑、无并发负载下也会红**——T6 单独重跑该用例 3 次即红 1 次(`task-6-evidence/f10-30-member-1-rerun-alone.txt`)。「24-hog 争用下才红」这个前提对成员 1 **不成立**,合并门禁不能靠「单独跑绿」来判定它。**并且它与本批任何改动无关**:同一用例在**批 BASE `ade44649`**(把 `sql.py` 单独 checkout 回去、其余不动)跑 6 次仍红 1 次,证据同文件。**T8 修复轮:部分处理(⚠️ 未结)。** T8 全量在该用例上翻红一次(症状是 :1196 那半边),分诊后在**同机、单独跑 24 次**量了三个状态:批 BASE `d4b43652` 的 `sql.py`/`__init__.py` **7/24 红**、T8 round-0 commit `42718363` **2/24 红**、T8 round-1 现状 **2/24 红**——BASE 更糟,故与 T8 无关,走窄口 (2)(b)。先试了本条自己排除过的手段确认它不是 F10-10:给该用例补 `only_test_driven_assessments` 后 24 次仍红 1 次,所以赛的**不是评估节奏**,是投影本身。根因随后定位:用例在 `flush_task()` 的**下一行**就读投影行,而 `flush_task` 约束的是**写**、不是投影。已改成对 `AnsichScopeRow` 的有界轮询(15s / 10ms),之后 24/24 绿。**为什么只算部分处理**:这条改动只给 :1196 那半边(scope 投影未落地)配了条件——它现在等的是一个确定性谓词(行在或不在),claim 真丢了投影仍会红。:1195 那半边(`stored_payload_state == {}`,flush 预算内没写完)**没有自己的条件**,它的 24/24 是等待窗口被拉宽后的**副作用**,不是钉子;该半边仍属本条家族,等共享 settle helper。本条「BASE 上同样红」的记录**不撤回**。
   2. `test_scope_safety_dependency_wait_crosses_deadline_into_failed_job_and_retry`(:514,`NoneType.job_id`——作业未建);
@@ -460,6 +460,8 @@
 
   10. `test_sql_safety.py::test_a_dependency_deferred_job_below_the_mark_re_judges_its_band_once`(断言在 :2294)——**P11-C 批 Task 1 的一次全量翻红,失败文本完整**(见下方记账)。第五个入口,回到 `test_sql_safety.py` 里,但构造与成员 1-4 都不同:它既不压 `terminal_flush_timeout_ms`、也不把轮询压到 60s,而是**自造了一个 `await anyio.sleep(0.3)` 当 settle 预算**,一共三处,每处后面紧跟 `assess_operations(now=…)` 再读结论。红的形状是 `assert trigger_conclusions == 4` 实得 **0**——触发器自己的 subject 一条结论都没有,即那 0.3 秒里 ToolCall 投影/scope-safety 证据根本没落地,评估无从判起。这是本族最直白的签名(「读到空态」),只是预算这次是一个硬编码的 sleep 而不是一个 flush 超时;修法同族(共享 settle helper 对持久行有界轮询),**不是**把 0.3 调大。
 
+  11. `test_sql_safety.py::test_absorbed_low_watermark_window_survives_an_evaluation_rollback`(断言在 :1946)——**P11-C 批 Task 2 的一次全量翻红,失败全文见下方记账**。第六个入口,与成员 10 同文件、同构造家族:它同样**自造了一个 `await anyio.sleep(0.5)` 当 settle 预算**——self-heal 那一步补投 blocking subject 的 ToolCall、`flush_task()`、`sleep(0.5)`、`assess_operations(now=…)`,然后数 `ansich_scope_conclusions` 的行。红的形状是 `assert late_conclusions == 4` 实得 **0**:那半秒里 blocking subject 的 ToolCall 投影没落地,scope-safety 的重试仍然停在依赖等待上,一条结论都没写。本族最直白的签名(「读到空态」),只是预算这次是 0.5 秒的硬编码 sleep;修法同族(共享 settle helper 对持久行有界轮询),**不是**把 0.5 调大。
+
 - **窄口放行记账**(本条收尾规定的「命令行、轮次、全文」):
   - P11-C 批 Task 1 全量,成员 10(**本条第一次由 P11-C 登记**):`cd backend && timeout 1800 env PYTHONPATH=. uv run pytest tests/ansich -q -p no:randomly --no-header -rf`(不接截断管道,全文落 `/tmp/ansich-final-run2.txt`)→ `1 failed, 815 passed, 28 warnings in 342.77s`。失败全文:
 
@@ -472,6 +474,17 @@
     ```
 
     讨伐,走 (2)(a):`cd backend && timeout 300 env PYTHONPATH=. uv run pytest "tests/ansich/test_sql_safety.py::test_a_dependency_deferred_job_below_the_mark_re_judges_its_band_once" -q -p no:randomly --no-header` **连跑 3 次,3/3 `1 passed`**(8.22s / 7.81s / 7.67s)。(2)(b) 无从走也不需要走:**该用例的函数体与批 BASE `dbfc9c8a` 逐字相同**(`git diff dbfc9c8a -- backend/tests/ansich/test_sql_safety.py` 只有两行,都在别的用例里),而 P11-C Task 1 的生产改动只碰 `retry_failed_projections` 的返回类型、新增 `rebuild_until_settled`、以及路由返回体——**这个用例一处都不调**(它只有 `flush_task` / `anyio.sleep(0.3)` / `assess_operations`)。同一轮之前的一次全量在同一棵树的前一个状态上是 **816 passed 全绿**,再前一轮红的是成员 4,即本族惯常的轮换。**唯一可想象的间接关联要如实写下**:同批把八处 `unsettled == 0` 的单轮断言改成了 `rebuild_until_settled()`,未结算时它最多多跑四轮重建,会给同一次全量增加墙钟与 CPU 负载——这不改变任何语义,但它正是本族赖以翻红的那个变量,所以记在这里而不是略过。
+  - P11-C 批 Task 2 全量,成员 11:`cd backend && timeout 1800 env PYTHONPATH=. uv run pytest tests/ansich -q -p no:randomly --no-header -rf`(不接截断管道,全文落 `/tmp/t2-full-run2.txt`)→ `1 failed, 820 passed, 28 warnings in 340.89s`。失败全文:
+
+    ```
+    >       assert late_conclusions == 4
+    E       assert 0 == 4
+
+    tests/ansich/test_sql_safety.py:1946: AssertionError
+    FAILED tests/ansich/test_sql_safety.py::test_absorbed_low_watermark_window_survives_an_evaluation_rollback[asyncio] - assert 0 == 4
+    ```
+
+    讨伐,走 (2)(a):`cd backend && timeout 300 env PYTHONPATH=. uv run pytest "tests/ansich/test_sql_safety.py::test_absorbed_low_watermark_window_survives_an_evaluation_rollback" -q -p no:randomly --no-header` **连跑 3 次,3/3 `1 passed`**(8.14s / 8.01s / 8.08s)。(2)(b) 不必走,理由是**结构性的**而不是统计性的:Task 2 的生产改动只有三处——`contracts.py` 的 `environment.sampled` 守卫(只在 `payload is None` 时改变行为)、`_claim_projection_job` 的 hydrate 顺序(对**内联** payload 逐字等价:`payload = row.payload_json`、`payload_ref_id = row.payload_ref_id`,不进 hydrate 分支)、以及 `get_environment_history`。该用例的 payload 全部远小于默认的 65536 字节、一条都不外部化,也不读环境 history,**三处一处都不经过**;同一棵树的前一个状态(只差 `contracts.py` 的一处等价重写与 AGENTS.md)那一轮全量是 **821 passed 全绿**。**唯一可想象的间接关联要如实写下**:这一轮全量是与我自己另外两批 pytest(`test_gateway_ansich_environment.py`,以及三个 persistence/feedback 文件)**并发**跑的,机器被自己压住——那正是本族赖以翻红的那个变量;此外 Task 2 新增的 800 指标外部化用例本身也给同一次全量加了墙钟与 CPU 负载。两者都不改变任何语义,但都记在这里而不是略过。
   - T10 复审轮,成员 6 与成员 7:**2026-08-22 按本条自己的记录规则补齐**(此前只记了结论,已按 `task-10-review.md` 的复审段重建;凡是重建不出来的都在下面明说,不补造)。
     - 命令行:`cd backend && timeout 2400 env PYTHONPATH=. uv run pytest tests/ansich -q -p no:randomly --no-header -rf`;那一轮复审者把自己的 PostgreSQL 实验(90 万行灌库 + `EXPLAIN`)与全量**并发**跑,机器被自己压住(1056s,对照实施者的 379s)。
     - 结果:`802 passed / 2 failed`。失败文本(复审段落逐字保留的两行):成员 6 `AssertionError: 子 Task 内部确实完成了`;成员 7 `tools_executed=0 != 1`。
@@ -480,9 +493,9 @@
   - P11-B 批终审全量,成员 9:调用形状是「`tests/ansich` 在一次**完整** `tests/` 全量里跑、`-p no:randomly`、不接截断管道」,那一轮 `tests/ansich` 得到 **804 passed / 1 failed**,失败就是上面成员 9 那段文本(全量整体 `14 failed, 9754 passed, 75 skipped in 785.35s`,另外 13 条红全部在 ansich 之外、属环境/实时 LLM/配置依赖,不在本批面上)。讨伐:该用例**单独重跑 3 次,3/3 `1 passed`**,并且是在**全量仍在跑**(即仍有负载)的条件下拿到的——比安静重跑更强——走 (2)(a)。**未随批留存的部分**:两份全文文件(`FINAL-pytest-ansich.txt`、`FINAL-flake-triage.txt`)在终审者的 scratchpad;逐字命令行没有进台账,只留下上面这句调用形状与全部数字。按窄口 (1),该红在被登记为成员 9 **之前**是阻断的,登记与放行是同一次修复波里做的。
   - T12 收尾全量,成员 8:`cd backend && PYTHONPATH=. uv run pytest tests/ansich -q` → `1 failed, 804 passed in 292.13s`,失败文本即上面那条 `IndexError`(完整栈已在 T12 报告里)。随后 `cd backend && PYTHONPATH=. uv run pytest "tests/ansich/test_ansich_evaluations_router.py::test_plain_alert_dismissal_never_changes_quality_beliefs" -q` 连跑 **3 次,3/3 `1 passed`**——走 (2)(a);随后同机把 `tests/ansich` 全量再跑一次,**805 passed 全绿**(第一轮 804+1 failed,第二轮多的那一条是 T12 新增的 lease-lock 钉子)。该用例在本批未被任何改动触达(T12 的树只加了两处注释与一条无关的新用例)。
 
-- 方向(经十名成员修正):这不是一份可枚举的成员清单,而是 `tests/ansich/` 里**所有「settle 之后紧接着读投影结果」的断言**的等价类(最先识别时以为它只住在 `test_sql_safety.py` 里,成员 6/7/8/9 证否)——多种构造、多种症状、同一机理(settle 预算输给负载)。修法应是一个**共享的确定性 settle helper**(对 flush/重排队/作业落地路径按持久行轮询,替代各测试自造的预算与等待),而非逐条加长各自的预算;成员 4 另需保证两条证据在**同一** watermark 区间内落地再断言。~~普通负载下极少翻红,合并门禁仍以安静机全绿为准。~~ **该收尾句已由 T6 撤回**:成员 1 与成员 5 都在安静机、无并发负载下翻红过(前者单独跑 3 次即红 1 次,且在批 BASE 上同样红),所以「安静机全绿」既不是这一族的稳定属性、也不能当作合并判据。在共享 settle helper 落地之前,合并门禁对本族**只开一个窄口**。放行必须同时满足 (1) 与 (2),缺任一即**阻断**:
+- 方向(经十一名成员修正):这不是一份可枚举的成员清单,而是 `tests/ansich/` 里**所有「settle 之后紧接着读投影结果」的断言**的等价类(最先识别时以为它只住在 `test_sql_safety.py` 里,成员 6/7/8/9 证否)——多种构造、多种症状、同一机理(settle 预算输给负载)。修法应是一个**共享的确定性 settle helper**(对 flush/重排队/作业落地路径按持久行轮询,替代各测试自造的预算与等待),而非逐条加长各自的预算;成员 4 另需保证两条证据在**同一** watermark 区间内落地再断言。~~普通负载下极少翻红,合并门禁仍以安静机全绿为准。~~ **该收尾句已由 T6 撤回**:成员 1 与成员 5 都在安静机、无并发负载下翻红过(前者单独跑 3 次即红 1 次,且在批 BASE 上同样红),所以「安静机全绿」既不是这一族的稳定属性、也不能当作合并判据。在共享 settle helper 落地之前,合并门禁对本族**只开一个窄口**。放行必须同时满足 (1) 与 (2),缺任一即**阻断**:
 
-  1. **具名成员**。翻红用例的**名字**必须已列在本条成员 1-10 之中(按用例名认领,不按行号)。**未列名的红一律阻断**,直到分诊完成;若分诊确认同机理,先带证据把它写进本条成为新成员,再走本窄口(成员 6/7/8/9/10 就是这样进来的)。**分诊时先看失败形状**:红的形状若是「`unsettled == 0` 被当作完成 / 重建单轮后断言完整性」,那不是本族——那是 F10-26 的 report-don't-wait 语义未被调用方消化,见该条 2026-08-22 的留观;本族的签名是「settle 之后紧接着读投影结果,读到空态/半态/多判一轮」。「`tests/ansich/` 里所有『settle 之后紧接着读投影结果』的断言的等价类」是**修法的范围**,**不是**门禁的认领范围——门禁只认已列名的用例。
+  1. **具名成员**。翻红用例的**名字**必须已列在本条成员 1-11 之中(按用例名认领,不按行号)。**未列名的红一律阻断**,直到分诊完成;若分诊确认同机理,先带证据把它写进本条成为新成员,再走本窄口(成员 6/7/8/9/10/11 就是这样进来的)。**分诊时先看失败形状**:红的形状若是「`unsettled == 0` 被当作完成 / 重建单轮后断言完整性」,那不是本族——那是 F10-26 的 report-don't-wait 语义未被调用方消化,见该条 2026-08-22 的留观;本族的签名是「settle 之后紧接着读投影结果,读到空态/半态/多判一轮」。「`tests/ansich/` 里所有『settle 之后紧接着读投影结果』的断言的等价类」是**修法的范围**,**不是**门禁的认领范围——门禁只认已列名的用例。
   2. **两条讨伐路径,至少走通一条,全文入证据**:(a) **单独重跑全绿**——该用例单独重跑 3 次 3/3 绿;或 (b) **BASE 对照复现**——在批 BASE 上以同样方式重跑,同一红在 BASE 上同样出现(⇒ 与本批改动无关)。改动重写了该路径致 BASE 对照不可行时,(a) 是唯一路径。两条都走不通(单独重跑仍红**且** BASE 上稳定全绿)⇒ **阻断**,按新回归处理。
 
   每一次放行都按本条记账:命令行、轮次、全文。

@@ -264,11 +264,12 @@ class ObservationEnvelope(BaseModel):
             if self.task_id != ANSICH_BOOTSTRAP_TASK_ID:
                 raise ValueError("observability.lost must carry the bootstrap Task sentinel")
             # Guarded on `payload is not None`, and that guard is the point
-            # (F10-29). A payload over `inline_payload_max_bytes` is stored in
-            # `ansich_payloads` and reads back as `payload_json IS NULL` plus a
-            # `payload_ref_id`; `_observation_from_row` hands exactly that to
-            # this model. `environment.sampled` raises on it and is the open
-            # instance of the class — this branch must not join it.
+            # (F10-8, and the shape F10-29 closed the class with). A payload
+            # over `inline_payload_max_bytes` is stored in `ansich_payloads` and
+            # reads back as `payload_json IS NULL` plus a `payload_ref_id`;
+            # `_observation_from_row` hands exactly that to this model. The
+            # `environment.sampled` branch below was the last one still raising
+            # on it and now guards too — no validating branch may join it again.
             if self.payload is not None:
                 first_sequence = self.payload.get("first_sequence")
                 last_sequence = self.payload.get("last_sequence")
@@ -318,11 +319,21 @@ class ObservationEnvelope(BaseModel):
         elif self.kind == "environment.sampled":
             if self.subject_type != "scope":
                 raise ValueError("environment observation subject_type must be scope")
-            if self.payload is None:
-                raise ValueError("environment observation requires a payload")
-            from ansich.environment import EnvironmentSamplePayload
+            # F10-29 ①. This branch used to raise unconditionally on a `None`
+            # payload, so an externalized environment sample could not be read
+            # back at all: every public read that rebuilds an envelope from a
+            # row (`list_observations`, `list_timeline`, alert evidence) blew up
+            # on a sample that was merely large. Guarding costs nothing that was
+            # worth keeping: the "requires a payload" rule it replaced is
+            # already carried, for every kind, by the exactly-one-of
+            # payload/payload_ref_id check at the end of this validator — so a
+            # `None` here means externalized and nothing else, and the guard
+            # skips validating a payload this envelope does not carry rather
+            # than validating an empty one into a different verdict.
+            if self.payload is not None:
+                from ansich.environment import EnvironmentSamplePayload
 
-            EnvironmentSamplePayload.model_validate(self.payload, strict=False)
+                EnvironmentSamplePayload.model_validate(self.payload, strict=False)
         elif self.kind.startswith("authorization."):
             if self.subject_type != "authorization_snapshot":
                 raise ValueError("authorization observation subject_type must be authorization_snapshot")

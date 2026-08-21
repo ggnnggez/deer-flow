@@ -512,22 +512,30 @@ child row; Ansich SQL tests that cover this path must enable
 whose payload was externalized keeps `payload_json IS NULL`, so a reader that
 validates a stored payload has to hydrate it back from `ansich_payloads`
 first — validating the column directly hands the model a `None`. The projection
-claim does this for every kind **except** `environment.sampled` (it builds the
-envelope before hydrating, so an externalized environment sample fails the
-claim itself and its projection job goes durably failed — F10-29's most severe
-instance), and so does the scope-safety assessor's evidence read
-(`_assess_scope_safety_at` via `_hydrated_observation_payload`, F10-23); a
-payload row that has gone missing raises on both paths rather than degrading to
-an empty dict, because an empty payload validates into a *different* verdict and
-would fabricate a conclusion instead of reporting unreadable evidence — the
-same raise also re-opens F10-23's Task-wide stall, which is why deleting a
-payload row is a retention concern, not just a storage one. **Not every reader
-does this yet**, and the two that do not are open, not fixed: `contracts.py`'s
-`environment.sampled` branch *raises* on a `None` payload (unconditionally — an
-externalized environment sample cannot be read back at all), and
-`get_environment_history` guard-and-skips one, so the sample silently drops
-out of the trend series. Both are the safe direction (loud, or an honest gap)
-rather than a fabricated reading, and F10-29 owns closing the class.
+claim hydrates **before** it builds the envelope, for every kind, so the
+envelope is validated once against the payload the projector will actually read
+instead of being validated empty and then patched by a `model_copy` that re-runs
+no validator; the scope-safety assessor's evidence read does the same
+(`_assess_scope_safety_at` via `_hydrated_observation_payload`, F10-23), and so
+does `get_environment_history`. A payload row that has gone missing raises on
+all of those paths rather than degrading to an empty dict, because an empty
+payload validates into a *different* verdict and would fabricate a conclusion
+instead of reporting unreadable evidence — the same raise also re-opens F10-23's
+Task-wide stall, which is why deleting a payload row is a retention concern, not
+just a storage one. **A reader that does not need the payload does not hydrate**,
+and that is a separate rule from the one above: `_observation_from_row` (the
+cheap public reads — `list_observations`, `list_timeline`, alert evidence)
+returns the envelope exactly as the row stores it, so an externalized row reads
+back as `payload=None` plus its `payload_ref_id`. Every validating branch in
+`contracts.py` is therefore guarded on `payload is not None`; `environment.sampled`
+was the last one still raising on it unconditionally, which made an externalized
+environment sample unreadable through all of those routes, and F10-29 closed
+that along with the claim order and the history reader's guard-and-skip (the
+skip had silently dropped large samples out of the trend series). Guarding
+concedes nothing, because the envelope already requires exactly one of
+`payload` / `payload_ref_id` for every kind: a `None` payload on a stored row
+therefore *means* externalized, and a genuinely payload-less sample is still
+refused by that check rather than by the branch.
 Task-summary assertion pointers are nullable with `ON DELETE SET NULL`, so a
 missing derived assertion preserves the paginated Task row and marks it
 degraded instead of violating the FK or deleting the summary. Persisted

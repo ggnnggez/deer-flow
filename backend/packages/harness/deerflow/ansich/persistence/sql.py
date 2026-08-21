@@ -2182,15 +2182,30 @@ class SqlAnsichBackend:
             job.lease_expires_at = now + timedelta(seconds=self._projector_lease_seconds)
             job.lease_generation = (job.lease_generation or 0) + 1
             claimed_generation = job.lease_generation
-            observation = self._observation_from_row(observation_row)
-            if observation.payload is None and observation.payload_ref_id is not None:
-                payload = await session.get(AnsichPayloadRow, observation.payload_ref_id)
-                if payload is None:
-                    raise RuntimeError(f"Ansich payload disappeared: {observation.payload_ref_id}")
-                decoded = json.loads(payload.body.decode(payload.encoding))
-                if not isinstance(decoded, dict):
-                    raise ValueError("Ansich projection payload must decode to an object")
-                observation = observation.model_copy(update={"payload": decoded, "payload_ref_id": None})
+            # Hydrate BEFORE the envelope is built, not after (F10-29 ②). The
+            # old order validated the envelope against the raw row — a `None`
+            # payload for anything externalized — and then patched it with a
+            # `model_copy`, which re-runs no validator. Two consequences, both
+            # real: a kind whose validator requires its payload (that was
+            # `environment.sampled`) failed inside the claim transaction, so its
+            # job could never be claimed, let alone projected; and for every
+            # other kind the payload the projector actually reads was never
+            # validated at all. This order validates once, against the payload
+            # that will be used.
+            payload = observation_row.payload_json
+            payload_ref_id = observation_row.payload_ref_id
+            if payload is None and payload_ref_id is not None:
+                # A payload row that has gone missing still raises rather than
+                # degrading to an empty dict: an empty payload validates into a
+                # *different* verdict, so silence would fabricate one instead of
+                # reporting that the evidence cannot be read.
+                payload = await self._hydrated_observation_payload(session, observation_row)
+                payload_ref_id = None
+            observation = self._observation_envelope(
+                observation_row,
+                payload=payload,
+                payload_ref_id=payload_ref_id,
+            )
             return (
                 job.job_id,
                 job.projector_name,
@@ -5756,7 +5771,10 @@ class SqlAnsichBackend:
         read, so it is derived from the immutable ``environment.sampled``
         Observations rather than adding a fourth rebuildable table whose only
         consumer is a sparkline. A sample that does not carry ``metric`` is
-        skipped, not zeroed — see ``EnvironmentHistoryView``.
+        skipped, not zeroed — see ``EnvironmentHistoryView``. A sample whose
+        payload was externalized is read back from ``ansich_payloads`` and
+        reported like any other, so "absent from the series" keeps meaning
+        "this sample did not report this metric" and nothing else.
 
         Note: this filters by ``subject_id`` while the available index is
         ``(kind, occurred_at)``. Environment observation volume is the same
@@ -5766,6 +5784,7 @@ class SqlAnsichBackend:
         """
 
         window_start = datetime.now(UTC) - timedelta(minutes=window_minutes)
+        payloads: list[tuple[AnsichObservationRow, dict]] = []
         async with self._session_factory() as session:
             rows = list(
                 (
@@ -5783,24 +5802,22 @@ class SqlAnsichBackend:
                     )
                 ).scalars()
             )
+            # Hydrate inside the session (F10-29 ③). This loop used to read
+            # `row.payload_json` and guard-and-skip a `None`, under a comment
+            # that had already retracted its own premise: environment payloads
+            # *can* be externalized -- nothing exempts this kind from
+            # `inline_payload_max_bytes`, it is only that they are usually small
+            # enough not to cross it -- so the skip silently dropped exactly the
+            # samples a busy Scope produces, and the sparkline broke the line
+            # across a gap that was not a gap. It now reads the payload back the
+            # same way every other hydrating reader does; a payload row that has
+            # gone missing raises there rather than degrading, which keeps this
+            # read from reporting an unreadable sample as an unreported metric.
+            for row in rows:
+                payloads.append((row, await self._hydrated_observation_payload(session, row)))
 
         points: list[EnvironmentHistoryPoint] = []
-        for row in rows:
-            payload = row.payload_json
-            if payload is None:
-                # RETRACTION: this used to claim environment payloads are "never
-                # externalized". They can be -- nothing exempts this kind from
-                # `inline_payload_max_bytes`; it is only that they are usually
-                # small enough not to cross it. So this branch is reachable, and
-                # what it does is guard-and-skip: the sample drops out of the
-                # series rather than being hydrated. That is the safe direction
-                # for a trend read (an absent point is an honest gap the
-                # sparkline breaks across, never an interpolated or zeroed
-                # reading), but it does under-report, and it is one of the open
-                # siblings of F10-23 -- the assessor's evidence read was fixed by
-                # hydrating; this one and `contracts.py`'s `environment.sampled`
-                # payload-None raise were not. F10-29 owns the class.
-                continue
+        for row, payload in payloads:
             if payload.get("environment_scope") != environment_scope:
                 continue
             metrics = payload.get("metrics")
@@ -8523,6 +8540,37 @@ class SqlAnsichBackend:
 
     @staticmethod
     def _observation_from_row(row: AnsichObservationRow) -> ObservationEnvelope:
+        """The envelope exactly as the row stores it — no payload store read.
+
+        An externalized row therefore reads back with ``payload=None`` and its
+        ``payload_ref_id``, which is what the cheap public reads
+        (``list_observations`` / ``list_timeline`` / alert evidence) want: the
+        ref is the honest answer, and hydrating every row of a page to serve a
+        list would put a second query per row on those reads. A caller that
+        needs the payload itself hydrates and uses ``_observation_envelope``
+        (see ``_claim_projection_job``).
+        """
+
+        return SqlAnsichBackend._observation_envelope(
+            row,
+            payload=row.payload_json,
+            payload_ref_id=row.payload_ref_id,
+        )
+
+    @staticmethod
+    def _observation_envelope(
+        row: AnsichObservationRow,
+        *,
+        payload: dict | None,
+        payload_ref_id: str | None,
+    ) -> ObservationEnvelope:
+        """One envelope from a row plus an explicitly resolved payload.
+
+        Split out of ``_observation_from_row`` so the claim can hand in a
+        hydrated payload and have the envelope validated against it once,
+        rather than validating an empty one and patching it afterwards.
+        """
+
         return ObservationEnvelope(
             obs_id=row.obs_id,
             schema_version=row.schema_version,
@@ -8543,8 +8591,8 @@ class SqlAnsichBackend:
             source_event_id=row.source_event_id,
             correlation_id=row.correlation_id,
             causation_obs_id=row.causation_obs_id,
-            payload=row.payload_json,
-            payload_ref_id=row.payload_ref_id,
+            payload=payload,
+            payload_ref_id=payload_ref_id,
         )
 
     async def _project_structural(
