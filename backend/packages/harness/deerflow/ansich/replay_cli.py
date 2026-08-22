@@ -34,6 +34,16 @@ refused rather than approximated -- and it is available only for projectors
 whose ability to restore what it deletes is proven by a test
 (``_REPLACE_PROVEN_PROJECTORS``); everything else is refused with
 ``replace_restore_unproven`` and the remedy named in the message.
+
+**One target is known-broken even without ``--replace``.** A *plain* replay of
+``task-control`` on a store whose control Observations have already been
+projected collides on ``ansich_transitions.evidence_obs_id`` and walks those
+jobs to durable failure (see ``_NON_IDEMPOTENT_PROJECTORS``). Exit code ``1``
+alone would read as a transient backlog and send the operator back into the
+same collision, so the defect is named on stderr before the pass and again
+beside a non-clean report. It is a warning rather than a refusal because the
+same command is correct on a store where those Observations have never been
+projected.
 """
 
 from __future__ import annotations
@@ -48,7 +58,7 @@ from ansich import ReplayReport, ReplaySelector
 from ansich.errors import ReplayTargetError
 from pydantic import ValidationError
 
-from deerflow.ansich.persistence.sql import SqlAnsichBackend
+from deerflow.ansich.persistence.sql import _NON_IDEMPOTENT_PROJECTORS, SqlAnsichBackend
 from deerflow.ansich.replay import DEFAULT_MAX_ROUNDS, execute_replay, plan_replay
 from deerflow.config import get_app_config
 from deerflow.persistence.engine import close_engine, get_session_factory, init_engine_from_config
@@ -138,6 +148,26 @@ def exit_code(report: ReplayReport) -> int:
     return 1 if report.unsettled or report.failed else 0
 
 
+def known_defect_warning(projector_name: str) -> str | None:
+    """The stderr line for a target whose re-projection is known to fail.
+
+    Printed **before** the pass runs, because the operator's decision is
+    whether to run it at all -- and printed again beside a non-clean report,
+    because exit code ``1`` says "work is owed" and reads as a transient
+    backlog. For a known-non-idempotent target it is not transient: re-running
+    and ``retry_failed_projections`` both re-collide, so an operator following
+    the ordinary remedy loops forever on a defect nothing in the report names.
+
+    Not a refusal (see ``_NON_IDEMPOTENT_PROJECTORS``): the same command is
+    correct on a store whose target Observations have never been projected.
+    """
+
+    mechanism = _NON_IDEMPOTENT_PROJECTORS.get(projector_name)
+    if mechanism is None:
+        return None
+    return f"warning: {projector_name} has a known projector-idempotence defect: {mechanism}"
+
+
 def render(report: ReplayReport, *, output_format: str) -> str:
     if output_format == "json":
         return json.dumps(report.model_dump(), indent=2, sort_keys=True)
@@ -191,6 +221,9 @@ def main(argv: list[str] | None = None) -> int:
     except (ValidationError, ValueError) as error:
         print(f"invalid replay filter: {error}", file=sys.stderr)
         return 2
+    defect = known_defect_warning(args.projector)
+    if defect is not None:
+        print(defect, file=sys.stderr)
     try:
         report = asyncio.run(run(args, selector))
     except ReplayTargetError as error:
@@ -200,7 +233,12 @@ def main(argv: list[str] | None = None) -> int:
         print(f"replay unavailable: {error}", file=sys.stderr)
         return 2
     print(render(report, output_format=args.format))
-    return exit_code(report)
+    code = exit_code(report)
+    if code and defect is not None:
+        # Attribution, not decoration: without it the failure reads as a
+        # backlog and the operator retries into the same collision.
+        print(f"note: this pass left work owed and {args.projector} carries the defect above; re-running will not clear it", file=sys.stderr)
+    return code
 
 
 if __name__ == "__main__":

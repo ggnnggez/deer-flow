@@ -1715,6 +1715,32 @@ def _heartbeat(task_id: str, *, run_id: str, ordinal: int, offset_seconds: int) 
     )
 
 
+async def _claimable_heartbeat_jobs(worker: _Worker) -> int:
+    """How many ``task-heartbeat`` jobs this worker's snapshot sees as claimable.
+
+    Deliberately **lock-free** -- a plain `SELECT` under READ COMMITTED, which
+    is what makes it usable from inside a peer's open write transaction: it
+    reports the row versions the claim predicate would evaluate, without
+    waiting on or skipping anything. It mirrors ``_claim_projection_job``'s
+    own predicate for the claimable statuses; the expired-lease branch is left
+    out because nothing here injects one.
+    """
+
+    async with worker.sessions() as session:
+        return int(
+            await session.scalar(
+                sa.select(sa.func.count())
+                .select_from(AnsichProjectionJobRow)
+                .where(
+                    AnsichProjectionJobRow.projector_name == "task-heartbeat",
+                    AnsichProjectionJobRow.status.in_(("pending", "retry")),
+                    AnsichProjectionJobRow.available_at <= datetime.now(UTC),
+                )
+            )
+            or 0
+        )
+
+
 async def _settle_everything(*workers: _Worker) -> None:
     """Drain projections, run one assessment, drain again -- until nothing is owed.
 
@@ -1749,21 +1775,31 @@ async def test_replay_and_replace_hold_on_postgres_with_a_second_worker_live() -
     purely to widen the column types that reach the canonicaliser here (JSON,
     aware timestamps) beyond the heartbeat table's three.
 
-    **(b) A second worker assesses across the mint's commit window.** The mint
-    is one transaction under ``_maintenance_lock`` that re-pends jobs and then
-    deletes active-Task read-model rows (ruling RC3). The configuration in which
-    that delete, the PB7 publish guard and the guarded sweep genuinely contend
-    is a *peer's* 1 Hz ``assess_operations`` running while the mint is open --
-    which needs two pools, so SQLite cannot express it. Worker B's tick is
-    driven from inside worker A's paused mint transaction.
+    **(b) A second worker's operations tick commits inside the mint's open
+    transaction.** The mint is one transaction under ``_maintenance_lock`` that
+    deletes, re-pends, mints and only then clears active-Task read-model rows
+    (ruling RC3). Worker B's ``assess_operations`` is driven from inside worker
+    A's paused mint, with A's whole-table delete and re-pend uncommitted, and
+    has to commit without blocking or aborting -- which needs two pools, so
+    SQLite cannot express it. **What it deliberately does not show** is B's tick
+    contending with A's own active-Task sweep: the pause fires on the re-pend,
+    which runs *before* ``_clear_frozen_active_task_rows``, so the two are
+    serialized here by construction. Their interleaving is a separate script
+    this one does not attempt.
 
     **(c) The bulk ``UPDATE ... WHERE obs_id IN (subquery)`` re-pend against a
     live claimer.** The re-pend takes row locks over its whole target set in one
     statement, in an order the planner picks; a claimer takes them one at a time
-    with ``FOR UPDATE SKIP LOCKED``. The claim is therefore expected to come
-    back **empty and promptly** rather than to block or to abort as a deadlock,
-    and "promptly" is asserted with a budget so a lock-order cycle would fail
-    the test rather than hang the tier.
+    with ``FOR UPDATE SKIP LOCKED``. For that to be under test the peer's claim
+    predicate has to *match* a locked row, which under READ COMMITTED means the
+    row's **pre-re-pend** version must be claimable -- so the script leaves one
+    heartbeat job ``pending`` and never claims it, and asserts from a
+    lock-free read that B genuinely sees a claimable job at pause time. The
+    claim must then come back **empty and promptly** rather than block or abort
+    as a deadlock. Without that spare job the assertion would be vacuous: every
+    other heartbeat job reads ``completed`` or live-``processing`` in B's
+    snapshot, so the predicate filters them out before ``SKIP LOCKED`` is ever
+    reached and an empty claim would prove nothing (review finding F4).
 
     **(d) ``--replace`` on PostgreSQL, and the §11 acceptance taken through it.**
     The replace deletes ``task-heartbeat``'s owned table whole inside that same
@@ -1807,14 +1843,26 @@ async def test_replay_and_replace_hold_on_postgres_with_a_second_worker_live() -
         assert first.digest is not None
         assert first.digest == second.digest
 
-        # The live claimer, taken before the replace so the re-pend has a real
-        # in-flight claim to invalidate. Its job has to be the *heartbeat* one
-        # -- that is the projector the replace re-pends -- so the sibling jobs
-        # this Observation also mints are settled out of the claim's way first,
-        # the same narrowing the takeover test above uses. Their read models are
-        # not what this test reads.
+        # Two late heartbeats, and they do different jobs.
+        #
+        # The first is the live claimer, taken before the replace so the
+        # re-pend has a real in-flight claim to invalidate. The second is left
+        # **pending and unclaimed**, because it is the only thing that makes
+        # (c) non-vacuous: under READ COMMITTED the peer evaluates its claim
+        # predicate against each row's pre-re-pend version, so a row that read
+        # `completed` (or live-`processing`) before the re-pend is filtered out
+        # before `SKIP LOCKED` is reached and an empty claim would say nothing
+        # about locking. A row that was `pending` is claimable in that snapshot
+        # *and* locked by the re-pend -- exactly the collision under test.
+        #
+        # Both claims have to land on the *heartbeat* job -- that is the
+        # projector the replace re-pends -- so the sibling jobs these
+        # Observations also mint are settled out of the way first, the same
+        # narrowing the takeover test above uses. Their read models are not
+        # what this test reads.
         late = _heartbeat(task_id, run_id=run_id, ordinal=9, offset_seconds=9)
-        await worker_a.backend.persist_and_project([late])
+        spare = _heartbeat(task_id, run_id=run_id, ordinal=10, offset_seconds=10)
+        await worker_a.backend.persist_and_project([late, spare])
         async with worker_a.sessions() as session, session.begin():
             await session.execute(
                 sa.update(AnsichProjectionJobRow)
@@ -1829,6 +1877,8 @@ async def test_replay_and_replace_hold_on_postgres_with_a_second_worker_live() -
         assert stale_claim[1] == "task-heartbeat"
         stale_job_id = stale_claim[0]
         stale_generation = stale_claim[-1]
+        # The claim orders by ingest_seq, so it took `late` and left `spare`.
+        assert await _claimable_heartbeat_jobs(worker_b) == 1
 
         # A row no Observation produces: it must not survive the replace, which
         # is how a whole-table delete is distinguished from an overwrite. Its
@@ -1851,7 +1901,7 @@ async def test_replay_and_replace_hold_on_postgres_with_a_second_worker_live() -
 
         mint_open = asyncio.Event()
         peer_done = asyncio.Event()
-        state: dict[str, object] = {"paused": False, "peer_claim": "not-run", "claim_seconds": None}
+        state: dict[str, object] = {"paused": False, "peer_claim": "not-run", "claim_seconds": None, "visible_claimable": None}
 
         async def pause_inside_the_open_mint(statement: object) -> None:
             text = _statement_text(statement)
@@ -1884,6 +1934,10 @@ async def test_replay_and_replace_hold_on_postgres_with_a_second_worker_live() -
                     # (b) the peer's operations tick, inside the open mint.
                     await worker_b.backend.assess_operations()
                     # (c) the peer's claim against the re-pend's locked set.
+                    # The lock-free count first: it is what turns "the claim
+                    # came back empty" into evidence about locking rather than
+                    # about an empty backlog.
+                    state["visible_claimable"] = await _claimable_heartbeat_jobs(worker_b)
                     started = asyncio.get_running_loop().time()
                     claimed = await asyncio.wait_for(worker_b.backend._claim_projection_job(), timeout=_INTERLEAVE_TIMEOUT_SECONDS)
                     state["claim_seconds"] = asyncio.get_running_loop().time() - started
@@ -1896,15 +1950,19 @@ async def test_replay_and_replace_hold_on_postgres_with_a_second_worker_live() -
             worker_a.session_class.after_execute = None  # type: ignore[assignment]
 
         assert state["paused"], "the script never reached the open mint transaction"
-        # (b)/(c): the peer neither raised nor cycled. `assess_operations`
-        # returning at all is the assertion for (b) -- it commits or it raises.
+        # (b): `assess_operations` returning at all is the assertion -- it
+        # commits inside A's open transaction, or it raises.
+        # (c): a claimable row was visible to the peer AND the claim still came
+        # back empty, which only `SKIP LOCKED` explains; and it came back
+        # promptly, so a lock-order cycle fails here rather than hanging.
+        assert state["visible_claimable"] == 1, f"the peer saw {state['visible_claimable']!r} claimable heartbeat jobs, so an empty claim would prove nothing"
         assert state["peer_claim"] == "empty", f"the peer's claim came back {state['peer_claim']!r} against the re-pend's locked set"
         assert float(state["claim_seconds"]) < _INTERLEAVE_TIMEOUT_SECONDS
 
         # (d) the replace landed, and the planted row is gone -- the table was
         # emptied, not written over.
         assert (replace_report.unsettled, replace_report.failed) == (0, 0), _unsettled(await _projection_jobs(worker_a))
-        assert await _row_count(worker_a, AnsichTaskHeartbeatRow) == heartbeats_before + 1
+        assert await _row_count(worker_a, AnsichTaskHeartbeatRow) == heartbeats_before + 2
         async with worker_a.sessions() as session:
             planted = await session.scalar(sa.select(sa.func.count()).select_from(AnsichTaskHeartbeatRow).where(AnsichTaskHeartbeatRow.ownership_epoch == "planted"))
         assert int(planted or 0) == 0

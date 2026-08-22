@@ -675,8 +675,17 @@ _DIGEST_EXCLUDED_COLUMNS: set[tuple[str, str]] = {
 #:   mints one window per Task when it finds none.
 #:
 #: Pinned against an AST audit of ``sql.py`` by
-#: ``TestOwnedPrimaryKeysAreDerived``, so a projector that starts minting a key
-#: cannot slip past on nobody re-reading this file.
+#: ``TestOwnedPrimaryKeysAreDerived``. That audit is a deliberate **lower
+#: bound**, in the same sense (and for the same reason) as
+#: ``TestOwnershipIsConservativeInFact``'s reachability walk: it recognises the
+#: two write shapes this file actually uses -- the ORM constructor keyword and a
+#: literal dict handed to ``_insert_ignoring_conflict`` -- plus one level of
+#: ``name = new_id()`` aliasing. A key minted through ``Model(**mapping)``, a
+#: dict assembled in a local, a helper's return value or an attribute assignment
+#: would produce no entry and the equality pin would still pass. Every call site
+#: today is one of the two handled shapes, so the audit's *answer* is correct;
+#: what it buys is that the common shapes cannot drift silently, not that no
+#: shape can.
 _DIGEST_RANDOM_KEY_COLUMNS: set[tuple[str, str]] = {
     ("ansich_transitions", "transition_id"),
     ("ansich_context_windows", "entity_id"),
@@ -708,22 +717,49 @@ _DIGEST_SURROGATE_ORDER: dict[str, tuple[str, ...]] = {
 #: exists. It owns ``ansich_transitions`` outright, and ``_project_control``
 #: computes each transition's ``from_value`` from the current control Belief --
 #: which lives in the shared Belief triple, which a projector-scoped replace
-#: neither owns nor clears. Replacing it therefore deletes
-#: ``unknown -> created`` and ``created -> running`` and re-derives
-#: ``running -> running``: not a hole, a different history, with the same row
-#: count. (Its plain, non-replace replay is separately broken -- re-projecting
-#: an already-projected control Observation collides on
+#: neither owns nor clears. Replacing it re-derives against a Belief that
+#: already carries the destination value, so ``should_select_control_candidate``
+#: refuses the earlier candidates outright: two transitions
+#: (``unknown -> created``, ``created -> running``) are deleted and **one**
+#: (``running -> running``) comes back. Fewer rows, and none of them the rows
+#: that history recorded. (Its plain, non-replace replay is separately broken --
+#: re-projecting an already-projected control Observation collides on
 #: ``ansich_transitions.evidence_obs_id`` -- which is a projector-idempotence
-#: defect this batch found rather than introduced, and did not fix.)
+#: defect this batch found rather than introduced, and did not fix; see
+#: ``_NON_IDEMPOTENT_PROJECTORS``.)
 #:
-#: Membership is decided by
-#: ``tests/ansich/test_replay.py::TestReplaceIsDeterministic``, which
-#: parametrizes over this set: for each member it replays, digests, replaces,
-#: replays and digests again over a non-empty row set, and asserts the two
-#: digests agree. Adding a projector here without that property turns that test
-#: red rather than shipping a silent rewrite. Everything else is refused with
-#: ``replace_restore_unproven`` -- unproven, not impossible, and the way in is
-#: to extend the fixture and let the check answer.
+#: **Membership has two conditions, and both are mechanised.**
+#:
+#: 1. *Restoration.* ``tests/ansich/test_replay.py::TestReplaceIsDeterministic``
+#:    parametrizes over this set: for each member it replays, digests,
+#:    replaces, replays and digests again over a non-empty row set, asserts the
+#:    two digests agree, and asserts no table **outside** the member's owned set
+#:    changed its row count.
+#: 2. *Cascade containment.* The owned set must be closed under inbound
+#:    ``ON DELETE CASCADE``. A DELETE's blast radius is not its statement list:
+#:    ``ansich_tool_calls`` (``task-step``) is CASCADE-referenced by three
+#:    ``task-safety``-owned tables, by ``ansich_scope_conclusions`` (the
+#:    assessor family's read model) and by ``ansich_task_spawns`` (shared) --
+#:    and transitively by the two authorization child tables under
+#:    ``ansich_authorization_snapshots``. So ``--replace --projector task-step``
+#:    would cascade-delete a sibling projector's rows through a channel the
+#:    ownership rule cannot see, because that rule reasons about *writers*, not
+#:    about referential cascade. Condition 1 would not catch it either: the
+#:    digest hashes only the target's own tables, so an emptied
+#:    ``task-safety`` would still compare equal. Pinned separately by
+#:    ``TestReplaceCascadeIsContained``, which computes the transitive closure
+#:    over ``Base.metadata``. Note SQLite cannot even reproduce this class --
+#:    ``tests/ansich/conftest.py`` leaves ``PRAGMA foreign_keys`` off, so the
+#:    cascade never fires there and only PostgreSQL would show it.
+#:
+#: ``task-step`` therefore carries **two independent disqualifiers**: the
+#: cascade above, and (report §3) the fact that several of its projections
+#: short-circuit on rows in ``ansich_steps``, a shared table a replace does not
+#: clear. Neither is fixed by extending the fixture.
+#:
+#: Everything not listed is refused with ``replace_restore_unproven`` --
+#: unproven, not impossible. The way in is to satisfy both conditions and let
+#: the checks answer.
 _REPLACE_PROVEN_PROJECTORS: frozenset[str] = frozenset(
     {
         "task-heartbeat",
@@ -731,6 +767,62 @@ _REPLACE_PROVEN_PROJECTORS: frozenset[str] = frozenset(
         "environment-projector",
     }
 )
+#: Projectors whose re-projection of an **already-projected** Observation is
+#: known to fail, with the mechanism, so an operator is told rather than left
+#: reading a durable failure as a transient backlog.
+#:
+#: ``task-control`` is the only member and the defect is real, reproduced and
+#: unfixed (review finding F8): ``_project_control`` inserts a transition
+#: unguarded, and ``ansich_transitions.evidence_obs_id`` is UNIQUE, so a replay
+#: of a settled store collides, re-arms to ``retry`` and walks to ``failed`` --
+#: which raises a ``projection_failure`` Alert and holds health at ``degraded``
+#: until a rebuild. The operator's instinctive next moves (run it again,
+#: ``retry_failed_projections``) re-collide forever, which is exactly why the
+#: CLI names the defect instead of letting exit code ``1`` read as "try again".
+#:
+#: It is **not** a refusal: an empty store, or one whose target Observations
+#: have never been projected, replays cleanly, and refusing that would take away
+#: the one case where the command is the right answer. ``rebuild_projections()``
+#: is the remedy for the settled-store case, because it clears the Belief rows
+#: the collision derives from.
+_NON_IDEMPOTENT_PROJECTORS: dict[str, str] = {
+    "task-control": (
+        "re-projecting an already-projected control Observation inserts a second ansich_transitions row for the same evidence_obs_id, which is UNIQUE; those jobs retry and then fail durably. "
+        "Use rebuild_projections() on a store where these Observations have already been projected."
+    ),
+}
+
+
+def _cascade_delete_closure(table_names: frozenset[str]) -> frozenset[str]:
+    """Every table that loses rows when *table_names* are deleted, transitively.
+
+    A ``DELETE``'s real blast radius is its statement list plus the transitive
+    closure of inbound ``ON DELETE CASCADE`` foreign keys, and the ownership map
+    cannot see that channel at all -- it reasons about which projector *writes*
+    a table, which says nothing about who points at it.
+
+    Transitive rather than one hop because the escapes chain: deleting
+    ``ansich_tool_calls`` cascades into ``ansich_authorization_snapshots``,
+    whose own children (``ansich_authorization_scopes`` /
+    ``_permissions``) then go with it.
+
+    Read off ``Base.metadata`` rather than declared, so a foreign key added
+    later is covered without anyone remembering to update a list.
+    """
+
+    reached = set(table_names)
+    frontier = list(reached)
+    while frontier:
+        current = frontier.pop()
+        for table in Base.metadata.tables.values():
+            if table.name in reached:
+                continue
+            if any(key.column.table.name == current and (key.ondelete or "").upper() == "CASCADE" for key in table.foreign_keys):
+                reached.add(table.name)
+                frontier.append(table.name)
+    return frozenset(reached)
+
+
 _NON_PROJECTOR_REBUILT_TABLES: tuple[type[Base], ...] = (
     AnsichAlertReadModelRow,
     AnsichAlertWorkflowEventRow,
@@ -2548,17 +2640,30 @@ class SqlAnsichBackend:
            reading of that map is what makes the delete safe: a table another
            projector's branch also writes would take that projector's rows with
            it and only get them back if it were replayed too (review finding
-           F1). The caller is expected to have validated the request with
-           ``_validate_replace_request`` -- a filtered replace and an unproven
-           projector are both refused there, before anything is read.
+           F1). ``_validate_replace_request`` is re-run here rather than trusted
+           from the caller: it is pure and cheap, and what a missed validation
+           costs is a cleared table with only the filtered window re-derived --
+           a loss whose sole symptom is a smaller table. A guarantee that
+           expensive should be structural, not conventional.
 
-           Shared and non-projector tables are never touched, which has a
-           consequence worth stating: a replace is *not* a scoped rebuild. It
-           re-derives one projector's own rows against a shared zone that keeps
-           standing, and for the two tables whose primary key is minted rather
-           than derived (``_DIGEST_RANDOM_KEY_COLUMNS``) the old key's
-           ``ansich_entities`` row is left behind as an orphan -- harmless, and
-           it accumulates one row per replaced Task per replace.
+           No shared or non-projector table is named by a DELETE here, but
+           "named by a DELETE" is not the same as "unaffected": inbound
+           ``ON DELETE CASCADE`` foreign keys carry the delete further, which is
+           why membership in ``_REPLACE_PROVEN_PROJECTORS`` also requires the
+           owned set to be closed under that cascade (condition 2 there, pinned
+           by ``TestReplaceCascadeIsContained``). Within that closure a replace
+           is still *not* a scoped rebuild: it re-derives one projector's own
+           rows against a shared zone that keeps standing.
+
+           One residual cost, currently **unreachable**: of the two minted-key
+           tables (``_DIGEST_RANDOM_KEY_COLUMNS``) only
+           ``ansich_context_windows`` has an ``ansich_entities`` row at all --
+           ``_project_control`` mints a bare ``transition_id`` with no Entity
+           and no foreign key into that table -- so only a window replace could
+           strand an orphan Entity, one per replaced Task per replace. It owns
+           that table through ``task-step``, which is refused, so today the cost
+           is zero. It becomes real if and only if ``task-step`` is ever
+           admitted.
 
         1. **Mint** a ``pending`` job for every targeted Observation the target
            ``(projector, version)`` has none for. This is how a version that
@@ -2636,6 +2741,7 @@ class SqlAnsichBackend:
         active Tasks than that.
         """
 
+        _validate_replace_request(projector_name, projector_version, selector, replace=replace)
         condition = _replay_observation_condition(projector_name, projector_version, selector)
         job_exists = _replay_job_exists_condition(projector_name, projector_version)
         mint_allowed = bool(_PROJECTOR_KINDS.get(projector_name))
@@ -2780,8 +2886,17 @@ class SqlAnsichBackend:
         out twice", whose answer is always no. Those two tables are ordered by
         ``_DIGEST_SURROGATE_ORDER``'s content-derived unique key instead, and
         the minted column is dropped from the payload alongside the wall-clock
-        ones. This is what makes the §11 check survive ``--replace``, which
-        re-derives the rows and therefore re-mints the keys.
+        ones.
+
+        That handling is **forward-looking insurance, inert today**: both
+        minted-key tables belong to projectors ``--replace`` refuses
+        (``task-control``, ``task-step``), so no parametrized determinism run
+        exercises it, and the only exclusions any proven member sees are two
+        wall-clock ``updated_at`` columns. It is driven instead by
+        ``test_a_minted_key_cannot_move_the_digest`` plus the structural pins,
+        and it is what stops the §11 check from breaking by construction on the
+        day ``task-step`` is admitted -- a replace re-derives the rows and
+        therefore re-mints those keys.
 
         Returns ``None`` when the projector owns no table exclusively rather
         than hashing the empty set: an empty hash compares equal to every other

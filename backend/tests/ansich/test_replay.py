@@ -56,6 +56,7 @@ from deerflow.ansich.persistence.sql import (
     _DIGEST_EXCLUDED_COLUMNS,
     _DIGEST_RANDOM_KEY_COLUMNS,
     _DIGEST_SURROGATE_ORDER,
+    _NON_IDEMPOTENT_PROJECTORS,
     _NON_PROJECTOR_REBUILT_TABLES,
     _PROJECTOR_KINDS,
     _PROJECTOR_OWNED_TABLES,
@@ -65,6 +66,7 @@ from deerflow.ansich.persistence.sql import (
     _REPLAYABLE_VERSIONS,
     _SHARED_REBUILT_TABLES,
     SqlAnsichBackend,
+    _cascade_delete_closure,
     _projectors_for_kind,
     _replay_observation_condition,
     _validate_replay_target,
@@ -1645,6 +1647,11 @@ class TestOwnedPrimaryKeysAreDerived:
             unique_columns = {(column.name,) for column in table.columns if column.unique} | {tuple(constraint.columns.keys()) for constraint in table.constraints if isinstance(constraint, UniqueConstraint)}
             assert tuple(order) in unique_columns, f"{table_name} orders by {order}, which nothing makes unique"
             assert all((table_name, column) not in _DIGEST_RANDOM_KEY_COLUMNS for column in order)
+            # UNIQUE alone is not a total order in SQL: NULLs do not compare
+            # equal, so a nullable unique column leaves rows unordered among
+            # themselves. Both surrogates are NOT NULL today; this keeps them
+            # that way.
+            assert all(not table.columns[column].nullable for column in order), f"{table_name}'s surrogate order is nullable, so it is not total"
 
     @pytest.mark.anyio
     async def test_a_minted_key_cannot_move_the_digest(
@@ -1752,6 +1759,7 @@ class TestReplaceIsRefusedWhereItCannotBeHonoured:
                 replace=True,
             )
         assert caught.value.reason == "replace_restore_unproven"
+        assert caught.value.projector_version == "1"
         assert "task-control" in str(caught.value)
         assert await _row_counts(sessions) == before
 
@@ -1787,6 +1795,81 @@ class TestReplaceIsRefusedWhereItCannotBeHonoured:
         assert _REPLACE_PROVEN_PROJECTORS
         for projector_name in _REPLACE_PROVEN_PROJECTORS:
             assert _PROJECTOR_OWNED_TABLES[projector_name], f"{projector_name} is declared replaceable but owns no table"
+
+    @pytest.mark.anyio
+    async def test_the_backend_refuses_an_unvalidated_replace_of_its_own(
+        self,
+        backend: tuple[SqlAnsichBackend, async_sessionmaker],
+        populated: dict[str, object],
+    ) -> None:
+        """The guarantee is structural, not a convention between two files.
+
+        ``_validate_replace_request`` lives in the module's entry points, and a
+        direct backend caller that skipped them would get exactly the loss the
+        refusal exists to prevent -- the whole table cleared, only the window
+        re-derived, and the sole symptom a smaller table. So the boundary that
+        does the deleting checks too (review finding F9), before it takes the
+        maintenance lock.
+        """
+
+        sql_backend, sessions = backend
+        before = await _row_counts(sessions)
+        with pytest.raises(ReplayTargetError) as filtered:
+            await sql_backend.mint_replay_jobs(
+                projector_name="task-heartbeat",
+                projector_version="1",
+                selector=ReplaySelector(task_id=str(populated["task_a"])),
+                replace=True,
+            )
+        assert filtered.value.reason == "filtered_replace_unsupported"
+        with pytest.raises(ReplayTargetError) as unproven:
+            await sql_backend.mint_replay_jobs(
+                projector_name="task-control",
+                projector_version="1",
+                selector=ReplaySelector(),
+                replace=True,
+            )
+        assert unproven.value.reason == "replace_restore_unproven"
+        assert await _row_counts(sessions) == before
+
+
+class TestReplaceCascadeIsContained:
+    """Review finding F3: a DELETE's blast radius is its FK cascade closure.
+
+    The ownership map reasons about *writers* and is structurally blind to
+    referential cascade, and neither of the other checks would catch an escape:
+    the determinism test digests only the target's own tables, so a replace that
+    quietly emptied a sibling projector's would still compare equal, and SQLite
+    leaves ``PRAGMA foreign_keys`` off so the cascade never fires there at all.
+    """
+
+    def test_no_proven_projectors_delete_escapes_its_owned_set(self) -> None:
+        for projector_name in sorted(_REPLACE_PROVEN_PROJECTORS):
+            owned = frozenset(model.__table__.name for model in _PROJECTOR_OWNED_TABLES[projector_name])
+            escapes = _cascade_delete_closure(owned) - owned
+            assert not escapes, f"--replace --projector {projector_name} would cascade-delete {sorted(escapes)}"
+
+    def test_task_step_is_the_counterexample_the_rule_exists_for(self) -> None:
+        """Named, so the reason survives someone reading only the allowlist.
+
+        ``ansich_tool_calls`` is CASCADE-referenced by three ``task-safety``-owned
+        tables, by the assessor family's ``ansich_scope_conclusions`` and by the
+        shared ``ansich_task_spawns`` -- and transitively by the two
+        authorization child tables hanging off the snapshots.
+        """
+
+        owned = frozenset(model.__table__.name for model in _PROJECTOR_OWNED_TABLES["task-step"])
+        escapes = _cascade_delete_closure(owned) - owned
+        assert "task-step" not in _REPLACE_PROVEN_PROJECTORS
+        assert {
+            "ansich_authorization_snapshots",
+            "ansich_authorization_scopes",
+            "ansich_authorization_permissions",
+            "ansich_tool_call_authorizations",
+            "ansich_tool_effects",
+            "ansich_scope_conclusions",
+            "ansich_task_spawns",
+        } <= escapes
 
 
 class TestReplaceIsProjectorScoped:
@@ -1929,11 +2012,20 @@ class TestReplaceIsDeterministic:
         assert first.failed == 0
         assert first.digest is not None
 
+        before = await _row_counts(sessions)
         second = await execute_replay(sql_backend, projector_name=projector_name, projector_version="1", selector=ReplaySelector(), replace=True)
         assert second.unsettled == 0
         assert second.failed == 0
         assert second.digest == first.digest
         assert await _owned_row_count(sessions, projector_name) > 0
+
+        # "Nothing else moved", per member rather than once for
+        # `task-heartbeat` (review finding F3). The digest speaks only for the
+        # target's own tables, so a replace that emptied a sibling's would
+        # compare equal; this is the assertion that would notice. Every owned
+        # table is deleted and re-derived from the same history, so the whole
+        # schema -- not merely its complement -- must come back unchanged.
+        assert await _row_counts(sessions) == before
 
 
 class TestReplaceCli:
@@ -1941,3 +2033,74 @@ class TestReplaceCli:
         args = replay_cli.build_parser().parse_args(["--projector", "task-heartbeat", "--version", "1", "--replace"])
         assert args.replace is True
         assert replay_cli.build_parser().parse_args(["--projector", "task-heartbeat", "--version", "1"]).replace is False
+
+
+class TestKnownDefectIsNamedAtTheSurfaceAnOperatorDrives:
+    """Review finding F8: exit ``1`` reads as transient; this one is not.
+
+    A plain replay of ``task-control`` on a settled store collides on
+    ``ansich_transitions.evidence_obs_id`` and walks its jobs to durable
+    failure. The operator's ordinary next moves -- run it again, retry the
+    failed jobs -- re-collide forever, and nothing in the report says so.
+    """
+
+    def test_the_defect_is_declared_with_its_mechanism(self) -> None:
+        assert set(_NON_IDEMPOTENT_PROJECTORS) == {"task-control"}
+        assert "evidence_obs_id" in _NON_IDEMPOTENT_PROJECTORS["task-control"]
+        assert "rebuild_projections()" in _NON_IDEMPOTENT_PROJECTORS["task-control"]
+
+    def test_only_the_known_target_is_warned_about(self) -> None:
+        warning = replay_cli.known_defect_warning("task-control")
+        assert warning is not None
+        assert "task-control" in warning
+        assert replay_cli.known_defect_warning("task-heartbeat") is None
+
+    def test_the_warning_is_printed_before_the_pass_and_attributed_after_it(self, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]) -> None:
+        """Before, because the decision is whether to run at all; after,
+        because that is where a `1` would otherwise read as a backlog."""
+
+        report = ReplayReport(
+            projector_name="task-control",
+            projector_version="1",
+            targeted=3,
+            minted=0,
+            re_pended=3,
+            replayed=1,
+            unsettled=2,
+            failed=0,
+            dry_run=False,
+            digest=None,
+        )
+        order: list[str] = []
+
+        async def fake_run(args: object, selector: object) -> ReplayReport:
+            order.append("ran")
+            return report
+
+        monkeypatch.setattr(replay_cli, "run", fake_run)
+        assert replay_cli.main(["--projector", "task-control", "--version", "1"]) == 1
+        captured = capsys.readouterr()
+        assert order == ["ran"]
+        assert "known projector-idempotence defect" in captured.err
+        assert "re-running will not clear it" in captured.err
+
+    def test_a_clean_target_gets_neither_line(self, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]) -> None:
+        report = ReplayReport(
+            projector_name="task-heartbeat",
+            projector_version="1",
+            targeted=3,
+            minted=0,
+            re_pended=3,
+            replayed=3,
+            unsettled=0,
+            failed=0,
+            dry_run=False,
+            digest="abc",
+        )
+
+        async def fake_run(args: object, selector: object) -> ReplayReport:
+            return report
+
+        monkeypatch.setattr(replay_cli, "run", fake_run)
+        assert replay_cli.main(["--projector", "task-heartbeat", "--version", "1"]) == 0
+        assert capsys.readouterr().err == ""

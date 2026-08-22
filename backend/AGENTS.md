@@ -128,9 +128,10 @@ live vs. expired lease, per-projector status counts agreeing from either worker,
 `0027`'s two `lease_generation` columns plus its `(projector_name, status)`
 index on a real server, and — added by P11-C — the whole versioned-replay path
 in one script: the read-model digest computed on the asyncpg dialect and equal
-across two replays, a peer worker's `assess_operations` driven from inside the
-mint's open transaction, the re-pend's bulk `UPDATE … IN (subquery)` against a
-live claimer, and `--replace` followed by a re-replace with an unchanged digest.
+across two replays, a peer worker's `assess_operations` committing inside the
+mint's open transaction, the re-pend's bulk `UPDATE … IN (subquery)` skipping a
+genuinely claimable row out of a concurrent claimer's way, and `--replace`
+followed by a re-replace with an unchanged digest.
 It is **not** a Postgres run of the whole suite:
 everything outside `tests/integration/` still runs on SQLite only.
 
@@ -2075,22 +2076,47 @@ outright (no second dispatch branch writes it — F1's conservative rule is
 satisfied), and `_project_control` still computes each transition's `from_value`
 from the **current control Belief**, which lives in the shared Belief triple a
 projector-scoped replace neither owns nor clears. Deleting and re-deriving
-therefore reads a Belief that already carries the destination value and rewrites
-`unknown -> created` plus `created -> running` into a single `running -> running`:
-same row count, different history. So `--replace` is opt-in per projector via
-`_REPLACE_PROVEN_PROJECTORS` (today `task-heartbeat`, `task-budget`,
-`environment-projector`); everything else is refused with
-`replace_restore_unproven` and pointed at `rebuild_projections()`. That set is a
-**proof obligation**, not a preference:
-`tests/ansich/test_replay.py::TestReplaceIsDeterministic` parametrizes over it and,
-for each member, replays → digests → replaces → replays → digests again over a
-non-empty row set and asserts the two agree, so adding a projector without the
-property turns that test red instead of shipping a silent rewrite. One
-pre-existing defect this found and did **not** fix: `_project_control` is not
+therefore reads a Belief that already carries the destination value, so
+`should_select_control_candidate` refuses the earlier candidates outright: two
+transitions (`unknown -> created`, `created -> running`) are deleted and **one**
+(`running -> running`) comes back — fewer rows, and none of them the rows history
+recorded.
+
+So `--replace` is opt-in per projector via `_REPLACE_PROVEN_PROJECTORS` (today
+`task-heartbeat`, `task-budget`, `environment-projector`); everything else is
+refused with `replace_restore_unproven` and pointed at `rebuild_projections()`.
+Membership is a **proof obligation** with two mechanised conditions, not a
+preference. (1) *Restoration* —
+`tests/ansich/test_replay.py::TestReplaceIsDeterministic` parametrizes over the
+set and, for each member, replays → digests → replaces → replays → digests again
+over a non-empty row set, asserts the two agree, and asserts a whole-schema
+row-count snapshot is unchanged. (2) *Cascade containment* — the owned set must
+be closed under inbound `ON DELETE CASCADE`, because a DELETE's blast radius is
+not its statement list: `ansich_tool_calls` (`task-step`) is CASCADE-referenced
+by three `task-safety`-owned tables, by the assessor family's
+`ansich_scope_conclusions` and by the shared `ansich_task_spawns` — and
+transitively by the two authorization child tables — so
+`--replace --projector task-step` would cascade-delete a sibling's rows through a
+channel the ownership rule cannot see (it reasons about *writers*, not
+referential cascade). Condition 1 alone would not catch that either, since the
+digest hashes only the target's own tables; and SQLite cannot reproduce the class
+at all, because `tests/ansich/conftest.py` leaves `PRAGMA foreign_keys` off.
+`TestReplaceCascadeIsContained` computes the transitive closure over
+`Base.metadata` and pins it. `task-step` therefore carries **two independent
+disqualifiers** — that cascade, and the fact that several of its projections
+short-circuit on rows in the shared `ansich_steps` — neither of which is fixed by
+extending a fixture.
+
+One pre-existing defect this found and did **not** fix: `_project_control` is not
 idempotent — re-projecting an already-projected control Observation collides on
 `ansich_transitions.evidence_obs_id` — so `task-control`'s *plain* replay is
 broken today too (a rebuild is unaffected, because it deletes the Beliefs as
-well).
+well). It is registered in `_NON_IDEMPOTENT_PROJECTORS` and the CLI names it on
+stderr before the pass and again beside a non-clean report, because exit code `1`
+otherwise reads as a transient backlog and the ordinary remedies (re-run,
+`retry_failed_projections`) re-collide forever. It warns rather than refuses: the
+same command is correct on a store where those Observations have never been
+projected.
 
 **The digest's primary-key audit** closes the other half of F5. Dropping
 wall-clock columns only helps if the same row can be *found* twice, and a
@@ -2103,13 +2129,26 @@ key from another owned table, so the fix stays local:
 wall-clock ones, and `_DIGEST_SURROGATE_ORDER` orders those two tables by a
 content-derived **unique** column instead (`evidence_obs_id`, `task_id`).
 `TestOwnedPrimaryKeysAreDerived` pins the declared set against the AST's answer
-and requires every surrogate order to be backed by a real uniqueness constraint.
-One accepted cost: after a replace the old minted key leaves an orphan
-`ansich_entities` row (a shared table, correctly not deleted) — harmless, and it
-accumulates one row per replaced Task per replace.
+and requires every surrogate order to be backed by a real uniqueness constraint
+and to be `NOT NULL` (a nullable UNIQUE column is not a total order). That audit
+is a deliberate **lower bound**, like `TestOwnershipIsConservativeInFact`'s
+reachability walk: it recognises the two write shapes this file uses (ORM
+constructor keyword, literal dict into `_insert_ignoring_conflict`) plus one
+level of `name = new_id()` aliasing, so it keeps the common shapes from drifting
+rather than proving no shape can. The whole mechanism is **forward-looking
+insurance and inert today** — both minted-key tables belong to projectors
+`--replace` refuses, so no parametrized determinism run exercises it; it is
+driven by `test_a_minted_key_cannot_move_the_digest` and exists so the §11 check
+does not break by construction the day `task-step` is admitted. The orphan
+`ansich_entities` row a replace could strand is likewise currently unreachable:
+only `ansich_context_windows` has an Entity row at all (`_project_control` mints
+a bare `transition_id` with no Entity and no FK into that table), and it is owned
+by the refused `task-step`, so the cost is **zero today** and becomes real only if
+`task-step` is ever admitted.
 
 The CLI carries `--projector/--version/--task-id/--occurred-from/--occurred-to/
---ingest-from/--ingest-to/--dry-run/--replace/--max-rounds/--format`. Exit codes are the machine-readable half of
+--ingest-from/--ingest-to/--dry-run/--replace/--max-rounds/--format`. Exit codes
+are the machine-readable half of
 the report and are decided by two counts, `unsettled` **and** `failed`: `0`
 clean, `1` the pass ran and work is owed, `2` the request was refused (bad
 target, malformed filter, either replace refusal, or `database.backend: memory`,
@@ -2127,13 +2166,22 @@ both ways — fixed, and reproduced with the in-transaction delete disarmed. The
 whole replay path is also proved once on a real server:
 `tests/integration/test_postgres_multiworker.py::test_replay_and_replace_hold_on_postgres_with_a_second_worker_live`
 runs one script covering the digest on the asyncpg dialect (computed, and equal
-across two replays), a second worker's `assess_operations` driven from *inside*
+across two replays), a second worker's `assess_operations` **committing inside**
 the mint's open transaction, the re-pend's bulk `UPDATE … WHERE obs_id IN
-(subquery)` against a live claimer (whose claim must come back empty **and
-promptly** — a lock-order cycle fails the test rather than hanging the tier),
-and `--replace` followed by a re-replace with an unchanged digest. It also pins
-the invariant those rest on: a job claimed *before* the replay cannot settle it
-afterwards, because the re-pend raised its `lease_generation`.
+(subquery)` against a live claimer, and `--replace` followed by a re-replace with
+an unchanged digest. It also pins the invariant those rest on: a job claimed
+*before* the replay cannot settle it afterwards, because the re-pend raised its
+`lease_generation`. Two scope limits are deliberate and stated at the test. The
+claimer case only means something if the peer's predicate matches a *locked* row,
+which under READ COMMITTED needs the row's pre-re-pend version to be claimable —
+so the script leaves one heartbeat job `pending`, asserts from a lock-free read
+that the peer really sees it, and only then asserts the claim came back empty and
+promptly (without that spare job every heartbeat row reads `completed` or live
+`processing` and an empty claim would prove nothing; verified by moving the pause
+ahead of the re-pend, where the same claim succeeds). And the peer's tick is
+serialized against A's *own* active-Task sweep by construction — the pause fires
+on the re-pend, which runs before `_clear_frozen_active_task_rows` — so that
+particular contention is **not** what this test shows.
 
 **Workspace change review**: `packages/harness/deerflow/workspace_changes/`
 captures a pre-run and post-run snapshot of the thread-owned `workspace` and
