@@ -854,6 +854,127 @@ class RetryOutcome(BaseModel):
     unsettled: int
 
 
+class ReplaySelector(BaseModel):
+    """Which Observations a replay aims at — the three filters, and nothing else.
+
+    A selector never names a projector: it describes a *slice of history*, and
+    the same slice is legal for any target. The three filters compose (all
+    given ones must hold) and each is chosen so an index serves it:
+
+    * ``task_id`` — served by ``ix_ansich_observations_task_ingest``.
+    * ``occurred_from`` / ``occurred_to`` — an **event-time** window, served by
+      ``ix_ansich_observations_kind_occurred`` once the caller pairs it with
+      the target projector's kind list. ``recorded_at`` is deliberately *not*
+      offered: that column carries no index, so the same window over it is a
+      full scan of a table that only grows.
+    * ``ingest_from`` / ``ingest_to`` — a primary-key range.
+
+    Both halves of each range are required together. A one-sided window is
+    almost always a typo for a two-sided one, and the open side is precisely
+    where an operator does not want to discover they replayed the whole store.
+
+    An all-``None`` selector is legal and means *everything the target claims*;
+    :attr:`is_unfiltered` says so, because "delete every affected read-model
+    row" and "delete the affected ones" are different statements and the
+    executor has to be able to tell.
+    """
+
+    model_config = ConfigDict(frozen=True)
+
+    task_id: str | None = None
+    occurred_from: datetime | None = None
+    occurred_to: datetime | None = None
+    ingest_from: int | None = Field(default=None, ge=1)
+    ingest_to: int | None = Field(default=None, ge=1)
+
+    @model_validator(mode="after")
+    def _ranges_are_two_sided_and_ordered(self) -> Self:
+        if (self.occurred_from is None) != (self.occurred_to is None):
+            raise ValueError("Ansich replay time filter needs both occurred_from and occurred_to")
+        if self.occurred_from is not None and self.occurred_to is not None and self.occurred_from > self.occurred_to:
+            raise ValueError("Ansich replay time filter starts after it ends")
+        if (self.ingest_from is None) != (self.ingest_to is None):
+            raise ValueError("Ansich replay ingest filter needs both ingest_from and ingest_to")
+        if self.ingest_from is not None and self.ingest_to is not None and self.ingest_from > self.ingest_to:
+            raise ValueError("Ansich replay ingest filter starts after it ends")
+        return self
+
+    @property
+    def is_unfiltered(self) -> bool:
+        """True when this selector narrows nothing at all."""
+
+        return self.task_id is None and self.occurred_from is None and self.ingest_from is None
+
+    @property
+    def has_time_filter(self) -> bool:
+        return self.occurred_from is not None
+
+
+class ReplayReport(BaseModel):
+    """What one replay pass targeted, changed, and can honestly claim.
+
+    Every field is a count of something the pass *observed*, and two of them
+    are deliberately allowed to be ``None`` rather than zero.
+
+    ``targeted`` is the number of Observations in the target set, and it always
+    equals ``minted + re_pended``: an Observation the target has no job for is
+    minted one, an Observation that already has one is re-pended, and there is
+    no third case. ``minted`` is zero for a projector that claims no kinds
+    (``task-spawn-reconcile``), which is not a defect — its jobs are enqueued
+    by another projector's transaction, never fanned out by kind, so a replay
+    of it re-pends what exists and invents nothing.
+
+    ``replayed`` is the number of jobs the drive loop settled, and it is
+    **store-wide, not target-scoped**. The loop drains the claim queue, and the
+    claim knows nothing about this replay's filters: a job another producer
+    minted while the loop ran is claimed by it like any other. So
+    ``replayed > targeted`` is ordinary rather than suspicious, and the
+    difference is the honest signal that the store moved underneath the pass —
+    the alternative, silently counting only the targeted subset, would let a
+    concurrently ingested Observation be absorbed with nothing said.
+
+    ``unsettled`` carries the same meaning and the same lower-bound caveat as
+    :class:`RebuildOutcome`'s: every projection or assessor job still
+    ``pending``/``retry``/``processing`` at the end of the last round, counted
+    at one known point rather than watched. A non-zero value after the round
+    budget is spent is **reported, not raised**.
+
+    ``digest`` is ``None`` in exactly two situations, and neither is an error
+    the caller can fix by retrying:
+
+    * ``unsettled > 0`` — a digest over a store that still owes work describes
+      a state nobody asked for and would compare unequal against the same
+      history replayed to completion. Refusing to compute it is the point.
+    * the target projector exclusively owns no read-model table, so there is
+      nothing to hash that the projector alone wrote (see
+      ``_PROJECTOR_OWNED_TABLES``). Hashing the empty set would make every such
+      replay "reproducible" by construction.
+
+    ``watermark`` is the store-wide projection continuity mark after the pass
+    (``min`` over the per-projector ``complete_through``), or ``None`` when the
+    store holds no Observations at all. It is not a per-target number.
+
+    ``errors`` is the free-text channel for everything above that has to be
+    said in words: a round budget spent with work still owed, durably failed
+    jobs found for the target, a digest that was not computed and why. It is
+    prose for a human and is never parsed.
+    """
+
+    model_config = ConfigDict(frozen=True)
+
+    projector_name: str
+    projector_version: str
+    targeted: int
+    minted: int
+    re_pended: int
+    replayed: int
+    unsettled: int
+    errors: tuple[str, ...] = ()
+    watermark: int | None = None
+    digest: str | None = None
+    dry_run: bool
+
+
 class LostRange(BaseModel):
     model_config = ConfigDict(frozen=True)
 

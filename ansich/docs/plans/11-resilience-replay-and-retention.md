@@ -84,6 +84,14 @@ Replay 流程：
 >
 > **同一条形状在 `retry_failed_projections` 上已经补齐**（P11-C 第一批）。此前它返回一个裸 `int`，只有 `re_armed` 的语义而没有 `RebuildOutcome` 那一半的「这趟还欠多少」信息；它的 docstring 是有的，而且明确记着这笔债（说这个形状「仍然欠着」并把它带到 C 批）——现在这笔债由本批结清：它返回 `RetryOutcome(re_armed, unsettled)`，`unsettled` 在重新入队**与**其驱动的重放之后再读一次整库欠账，因此一个刚被重新入队、又立刻走回依赖等待的作业会被算进去，而不是被误读成已修复；`re_armed == 0` 的短路路径同样照读，因为「没重新入队任何行」不等于「没欠任何东西」。lower-bound 的告诫与 `RebuildOutcome` 完全一致（见 `ansich.contracts.RetryOutcome`）。凡是把 retry 当成「重试完了」的完成条件，仍然必须回读失败作业计数，而不是读这两个数里的任何一个。
 
+> **实现状态：第 1–2、4–5 步已由 P11-C 落地**（`deerflow/ansich/replay.py` + `replay_cli.py`，`sql.py::_replay_observation_condition` / `mint_replay_jobs` / `read_model_digest`；第 3 步 `--replace` 属下一任务）。本节四处必须一起读的偏离与澄清：
+> 1. **目标集过滤必须带 kind 上界**（澄清，非偏离）。时间窗走 `occurred_at` 且必须与 `_PROJECTOR_KINDS[projector]` 同用，`ix_ansich_observations_kind_occurred` 才服务得了；`recorded_at` 从不读（无索引 ⇒ 全表扫描，而 Observation 表没有 retention）。因此**没有 kind 声明的 projector 不接受时间过滤**，以新的 `ReplayTargetRefusal` 成员 `time_filter_unsupported` 拒绝——今天恰好只有 `task-spawn-reconcile` 一个（它的作业由 `_project_task_spawn` 在自己的事务里入队，不按 kind 扇出）。同一处空集也让「按过滤器铸新作业」对它变成**错误**而不只是无用，所以对它的重放只重新入队既有作业、绝不铸新。
+> 2. **第 2 步的写入必须同事务删除活动 Task 读模型行，且删除范围比计划字面更宽**（记录在案的偏离，RC3 + 全局约束 4）。`_is_staler_publish` 的 docstring 点名了这个形状：在当前连续性标记之下重新入队一条作业会拉低 `min(unsettled ingest_seq)`，此后每一次运维 tick 都读作更旧而被跳过，读模型永久冻结（已停止的 Task 那一半还是**静默**的）。计划把删除范围写成「目标 Observation 的 task_id 集合」，那要在标记是 per-Task 时才成立——`_refresh_active_task_read_model` 盖的是**全库**连续性标记，所以执行器删除的是两个集合的并：目标 Task，加上任何 `projection_watermark` 已经高于本次写入后新标记的行。多删一行的代价是一个 tick 的重发，漏删一行的代价是读模型停到下一次 rebuild。
+> 3. **驱动循环每轮在排空之后跑一次 `assess_operations`**（澄清）。与 `_rebuild_projections_locked` 收尾同形：被重投影的 Observation 会入队 assessor 作业，而只有这一趟会结算它们；没有它，任何重放都会报告一个永远未结算的库，从而永远拿不到 digest，第 5 步的完成条件就不可达。这一趟同时重发第 2 步删掉的读模型行。
+> 4. **digest 覆盖的是「该 projector 独占拥有的读模型表」**（记录在案的偏离，与 RC4 的窄化同源）。`_PROJECTOR_OWNED_TABLES` 把 rebuild 删除列表分成三类而不是按 projector 二分：独占表、多写者共享表（`ansich_entities`、Belief 三件套、Task/Scope/Relation/AgentRelease/usage）、无 projector 拥有的表（assessor 家族、告警机、operator 审计、两张作业/错误账、运维 tick 自己的读模型）。结构测试钉住三类互斥且恰好覆盖 `_REBUILD_DELETE_ORDER`。归属取**保守**读法（只有当没有第二个 projector 的分派分支能写到它时才算独占），因为多claim 一张表会让 `--replace` 连带删掉兄弟 projector 的行。代价是 `task-structural`、`task-usage`、`task-spawn-reconcile` 三个 projector 一张表都不独占（前者因为 `_project_control` 会先调用 `_project_structural`），对它们的重放**如实报告没有 digest**，而不是拿空集的哈希冒充确定性。
+>
+> 另记（第 1 步的边界）：分派链只按 `projector_name` 分支、从不读 version，所以「target 被接受」既不证明两个 version 会产出不同读模型，也不构成两版 digest 可比的依据——要比之前得先让那个分支真的区分版本。CLI 不带 `--replace`（属下一任务，先挂一个什么都不做的旗标比没有更糟）；退出码 `0` 干净、`1` 跑完但仍有欠账、`2` 请求本身被拒。
+
 ## 6. Retention 与删除
 
 配置分离：

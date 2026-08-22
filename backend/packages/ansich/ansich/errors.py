@@ -59,8 +59,8 @@ class StorageUnavailableError(Exception):
     """
 
 
-#: Why a replay target was refused. Three refusals, three different remedies,
-#: which is the whole reason the caller gets a code rather than a sentence:
+#: Why a replay target was refused. Each refusal has a different remedy, which
+#: is the whole reason the caller gets a code rather than a sentence:
 #:
 #: * ``unknown_projector`` — the name is not registered in this build (a typo,
 #:   or a projector that does not exist yet). Fix the request.
@@ -68,6 +68,15 @@ class StorageUnavailableError(Exception):
 #:   the version asked for. Deploy the build that can.
 #: * ``not_executable`` — this build *declares* the version replayable and
 #:   cannot run it. Fix the deploy, not the command line.
+#: * ``time_filter_unsupported`` — the request pairs an ``occurred_at`` window
+#:   with a projector that claims **no** Observation kinds, so there is no kind
+#:   list to bound the window with and ``ix_ansich_observations_kind_occurred``
+#:   cannot serve it. Reaching it takes exactly one target today,
+#:   ``task-spawn-reconcile`` (its jobs are enqueued inside another projector's
+#:   transaction rather than fanned out by kind), and the remedy is a task or
+#:   ingest filter instead — both of which have an index of their own. This is
+#:   a refusal rather than a silent full scan because the scan is over a table
+#:   with no retention: it gets slower every day and never gets faster.
 #:
 #: ``not_executable`` covers **two** conditions, deliberately, because they
 #: share that one remedy and a caller never needs to tell them apart: the
@@ -80,6 +89,7 @@ ReplayTargetRefusal = Literal[
     "unknown_projector",
     "unknown_version",
     "not_executable",
+    "time_filter_unsupported",
 ]
 
 

@@ -113,6 +113,7 @@ from ansich.contracts import (
     LostRange,
     ObservationKind,
     ProjectorHealth,
+    ReplaySelector,
     TaskLifecycleScope,
     UsageDimension,
     control_values_for_lifecycle_scope,
@@ -174,7 +175,7 @@ from ansich.release import (
     release_entity_id,
     validate_agent_release,
 )
-from ansich.release.canonical import canonical_json_bytes
+from ansich.release.canonical import canonical_json_bytes, sha256_canonical
 from ansich.safety import AuthorizationPermission, AuthorizationSnapshot, ScopeDescriptor, host_scope_id
 from ansich.task_tree import TaskSpawnView, TaskTreeDirection
 from ansich.tool import ContentDerivationSourceRole, ToolTransformKind
@@ -265,6 +266,7 @@ from deerflow.ansich.persistence.models import (
     AnsichTransitionRow,
     AnsichUsageContributionRow,
 )
+from deerflow.persistence.base import Base
 
 _CONTROL_BY_KIND = {
     "task.created": "created",
@@ -413,6 +415,203 @@ _REPLAYABLE_VERSIONS: dict[str, tuple[str, ...]] = {
 #: else, which is the failure ``not_executable`` exists to catch *before* a
 #: replay has minted a job that can only ever fail.
 _EXECUTABLE_PROJECTOR_NAMES = frozenset(name for name, _ in _PROJECTORS)
+#: Everything ``rebuild_projections()`` deletes before replaying, in an order
+#: that respects the foreign keys between these tables (children first).
+#:
+#: Hoisted out of ``_rebuild_projections_locked`` so the ownership partition
+#: below can be pinned against the *same* list the rebuild iterates rather than
+#: against a restatement of it. A second copy would drift the first time a
+#: table was added, and the drift would be silent in the direction that costs
+#: most: ``--replace`` would keep deleting the old set.
+_REBUILD_DELETE_ORDER: tuple[type[Base], ...] = (
+    AnsichAlertReadModelRow,
+    AnsichAlertWorkflowEventRow,
+    AnsichAlertEvidenceRow,
+    AnsichAlertRow,
+    AnsichOperatorActionRow,
+    AnsichAssessorErrorRow,
+    AnsichAssessorJobRow,
+    # Deleted with the conclusions it describes: a surviving mark would make
+    # the post-rebuild assessment skip the very ToolCalls whose conclusions
+    # were just dropped.
+    AnsichAssessorWatermarkRow,
+    AnsichScopeConclusionRow,
+    AnsichTaskHeartbeatRow,
+    AnsichActiveTaskReadModelRow,
+    AnsichEvaluationIndexRow,
+    AnsichReleaseQualityStatsRow,
+    AnsichTaskBudgetRow,
+    AnsichTaskUsageRow,
+    AnsichUsageContributionRow,
+    AnsichTaskAncestryRow,
+    AnsichTaskSpawnRow,
+    AnsichContextSnapshotMissingItemRow,
+    AnsichContextSnapshotBlockMembershipRow,
+    AnsichContextSnapshotItemRow,
+    AnsichContextSnapshotRow,
+    AnsichContextWindowRow,
+    AnsichContextCompressionItemRow,
+    AnsichContextCompressionRow,
+    AnsichContextStateMissingBlockRow,
+    AnsichContextStateDeltaRow,
+    AnsichContextStateCheckpointItemRow,
+    AnsichContextStateRow,
+    AnsichContentBlockDerivationRow,
+    AnsichBlockProducerRow,
+    AnsichToolEffectRow,
+    AnsichToolCallAuthorizationRow,
+    AnsichAuthorizationPermissionRow,
+    AnsichAuthorizationScopeRow,
+    AnsichAuthorizationSnapshotRow,
+    AnsichToolCallResultRow,
+    AnsichToolCallRow,
+    AnsichContentOccurrenceRow,
+    AnsichContentBlockRow,
+    AnsichLlmAttemptRow,
+    AnsichStepRow,
+    AnsichTaskSummaryRow,
+    AnsichCurrentBeliefRow,
+    AnsichBeliefEvidenceRow,
+    AnsichTransitionRow,
+    AnsichBeliefAssertionRow,
+    AnsichRelationEvidenceRow,
+    AnsichRelationRow,
+    AnsichTaskAgentReleaseRow,
+    AnsichAgentReleaseComponentRow,
+    AnsichAgentReleaseRow,
+    # Coverage and state carry an FK onto the Scope entity they describe, so
+    # they are deleted before AnsichEntityRow; the per-tool-call samples are
+    # FK-free but rebuild alongside them.
+    AnsichEnvironmentStateRow,
+    AnsichEnvironmentCoverageRow,
+    AnsichToolEnvSampleRow,
+    AnsichScopeRow,
+    AnsichTaskRow,
+    AnsichEntityRow,
+    AnsichProjectionErrorRow,
+)
+#: The read-model tables **only one projector's code writes**, per projector.
+#:
+#: Read models carry no projector column and no version column (plan ruling
+#: RC4's premise), so ownership cannot be derived from a row at runtime. It is
+#: declared here, and the declaration is deliberately the *conservative*
+#: reading: a table belongs to a projector only when no other projector's
+#: dispatch branch can reach a write to it. Over-claiming is the direction that
+#: destroys data -- ``--replace`` (T5) deletes these tables wholesale, and a
+#: table listed under the wrong projector would take a sibling's rows with it
+#: and only get them back if that sibling were replayed too. Under-claiming
+#: costs a table that a ``--replace`` does not clear, which the replay
+#: overwrites anyway.
+#:
+#: Three names own nothing, and that is a fact about the code rather than an
+#: omission:
+#:
+#: * ``task-structural`` -- ``_project_control`` calls ``_project_structural``
+#:   first, so every Task/Scope/Relation/AgentRelease write it makes is
+#:   reachable from ``task-control`` too.
+#: * ``task-usage`` -- ``task-structural``'s spawn backfill and
+#:   ``task-spawn-reconcile`` both write usage contributions and the usage
+#:   summary through the same helpers.
+#: * ``task-spawn-reconcile`` -- it exists to re-run another projector's
+#:   fan-out, so everything it touches is by construction shared.
+#:
+#: The consequence for those three is that a replay of them reports no digest
+#: (see ``read_model_digest``), which is the honest answer: there is no set of
+#: rows this projector alone produced to compare.
+_PROJECTOR_OWNED_TABLES: dict[str, tuple[type[Base], ...]] = {
+    "task-structural": (),
+    "task-control": (AnsichTransitionRow,),
+    "task-step": (
+        AnsichStepRow,
+        AnsichLlmAttemptRow,
+        AnsichToolCallRow,
+        AnsichToolCallResultRow,
+        AnsichContentBlockRow,
+        AnsichContentOccurrenceRow,
+        AnsichBlockProducerRow,
+        AnsichContentBlockDerivationRow,
+        AnsichContextSnapshotRow,
+        AnsichContextSnapshotItemRow,
+        AnsichContextSnapshotMissingItemRow,
+        AnsichContextSnapshotBlockMembershipRow,
+        AnsichContextWindowRow,
+        AnsichContextCompressionRow,
+        AnsichContextCompressionItemRow,
+        AnsichContextStateRow,
+        AnsichContextStateDeltaRow,
+        AnsichContextStateCheckpointItemRow,
+        AnsichContextStateMissingBlockRow,
+    ),
+    "task-usage": (),
+    "task-budget": (AnsichTaskBudgetRow,),
+    "task-heartbeat": (AnsichTaskHeartbeatRow,),
+    "task-safety": (
+        AnsichAuthorizationSnapshotRow,
+        AnsichAuthorizationScopeRow,
+        AnsichAuthorizationPermissionRow,
+        AnsichToolCallAuthorizationRow,
+        AnsichToolEffectRow,
+    ),
+    "environment-projector": (
+        AnsichEnvironmentCoverageRow,
+        AnsichEnvironmentStateRow,
+        AnsichToolEnvSampleRow,
+    ),
+    "evaluation-projector": (
+        AnsichEvaluationIndexRow,
+        AnsichReleaseQualityStatsRow,
+    ),
+    "task-spawn-reconcile": (),
+}
+#: Rebuilt tables that **more than one** projector writes. Named as a class
+#: rather than assigned to a "primary" owner, because assigning one would be a
+#: licence for ``--replace`` to delete the other writers' rows.
+#:
+#: ``ansich_entities`` is the extreme case (nine projectors create entities in
+#: it), but the Belief triple is the instructive one: ``task-control``,
+#: ``task-step``, ``evaluation-projector`` *and* the assessor family all append
+#: assertions to it, so there is no projector whose replay could legitimately
+#: clear it.
+_SHARED_REBUILT_TABLES: tuple[type[Base], ...] = (
+    AnsichEntityRow,
+    AnsichTaskRow,
+    AnsichTaskSummaryRow,
+    AnsichScopeRow,
+    AnsichRelationRow,
+    AnsichRelationEvidenceRow,
+    AnsichTaskSpawnRow,
+    AnsichTaskAncestryRow,
+    AnsichAgentReleaseRow,
+    AnsichAgentReleaseComponentRow,
+    AnsichTaskAgentReleaseRow,
+    AnsichCurrentBeliefRow,
+    AnsichBeliefAssertionRow,
+    AnsichBeliefEvidenceRow,
+    AnsichUsageContributionRow,
+    AnsichTaskUsageRow,
+)
+#: Rebuilt tables **no projector writes at all**: the assessor family, the
+#: Alert machine, the operator-action audit, the operations tick's own
+#: materialised read model, and the two durable job/error ledgers.
+#:
+#: They are in the rebuild's delete list because a rebuild re-derives the whole
+#: derived zone, not because a projector owns them -- so a projector-scoped
+#: replay must never touch them. ``ansich_active_task_read_model`` is the one
+#: exception a replay does write, and it deletes rows for a reason that has
+#: nothing to do with ownership (PB7, see ``mint_replay_jobs``).
+_NON_PROJECTOR_REBUILT_TABLES: tuple[type[Base], ...] = (
+    AnsichAlertReadModelRow,
+    AnsichAlertWorkflowEventRow,
+    AnsichAlertEvidenceRow,
+    AnsichAlertRow,
+    AnsichOperatorActionRow,
+    AnsichAssessorErrorRow,
+    AnsichAssessorJobRow,
+    AnsichAssessorWatermarkRow,
+    AnsichScopeConclusionRow,
+    AnsichActiveTaskReadModelRow,
+    AnsichProjectionErrorRow,
+)
 _ASSESSOR_VERSIONS = {
     ACTION_REPETITION_ASSESSOR.name: ACTION_REPETITION_ASSESSOR.version,
     TOOL_FREQUENCY_ASSESSOR.name: TOOL_FREQUENCY_ASSESSOR.version,
@@ -664,6 +863,84 @@ def _validate_replay_target(projector_name: str, version: str) -> None:
             projector_version=version,
         )
     return None
+
+
+def _replay_observation_condition(projector_name: str, selector: ReplaySelector):
+    """The WHERE clause naming a replay's target Observations.
+
+    Four predicates, ANDed, each chosen so an index serves it -- because this
+    runs over ``ansich_observations``, the one table in the store with no
+    retention at all, so an unindexed form here does not merely cost time, it
+    costs more time every day.
+
+    1. **Kind**, from ``_PROJECTOR_KINDS[projector_name]``. Always applied when
+       the projector claims kinds, and it is not an optimisation: a replay of
+       ``task-heartbeat`` over a ``tool.issued`` Observation would mint a job
+       the projector cannot execute. It is also what makes (3) indexable.
+    2. **Task**, served by ``ix_ansich_observations_task_ingest``.
+    3. **Event-time window** on ``occurred_at``, served by
+       ``ix_ansich_observations_kind_occurred`` *because* (1) supplies the
+       leading column. ``recorded_at`` is deliberately never read here: it is
+       the column that would answer "when did this land", and it carries no
+       index, so the same window over it is a full scan.
+    4. **Ingest range**, a primary-key range.
+
+    A projector with **no** kind list (``task-spawn-reconcile``, whose jobs are
+    enqueued inside ``_project_task_spawn``'s transaction rather than fanned
+    out by kind) cannot supply (1), so a time window over it has no leading
+    column and is refused with ``time_filter_unsupported`` rather than served
+    as a scan. Its other two filters have indexes of their own and are fine.
+
+    Note what the returned condition does **not** encode: whether a job already
+    exists for the target ``(projector, version)``. That is the mint/re-pend
+    split, and it is a separate predicate on the job table -- keeping it out of
+    here is what lets the same condition name the target set for a dry-run
+    count, for the mint, for the re-pend and for the read-model delete.
+    """
+
+    kinds = _PROJECTOR_KINDS.get(projector_name, frozenset())
+    if selector.has_time_filter and not kinds:
+        raise ReplayTargetError(
+            f"Ansich projector {projector_name!r} claims no Observation kinds, so an occurred_at window over it has no index to stand on; filter by task or ingest range instead",
+            reason="time_filter_unsupported",
+            projector_name=projector_name,
+            projector_version="",
+        )
+    conditions = []
+    if kinds:
+        conditions.append(AnsichObservationRow.kind.in_(sorted(kinds)))
+    if selector.task_id is not None:
+        conditions.append(AnsichObservationRow.task_id == selector.task_id)
+    if selector.occurred_from is not None and selector.occurred_to is not None:
+        conditions.append(AnsichObservationRow.occurred_at >= selector.occurred_from)
+        conditions.append(AnsichObservationRow.occurred_at <= selector.occurred_to)
+    if selector.ingest_from is not None and selector.ingest_to is not None:
+        conditions.append(AnsichObservationRow.ingest_seq >= selector.ingest_from)
+        conditions.append(AnsichObservationRow.ingest_seq <= selector.ingest_to)
+    if not conditions:
+        return text("1 = 1")
+    return and_(*conditions)
+
+
+def _replay_job_exists_condition(projector_name: str, projector_version: str):
+    """Does the target ``(projector, version)`` already have a job for this row?
+
+    The mint/re-pend discriminator, written as a correlated ``EXISTS`` rather
+    than as a materialised id set: an unfiltered replay's target set is the
+    whole Observation table, and pulling it into an ``IN`` list would put the
+    store's entire history in one process's memory to answer a question the
+    unique index ``uq_ansich_projection_job_version`` already answers per row.
+    """
+
+    return (
+        select(AnsichProjectionJobRow.job_id)
+        .where(
+            AnsichProjectionJobRow.obs_id == AnsichObservationRow.obs_id,
+            AnsichProjectionJobRow.projector_name == projector_name,
+            AnsichProjectionJobRow.projector_version == projector_version,
+        )
+        .exists()
+    )
 
 
 def _assessors_after_projection(
@@ -982,6 +1259,28 @@ def _as_non_negative_int(value: object) -> int | None:
 
     if isinstance(value, bool) or not isinstance(value, int) or value < 0:
         return None
+    return value
+
+
+def _canonical_digest_value(value: object) -> object:
+    """Make one stored column value hashable by ``sha256_canonical``.
+
+    Canonical JSON accepts JSON values only, and a read-model row is not one:
+    it carries ``datetime`` columns everywhere and, in a few tables, ``bytes``.
+    Both are normalised rather than skipped, because skipping them would leave
+    a digest that could not tell two states apart on exactly the fields most
+    likely to differ.
+
+    ``datetime`` becomes an explicit-UTC ISO string. That matters beyond
+    formatting: SQLite hands back naive datetimes where PostgreSQL hands back
+    aware ones, so hashing the objects directly would make the same rows digest
+    differently on the two dialects.
+    """
+
+    if isinstance(value, datetime):
+        return _as_utc(value).isoformat()
+    if isinstance(value, bytes):
+        return value.hex()
     return value
 
 
@@ -1973,75 +2272,301 @@ class SqlAnsichBackend:
             assessor_jobs = await session.scalar(select(func.count()).select_from(AnsichAssessorJobRow).where(AnsichAssessorJobRow.status.in_((*_CLAIMABLE_JOB_STATUSES, "processing"))))
         return int(projection_jobs or 0) + int(assessor_jobs or 0)
 
+    async def unsettled_job_count(self) -> int:
+        """The public form of the rebuild's own backlog read.
+
+        Exposed because the replay drive loop (``deerflow.ansich.replay``) needs
+        exactly the number ``RebuildOutcome.unsettled`` carries, computed the
+        same way, so a replay's completeness claim and a rebuild's cannot mean
+        two different things. Same lower-bound caveat as
+        :class:`~ansich.contracts.RebuildOutcome`: a count at one known point,
+        not a live gauge.
+        """
+
+        return await self._unsettled_job_count()
+
+    async def projection_continuity_mark(self) -> int | None:
+        """The store-wide ``complete_through`` -- the number PB7's guard compares.
+
+        ``None`` when the store holds no Observations at all, which is a
+        different statement from ``0`` (see ``_is_staler_publish``).
+        """
+
+        return (await self._database_projection_snapshot()).complete_through
+
+    async def failed_projection_job_count(self, *, projector_name: str, projector_version: str) -> int:
+        """Durably failed jobs for one target, served by the projector/status index."""
+
+        async with self._session_factory() as session:
+            count = await session.scalar(
+                select(func.count())
+                .select_from(AnsichProjectionJobRow)
+                .where(
+                    AnsichProjectionJobRow.status == "failed",
+                    AnsichProjectionJobRow.projector_name == projector_name,
+                    AnsichProjectionJobRow.projector_version == projector_version,
+                )
+            )
+        return int(count or 0)
+
+    async def count_replay_targets(
+        self,
+        *,
+        projector_name: str,
+        projector_version: str,
+        selector: ReplaySelector,
+    ) -> tuple[int, int]:
+        """``(would mint, would re-pend)`` for a target set, writing nothing.
+
+        The whole of what ``--dry-run`` answers. It takes no maintenance lock
+        and opens no write transaction: a plan that locked would make asking
+        "what would this do" as expensive as doing it, and would queue behind
+        (or in front of) a real operator on a question that changes nothing.
+
+        The two numbers are read in one session but not one snapshot, so under
+        a concurrently-ingesting store they describe slightly different
+        moments. That is tolerable *because* nothing acts on them -- the
+        executor re-derives its own counts inside the write transaction.
+
+        ``minted`` is forced to zero for a projector that claims no kinds: see
+        ``mint_replay_jobs`` for why inventing jobs for it would be wrong
+        rather than merely useless.
+        """
+
+        condition = _replay_observation_condition(projector_name, selector)
+        job_exists = _replay_job_exists_condition(projector_name, projector_version)
+        mint_allowed = bool(_PROJECTOR_KINDS.get(projector_name))
+        async with self._session_factory() as session:
+            re_pended = await session.scalar(select(func.count()).select_from(AnsichObservationRow).where(condition, job_exists))
+            minted = 0
+            if mint_allowed:
+                minted = await session.scalar(select(func.count()).select_from(AnsichObservationRow).where(condition, ~job_exists))
+        return int(minted or 0), int(re_pended or 0)
+
+    async def mint_replay_jobs(
+        self,
+        *,
+        projector_name: str,
+        projector_version: str,
+        selector: ReplaySelector,
+        batch_size: int = 1000,
+    ) -> tuple[int, int]:
+        """Put a target set back in the queue, and clear what its return breaks.
+
+        Three writes, **one transaction**, under the same ``_maintenance_lock``
+        ``rebuild_projections`` holds -- so a replay and a rebuild (or two
+        replays) queue rather than interleaving their re-pends.
+
+        1. **Mint** a ``pending`` job for every targeted Observation the target
+           ``(projector, version)`` has none for. This is how a version that
+           has never run acquires jobs for history: live ingest mints only for
+           ``_PROJECTORS``, so a replayable-but-not-live version starts with
+           nothing. New rows begin at ``lease_generation = 0`` because no claim
+           has ever been taken against them.
+
+           A projector with **no** kind list mints nothing at all, and the
+           guard is a correctness one rather than an optimisation:
+           ``task-spawn-reconcile`` claims no kinds because
+           ``_project_task_spawn`` enqueues its jobs directly, so "every
+           Observation it claims" is empty -- minting by filter alone would
+           hand every Observation in the store a spawn-reconcile job whose
+           projector expects a spawn edge that does not exist.
+
+        2. **Re-pend** the ones that do, raising ``lease_generation`` by one
+           (Global Constraint 6 -- monotonic, never reset). The lock excludes
+           another *operator*; it does not stop a worker that claimed one of
+           these jobs before the replay started, and that worker's late
+           completion would otherwise mark the job settled before the replay
+           claimed it, silently dropping the Observation from the result. The
+           bump makes that write fail its compare-and-set instead. ``status``
+           and ``attempts`` move together so ``pending <=> attempts == 0``
+           holds store-wide (Constraint 7).
+
+        3. **Delete active-Task read-model rows** -- and this is the dangerous
+           interaction, not a tidy-up (Global Constraint 4 / plan ruling RC3).
+           ``_is_staler_publish``'s docstring names this exact shape as the way
+           to freeze that read model permanently: a job re-pended below the
+           current continuity mark lowers ``min(unsettled ingest_seq)``, every
+           later operations tick then reads as staler than the mark already on
+           the row, and the guard skips it forever -- for a stopped Task,
+           silently, leaving it displayed as running.
+
+           **What gets deleted is wider than "the affected Tasks", on purpose.**
+           The plan's letter is the targeted Observations' ``task_id`` set, and
+           that would be right if the stamp were per-Task. It is not:
+           ``_refresh_active_task_read_model`` stamps the **store-wide**
+           continuity mark (the lowest per-projector ``complete_through``) onto
+           *every* row, so re-pending one job at a low sequence freezes rows
+           belonging to Tasks this replay never named. So the delete is the
+           union of two sets -- the targeted Tasks (the ruling), and every row
+           whose stamped basis now sits above the post-write mark (the actual
+           freeze set). Deleting a row that was not frozen costs one tick of
+           republish; leaving a frozen one costs the read model until the next
+           rebuild.
+
+        The read-model rows are locked in ``task_id`` order before the delete
+        (``backend/AGENTS.md`` lock-ordering rule): the operations tick takes
+        its ``FOR UPDATE`` set in that same order, so the two writers cannot
+        cross-hold.
+
+        Observations and payloads are never written, read-only, always
+        (Global Constraint 3).
+        """
+
+        condition = _replay_observation_condition(projector_name, selector)
+        job_exists = _replay_job_exists_condition(projector_name, projector_version)
+        mint_allowed = bool(_PROJECTOR_KINDS.get(projector_name))
+        now = datetime.now(UTC)
+        minted = 0
+        async with self._maintenance_lock():
+            async with self._session_factory() as session, session.begin():
+                targeted_obs = select(AnsichObservationRow.obs_id).where(condition)
+                # Re-pend BEFORE minting, so "already has a job" means "had one
+                # before this call" and the rows this call creates cannot be
+                # re-pended by it -- which would count them twice and raise a
+                # generation against a claim that never existed.
+                re_pended = (
+                    await session.execute(
+                        update(AnsichProjectionJobRow)
+                        .where(
+                            AnsichProjectionJobRow.projector_name == projector_name,
+                            AnsichProjectionJobRow.projector_version == projector_version,
+                            AnsichProjectionJobRow.obs_id.in_(targeted_obs),
+                        )
+                        .values(
+                            status="pending",
+                            attempts=0,
+                            available_at=now,
+                            dependency_pending_since=None,
+                            lease_owner=None,
+                            lease_expires_at=None,
+                            last_error=None,
+                            lease_generation=AnsichProjectionJobRow.lease_generation + 1,
+                        )
+                    )
+                ).rowcount
+                if mint_allowed:
+                    registration = await session.get(AnsichProjectorVersionRow, (projector_name, projector_version))
+                    if registration is None:
+                        session.add(
+                            AnsichProjectorVersionRow(
+                                projector_name=projector_name,
+                                projector_version=projector_version,
+                            )
+                        )
+                    while True:
+                        # Re-evaluated each pass rather than paged by offset:
+                        # the rows this returns stop matching `~job_exists` as
+                        # soon as they are inserted, so "the next batch" is
+                        # always the first `batch_size` still without a job.
+                        obs_ids = list((await session.execute(select(AnsichObservationRow.obs_id).where(condition, ~job_exists).order_by(AnsichObservationRow.ingest_seq).limit(batch_size))).scalars().all())
+                        if not obs_ids:
+                            break
+                        for obs_id in obs_ids:
+                            session.add(
+                                AnsichProjectionJobRow(
+                                    job_id=new_id(),
+                                    obs_id=obs_id,
+                                    projector_name=projector_name,
+                                    projector_version=projector_version,
+                                    status="pending",
+                                    attempts=0,
+                                    available_at=now,
+                                )
+                            )
+                        await session.flush()
+                        minted += len(obs_ids)
+                await self._clear_frozen_active_task_rows(session, selector=selector, condition=condition)
+        return minted, int(re_pended or 0)
+
+    async def _clear_frozen_active_task_rows(
+        self,
+        session: AsyncSession,
+        *,
+        selector: ReplaySelector,
+        condition,
+    ) -> int:
+        """Delete every active-Task row a lowered continuity mark would freeze.
+
+        Runs inside ``mint_replay_jobs``' transaction, after the mint and
+        re-pend, so the mark it reads is the one the next operations tick will
+        read. See that method for why the set is wider than the targeted Tasks.
+        """
+
+        unsettled_minimum = await session.scalar(
+            select(func.min(AnsichObservationRow.ingest_seq))
+            .select_from(AnsichProjectionJobRow)
+            .join(AnsichObservationRow, AnsichObservationRow.obs_id == AnsichProjectionJobRow.obs_id)
+            .where(AnsichProjectionJobRow.status.in_(_UNSETTLED_JOB_STATUSES))
+        )
+        highest = await session.scalar(select(func.max(AnsichObservationRow.ingest_seq)))
+        mark = None if unsettled_minimum is None else int(unsettled_minimum) - 1
+        if mark is None:
+            mark = None if highest is None else int(highest)
+        frozen = AnsichActiveTaskReadModelRow.projection_watermark.is_not(None) if mark is None else AnsichActiveTaskReadModelRow.projection_watermark > mark
+        if selector.is_unfiltered:
+            # An unfiltered target clears every row (the plan's own rule for
+            # this case), written directly rather than as a subquery over the
+            # whole Observation table. It is not merely the cheap form: the
+            # kind bound means "Tasks with a targeted Observation" is narrower
+            # than "every Task", while the basis the guard compares is
+            # store-wide -- so narrowing here would leave exactly the rows the
+            # `frozen` half exists to catch.
+            affected = text("1 = 1")
+        else:
+            affected = AnsichActiveTaskReadModelRow.task_id.in_(select(AnsichObservationRow.task_id).where(condition))
+        doomed = sorted((await session.execute(select(AnsichActiveTaskReadModelRow.task_id).where(or_(affected, frozen)).order_by(AnsichActiveTaskReadModelRow.task_id).with_for_update())).scalars().all())
+        if not doomed:
+            return 0
+        await session.execute(delete(AnsichActiveTaskReadModelRow).where(AnsichActiveTaskReadModelRow.task_id.in_(doomed)))
+        return len(doomed)
+
+    async def read_model_digest(self, projector_name: str) -> str | None:
+        """A canonical hash of the rows this projector alone produced.
+
+        The §11 determinism check: replay one Observation set twice, hash the
+        result twice, and the two must agree. What is hashed is every row of
+        every table in ``_PROJECTOR_OWNED_TABLES[projector_name]``, each table
+        ordered by its own primary key -- ordered, because physical row order
+        is an artefact of the interleaving that produced it and comparing it
+        would answer "were these written in the same order" instead of "do
+        these hold the same facts".
+
+        Returns ``None`` when the projector owns no table exclusively rather
+        than hashing the empty set: an empty hash compares equal to every other
+        empty hash, so it would report determinism nobody established.
+
+        Non-JSON column values are normalised before hashing (``datetime`` to
+        an explicit UTC ISO string, ``bytes`` to hex) because
+        ``sha256_canonical`` accepts only JSON values -- and a hash that raised
+        on a timestamp column would be a check nobody could run.
+
+        What it deliberately does not cover: the shared tables this projector
+        also writes into (``ansich_entities``, the Belief triple, ...). Two
+        digests agreeing is therefore a statement about the owned tables, not
+        about the whole derived zone.
+        """
+
+        tables = _PROJECTOR_OWNED_TABLES.get(projector_name, ())
+        if not tables:
+            return None
+        payload: list[object] = []
+        async with self._session_factory() as session:
+            for model in tables:
+                table = model.__table__
+                column_names = [column.name for column in table.columns]
+                rows = (await session.execute(select(*table.columns).order_by(*table.primary_key.columns))).all()
+                payload.append(
+                    [
+                        table.name,
+                        [{name: _canonical_digest_value(value) for name, value in zip(column_names, row, strict=True)} for row in rows],
+                    ]
+                )
+        return sha256_canonical(payload)
+
     async def _rebuild_projections_locked(self) -> RebuildOutcome:
         async with self._session_factory() as session, session.begin():
-            for model in (
-                AnsichAlertReadModelRow,
-                AnsichAlertWorkflowEventRow,
-                AnsichAlertEvidenceRow,
-                AnsichAlertRow,
-                AnsichOperatorActionRow,
-                AnsichAssessorErrorRow,
-                AnsichAssessorJobRow,
-                # Deleted with the conclusions it describes: a surviving mark
-                # would make the post-rebuild assessment skip the very
-                # ToolCalls whose conclusions were just dropped.
-                AnsichAssessorWatermarkRow,
-                AnsichScopeConclusionRow,
-                AnsichTaskHeartbeatRow,
-                AnsichActiveTaskReadModelRow,
-                AnsichEvaluationIndexRow,
-                AnsichReleaseQualityStatsRow,
-                AnsichTaskBudgetRow,
-                AnsichTaskUsageRow,
-                AnsichUsageContributionRow,
-                AnsichTaskAncestryRow,
-                AnsichTaskSpawnRow,
-                AnsichContextSnapshotMissingItemRow,
-                AnsichContextSnapshotBlockMembershipRow,
-                AnsichContextSnapshotItemRow,
-                AnsichContextSnapshotRow,
-                AnsichContextWindowRow,
-                AnsichContextCompressionItemRow,
-                AnsichContextCompressionRow,
-                AnsichContextStateMissingBlockRow,
-                AnsichContextStateDeltaRow,
-                AnsichContextStateCheckpointItemRow,
-                AnsichContextStateRow,
-                AnsichContentBlockDerivationRow,
-                AnsichBlockProducerRow,
-                AnsichToolEffectRow,
-                AnsichToolCallAuthorizationRow,
-                AnsichAuthorizationPermissionRow,
-                AnsichAuthorizationScopeRow,
-                AnsichAuthorizationSnapshotRow,
-                AnsichToolCallResultRow,
-                AnsichToolCallRow,
-                AnsichContentOccurrenceRow,
-                AnsichContentBlockRow,
-                AnsichLlmAttemptRow,
-                AnsichStepRow,
-                AnsichTaskSummaryRow,
-                AnsichCurrentBeliefRow,
-                AnsichBeliefEvidenceRow,
-                AnsichTransitionRow,
-                AnsichBeliefAssertionRow,
-                AnsichRelationEvidenceRow,
-                AnsichRelationRow,
-                AnsichTaskAgentReleaseRow,
-                AnsichAgentReleaseComponentRow,
-                AnsichAgentReleaseRow,
-                # Coverage and state carry an FK onto the Scope entity they
-                # describe, so they are deleted before AnsichEntityRow; the
-                # per-tool-call samples are FK-free but rebuild alongside them.
-                AnsichEnvironmentStateRow,
-                AnsichEnvironmentCoverageRow,
-                AnsichToolEnvSampleRow,
-                AnsichScopeRow,
-                AnsichTaskRow,
-                AnsichEntityRow,
-                AnsichProjectionErrorRow,
-            ):
+            for model in _REBUILD_DELETE_ORDER:
                 await session.execute(delete(model))
             await session.execute(
                 update(AnsichProjectionJobRow).values(

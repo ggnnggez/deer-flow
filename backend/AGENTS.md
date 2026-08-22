@@ -1919,6 +1919,108 @@ new `health_database_timeout_ms`; a test pins the mapping against
 `AnsichService.__init__`'s own keyword parameters, so a future knob cannot be
 threaded into one branch only. Tests: `tests/ansich/test_database_health.py`.
 
+**P11-C versioned replay** (spec §5). `deerflow.ansich.replay` (`plan_replay` /
+`execute_replay`) plus the `python -m deerflow.ansich.replay_cli` command is how
+an operator re-derives one projector's read models over a slice of history. It
+is a **command, never a route**: it re-pends durable jobs and clears read models
+under the cross-worker maintenance lock, which is a deliberate action taken from
+a shell. It lives harness-side and imports no `app.*`.
+
+*Target selection* (`sql.py::_replay_observation_condition`) ANDs four
+predicates, each chosen so an index serves it, because `ansich_observations` has
+no retention and an unindexed form there gets slower every day: the projector's
+kind list, `task_id` (`ix_ansich_observations_task_ingest`), an `occurred_at`
+window (`ix_ansich_observations_kind_occurred`, which is *why* the kind bound is
+mandatory), and an `ingest_seq` range (primary key). `recorded_at` is never
+read — it carries no index. A projector with **no** kind list has no leading
+column for the window, so a time-filtered replay of it is refused with the new
+`ReplayTargetRefusal` member `time_filter_unsupported`; today that is exactly
+`task-spawn-reconcile`, whose jobs `_project_task_spawn` enqueues directly. The
+same emptiness makes minting wrong rather than merely useless for it — minting
+by filter alone would give every Observation in the store a spawn-reconcile job
+— so a replay of a kind-less projector re-pends what exists and invents nothing.
+
+*The write* (`mint_replay_jobs`) is one transaction under `_maintenance_lock`:
+re-pend first (so the rows it mints cannot be re-pended by the same call),
+raising `lease_generation` by one — the rebuild's precedent, and never reset —
+then mint `pending`/`attempts=0` rows for the rest, then clear active-Task
+read-model rows. That third step is **the batch's most dangerous interaction**
+(Global Constraint 4 / ruling RC3) and it is the shape `_is_staler_publish`'s
+docstring names: a job re-pended below the current mark lowers
+`min(unsettled ingest_seq)`, and without the delete every later tick reads as
+staler and the read model freezes — silently, for Tasks that have since stopped.
+**The delete is deliberately wider than the plan's letter**, and this is the
+recorded deviation: the plan scoped it to the targeted Observations' `task_id`
+set, which would be right if the stamp were per-Task, but
+`_refresh_active_task_read_model` stamps the *store-wide* continuity mark on
+every row. So the executor deletes the union of the targeted Tasks and every row
+whose stamped basis now sits above the post-write mark. Deleting an unfrozen row
+costs one tick of republish; leaving a frozen one costs the read model until the
+next rebuild. Rows are locked in `task_id` order, matching the operations tick's
+own `FOR UPDATE` order.
+
+*The drive loop* is a bounded caller loop (ruling RC1), not a wait: each round
+drains `project_pending` and then runs one `assess_operations`, exactly as
+`_rebuild_projections_locked` ends — a re-projected Observation enqueues assessor
+jobs and nothing but that pass settles them, so without it every replay would
+report a permanently unsettled store. That pass is also what republishes the
+read-model rows the mint deleted. Both locks are released between rounds, which
+is what lets a dependency-deferred job become claimable. Exhausting `max_rounds`
+is reported, not raised, and `RebuildOutcome`'s lower-bound caveat applies
+unchanged: `unsettled == 0` is a count at one known point, not proof.
+
+*The digest* hashes every row of the target projector's exclusively-owned
+read-model tables, each table ordered by its own primary key, through
+`sha256_canonical` — ordered, because physical row order is an artefact of the
+interleaving and comparing it would answer the wrong question. It is `None`
+when `unsettled > 0` (a digest over a store that still owes work is a lie with a
+checksum) and `None` when the projector owns no table exclusively (an empty hash
+compares equal to every other empty hash).
+
+*`_PROJECTOR_OWNED_TABLES`* is the ownership map T5's `--replace` consumes, and
+its shape is a **second recorded deviation**: the plan asked for a partition of
+the rebuild delete list "by owning projector", and that is not a thing that
+exists. The list is partitioned into **three** named classes instead —
+`_PROJECTOR_OWNED_TABLES` (tables only one projector's code can write),
+`_SHARED_REBUILT_TABLES` (`ansich_entities`, the Belief triple, the Task/Scope/
+Relation/AgentRelease/usage tables — more than one projector writes each), and
+`_NON_PROJECTOR_REBUILT_TABLES` (the assessor family, the Alert machine, the
+operator-action audit, the two error/job ledgers, and the operations tick's own
+read model). A structural test pins that the three are disjoint and cover
+`_REBUILD_DELETE_ORDER` — itself hoisted out of `_rebuild_projections_locked` so
+the pin is against the list the rebuild actually iterates, not a restatement.
+Ownership is the *conservative* reading (a table belongs to a projector only
+when no other projector's dispatch branch can reach a write to it) because
+over-claiming is what would make `--replace` delete a sibling's rows. Three
+projectors consequently own **nothing**: `task-structural` (because
+`_project_control` calls `_project_structural` first, so `task-control` reaches
+everything it writes), `task-usage` and `task-spawn-reconcile` (the usage
+contribution/summary helpers are shared three ways). A replay of those three
+reports no digest, which is the honest answer rather than a gap.
+
+*What an accepted target does not assert.* `project_pending`'s dispatch branches
+on `projector_name` alone and never reads the version, so declaring a second
+version replayable and replaying it executes the *same* code as the first until
+that branch is taught the difference. `_validate_replay_target` accepts such a
+target because the registry declares it executable; nothing can verify the
+declaration, and comparing two versions' digests is meaningless until the
+dispatch really discriminates. `_EXECUTABLE_PROJECTOR_NAMES` likewise proxies
+"has a dispatch branch" with "is live-registered".
+
+The CLI carries `--projector/--version/--task-id/--occurred-from/--occurred-to/
+--ingest-from/--ingest-to/--dry-run/--max-rounds/--format`. `--replace` is
+**not** wired here — it is T5's, and shipping a flag that silently did nothing
+would be worse than not having it. Exit codes are the machine-readable half of
+the report: `0` clean, `1` the pass ran and something is still owed, `2` the
+request was refused (bad target, malformed filter, or `database.backend:
+memory`, which stores no Observations to replay). `--dry-run` reads only, takes
+no lock and computes no digest — a digest computed before the replay would
+describe the pre-replay store while reading as this pass's result. Tests:
+`tests/ansich/test_replay.py`, including the §11 double-replay determinism
+check, the late-Observation case (an Observation ingested mid-pass is outside
+`targeted` and visible in the store-wide `replayed`), and the PB7 freeze proved
+both ways — fixed, and reproduced with the in-transaction delete disarmed.
+
 **Workspace change review**: `packages/harness/deerflow/workspace_changes/`
 captures a pre-run and post-run snapshot of the thread-owned `workspace` and
 `outputs` directories. `runtime/runs/worker.py` performs the filesystem scan via
