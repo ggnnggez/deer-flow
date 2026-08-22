@@ -16,9 +16,12 @@ be able to trigger. That is also why it lives harness-side and imports no
 **Exit codes are the machine-readable half of the report**, because a script
 that has to parse prose to decide whether to page someone will get it wrong:
 
-* ``0`` -- the pass settled and reported nothing.
-* ``1`` -- the pass ran and something is still owed (unsettled work, durably
-  failed jobs, or no digest). Re-running is the remedy; the store is fine.
+* ``0`` -- the pass settled and nothing is owed.
+* ``1`` -- the pass ran and work is still owed: jobs still unsettled, or jobs
+  durably failed for this target. Re-running (or an operator retry) is the
+  remedy; the request was fine. A **missing digest is not** one of these
+  conditions on its own -- three projectors own no read-model table
+  exclusively and honestly have none.
 * ``2`` -- the request itself was refused (a target this build cannot honour, a
   malformed filter, or no SQL store configured). Re-running changes nothing.
 """
@@ -94,11 +97,30 @@ def selector_from_args(args: argparse.Namespace) -> ReplaySelector:
 
 
 def exit_code(report: ReplayReport) -> int:
-    """``0`` for a clean pass, ``1`` for one that has something to report."""
+    """``0`` for a clean pass, ``1`` for one that left work owed.
+
+    Two facts decide it, and both have to be here because neither implies the
+    other. ``unsettled`` counts ``pending``/``retry``/``processing`` and
+    excludes ``failed`` — a durably failed job is *settled*, badly — so a pass
+    can end with ``unsettled == 0``, a computable digest, and N projections
+    that will never land. Reading only ``unsettled`` is what let that pass exit
+    ``0`` while its own ``errors`` said otherwise (review finding F2), which is
+    exactly the prose-parsing this exit code exists to spare a script.
+
+    A missing digest is deliberately **not** part of the test. Three projectors
+    own no read-model table exclusively and honestly have no digest (see
+    ``_PROJECTOR_OWNED_TABLES``); paging on that would make a clean replay of
+    ``task-structural`` look like an incident and train an operator to ignore
+    the code. When a digest is missing *because* work is owed, the two counts
+    below already say so.
+
+    A dry run always exits ``0``: it reports, it changes nothing, and a plan
+    that found a backlog is a successful plan.
+    """
 
     if report.dry_run:
         return 0
-    return 1 if report.unsettled or report.digest is None else 0
+    return 1 if report.unsettled or report.failed else 0
 
 
 def render(report: ReplayReport, *, output_format: str) -> str:
@@ -109,6 +131,7 @@ def render(report: ReplayReport, *, output_format: str) -> str:
         f"targeted:  {report.targeted} ({report.minted} minted, {report.re_pended} re-pended)",
         f"replayed:  {report.replayed} (store-wide, not target-scoped)",
         f"unsettled: {report.unsettled}",
+        f"failed:    {report.failed}",
         f"watermark: {'unknown' if report.watermark is None else report.watermark}",
         f"digest:    {report.digest or '(none)'}",
     ]

@@ -939,16 +939,33 @@ class ReplayReport(BaseModel):
     at one known point rather than watched. A non-zero value after the round
     budget is spent is **reported, not raised**.
 
-    ``digest`` is ``None`` in exactly two situations, and neither is an error
-    the caller can fix by retrying:
+    ``failed`` is the number of **durably failed** projection jobs for the
+    target ``(projector, version)``, and it exists because ``unsettled`` cannot
+    see them: a failed job is settled, badly, so a pass can report
+    ``unsettled == 0`` and still have left projections that never landed. It is
+    the one number a script has to read beside ``unsettled`` before calling a
+    replay clean. It is scoped to the projector but **not** to the selector, so
+    a filtered replay also counts failures outside its own target set — a
+    durable failure anywhere in the projector is worth saying, but the number is
+    not always this pass's own doing.
+
+    ``digest`` is ``None`` in exactly three situations, and none of them is an
+    error the caller can fix by retrying:
 
     * ``unsettled > 0`` — a digest over a store that still owes work describes
       a state nobody asked for and would compare unequal against the same
       history replayed to completion. Refusing to compute it is the point.
+    * ``failed > 0`` — the same principle for the one state in which owned rows
+      are *known* never to have been written.
     * the target projector exclusively owns no read-model table, so there is
       nothing to hash that the projector alone wrote (see
       ``_PROJECTOR_OWNED_TABLES``). Hashing the empty set would make every such
       replay "reproducible" by construction.
+
+    Because of the third case, **a missing digest is not by itself an incomplete
+    pass**: three projectors honestly have none, and treating that as a failure
+    would page an operator for a clean replay. ``unsettled`` and ``failed`` are
+    what say whether work is owed.
 
     ``watermark`` is the store-wide projection continuity mark after the pass
     (``min`` over the per-projector ``complete_through``), or ``None`` when the
@@ -969,6 +986,7 @@ class ReplayReport(BaseModel):
     re_pended: int
     replayed: int
     unsettled: int
+    failed: int = 0
     errors: tuple[str, ...] = ()
     watermark: int | None = None
     digest: str | None = None

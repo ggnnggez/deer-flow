@@ -1972,10 +1972,31 @@ unchanged: `unsettled == 0` is a count at one known point, not proof.
 *The digest* hashes every row of the target projector's exclusively-owned
 read-model tables, each table ordered by its own primary key, through
 `sha256_canonical` — ordered, because physical row order is an artefact of the
-interleaving and comparing it would answer the wrong question. It is `None`
-when `unsettled > 0` (a digest over a store that still owes work is a lie with a
-checksum) and `None` when the projector owns no table exclusively (an empty hash
-compares equal to every other empty hash).
+interleaving and comparing it would answer the wrong question. It is `None` in
+three cases: `unsettled > 0` (a digest over a store that still owes work is a
+lie with a checksum); `failed > 0` for the target `(projector, version)` — the
+same principle for the one state in which owned rows are *known* never to have
+been written, and `unsettled` structurally cannot see it because a durably
+failed job is settled, badly; and when the projector owns no table exclusively
+(an empty hash compares equal to every other empty hash). `_DIGEST_EXCLUDED_COLUMNS`
+drops every `DateTime` column carrying a Python-side callable default before
+hashing — `ansich_content_occurrences.created_at` and
+`ansich_context_states.created_at` are the motivating pair, the two
+`ansich_environment_*.updated_at` columns collateral. A determinism digest must
+not hash *when the projection ran*: today a `task-step` double replay agrees
+only because those rows are inserted if-absent and a replay never deletes them,
+so T5's `--replace` would otherwise make the §11 digests differ by construction
+with nothing going red (the §11 test drives `task-heartbeat`, which has no such
+column). What that exclusion does **not** cover, and T5 must check before
+`--replace` ships: whether every owned table's primary key is derived from
+Observation content rather than minted fresh.
+
+*A replay also refreshes the process-local failed-job count* (`_refresh_failed_job_count`,
+as `rebuild` and `retry` both do). The re-pend clears `failed` rows in the
+database; without the refresh a successful replay left this worker's advisory
+`failed_jobs` untouched, and since `lifecycle.derive_status` keys `degraded` on
+it, an operator's own remedy made the service read `degraded` for the rest of
+the process's life beside a `database` block saying `failed_jobs: 0`.
 
 *`_PROJECTOR_OWNED_TABLES`* is the ownership map T5's `--replace` consumes, and
 its shape is a **second recorded deviation**: the plan asked for a partition of
@@ -1998,6 +2019,24 @@ everything it writes), `task-usage` and `task-spawn-reconcile` (the usage
 contribution/summary helpers are shared three ways). A replay of those three
 reports no digest, which is the honest answer rather than a gap.
 
+**`ansich_steps` is shared, not `task-step`'s**, and the reason is the whole
+argument for the conservative rule: on a terminal Task Observation
+`_project_control` calls `_close_settled_acting_steps`, which writes
+`status = "closed"` onto Step rows. Had `task-step` owned the table,
+`--replace --projector task-step` would delete every Step and re-derive from
+`task-step`'s Observations alone — every Step `task-control` had closed comes
+back `acting` and stays that way, because nothing re-pends the `task-control`
+job that closed it, while `list_steps`, the active-Task read model and
+`_assess_and_reconcile_dwell` all read that column. Because the disjoint/covering
+test cannot see a *wrong assignment* (only a missing or duplicated one), the
+rule itself is pinned separately: `TestOwnershipIsConservativeInFact` walks the
+AST from each dispatch entry through the helpers it calls and asserts no owned
+table is written from a second branch. That walk is a deliberate **lower bound**
+on writes (constructor calls, bulk `delete`/`update`/upsert, and attribute
+assignment on a local bound from a `select`/`get` — the shape
+`_close_settled_acting_steps` uses), so a table it clears is not thereby proven
+exclusive; what it catches is the class of mistake, which is the point.
+
 *What an accepted target does not assert.* `project_pending`'s dispatch branches
 on `projector_name` alone and never reads the version, so declaring a second
 version replayable and replaying it executes the *same* code as the first until
@@ -2011,9 +2050,14 @@ The CLI carries `--projector/--version/--task-id/--occurred-from/--occurred-to/
 --ingest-from/--ingest-to/--dry-run/--max-rounds/--format`. `--replace` is
 **not** wired here — it is T5's, and shipping a flag that silently did nothing
 would be worse than not having it. Exit codes are the machine-readable half of
-the report: `0` clean, `1` the pass ran and something is still owed, `2` the
-request was refused (bad target, malformed filter, or `database.backend:
-memory`, which stores no Observations to replay). `--dry-run` reads only, takes
+the report and are decided by two counts, `unsettled` **and** `failed`: `0`
+clean, `1` the pass ran and work is owed, `2` the request was refused (bad
+target, malformed filter, or `database.backend: memory`, which stores no
+Observations to replay). Both counts are needed because neither implies the
+other — `unsettled` excludes `failed`, so keying on it alone let a pass exit `0`
+having left N projections permanently unlanded. A **missing digest is
+deliberately not** part of that test: three projectors honestly have none, and
+paging on it would train an operator to ignore the code. `--dry-run` reads only, takes
 no lock and computes no digest — a digest computed before the replay would
 describe the pre-replay store while reading as this pass's result. Tests:
 `tests/ansich/test_replay.py`, including the §11 double-replay determinism

@@ -24,6 +24,7 @@ before it touches anything, and the reason vocabulary it refuses with.
 
 from __future__ import annotations
 
+import ast
 from collections.abc import AsyncIterator
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -39,14 +40,18 @@ from sqlalchemy.dialects import sqlite
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
 from deerflow.ansich import replay_cli
+from deerflow.ansich.persistence import models as models_module
+from deerflow.ansich.persistence import sql as sql_module
 from deerflow.ansich.persistence.models import (
     AnsichActiveTaskReadModelRow,
     AnsichObservationRow,
     AnsichProjectionJobRow,
     AnsichProjectorVersionRow,
+    AnsichStepRow,
     AnsichTaskHeartbeatRow,
 )
 from deerflow.ansich.persistence.sql import (
+    _DIGEST_EXCLUDED_COLUMNS,
     _NON_PROJECTOR_REBUILT_TABLES,
     _PROJECTOR_KINDS,
     _PROJECTOR_OWNED_TABLES,
@@ -63,6 +68,112 @@ from deerflow.ansich.replay import execute_replay, plan_replay
 from deerflow.persistence.base import Base
 
 _OCCURRED_AT = datetime(2026, 7, 1, 12, 0, tzinfo=UTC)
+
+
+#: Which ``project_pending`` dispatch branch each projector name enters at.
+#: Declared rather than parsed out of the dispatch chain, and pinned against
+#: ``_PROJECTOR_OWNED_TABLES``'s key set below so a new projector cannot be
+#: added without deciding what it writes.
+_DISPATCH_ENTRY = {
+    "task-structural": "_project_structural",
+    "task-control": "_project_control",
+    "task-step": "_project_step",
+    "task-usage": "_project_usage",
+    "task-budget": "_project_budget",
+    "task-heartbeat": "_project_heartbeat",
+    "task-safety": "_project_safety",
+    "environment-projector": "_project_environment",
+    "evaluation-projector": "_project_evaluation",
+    "task-spawn-reconcile": "_reconcile_spawn_usage",
+}
+_MODEL_WRITE_CALLS = frozenset({"delete", "update", "postgresql_insert", "sqlite_insert"})
+
+
+def _is_row_class(name: str) -> bool:
+    return name.startswith("Ansich") and name.endswith("Row")
+
+
+def _mentioned_models(node: ast.AST) -> set[str]:
+    return {child.id for child in ast.walk(node) if isinstance(child, ast.Name) and _is_row_class(child.id)}
+
+
+def _function_facts(function: ast.AST) -> tuple[set[str], set[str]]:
+    """``(models this body writes, functions it calls)`` for one function.
+
+    Writes are detected in four forms, and the set is a deliberate **lower
+    bound** -- see the test that consumes it for why that is the useful
+    direction here.
+    """
+
+    writes: set[str] = set()
+    calls: set[str] = set()
+    bound: dict[str, str] = {}
+
+    # Two passes so `rows = select(X)...` then `for row in rows:` resolves
+    # regardless of which the walk reaches first.
+    for _ in range(2):
+        for node in ast.walk(function):
+            if isinstance(node, ast.Assign) and len(node.targets) == 1 and isinstance(node.targets[0], ast.Name):
+                models = _mentioned_models(node.value) | {bound[child.id] for child in ast.walk(node.value) if isinstance(child, ast.Name) and child.id in bound}
+                if len(models) == 1:
+                    bound[node.targets[0].id] = next(iter(models))
+            elif isinstance(node, ast.For) and isinstance(node.target, ast.Name):
+                models = _mentioned_models(node.iter) | {bound[child.id] for child in ast.walk(node.iter) if isinstance(child, ast.Name) and child.id in bound}
+                if len(models) == 1:
+                    bound[node.target.id] = next(iter(models))
+
+    for node in ast.walk(function):
+        if isinstance(node, ast.Call):
+            callee = node.func
+            if isinstance(callee, ast.Name):
+                if _is_row_class(callee.id):
+                    writes.add(callee.id)
+                elif callee.id in _MODEL_WRITE_CALLS or "insert" in callee.id or "upsert" in callee.id:
+                    writes |= {argument.id for argument in node.args if isinstance(argument, ast.Name) and _is_row_class(argument.id)}
+                calls.add(callee.id)
+            elif isinstance(callee, ast.Attribute):
+                calls.add(callee.attr)
+                if "insert" in callee.attr or "upsert" in callee.attr:
+                    writes |= {argument.id for argument in node.args if isinstance(argument, ast.Name) and _is_row_class(argument.id)}
+                if callee.attr in {"add", "delete", "merge"}:
+                    for argument in node.args:
+                        if isinstance(argument, ast.Call) and isinstance(argument.func, ast.Name) and _is_row_class(argument.func.id):
+                            writes.add(argument.func.id)
+                        elif isinstance(argument, ast.Name) and argument.id in bound:
+                            writes.add(bound[argument.id])
+        elif isinstance(node, ast.Assign | ast.AugAssign):
+            targets = node.targets if isinstance(node, ast.Assign) else [node.target]
+            for target in targets:
+                if isinstance(target, ast.Attribute) and isinstance(target.value, ast.Name) and target.value.id in bound:
+                    writes.add(bound[target.value.id])
+    return writes, calls
+
+
+def _dispatch_branch_writers() -> dict[str, set[str]]:
+    """``table name -> the projector branches whose code writes it``."""
+
+    source = Path(sql_module.__file__).read_text(encoding="utf-8")
+    functions: dict[str, ast.AST] = {}
+    for node in ast.walk(ast.parse(source)):
+        if isinstance(node, ast.FunctionDef | ast.AsyncFunctionDef):
+            functions[node.name] = node
+    facts = {name: _function_facts(function) for name, function in functions.items()}
+
+    def reachable_writes(name: str, seen: set[str]) -> set[str]:
+        if name in seen or name not in facts:
+            return set()
+        seen.add(name)
+        writes, calls = facts[name]
+        return set(writes).union(*(reachable_writes(callee, seen) for callee in calls)) if calls else set(writes)
+
+    writers: dict[str, set[str]] = {}
+    for projector_name, entry in _DISPATCH_ENTRY.items():
+        for model_name in reachable_writes(entry, set()):
+            model = getattr(models_module, model_name, None)
+            if model is None:
+                continue
+            writers.setdefault(model.__table__.name, set()).add(projector_name)
+    return writers
 
 
 @pytest.fixture
@@ -424,7 +535,7 @@ class TestReplayTargetSelection:
         populated: dict[str, object],
     ) -> None:
         sql_backend, sessions = backend
-        condition = _replay_observation_condition("task-heartbeat", ReplaySelector(task_id=populated["task_a"]))
+        condition = _replay_observation_condition("task-heartbeat", "1", ReplaySelector(task_id=populated["task_a"]))
         async with sessions() as session:
             selected = {row for row in (await session.execute(select(AnsichObservationRow.obs_id).where(condition))).scalars()}
         assert selected == populated["heartbeats_a"]
@@ -437,7 +548,7 @@ class TestReplayTargetSelection:
     ) -> None:
         sql_backend, sessions = backend
         by_seq: dict[int, str] = populated["by_ingest_seq"]
-        condition = _replay_observation_condition("task-control", ReplaySelector(ingest_from=1, ingest_to=2))
+        condition = _replay_observation_condition("task-control", "1", ReplaySelector(ingest_from=1, ingest_to=2))
         async with sessions() as session:
             selected = {row for row in (await session.execute(select(AnsichObservationRow.obs_id).where(condition))).scalars()}
         control_kinds = _PROJECTOR_KINDS["task-control"]
@@ -454,6 +565,7 @@ class TestReplayTargetSelection:
         sql_backend, sessions = backend
         condition = _replay_observation_condition(
             "task-heartbeat",
+            "1",
             ReplaySelector(occurred_from=_OCCURRED_AT, occurred_to=_OCCURRED_AT + timedelta(seconds=1)),
         )
         async with sessions() as session:
@@ -472,6 +584,7 @@ class TestReplayTargetSelection:
 
         condition = _replay_observation_condition(
             "task-heartbeat",
+            "1",
             ReplaySelector(occurred_from=_OCCURRED_AT, occurred_to=_OCCURRED_AT + timedelta(hours=1)),
         )
         compiled = str(select(AnsichObservationRow.obs_id).where(condition).compile(dialect=sqlite.dialect(), compile_kwargs={"literal_binds": True}))
@@ -493,13 +606,14 @@ class TestReplayTargetSelection:
         with pytest.raises(ReplayTargetError) as caught:
             _replay_observation_condition(
                 "task-spawn-reconcile",
+                "1",
                 ReplaySelector(occurred_from=_OCCURRED_AT, occurred_to=_OCCURRED_AT + timedelta(hours=1)),
             )
         assert caught.value.reason == "time_filter_unsupported"
 
     def test_a_kindless_projector_still_accepts_a_task_or_ingest_filter(self) -> None:
-        assert _replay_observation_condition("task-spawn-reconcile", ReplaySelector(task_id=new_id())) is not None
-        assert _replay_observation_condition("task-spawn-reconcile", ReplaySelector(ingest_from=1, ingest_to=5)) is not None
+        assert _replay_observation_condition("task-spawn-reconcile", "1", ReplaySelector(task_id=new_id())) is not None
+        assert _replay_observation_condition("task-spawn-reconcile", "1", ReplaySelector(ingest_from=1, ingest_to=5)) is not None
 
 
 class TestReplaySelectorContract:
@@ -1074,3 +1188,261 @@ class TestReplayCli:
         )
         with pytest.raises(ValidationError):
             replay_cli.selector_from_args(args)
+
+
+class TestOwnershipIsConservativeInFact:
+    """The map states a rule; these pin that the entries obey it.
+
+    Review finding F1: ``ansich_steps`` sat in ``task-step``'s owned tuple while
+    ``task-control``'s branch writes ``status`` on it through
+    ``_close_settled_acting_steps``. The partition test could not see that --
+    it proves disjointness and coverage, which a wrong *assignment* satisfies
+    perfectly. So the rule itself is checked here.
+    """
+
+    def test_steps_are_shared_because_task_control_closes_them(self) -> None:
+        """The concrete regression, named so the reason survives the fix.
+
+        On a terminal Task Observation ``_project_control`` calls
+        ``_close_settled_acting_steps``, which flips ``ansich_steps.status`` to
+        ``closed``. If ``task-step`` owned the table, T5's
+        ``--replace --projector task-step`` would delete every Step and
+        re-derive from ``task-step``'s Observations alone: every Step
+        ``task-control`` had closed comes back ``acting`` and stays that way,
+        because nothing re-pends the ``task-control`` job that closed it.
+        """
+
+        owned = {model for models in _PROJECTOR_OWNED_TABLES.values() for model in models}
+        assert AnsichStepRow not in owned
+        assert AnsichStepRow in _SHARED_REBUILT_TABLES
+
+    def test_no_owned_table_is_written_from_a_second_dispatch_branch(self) -> None:
+        """The rule, mechanised: one writing branch per owned table.
+
+        A static walk from each ``project_pending`` dispatch entry through the
+        helpers it calls, collecting the tables each one writes. It is a
+        deliberate **lower bound** on writes -- it sees constructor calls, bulk
+        ``delete``/``update``/upsert statements, and attribute assignment on a
+        local bound from a ``select``/``get`` of one model, which is the shape
+        ``_close_settled_acting_steps`` uses -- so a table it clears is not
+        thereby proven exclusive. What it does catch is exactly the class of
+        mistake F1 was, and catching that class is the point: the alternative
+        is re-deriving this by hand every time a projector gains a helper.
+        """
+
+        writers = _dispatch_branch_writers()
+        for projector_name, models in _PROJECTOR_OWNED_TABLES.items():
+            for model in models:
+                branches = writers.get(model.__table__.name, set())
+                assert branches <= {projector_name}, f"{model.__table__.name} is claimed by {projector_name} but written from {sorted(branches)}"
+
+
+class TestDigestExcludesWallClockColumns:
+    """Review finding F5: a digest must not hash "when the projection ran".
+
+    Two columns default to ``_utc_now`` inside a projector's owned set
+    (``ansich_content_occurrences.created_at``,
+    ``ansich_context_states.created_at``). Today a double replay agrees anyway,
+    because those rows are inserted only if absent and a replay never deletes
+    them -- so the wall clock is never re-stamped. T5's ``--replace`` deletes
+    them and re-derives, and the §11 digests would then differ **by
+    construction** with nothing going red, because the §11 test drives
+    ``task-heartbeat``, whose one owned table has no such column.
+    """
+
+    def test_the_excluded_set_is_exactly_the_wall_clock_defaults(self) -> None:
+        expected = {
+            ("ansich_content_occurrences", "created_at"),
+            ("ansich_context_states", "created_at"),
+            ("ansich_environment_coverage", "updated_at"),
+            ("ansich_environment_state", "updated_at"),
+        }
+        assert _DIGEST_EXCLUDED_COLUMNS == expected
+
+    @pytest.mark.anyio
+    async def test_an_excluded_column_cannot_move_the_digest(
+        self,
+        backend: tuple[SqlAnsichBackend, async_sessionmaker],
+        populated: dict[str, object],
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """The mechanism, driven on a table the fixture actually populates.
+
+        The four real exclusions live on tables this fixture has no rows for
+        (they need step/tool/environment Observations), so the exclusion is
+        exercised by pointing it at a heartbeat column instead. What is under
+        test is that an excluded column is genuinely dropped from the payload,
+        not which columns are on the list -- that is the structural pin above.
+        """
+
+        sql_backend, sessions = backend
+        monkeypatch.setattr(
+            "deerflow.ansich.persistence.sql._DIGEST_EXCLUDED_COLUMNS",
+            {("ansich_task_heartbeats", "elapsed_ms")},
+        )
+        before = await sql_backend.read_model_digest("task-heartbeat")
+        async with sessions() as session, session.begin():
+            row = await session.scalar(select(AnsichTaskHeartbeatRow).limit(1))
+            row.elapsed_ms = row.elapsed_ms + 4242
+        assert await sql_backend.read_model_digest("task-heartbeat") == before
+
+
+class TestDurableFailuresAreNotSilent:
+    @pytest.mark.anyio
+    async def test_a_durably_failed_job_in_the_target_blocks_the_digest(
+        self,
+        backend: tuple[SqlAnsichBackend, async_sessionmaker],
+        populated: dict[str, object],
+    ) -> None:
+        """Review finding F3. ``failed`` is settled, badly -- and not `unsettled`.
+
+        ``unsettled_job_count`` counts pending/retry/processing only, so a
+        durably failed job is the one state in which owned rows are *known*
+        never to have been written and the old gate did not fire. A digest over
+        that store is the precise thing the gate exists to refuse.
+        """
+
+        sql_backend, sessions = backend
+        other_task_heartbeat = sorted(populated["all_heartbeats"] - populated["heartbeats_a"])[0]
+        async with sessions() as session, session.begin():
+            await session.execute(
+                update(AnsichProjectionJobRow)
+                .where(
+                    AnsichProjectionJobRow.projector_name == "task-heartbeat",
+                    AnsichProjectionJobRow.obs_id == other_task_heartbeat,
+                )
+                .values(status="failed", attempts=5, last_error="poisoned")
+            )
+
+        report = await execute_replay(
+            sql_backend,
+            projector_name="task-heartbeat",
+            projector_version="1",
+            # Deliberately not the failed row's Task: a replay that re-pended it
+            # would have repaired the very state under test.
+            selector=ReplaySelector(task_id=populated["task_a"]),
+        )
+        assert report.unsettled == 0
+        assert report.failed == 1
+        assert report.digest is None
+        assert any("durably failed" in error for error in report.errors)
+
+    @pytest.mark.anyio
+    async def test_a_replay_refreshes_the_process_failed_job_count(
+        self,
+        backend: tuple[SqlAnsichBackend, async_sessionmaker],
+        populated: dict[str, object],
+    ) -> None:
+        """Review finding F4: an operator's own remedy left the service degraded.
+
+        The re-pend clears ``failed`` rows in the database, but
+        ``SqlAnsichBackend._failed_jobs`` -- what the process-local health block
+        reports, and what ``lifecycle.derive_status`` keys ``degraded`` on -- is
+        only recomputed at start, rebuild, retry and the assessor-error path.
+        Without a refresh here, a successful replay leaves the service reporting
+        ``degraded`` for the rest of the process's life beside a database block
+        that says ``failed_jobs: 0``.
+        """
+
+        sql_backend, sessions = backend
+        async with sessions() as session, session.begin():
+            await session.execute(update(AnsichProjectionJobRow).where(AnsichProjectionJobRow.projector_name == "task-heartbeat").values(status="failed", attempts=5, last_error="poisoned"))
+        sql_backend._failed_jobs = 5
+
+        report = await execute_replay(sql_backend, projector_name="task-heartbeat", projector_version="1", selector=ReplaySelector())
+        assert report.failed == 0
+        assert sql_backend.get_projection_metrics()["failed_jobs"] == 0
+
+    @pytest.mark.anyio
+    async def test_the_drive_loop_cannot_spin_forever_inside_one_round(
+        self,
+        backend: tuple[SqlAnsichBackend, async_sessionmaker],
+        populated: dict[str, object],
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Review finding F8: only the outer round count was bounded.
+
+        A store ingesting faster than the loop drains would keep
+        ``project_pending`` returning non-zero, and the inner ``while`` exits
+        only on a zero. The rebuild has the same shape but holds both locks
+        while it does it; the replay's drive loop deliberately holds neither, so
+        it is the more exposed of the two. Simulated with a claim that never
+        runs dry.
+        """
+
+        sql_backend, _ = backend
+        calls = {"count": 0}
+
+        async def never_dry(*, limit: int = 200) -> int:
+            calls["count"] += 1
+            return 1
+
+        monkeypatch.setattr(sql_backend, "project_pending", never_dry)
+        report = await execute_replay(
+            sql_backend,
+            projector_name="task-heartbeat",
+            projector_version="1",
+            selector=ReplaySelector(),
+            max_rounds=2,
+            max_drain_batches=3,
+        )
+        assert calls["count"] == 6
+        assert report.replayed == 6
+
+
+class TestRefusalCarriesTheVersion:
+    def test_a_time_filter_refusal_names_the_version_that_was_asked_for(self) -> None:
+        """Review finding F6. Every other refusal in the taxonomy carries it."""
+
+        with pytest.raises(ReplayTargetError) as caught:
+            _replay_observation_condition(
+                "task-spawn-reconcile",
+                "1",
+                ReplaySelector(occurred_from=_OCCURRED_AT, occurred_to=_OCCURRED_AT + timedelta(hours=1)),
+            )
+        assert caught.value.reason == "time_filter_unsupported"
+        assert caught.value.projector_version == "1"
+
+
+class TestExitCodesAreHonest:
+    """Review finding F2: the exit code was the only machine-readable half."""
+
+    def _report(self, **overrides: object) -> ReplayReport:
+        base = {
+            "projector_name": "task-heartbeat",
+            "projector_version": "1",
+            "targeted": 3,
+            "minted": 0,
+            "re_pended": 3,
+            "replayed": 3,
+            "unsettled": 0,
+            "failed": 0,
+            "digest": "abc",
+            "dry_run": False,
+        }
+        return ReplayReport(**{**base, **overrides})
+
+    def test_durably_failed_jobs_page(self) -> None:
+        """``unsettled`` excludes ``failed``, so this used to exit ``0``.
+
+        A cron wrapper that pages on non-zero accepted a replay that left N
+        projections permanently unlanded, with the fact visible only in prose
+        the CLI's own docstring says a script will get wrong.
+        """
+
+        assert replay_cli.exit_code(self._report(failed=2, digest=None, errors=("2 job(s) durably failed",))) == 1
+
+    def test_a_projector_owning_no_table_still_exits_clean(self) -> None:
+        """The false alarm the obvious fix would introduce.
+
+        ``digest is None`` is not by itself an incomplete pass: three
+        projectors own no table exclusively and honestly have no digest, and
+        paging on that would train an operator to ignore the exit code.
+        """
+
+        assert replay_cli.exit_code(self._report(projector_name="task-structural", digest=None)) == 0
+
+    def test_unsettled_work_pages_and_a_clean_pass_does_not(self) -> None:
+        assert replay_cli.exit_code(self._report(unsettled=2, digest=None)) == 1
+        assert replay_cli.exit_code(self._report()) == 0
+        assert replay_cli.exit_code(self._report(dry_run=True, digest=None)) == 0

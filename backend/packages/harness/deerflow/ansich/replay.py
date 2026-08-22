@@ -13,7 +13,9 @@ this order and no other:
    waits (plan ruling RC1). Each round drains the claim queue and then runs one
    assessment pass, the same shape ``_rebuild_projections_locked`` uses -- a
    re-projected Observation enqueues assessor jobs, and nothing but
-   ``assess_operations`` settles those.
+   ``assess_operations`` settles those. Both the round count *and* the drain
+   inside each round are capped, so the whole pass is bounded even against a
+   store that keeps minting.
 4. **Digest the result**, but only if step 3 actually reached settled.
 
 Observations and payloads are never written, never deleted, and never replayed
@@ -69,8 +71,20 @@ DEFAULT_MAX_ROUNDS = 5
 #: Jobs claimed per ``project_pending`` call. The same figure the rebuild's own
 #: drain loop uses; it bounds one transaction, not the pass.
 DEFAULT_BATCH_LIMIT = 200
+#: How many ``project_pending`` calls one round makes before it stops draining
+#: and re-reads the backlog, whatever the last call returned.
+#:
+#: Without it the inner drain exits only on a call that claims nothing, so a
+#: store ingesting faster than the loop drains never finishes a round and the
+#: outer ``max_rounds`` bound never gets to apply (review finding F8). The
+#: rebuild's drain has the same shape, but it runs holding both the maintenance
+#: lock and the caller's projector lock, whereas this loop deliberately holds
+#: neither -- so the replay is the more exposed of the two. Hitting the cap
+#: ends the round early and is not an error: the recount that follows reports
+#: what is still owed, exactly as a naturally-drained round would.
+DEFAULT_MAX_DRAIN_BATCHES = 500
 
-__all__ = ["DEFAULT_BATCH_LIMIT", "DEFAULT_MAX_ROUNDS", "execute_replay", "plan_replay"]
+__all__ = ["DEFAULT_BATCH_LIMIT", "DEFAULT_MAX_DRAIN_BATCHES", "DEFAULT_MAX_ROUNDS", "execute_replay", "plan_replay"]
 
 
 async def plan_replay(
@@ -105,9 +119,12 @@ async def plan_replay(
         selector=selector,
     )
     unsettled = await backend.unsettled_job_count()
+    failed = await backend.failed_projection_job_count(projector_name=projector_name, projector_version=projector_version)
     errors = ["dry run: nothing was written, so no digest was computed"]
     if unsettled:
         errors.append(f"{unsettled} job(s) unsettled in the store before this replay")
+    if failed:
+        errors.append(f"{failed} job(s) durably failed for {projector_name}@{projector_version} before this replay")
     return ReplayReport(
         projector_name=projector_name,
         projector_version=projector_version,
@@ -116,6 +133,7 @@ async def plan_replay(
         re_pended=re_pended,
         replayed=0,
         unsettled=unsettled,
+        failed=failed,
         errors=tuple(errors),
         watermark=await backend.projection_continuity_mark(),
         digest=None,
@@ -131,6 +149,7 @@ async def execute_replay(
     selector: ReplaySelector | None = None,
     max_rounds: int = DEFAULT_MAX_ROUNDS,
     batch_limit: int = DEFAULT_BATCH_LIMIT,
+    max_drain_batches: int = DEFAULT_MAX_DRAIN_BATCHES,
 ) -> ReplayReport:
     """Re-derive a projector's read models over a slice of history.
 
@@ -171,7 +190,7 @@ async def execute_replay(
     replayed = 0
     unsettled = await backend.unsettled_job_count()
     for _ in range(max(max_rounds, 1)):
-        while True:
+        for _ in range(max(max_drain_batches, 1)):
             processed = await backend.project_pending(limit=batch_limit)
             replayed += processed
             if processed == 0:
@@ -195,18 +214,30 @@ async def execute_replay(
 
     errors: list[str] = []
     if unsettled:
-        errors.append(f"{unsettled} job(s) still unsettled after {max(max_rounds, 1)} round(s); the store still owes work, run the replay again")
+        errors.append(f"{unsettled} job(s) still unsettled after {max(max_rounds, 1)} round(s); the store still owes work, run the replay again or raise --max-rounds")
+    # Durably failed jobs are *settled*, badly, so they never appear in
+    # `unsettled` -- a pass can report a clean settle and still have left
+    # projections that never landed. It is scoped to the target
+    # `(projector, version)` because that is what the digest below hashes: a
+    # failure in another projector cannot leave a row missing from *this*
+    # projector's exclusively-owned tables. It is **not** scoped to the
+    # selector, so a filtered replay reports failures elsewhere in the same
+    # projector too -- deliberate (a durable failure anywhere in it is worth
+    # saying), but it means the number is not always this pass's own doing.
     failed = await backend.failed_projection_job_count(projector_name=projector_name, projector_version=projector_version)
     if failed:
-        # Durably failed jobs are *settled*, badly, so they never appear in
-        # `unsettled` -- a pass can report a clean settle and still have left
-        # projections that never landed. Saying so here is the only place an
-        # operator driving a replay would see it.
         errors.append(f"{failed} job(s) durably failed for {projector_name}@{projector_version}; see GET /operations/failed-jobs")
 
     digest: str | None = None
     if unsettled:
         errors.append("no digest: a digest over a store that still owes work describes a state nobody asked for")
+    elif failed:
+        # The same gate, for the one state in which owned rows are *known*
+        # never to have been written. `unsettled` cannot see it -- a durably
+        # failed job is settled -- so without this clause the digest describes a
+        # read model with holes in it and compares unequal against the same
+        # history replayed successfully, with nothing but prose to say why.
+        errors.append("no digest: durably failed jobs mean rows this projector owns were never written")
     elif not _PROJECTOR_OWNED_TABLES.get(projector_name):
         errors.append(f"no digest: {projector_name} owns no read-model table exclusively, and hashing the empty set would report determinism nobody established")
     else:
@@ -220,6 +251,7 @@ async def execute_replay(
         re_pended=re_pended,
         replayed=replayed,
         unsettled=unsettled,
+        failed=failed,
         errors=tuple(errors),
         watermark=await backend.projection_continuity_mark(),
         digest=digest,

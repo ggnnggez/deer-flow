@@ -192,7 +192,7 @@ from ansich.usage import (
     child_task_contribution_for_tool_started,
     usage_contributions_for_observation,
 )
-from sqlalchemy import and_, case, delete, func, or_, select, text, update
+from sqlalchemy import DateTime, and_, case, delete, func, or_, select, text, update
 from sqlalchemy.dialects.postgresql import insert as postgresql_insert
 from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 from sqlalchemy.exc import DisconnectionError, InterfaceError, OperationalError
@@ -522,7 +522,6 @@ _PROJECTOR_OWNED_TABLES: dict[str, tuple[type[Base], ...]] = {
     "task-structural": (),
     "task-control": (AnsichTransitionRow,),
     "task-step": (
-        AnsichStepRow,
         AnsichLlmAttemptRow,
         AnsichToolCallRow,
         AnsichToolCallResultRow,
@@ -542,6 +541,18 @@ _PROJECTOR_OWNED_TABLES: dict[str, tuple[type[Base], ...]] = {
         AnsichContextStateCheckpointItemRow,
         AnsichContextStateMissingBlockRow,
     ),
+    # ``ansich_steps`` is deliberately NOT here, and the reason is the exact
+    # failure the conservative rule exists to prevent (review finding F1). On a
+    # terminal Task Observation ``_project_control`` calls
+    # ``_close_settled_acting_steps``, which writes ``status = "closed"`` onto
+    # Step rows -- a second dispatch branch writing the table. Had ``task-step``
+    # owned it, T5's ``--replace --projector task-step`` would delete every Step
+    # and re-derive from ``task-step``'s Observations alone: every Step
+    # ``task-control`` had closed comes back ``acting`` and stays that way
+    # forever, because nothing re-pends the ``task-control`` job that closed it,
+    # and ``list_steps``, the active-Task read model and
+    # ``_assess_and_reconcile_dwell`` all read that column. Pinned by
+    # ``TestOwnershipIsConservativeInFact``.
     "task-usage": (),
     "task-budget": (AnsichTaskBudgetRow,),
     "task-heartbeat": (AnsichTaskHeartbeatRow,),
@@ -576,6 +587,11 @@ _SHARED_REBUILT_TABLES: tuple[type[Base], ...] = (
     AnsichEntityRow,
     AnsichTaskRow,
     AnsichTaskSummaryRow,
+    # ``task-step`` creates Step rows; ``task-control`` closes them
+    # (``_close_settled_acting_steps``). Two branches, so neither owns it --
+    # see the note above ``task-usage`` in the owned map for what claiming it
+    # would have cost ``--replace``.
+    AnsichStepRow,
     AnsichScopeRow,
     AnsichRelationRow,
     AnsichRelationEvidenceRow,
@@ -599,6 +615,46 @@ _SHARED_REBUILT_TABLES: tuple[type[Base], ...] = (
 #: replay must never touch them. ``ansich_active_task_read_model`` is the one
 #: exception a replay does write, and it deletes rows for a reason that has
 #: nothing to do with ownership (PB7, see ``mint_replay_jobs``).
+#: ``(table, column)`` pairs the read-model digest drops before hashing: every
+#: timestamp column filled in by a Python-side callable default -- i.e. stamped
+#: with the wall clock at insert time (``models._utc_now``) rather than derived
+#: from the Observation.
+#:
+#: **A determinism digest must not hash "when the projection ran"** (review
+#: finding F5). Today a double replay of ``task-step`` agrees anyway, but only
+#: by accident of one projector property nobody wrote down: those rows are
+#: inserted **only if absent** and a replay never deletes them, so the clock is
+#: never re-stamped. T5's ``--replace`` deletes the owned tables and re-derives,
+#: at which point ``created_at`` is stamped at the new projection time and the
+#: §11 digests differ *by construction* — with nothing going red, because the
+#: §11 test drives ``task-heartbeat``, whose one owned table has no such column.
+#:
+#: Derived from the model metadata rather than listed by hand, so a column
+#: added later with the same default is excluded without anyone remembering to.
+#: Two of the four are the motivating pair
+#: (``ansich_content_occurrences.created_at``,
+#: ``ansich_context_states.created_at``); the environment pair is collateral —
+#: ``_project_environment`` always passes ``observation.recorded_at``
+#: explicitly, so their default is never taken and dropping them costs a little
+#: sensitivity for a rule that needs no exceptions.
+#:
+#: What this does **not** cover, and T5 must check before ``--replace`` ships:
+#: whether every owned table's primary key is derived from Observation content
+#: rather than minted fresh. A randomly-keyed read-model row would break
+#: replace-and-compare the same way, and this exclusion would not save it.
+_DIGEST_EXCLUDED_COLUMNS: set[tuple[str, str]] = {
+    (model.__table__.name, column.name)
+    for models in _PROJECTOR_OWNED_TABLES.values()
+    for model in models
+    for column in model.__table__.columns
+    # Matched on the *shape* rather than on ``arg is _utc_now``: SQLAlchemy wraps
+    # a zero-argument default in a context-taking lambda and copies the original
+    # ``__name__`` onto it, so an identity test silently matches nothing. A
+    # ``DateTime`` column with a callable default is precisely the hazard class,
+    # and the JSON ``list``/``dict`` defaults elsewhere in these tables are not
+    # ``DateTime``, so nothing deterministic is caught by it.
+    if isinstance(column.type, DateTime) and column.default is not None and column.default.is_callable
+}
 _NON_PROJECTOR_REBUILT_TABLES: tuple[type[Base], ...] = (
     AnsichAlertReadModelRow,
     AnsichAlertWorkflowEventRow,
@@ -865,7 +921,7 @@ def _validate_replay_target(projector_name: str, version: str) -> None:
     return None
 
 
-def _replay_observation_condition(projector_name: str, selector: ReplaySelector):
+def _replay_observation_condition(projector_name: str, projector_version: str, selector: ReplaySelector):
     """The WHERE clause naming a replay's target Observations.
 
     Four predicates, ANDed, each chosen so an index serves it -- because this
@@ -904,7 +960,7 @@ def _replay_observation_condition(projector_name: str, selector: ReplaySelector)
             f"Ansich projector {projector_name!r} claims no Observation kinds, so an occurred_at window over it has no index to stand on; filter by task or ingest range instead",
             reason="time_filter_unsupported",
             projector_name=projector_name,
-            projector_version="",
+            projector_version=projector_version,
         )
     conditions = []
     if kinds:
@@ -2333,7 +2389,7 @@ class SqlAnsichBackend:
         rather than merely useless.
         """
 
-        condition = _replay_observation_condition(projector_name, selector)
+        condition = _replay_observation_condition(projector_name, projector_version, selector)
         job_exists = _replay_job_exists_condition(projector_name, projector_version)
         mint_allowed = bool(_PROJECTOR_KINDS.get(projector_name))
         async with self._session_factory() as session:
@@ -2411,9 +2467,29 @@ class SqlAnsichBackend:
 
         Observations and payloads are never written, read-only, always
         (Global Constraint 3).
+
+        **Cost shape, because it is paid under the lock.** The mint loop
+        re-evaluates ``condition AND NOT EXISTS(job)`` each pass instead of
+        paging by offset -- offset paging would *skip* rows, since every row it
+        inserts stops matching the predicate and shifts the window. The price
+        is ``ceil(N / batch_size)`` evaluations of the target predicate plus
+        ``N`` per-row INSERTs, all inside one transaction holding
+        ``_maintenance_lock``: on PostgreSQL a second operator queues behind it
+        and, past ``database.command_timeout`` (30s), fails loudly rather than
+        waiting. For a filtered replay that is nothing; for an unfiltered mint
+        of a version that has never run, ``N`` is the whole store. A single
+        ``INSERT … SELECT … WHERE NOT EXISTS`` with a database-side id would be
+        both correct and one statement, and is the shape to reach for if this
+        ever becomes the bottleneck (it needs a portable id expression, which
+        is why it is not written that way today).
+
+        The final read-model delete then materialises every doomed ``task_id``
+        as bind parameters, which asyncpg caps at 32767 per statement -- the
+        ceiling that matters only for an unfiltered replay of a store with more
+        active Tasks than that.
         """
 
-        condition = _replay_observation_condition(projector_name, selector)
+        condition = _replay_observation_condition(projector_name, projector_version, selector)
         job_exists = _replay_job_exists_condition(projector_name, projector_version)
         mint_allowed = bool(_PROJECTOR_KINDS.get(projector_name))
         now = datetime.now(UTC)
@@ -2477,6 +2553,17 @@ class SqlAnsichBackend:
                         await session.flush()
                         minted += len(obs_ids)
                 await self._clear_frozen_active_task_rows(session, selector=selector, condition=condition)
+        # The re-pend clears `failed` rows in the database, so the process-local
+        # count this worker reports is now stale in the direction that matters:
+        # `lifecycle.derive_status` keys `degraded` on it, and nothing else in a
+        # replay recomputes it (it is only ever incremented, or recomputed at
+        # start, rebuild, retry and the assessor-error path). Without this an
+        # operator's own successful remedy leaves the service reporting
+        # `degraded` for the rest of the process's life beside a `database`
+        # block that says `failed_jobs: 0`. Both siblings do the same thing --
+        # `_rebuild_projections_locked` zeroes it, `retry_failed_projections`
+        # recomputes it -- and outside the lock, because it is a read.
+        await self._refresh_failed_job_count()
         return minted, int(re_pended or 0)
 
     async def _clear_frozen_active_task_rows(
@@ -2554,8 +2641,9 @@ class SqlAnsichBackend:
         async with self._session_factory() as session:
             for model in tables:
                 table = model.__table__
-                column_names = [column.name for column in table.columns]
-                rows = (await session.execute(select(*table.columns).order_by(*table.primary_key.columns))).all()
+                columns = [column for column in table.columns if (table.name, column.name) not in _DIGEST_EXCLUDED_COLUMNS]
+                column_names = [column.name for column in columns]
+                rows = (await session.execute(select(*columns).order_by(*table.primary_key.columns))).all()
                 payload.append(
                     [
                         table.name,
