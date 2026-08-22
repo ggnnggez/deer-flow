@@ -21,28 +21,48 @@ head, then downgrade back to 0027 and up again), and on PostgreSQL by
 
 from __future__ import annotations
 
+import ast
 import asyncio
 import importlib
-from datetime import UTC, datetime
+import inspect
+from collections.abc import AsyncIterator
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
+from typing import get_args
 
 import pytest
 import sqlalchemy as sa
 import yaml
 from alembic import command as alembic_command
+from ansich import ObservationEnvelope, RetentionPolicy, new_id
+from ansich.errors import PayloadExpiredError
+from ansich.evaluation import EvaluationProjectionStatus
 from pydantic import ValidationError
-from sqlalchemy import create_engine, event, select
+from sqlalchemy import create_engine, event, func, select, update
 from sqlalchemy.exc import IntegrityError
-from sqlalchemy.ext.asyncio import create_async_engine
+from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 from sqlalchemy.orm import Session
 
 # Pre-import models so ``Base.metadata`` carries the DeerFlow tables too.
 import deerflow.persistence.models  # noqa: F401
+from deerflow.ansich import retention_policy_from_config
+from deerflow.ansich.persistence import sql as sql_module
 from deerflow.ansich.persistence.models import (
     AnsichActiveVersionRow,
+    AnsichAgentReleaseRow,
+    AnsichContentBlobRow,
+    AnsichEntityRow,
     AnsichObservationRow,
     AnsichPayloadRow,
+    AnsichProjectionJobRow,
     AnsichRetentionStateRow,
+)
+from deerflow.ansich.persistence.sql import (
+    _PAYLOAD_REFERRER_TIERS,
+    _PG_MAINTENANCE_LOCK_KEY,
+    _PG_RETENTION_LOCK_KEY,
+    SqlAnsichBackend,
+    _payload_referrer_columns,
 )
 from deerflow.config.ansich_config import AnsichConfig, AnsichRetentionConfig
 from deerflow.config.reload_boundary import STARTUP_ONLY_FIELDS
@@ -956,3 +976,1016 @@ async def test_the_downgrade_runs_with_the_check_already_absent(tmp_path: Path):
         assert body == b"{}\n\n"
     finally:
         await engine.dispose()
+
+
+# ---------------------------------------------------------------------------
+# 5. Tier 1 — payload tombstoning, and the horizon machinery behind it
+# ---------------------------------------------------------------------------
+#
+# Everything below drives the real ingest path rather than inserting rows,
+# because what tier 1 is aimed at is what live ingest produces: a payload row
+# minted by externalization, referenced by exactly the Observation that owns
+# it, aged by that Observation's *event* time. The two exceptions insert rows
+# directly and say why at the test — a shared payload and a release manifest
+# are shapes the ingest path cannot produce on demand.
+
+_RETENTION_OCCURRED_AT = datetime(2026, 7, 1, 12, 0, tzinfo=UTC)
+#: Ten days after the evidence happened, so a seven-day payload policy has
+#: expired it and a thirty-day Observation policy has not. Past-dated for the
+#: same reason every fixture clock in this suite is: a test that computes its
+#: own "now" from the wall clock stops being a test of the cutoff.
+_RETENTION_NOW = _RETENTION_OCCURRED_AT + timedelta(days=10)
+_POLICY = RetentionPolicy(
+    raw_payload_days=7,
+    observation_days=30,
+    structural_days=90,
+    cleanup_batch_size=2,
+)
+
+
+@pytest.fixture
+async def retention_backend(tmp_path: Path) -> AsyncIterator[tuple[SqlAnsichBackend, async_sessionmaker]]:
+    """One worker over one SQLite file, externalizing **every** payload.
+
+    ``inline_payload_max_bytes=1`` is the whole fixture: it puts every
+    Observation's payload in ``ansich_payloads`` instead of inline, which is
+    what makes tier 1 reachable at all from ordinary ingest. Production crosses
+    that threshold with an 800-metric environment sample; a test should not have
+    to build one.
+    """
+
+    engine = create_async_engine(f"sqlite+aiosqlite:///{(tmp_path / 'ansich-retention-exec.db').as_posix()}")
+    async with engine.begin() as connection:
+        await connection.run_sync(Base.metadata.create_all)
+    sessions = async_sessionmaker(engine, expire_on_commit=False)
+    try:
+        yield SqlAnsichBackend(sessions, inline_payload_max_bytes=1), sessions
+    finally:
+        await engine.dispose()
+
+
+def _retention_task_created(task_id: str, *, source_id: str = "run-retention") -> ObservationEnvelope:
+    return ObservationEnvelope.task_lifecycle(
+        kind="task.created",
+        task_id=task_id,
+        source_kind="deerflow_run",
+        source_id=source_id,
+        occurred_at=_RETENTION_OCCURRED_AT,
+        source_event_id=f"run:{source_id}:task:created",
+    )
+
+
+def _retention_heartbeat(task_id: str, *, ordinal: int, source_id: str = "run-retention", occurred_at: datetime | None = None) -> ObservationEnvelope:
+    return ObservationEnvelope.task_heartbeat(
+        task_id=task_id,
+        run_id=source_id,
+        occurred_at=occurred_at or _RETENTION_OCCURRED_AT,
+        elapsed_ms=1000 * ordinal,
+        worker_id="worker-retention",
+        ownership_epoch="epoch-1",
+        source_event_id=f"run:{source_id}:heartbeat:{ordinal}",
+        producer_seq=ordinal,
+    )
+
+
+async def _settle_retention(backend: SqlAnsichBackend, *, rounds: int = 5) -> None:
+    """Drain the claim queue in bounded rounds (Constraint 11's loop shape)."""
+
+    for _ in range(max(rounds, 1)):
+        while await backend.project_pending(limit=200):
+            pass
+        if await backend.unsettled_job_count() == 0:
+            return
+
+
+async def _unsettled_projection_jobs(sessions: async_sessionmaker) -> int:
+    """Projection jobs still owed, ignoring the assessor family.
+
+    Scoped deliberately. ``unsettled_job_count`` spans both job tables, and
+    assessor jobs are settled by ``assess_operations`` rather than by
+    ``project_pending`` — a heartbeat leaves one behind that nothing in these
+    tests drives. What every assertion below is actually about is the
+    *projection* queue: whether an expired payload stalls it, and whether a
+    payload with work still in flight is protected. Counting the assessor
+    backlog into that would be measuring a different thing and calling it this
+    one.
+    """
+
+    async with sessions() as session:
+        return int(
+            await session.scalar(
+                select(func.count()).select_from(AnsichProjectionJobRow).where(AnsichProjectionJobRow.status.in_(("pending", "retry", "processing"))),
+            )
+            or 0
+        )
+
+
+async def _payload_rows(sessions: async_sessionmaker) -> dict[str, AnsichPayloadRow]:
+    async with sessions() as session:
+        rows = (await session.execute(select(AnsichPayloadRow))).scalars()
+        return {row.payload_id: row for row in rows}
+
+
+async def _settled_store(backend: SqlAnsichBackend, *, heartbeats: int = 3) -> str:
+    task_id = new_id()
+    envelopes: list[ObservationEnvelope] = [_retention_task_created(task_id)]
+    envelopes.extend(_retention_heartbeat(task_id, ordinal=index + 1) for index in range(heartbeats))
+    assert await backend.persist_and_project(envelopes) == len(envelopes)
+    await _settle_retention(backend)
+    return task_id
+
+
+@pytest.mark.anyio
+async def test_an_expired_payload_body_becomes_a_tombstone_with_its_lineage_intact(retention_backend):
+    """D6-3's first tier: the body goes, the row and its lineage stay.
+
+    The two halves are asserted together because either alone is the wrong
+    outcome. Deleting the row would make every hydrator raise for a *policy*
+    outcome; keeping the body would make the policy decorative. What must
+    survive is exactly the pair that lets a later reader say what the bytes were
+    without saying what they said.
+    """
+
+    backend, sessions = retention_backend
+    await _settled_store(backend)
+    before = await _payload_rows(sessions)
+    assert before, "the fixture must actually externalize payloads"
+    lineage = {payload_id: (row.sha256, row.byte_size, row.content_type) for payload_id, row in before.items()}
+
+    report = await backend.run_retention(_POLICY, now=_RETENTION_NOW)
+
+    assert report.payload_tombstoned == len(before)
+    assert report.finished is True
+    assert report.resumed_from_cursor is False
+    assert report.started_at == _RETENTION_NOW
+    # Tiers 2 and 3 did not run in this build, and the report says so with
+    # `None` rather than lying about an empty sweep.
+    assert report.observations_deleted is None
+    assert report.structural_deleted is None
+
+    after = await _payload_rows(sessions)
+    assert set(after) == set(before), "tier 1 must never delete a payload row"
+    for payload_id, row in after.items():
+        assert row.body is None
+        assert row.deleted_at is not None
+        assert row.policy == "raw_payload_days=7"
+        assert (row.sha256, row.byte_size, row.content_type) == lineage[payload_id]
+
+
+@pytest.mark.anyio
+async def test_a_payload_younger_than_the_policy_is_left_alone(retention_backend):
+    backend, sessions = retention_backend
+    await _settled_store(backend)
+
+    # Six days after the evidence, under a seven-day policy.
+    report = await backend.run_retention(_POLICY, now=_RETENTION_OCCURRED_AT + timedelta(days=6))
+
+    assert report.payload_tombstoned == 0
+    assert all(row.body is not None for row in (await _payload_rows(sessions)).values())
+
+
+@pytest.mark.anyio
+async def test_a_payload_with_any_referrer_younger_than_the_policy_is_skipped(retention_backend):
+    """One young referrer protects the whole payload.
+
+    Rows are inserted directly here because the shape under test — two
+    Observations sharing one payload row — is not something the ingest path
+    produces on demand, and it is exactly the shape a per-referrer answer would
+    get wrong. A body two Observations reference is expired only when *both* of
+    them are; expiring it on the older one's account would delete evidence the
+    younger one still needs, and the only symptom would be a reader that used to
+    work.
+    """
+
+    backend, sessions = retention_backend
+    async with sessions() as session, session.begin():
+        session.add(
+            AnsichPayloadRow(
+                payload_id="shared-payload",
+                content_type="application/json",
+                encoding="utf-8",
+                compression="none",
+                byte_size=2,
+                sha256="b" * 64,
+                body=b"{}",
+                created_at=_RETENTION_OCCURRED_AT,
+            )
+        )
+        await session.flush()
+        for suffix, occurred_at in (("old", _RETENTION_OCCURRED_AT), ("young", _RETENTION_NOW)):
+            row = _observation(f"obs-shared-{suffix}")
+            row.occurred_at = occurred_at
+            row.recorded_at = occurred_at
+            row.payload_json = None
+            row.payload_ref_id = "shared-payload"
+            session.add(row)
+
+    report = await backend.run_retention(_POLICY, now=_RETENTION_NOW)
+
+    assert report.payload_tombstoned == 0
+    assert (await _payload_rows(sessions))["shared-payload"].body == b"{}"
+
+
+@pytest.mark.anyio
+async def test_an_agent_release_manifest_is_never_expired_by_time_retention(retention_backend):
+    """A manifest is identity, not evidence, and is declared out of the tiers.
+
+    Asserted rather than left to the declaration, because the cost of getting it
+    wrong is invisible until someone opens a release page: ``release_hash`` is
+    derived from the manifest and every release detail and comparison read
+    returns it, so expiring it at seven days would blind those reads for every
+    release older than a week — including releases still bound to running Tasks.
+    """
+
+    backend, sessions = retention_backend
+    async with sessions() as session, session.begin():
+        session.add(
+            AnsichPayloadRow(
+                payload_id="manifest-payload",
+                content_type="application/vnd.ansich.agent-release+json",
+                encoding="utf-8",
+                compression="none",
+                byte_size=2,
+                sha256="c" * 64,
+                body=b"{}",
+                created_at=_RETENTION_OCCURRED_AT,
+            )
+        )
+        discovered = _observation("obs-release-discovered")
+        discovered.occurred_at = _RETENTION_OCCURRED_AT
+        discovered.recorded_at = _RETENTION_OCCURRED_AT
+        session.add(discovered)
+        await session.flush()
+        session.add(AnsichEntityRow(entity_id="release-1", entity_type="agent_release", discovered_obs_id="obs-release-discovered"))
+        await session.flush()
+        session.add(
+            AnsichAgentReleaseRow(
+                entity_id="release-1",
+                namespace="test",
+                agent_name="lead-agent",
+                release_hash="d" * 64,
+                schema_version=1,
+                model_hash="e" * 64,
+                prompt_hash="f" * 64,
+                tool_catalog_hash="0" * 64,
+                policy_hash="1" * 64,
+                runtime_build_id="build-1",
+                manifest_payload_id="manifest-payload",
+                discovered_obs_id="obs-release-discovered",
+                created_at=_RETENTION_OCCURRED_AT,
+            )
+        )
+
+    # A year on, and still not a candidate.
+    report = await backend.run_retention(_POLICY, now=_RETENTION_OCCURRED_AT + timedelta(days=365))
+
+    payloads = await _payload_rows(sessions)
+    assert payloads["manifest-payload"].body == b"{}"
+    assert payloads["manifest-payload"].deleted_at is None
+    assert report.payload_tombstoned == 0
+
+
+@pytest.mark.anyio
+async def test_a_payload_whose_observation_still_owes_a_projection_is_skipped(retention_backend):
+    """An in-flight job pins its evidence, whatever the evidence's age.
+
+    This is what keeps the expired-evidence claim path off the ordinary loop: a
+    projector that is about to read a body must find one. It is a separate
+    refusal from the age rule, so it is asserted on a payload the age rule would
+    otherwise have taken.
+    """
+
+    backend, sessions = retention_backend
+    task_id = new_id()
+    assert await backend.persist_and_project([_retention_task_created(task_id)]) == 1
+    # Deliberately not settled: the jobs minted with the Observation are still
+    # `pending`.
+    async with sessions() as session:
+        pending = int(await session.scalar(select(func.count()).select_from(AnsichProjectionJobRow).where(AnsichProjectionJobRow.status == "pending")) or 0)
+    assert pending > 0
+
+    report = await backend.run_retention(_POLICY, now=_RETENTION_NOW)
+
+    assert report.payload_tombstoned == 0
+    assert all(row.body is not None for row in (await _payload_rows(sessions)).values())
+
+
+@pytest.mark.anyio
+async def test_a_durably_failed_job_does_not_pin_its_payload_out_of_retention(retention_backend):
+    """``failed`` is settled, badly — it must not hold a body past its policy.
+
+    The other direction of the previous test, and the reason
+    ``_IN_FLIGHT_JOB_STATUSES`` is not simply ``_UNSETTLED_JOB_STATUSES``: a
+    durably failed job can sit there for as long as nobody retries it, and
+    counting it as in-flight would let one poison job keep its evidence
+    indefinitely. A retry that lands after the body expired settles as expired
+    evidence instead, which is a state the store can express.
+    """
+
+    backend, sessions = retention_backend
+    task_id = new_id()
+    assert await backend.persist_and_project([_retention_task_created(task_id)]) == 1
+    async with sessions() as session, session.begin():
+        await session.execute(update(AnsichProjectionJobRow).values(status="failed", attempts=5, last_error="boom"))
+
+    report = await backend.run_retention(_POLICY, now=_RETENTION_NOW)
+
+    assert report.payload_tombstoned == 1
+    assert all(row.body is None for row in (await _payload_rows(sessions)).values())
+
+
+@pytest.mark.anyio
+async def test_a_pass_killed_mid_tier_resumes_from_its_cursor_without_double_counting(retention_backend):
+    """D6-4's resumable cursor, proved by killing a pass in the middle.
+
+    The injected failure fires on the second batch, so the first batch's UPDATE
+    *and* its cursor advance are already committed and the rest is not. The
+    re-run must then tombstone exactly the remainder — not the whole set again
+    (which would restamp the first batch's policy and inflate the count) and not
+    the tail alone by accident of the predicate, which is why the assertion is
+    on the total across both passes as well as on each pass's own number.
+    """
+
+    backend, sessions = retention_backend
+    await _settled_store(backend, heartbeats=4)
+    total = len(await _payload_rows(sessions))
+    assert total >= 4, "the fixture needs more payloads than one batch holds"
+
+    calls = {"n": 0}
+    real_state = SqlAnsichBackend._retention_state
+
+    async def _explode_on_the_second_batch(session):
+        state = await real_state(session)
+        # The run marker's own transaction is call 1; batches start at 2.
+        calls["n"] += 1
+        if calls["n"] == 3:
+            raise RuntimeError("injected mid-tier failure")
+        return state
+
+    # Shadowed on the instance and then removed, rather than rebound: the real
+    # ``_retention_state`` is a ``staticmethod``, so rebinding it through
+    # ``__get__`` would hand it ``self`` as its session argument.
+    backend._retention_state = _explode_on_the_second_batch  # type: ignore[method-assign]
+    with pytest.raises(RuntimeError, match="injected mid-tier failure"):
+        await backend.run_retention(_POLICY, now=_RETENTION_NOW)
+    del backend._retention_state
+
+    after_crash = await _payload_rows(sessions)
+    tombstoned_first = [row for row in after_crash.values() if row.body is None]
+    assert len(tombstoned_first) == _POLICY.cleanup_batch_size
+    async with sessions() as session:
+        cursor = await session.scalar(select(AnsichRetentionStateRow.payload_cursor))
+        started = await session.scalar(select(AnsichRetentionStateRow.last_run_started_at))
+        finished = await session.scalar(select(AnsichRetentionStateRow.last_run_finished_at))
+    assert cursor is not None, "an interrupted pass must leave the cursor where it stopped"
+    assert started is not None and finished is None, "a pass that started and died is not a pass that never ran"
+
+    report = await backend.run_retention(_POLICY, now=_RETENTION_NOW)
+
+    assert report.resumed_from_cursor is True
+    assert report.payload_tombstoned == total - _POLICY.cleanup_batch_size
+    assert all(row.body is None for row in (await _payload_rows(sessions)).values())
+    async with sessions() as session:
+        assert await session.scalar(select(AnsichRetentionStateRow.payload_cursor)) is None
+
+
+@pytest.mark.anyio
+async def test_a_completed_pass_records_its_window_and_the_policy_it_ran_under(retention_backend):
+    """``last_run_policy``'s shape is this task's to set, so it is pinned here.
+
+    A flat mapping of the four field names to their integers and nothing else.
+    The pin is exact — key set *and* values — because the column's whole purpose
+    is to let a later reader tell which rule expired a row after the
+    configuration has been retuned, and a shape nobody pinned is a shape the
+    next writer changes.
+    """
+
+    backend, sessions = retention_backend
+    await _settled_store(backend)
+
+    report = await backend.run_retention(_POLICY, now=_RETENTION_NOW)
+
+    async with sessions() as session:
+        state = await session.get(AnsichRetentionStateRow, 1)
+    assert state is not None
+    assert state.last_run_policy == {
+        "raw_payload_days": 7,
+        "observation_days": 30,
+        "structural_days": 90,
+        "cleanup_batch_size": 2,
+    }
+    assert state.last_run_started_at is not None
+    assert state.last_run_finished_at is not None
+    assert report.finished_at >= report.started_at
+
+    last_run = await backend.get_retention_last_run()
+    assert last_run is not None
+    assert last_run.policy == state.last_run_policy
+    assert last_run.observation_horizon_ingest_seq == 0
+
+
+@pytest.mark.anyio
+async def test_retention_last_run_is_none_until_a_pass_has_run(retention_backend):
+    """Constraint 2: never run is ``None``, never an epoch-zero timestamp."""
+
+    backend, _sessions = retention_backend
+    assert await backend.get_retention_last_run() is None
+    await backend.run_retention(_POLICY, now=_RETENTION_NOW)
+    assert await backend.get_retention_last_run() is not None
+
+
+@pytest.mark.anyio
+async def test_the_horizon_starts_at_zero_and_zero_means_nothing_deleted(retention_backend):
+    """``0`` is an answer, not a missing value (T8's carried note).
+
+    ``ingest_seq`` starts at 1, so zero is the store saying "no Observation-tier
+    deletion has completed". A consumer that read it as unknown and fell back to
+    ``failed`` would reproduce the FC-3 flip on the one store where it is least
+    defensible: one where nothing has been deleted at all.
+    """
+
+    backend, _sessions = retention_backend
+    assert await backend.observation_retention_horizon() == 0
+    await backend.run_retention(_POLICY, now=_RETENTION_NOW)
+    assert await backend.observation_retention_horizon() == 0
+
+
+# ---------------------------------------------------------------------------
+# 6. RC6 — the three payload states at every reader
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.anyio
+async def test_the_hydrator_tells_present_expired_and_missing_apart(retention_backend):
+    """The three states, and the fourth thing that is none of them.
+
+    ``{}`` for a row that carried no payload at all stays its own answer (T2's
+    F6 note): it means the Observation carried nothing, which is a fact about
+    the Observation, while ``expired`` means it carried something nobody can
+    read any more. A reader that folded them would report deleted evidence as
+    absent evidence.
+    """
+
+    backend, sessions = retention_backend
+    task_id = new_id()
+    assert await backend.persist_and_project([_retention_task_created(task_id)]) == 1
+    await _settle_retention(backend)
+
+    async with sessions() as session:
+        row = (await session.execute(select(AnsichObservationRow))).scalars().first()
+        assert row is not None and row.payload_ref_id is not None
+        present = await backend._hydrated_observation_payload(session, row)
+    assert present.expired is False
+    assert isinstance(present.payload, dict) and present.payload
+
+    await backend.run_retention(_POLICY, now=_RETENTION_NOW)
+
+    async with sessions() as session:
+        row = await session.get(AnsichObservationRow, row.ingest_seq)
+        expired = await backend._hydrated_observation_payload(session, row)
+    assert expired.expired is True
+    assert expired.payload is None
+    assert expired.policy == "raw_payload_days=7"
+    assert expired.sha256 and expired.byte_size, "the lineage half is what an expired reader may still say"
+
+    # Missing stays loud: a payload row that is simply gone is corruption, and
+    # nothing about retention makes it less so — retention empties rows, it
+    # never deletes them.
+    async with sessions() as session, session.begin():
+        await session.execute(sa.delete(AnsichPayloadRow))
+    async with sessions() as session:
+        row = await session.get(AnsichObservationRow, row.ingest_seq)
+        with pytest.raises(RuntimeError, match="payload disappeared"):
+            await backend._hydrated_observation_payload(session, row)
+
+    # And the payload-less row is neither of those.
+    async with sessions() as session, session.begin():
+        bare = _observation("obs-bare")
+        bare.payload_json = {}
+        session.add(bare)
+    async with sessions() as session:
+        bare_row = (await session.execute(select(AnsichObservationRow).where(AnsichObservationRow.obs_id == "obs-bare"))).scalar_one()
+        bare_state = await backend._hydrated_observation_payload(session, bare_row)
+    assert bare_state.expired is False
+    assert bare_state.payload == {}
+
+
+@pytest.mark.anyio
+async def test_the_claim_path_settles_expired_evidence_instead_of_failing_it(retention_backend):
+    """A replay over expired evidence must not durably fail (RC6, PB7-adjacent).
+
+    ``failed`` is what the ``projection_failure`` Alert counts and what the
+    failed-job route lists, so failing here would raise a critical-looking alarm
+    about a configured deletion and every operator remedy would re-collide with
+    it forever. Leaving the row claimable is worse still: the claim is ordered
+    by ``ingest_seq``, so one expired row that is the lowest claimable one
+    stalls **all** projection in the process, silently.
+
+    Reached the way production reaches it: a rebuild re-pends jobs for
+    Observations whose payloads have since expired.
+    """
+
+    backend, sessions = retention_backend
+    await _settled_store(backend, heartbeats=2)
+    await backend.run_retention(_POLICY, now=_RETENTION_NOW)
+
+    outcome = await backend.rebuild_projections()
+    assert outcome.unsettled >= 0
+
+    await _settle_retention(backend)
+
+    async with sessions() as session:
+        statuses = list((await session.execute(select(AnsichProjectionJobRow.status))).scalars())
+        errors = [error for error in (await session.execute(select(AnsichProjectionJobRow.last_error))).scalars() if error]
+    assert statuses, "the rebuild must have re-pended something"
+    assert "failed" not in statuses, "an expired payload is a policy outcome, not a failure"
+    assert await _unsettled_projection_jobs(sessions) == 0, "an expired payload must not leave the projection queue stalled"
+    assert any("expired under retention" in error for error in errors), "the expiry has to be recorded somewhere durable"
+    assert any("raw_payload_days=7" in error for error in errors), "and it has to name the rule that did it"
+
+
+@pytest.mark.anyio
+async def test_scope_safety_degrades_over_expired_evidence_rather_than_raising(retention_backend):
+    """H6-A's decided answer, at the site that made it a hazard.
+
+    This read runs on every assessment tick for the Task, so a raise is a
+    per-tick, Task-wide stall (F10-23's shape). Skipping the row does not
+    fabricate anything either: an unreadable authorization snapshot contributes
+    no snapshot, and the assessment reads a ToolCall with fewer snapshots as
+    *less* verified rather than more — the direction is what makes the skip
+    safe.
+    """
+
+    backend, sessions = retention_backend
+    task_id = new_id()
+    assert await backend.persist_and_project([_retention_task_created(task_id)]) == 1
+    await _settle_retention(backend)
+    async with sessions() as session, session.begin():
+        session.add(
+            AnsichPayloadRow(
+                payload_id="expired-authz",
+                content_type="application/json",
+                encoding="utf-8",
+                compression="none",
+                byte_size=2,
+                sha256="9" * 64,
+                body=None,
+                deleted_at=_RETENTION_NOW,
+                policy="raw_payload_days=7",
+                created_at=_RETENTION_OCCURRED_AT,
+            )
+        )
+        await session.flush()
+        row = _observation("obs-expired-authz")
+        row.kind = "authorization.evaluated"
+        row.task_id = task_id
+        row.occurred_at = _RETENTION_OCCURRED_AT
+        row.recorded_at = _RETENTION_OCCURRED_AT
+        row.payload_json = None
+        row.payload_ref_id = "expired-authz"
+        session.add(row)
+        await session.flush()
+        watermark = row.ingest_seq
+
+    async with sessions() as session:
+        # No raise, and no fabricated conclusion either: the only evidence in
+        # the window was unreadable, so there is nothing to conclude about.
+        results = await backend._assess_scope_safety_at(
+            session,
+            task_id=task_id,
+            evidence_watermark=watermark,
+            window_start_exclusive=None,
+            now=_RETENTION_NOW,
+        )
+    assert results == ()
+
+
+@pytest.mark.anyio
+async def test_environment_history_counts_expired_samples_instead_of_dropping_them(retention_backend):
+    """An expired sample is neither a point nor a silent absence.
+
+    The series' own rule is that a missing metric is absent rather than zero, so
+    an expired sample cannot become a value. But reporting nothing at all would
+    make a deliberate deletion look exactly like a Scope that never sampled,
+    which is the one reading this view exists to prevent.
+    """
+
+    backend, sessions = retention_backend
+    scope_id = new_id()
+    async with sessions() as session, session.begin():
+        session.add(
+            AnsichPayloadRow(
+                payload_id="expired-sample",
+                content_type="application/json",
+                encoding="utf-8",
+                compression="none",
+                byte_size=2,
+                sha256="8" * 64,
+                body=None,
+                deleted_at=_RETENTION_NOW,
+                policy="raw_payload_days=7",
+                created_at=_RETENTION_OCCURRED_AT,
+            )
+        )
+        await session.flush()
+        row = _observation("obs-expired-sample")
+        row.kind = "environment.sampled"
+        row.subject_type = "scope"
+        row.subject_id = scope_id
+        # The history window is measured against the wall clock (the read takes
+        # no injectable `now`), so this one fixture timestamp has to be recent
+        # rather than past-dated. The assertion is about the expired *count*,
+        # not about the clock.
+        row.occurred_at = datetime.now(UTC) - timedelta(minutes=5)
+        row.recorded_at = row.occurred_at
+        row.payload_json = None
+        row.payload_ref_id = "expired-sample"
+        session.add(row)
+
+    view = await backend.get_environment_history(
+        scope_id=scope_id,
+        environment_scope="container",
+        metric="fd_open",
+        window_minutes=60,
+        max_points=100,
+    )
+
+    assert view.points == ()
+    assert view.expired_points == 1
+
+
+@pytest.mark.anyio
+async def test_a_raw_payload_read_answers_expired_rather_than_not_found(retention_backend):
+    """410, not 404 — the distinction the tombstone exists to make.
+
+    A raw-body read has nothing to degrade *to*, so it is the one family that
+    raises. What it must not do is answer "not found", which says the evidence
+    never was; this evidence was readable for as long as the policy kept it, and
+    the refusal carries the date and the rule that ended that.
+    """
+
+    backend, sessions = retention_backend
+    async with sessions() as session, session.begin():
+        session.add(
+            AnsichPayloadRow(
+                payload_id="expired-evaluation",
+                content_type="application/json",
+                encoding="utf-8",
+                compression="none",
+                byte_size=2,
+                sha256="7" * 64,
+                body=None,
+                deleted_at=_RETENTION_NOW,
+                policy="raw_payload_days=7",
+                created_at=_RETENTION_OCCURRED_AT,
+            )
+        )
+        await session.flush()
+        row = _observation("obs-expired-evaluation")
+        row.kind = "evaluation.recorded"
+        row.payload_json = None
+        row.payload_ref_id = "expired-evaluation"
+        session.add(row)
+
+    with pytest.raises(PayloadExpiredError) as raised:
+        await backend.get_evaluation_observation_payload("obs-expired-evaluation")
+
+    assert raised.value.payload_id == "expired-evaluation"
+    assert raised.value.policy == "raw_payload_days=7"
+    assert raised.value.sha256 == "7" * 64
+    assert raised.value.byte_size == 2
+
+    # An id that genuinely has no payload still answers `None`, so the two
+    # remain different answers rather than one.
+    assert await backend.get_evaluation_observation_payload("obs-that-never-was") is None
+
+
+@pytest.mark.anyio
+async def test_the_content_blob_collision_check_falls_back_to_the_tombstone_lineage(retention_backend):
+    """The retained digest answers the question the bytes used to answer.
+
+    The check exists to prove two writers agreeing on a ``blob_key`` really
+    agree on the bytes. An expired body cannot be compared — but it does not
+    have to be, because ``sha256``/``byte_size`` were retained for exactly this.
+    Degrading to "assume they match" would let a genuine collision through
+    unnoticed on any store old enough to have run retention.
+    """
+
+    backend, sessions = retention_backend
+    async with sessions() as session, session.begin():
+        session.add(
+            AnsichPayloadRow(
+                payload_id="expired-blob-payload",
+                content_type="application/json",
+                encoding="utf-8",
+                compression="none",
+                byte_size=len(b'{"a": 1}'),
+                sha256=__import__("hashlib").sha256(b'{"a": 1}').hexdigest(),
+                body=None,
+                deleted_at=_RETENTION_NOW,
+                policy="raw_payload_days=7",
+                created_at=_RETENTION_OCCURRED_AT,
+            )
+        )
+        await session.flush()
+        session.add(
+            AnsichContentBlobRow(
+                blob_key="blob-expired",
+                content_hash=__import__("hashlib").sha256(b'{"a": 1}').hexdigest(),
+                byte_size=len(b'{"a": 1}'),
+                content_type="application/json",
+                canonicalization_version=1,
+                payload_status="available",
+                inline_body=None,
+                payload_ref_id="expired-blob-payload",
+            )
+        )
+
+    async with sessions() as session, session.begin():
+        blob = await session.get(AnsichContentBlobRow, "blob-expired")
+        with pytest.raises(PayloadExpiredError):
+            await backend._content_blob_bytes(session, blob)
+
+    # Same bytes: accepted from the lineage alone.
+    async with sessions() as session, session.begin():
+        await backend._ensure_content_blob(
+            session,
+            blob_key="blob-expired",
+            content_hash=__import__("hashlib").sha256(b'{"a": 1}').hexdigest(),
+            content_bytes=b'{"a": 1}',
+            content_type="application/json",
+        )
+
+    # Different bytes under the same key: still refused.
+    async with sessions() as session, session.begin():
+        with pytest.raises(ValueError, match="key collision"):
+            await backend._ensure_content_blob(
+                session,
+                blob_key="blob-expired",
+                content_hash=__import__("hashlib").sha256(b'{"b": 2}').hexdigest(),
+                content_bytes=b'{"b": 2}',
+                content_type="application/json",
+            )
+
+
+# ---------------------------------------------------------------------------
+# 7. RC7 — the retention horizon and the receipt that must not flip
+# ---------------------------------------------------------------------------
+
+
+def test_the_projection_status_vocabulary_gained_exactly_one_value():
+    """The fourth value is minted, and the record that said it was not is fixed.
+
+    Pinned as a set rather than by membership so a fifth value has to be
+    decided rather than added: this literal crosses the wire on the
+    ``POST /evaluations`` receipt, and every value in it is a claim a caller
+    acts on.
+    """
+
+    assert set(get_args(EvaluationProjectionStatus)) == {"pending", "applied", "failed", "expired"}
+
+    record = inspect.getdoc(sql_module.StorageUnavailableError) or ""
+    assert "P11-C" in record, "RC7 requires the no-fourth-value record to be updated in the same change"
+    assert "expired" in record
+
+
+@pytest.mark.anyio
+async def test_a_receipt_for_a_deleted_observation_reads_expired_never_failed(retention_backend):
+    """The FC-3 regression, and the reason the horizon is durable.
+
+    Projection jobs cascade from their Observation, so deleting one under the
+    policy leaves the receipt ladder looking at an accepted id with no jobs —
+    which it reads as ``failed``, because jobs commit with the Observation they
+    belong to. That inference is sound until retention exists and then it turns
+    a configured deletion into an integrity alarm about a write that really did
+    land. The horizon is the store's own record that deletion *completed*, which
+    is what makes ``expired`` an answer rather than a guess.
+    """
+
+    backend, sessions = retention_backend
+    task_id = new_id()
+    assert await backend.persist_and_project([_retention_task_created(task_id)]) == 1
+    await _settle_retention(backend)
+    async with sessions() as session:
+        obs_id, ingest_seq = (await session.execute(select(AnsichObservationRow.obs_id, AnsichObservationRow.ingest_seq))).first()
+    assert await backend.get_observation_projection_status(obs_id) == "applied"
+
+    # Retention's Observation tier, standing in for tiers this change does not
+    # build: the row goes and the horizon records that it did. The job delete is
+    # spelled out rather than left to the foreign key because
+    # ``tests/ansich/conftest.py`` deliberately leaves ``PRAGMA foreign_keys``
+    # off — in production ``ansich_projection_jobs.obs_id`` is
+    # ``ON DELETE CASCADE`` and takes the jobs with the Observation, which is
+    # precisely the mechanism that creates the flip this test is about.
+    async with sessions() as session, session.begin():
+        await session.execute(sa.delete(AnsichProjectionJobRow).where(AnsichProjectionJobRow.obs_id == obs_id))
+        await session.execute(sa.delete(AnsichObservationRow).where(AnsichObservationRow.obs_id == obs_id))
+        state = await sql_module.SqlAnsichBackend._retention_state(session)
+        state.observation_horizon_ingest_seq = int(ingest_seq)
+
+    assert await backend.get_observation_projection_status(obs_id) == "expired"
+
+
+@pytest.mark.anyio
+async def test_an_absent_observation_still_reads_lost_when_nothing_was_ever_deleted(retention_backend):
+    """Horizon ``0`` is load-bearing, and this is the test that keeps it so.
+
+    Zero means "no Observation-tier deletion has ever completed", so retention
+    cannot be the explanation for an absent row and the pre-existing answer
+    stands. Reading ``0`` as "unknown, so probably expired" would launder every
+    genuinely lost write into a policy outcome on the store where the claim is
+    least defensible: one that has never deleted anything.
+    """
+
+    backend, _sessions = retention_backend
+    assert await backend.observation_retention_horizon() == 0
+    assert await backend.get_observation_projection_status(new_id()) is None
+
+
+@pytest.mark.anyio
+async def test_a_surviving_observation_is_never_read_as_expired(retention_backend):
+    """The horizon only answers for rows that are actually gone.
+
+    A moved horizon must not make a *present* Observation read as expired — the
+    horizon is consulted only after the row itself has been looked for and not
+    found, so a store mid-sweep still answers from its jobs.
+    """
+
+    backend, sessions = retention_backend
+    task_id = new_id()
+    assert await backend.persist_and_project([_retention_task_created(task_id)]) == 1
+    await _settle_retention(backend)
+    async with sessions() as session, session.begin():
+        state = await sql_module.SqlAnsichBackend._retention_state(session)
+        state.observation_horizon_ingest_seq = 10_000
+    async with sessions() as session:
+        obs_id = (await session.execute(select(AnsichObservationRow.obs_id))).scalars().first()
+    assert await backend.get_observation_projection_status(obs_id) == "applied"
+
+
+# ---------------------------------------------------------------------------
+# 8. Structural pins
+# ---------------------------------------------------------------------------
+
+_JOB_ROW_CLASSES = frozenset({"AnsichProjectionJobRow", "AnsichAssessorJobRow"})
+_INSERT_CALLS = frozenset({"insert", "postgresql_insert", "sqlite_insert"})
+
+
+def _sql_module_ast() -> ast.Module:
+    return ast.parse(Path(sql_module.__file__).read_text(encoding="utf-8"))
+
+
+def _named_functions(tree: ast.Module) -> dict[str, ast.AST]:
+    """Every module function and ``SqlAnsichBackend`` method, by bare name."""
+
+    functions: dict[str, ast.AST] = {}
+    for node in ast.walk(tree):
+        if isinstance(node, ast.FunctionDef | ast.AsyncFunctionDef):
+            functions[node.name] = node
+    return functions
+
+
+def _retention_closure() -> set[str]:
+    """Bounded walk from ``run_retention`` over everything it can reach.
+
+    Resolution is by bare name — the same conservative shape the replay suite's
+    ownership walk uses, and a deliberate **over**-approximation here: catching
+    a function that only shares a name costs a false positive on a test whose
+    whole job is to refuse, which is the safe direction for a constraint.
+    """
+
+    functions = _named_functions(_sql_module_ast())
+    seen: set[str] = set()
+    frontier = ["run_retention"]
+    while frontier:
+        name = frontier.pop()
+        if name in seen or name not in functions:
+            continue
+        seen.add(name)
+        for child in ast.walk(functions[name]):
+            if isinstance(child, ast.Call):
+                target = child.func
+                if isinstance(target, ast.Name):
+                    frontier.append(target.id)
+                elif isinstance(target, ast.Attribute):
+                    frontier.append(target.attr)
+    return seen
+
+
+def test_retention_never_creates_or_re_pends_a_job():
+    """Global Constraint 4 (PB7), asserted structurally rather than promised.
+
+    The precondition ``_is_staler_publish`` depends on is that
+    ``min(unsettled ingest_seq)`` never moves *down* while an active-Task
+    read-model row exists. A retention path that "re-projected" an expired range
+    would lower it and freeze that read model permanently — silently, and for
+    Tasks that have since stopped — until somebody ran a rebuild. Retention
+    holds the constraint trivially by creating no job at all, and the point of
+    an AST pin is that "trivially" stays true through the next edit rather than
+    through the next reader's memory.
+
+    Three write shapes are refused: constructing a job row, passing one to an
+    ``insert``, and adding one to a session. Reads are untouched — the payload
+    tier's in-flight guard genuinely has to look at ``ansich_projection_jobs``,
+    and a pin that forbade mentioning the table would forbid the guard that
+    keeps a projector from finding an empty body.
+    """
+
+    functions = _named_functions(_sql_module_ast())
+    closure = _retention_closure()
+    assert {"run_retention", "_run_payload_retention_tier", "_payload_retention_condition"} <= closure, "the walk must reach the tier it is guarding"
+
+    offenders: list[str] = []
+    for name in sorted(closure):
+        node = functions.get(name)
+        if node is None:
+            continue
+        for child in ast.walk(node):
+            if not isinstance(child, ast.Call):
+                continue
+            target = child.func
+            if isinstance(target, ast.Name) and target.id in _JOB_ROW_CLASSES:
+                offenders.append(f"{name}: constructs {target.id}")
+            mentions = {inner.id for inner in ast.walk(child) if isinstance(inner, ast.Name)} & _JOB_ROW_CLASSES
+            if isinstance(target, ast.Name) and target.id in _INSERT_CALLS and mentions:
+                offenders.append(f"{name}: inserts into {sorted(mentions)}")
+            if isinstance(target, ast.Attribute) and target.attr == "add" and mentions:
+                offenders.append(f"{name}: session.add of {sorted(mentions)}")
+    assert offenders == []
+
+
+def test_every_payload_referrer_is_derived_and_declares_an_age_rule():
+    """The set comes from the schema; the clock for each one is declared.
+
+    Deriving the set is what stops a new referrer from silently narrowing
+    retention into expiring bodies something still points at. Declaring the age
+    column is the half metadata cannot answer — "old" means a different column
+    on every one of these tables — and an undeclared referrer refuses the pass
+    rather than defaulting, because both defaults are wrong in opposite
+    directions.
+    """
+
+    derived = {table.name for table, _column in _payload_referrer_columns()}
+    assert derived == set(_PAYLOAD_REFERRER_TIERS), "a referrer with no declared age rule must not be reachable"
+
+    for table_name, referrer in _PAYLOAD_REFERRER_TIERS.items():
+        assert referrer.reason.strip(), f"{table_name} must say why it ages the way it does"
+        if referrer.age_column is None:
+            continue
+        assert referrer.age_column in Base.metadata.tables[table_name].c, f"{table_name}.{referrer.age_column} does not exist"
+
+    # The referrer order is deterministic, which is what makes the generated
+    # predicate identical between processes (Constraint 8, applied to a
+    # predicate rather than to a lock order).
+    derived_pairs = [(table.name, column.name) for table, column in _payload_referrer_columns()]
+    assert derived_pairs == sorted(derived_pairs)
+
+
+def test_retention_takes_its_own_advisory_key(monkeypatch):
+    """A sweep must not queue an operator's remedy behind it.
+
+    The keys are separate because the two operations have opposite time
+    profiles: a retention pass runs long and unattended, a rebuild or a
+    failed-job retry is an operator waiting at a terminal. One shared key would
+    put every remedy behind whatever sweep was mid-pass and, past
+    ``database.command_timeout``, fail the *remedy* loudly for a reason that has
+    nothing to do with it.
+    """
+
+    assert _PG_RETENTION_LOCK_KEY != _PG_MAINTENANCE_LOCK_KEY
+    assert 0 < _PG_RETENTION_LOCK_KEY < 2**63, "an advisory lock id is a signed bigint"
+
+    source = inspect.getsource(SqlAnsichBackend._retention_lock)
+    assert "_PG_RETENTION_LOCK_KEY" in source
+    assert "_PG_MAINTENANCE_LOCK_KEY" not in source
+
+
+def test_the_config_maps_onto_the_policy_the_executor_takes():
+    """The one seam between DeerFlow's configuration and the framework-free API.
+
+    ``ansich`` must not import ``deerflow``, so ``run_retention`` names its
+    argument in its own vocabulary and the adapter converts once. A drifting
+    field is the bug this pins: it would show up as a policy silently running on
+    a default the operator did not set.
+    """
+
+    config = AnsichRetentionConfig(raw_payload_days=3, observation_days=11, structural_days=41, cleanup_batch_size=7)
+    policy = retention_policy_from_config(config)
+
+    assert policy.snapshot() == {
+        "raw_payload_days": 3,
+        "observation_days": 11,
+        "structural_days": 41,
+        "cleanup_batch_size": 7,
+    }
+    assert set(policy.snapshot()) == set(AnsichRetentionConfig.model_fields)
+    assert policy.payload_policy_label() == "raw_payload_days=3"
+
+
+def test_the_policy_model_enforces_the_same_containment_as_the_config():
+    """Restated rather than delegated: a policy is reachable without a config."""
+
+    with pytest.raises(ValidationError, match="raw_payload_days must not exceed observation_days"):
+        RetentionPolicy(raw_payload_days=9, observation_days=8, structural_days=90, cleanup_batch_size=1)
+    with pytest.raises(ValidationError, match="observation_days must not exceed structural_days"):
+        RetentionPolicy(raw_payload_days=1, observation_days=90, structural_days=30, cleanup_batch_size=1)

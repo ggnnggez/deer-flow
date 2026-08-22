@@ -6,6 +6,7 @@ from uuid import uuid4
 import pytest
 from _router_auth_helpers import make_authed_test_app
 from ansich import AnsichService, ObservationEnvelope, Producer, RetryOutcome, new_id
+from ansich.errors import PayloadExpiredError
 from ansich.release import AgentRuntimeDescriptor, build_agent_release
 from httpx import ASGITransport, AsyncClient
 from langchain.agents import create_agent
@@ -1410,3 +1411,46 @@ async def test_failed_jobs_endpoints_503_when_storage_unavailable():
 
     assert list_response.status_code == 503
     assert retry_response.status_code == 503
+
+
+@pytest.mark.anyio
+async def test_a_raw_payload_expired_under_retention_answers_410_not_404():
+    """Plan ruling RC6 at the transport: expired is not "not found".
+
+    A raw-body route has nothing to degrade to, so it is the one payload family
+    that raises — and the status code is the whole point. 404 says the evidence
+    has no body: it never was recorded, or the id is wrong, and a reader who
+    gets it goes looking for a bug. 410 says it was recorded, it was readable
+    for as long as the configured policy kept it, and the policy expired it on
+    the date in the response. The lineage travels with it because that is the
+    whole of what can still be said truthfully about the bytes, and it is what
+    separates a retention outcome from a deletion nobody configured.
+    """
+
+    app = make_authed_test_app(user_factory=admin_user)
+    service = AnsichService.in_memory()
+
+    async def _expired(_block_id: str):
+        raise PayloadExpiredError(
+            "Ansich ContentBlock payload expired",
+            payload_id="payload-expired",
+            policy="raw_payload_days=7",
+            deleted_at=datetime(2026, 8, 22, 12, 0, tzinfo=UTC),
+            sha256="a" * 64,
+            byte_size=4096,
+        )
+
+    service.get_content_block_payload = _expired  # type: ignore[method-assign]
+    app.state.ansich_service = service
+    app.include_router(ansich_router.router)
+
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        response = await client.get(f"/api/ansich/content-blocks/{new_id()}/payload")
+
+    assert response.status_code == 410
+    detail = response.json()["detail"]
+    assert detail["payload_id"] == "payload-expired"
+    assert detail["policy"] == "raw_payload_days=7"
+    assert detail["deleted_at"] == "2026-08-22T12:00:00+00:00"
+    assert detail["sha256"] == "a" * 64
+    assert detail["byte_size"] == 4096

@@ -854,6 +854,158 @@ class RetryOutcome(BaseModel):
     unsettled: int
 
 
+class RetentionPolicy(BaseModel):
+    """The four numbers one retention pass runs under.
+
+    A framework-independent restatement of ``AnsichRetentionConfig`` — the same
+    four fields with the same bounds and the same containment rule — so this
+    package's ``run_retention`` boundary can name what it takes without
+    importing DeerFlow's configuration layer. The adapter converts once
+    (``deerflow.ansich.retention_policy_from_config``); nothing here reads
+    configuration.
+
+    It is passed **per pass** rather than held on the backend on purpose. The
+    configuration is startup-only, but a retention pass is a deliberate
+    operation whose policy is worth recording *as it ran* — which is exactly
+    what :meth:`snapshot` produces and what the retention state row's
+    ``last_run_policy`` column stores, so an operator reading an expired row
+    later can tell which rule expired it rather than inferring it from a
+    configuration that may since have been retuned.
+    """
+
+    model_config = ConfigDict(frozen=True)
+
+    raw_payload_days: int = Field(ge=1)
+    observation_days: int = Field(ge=1)
+    structural_days: int = Field(ge=1)
+    cleanup_batch_size: int = Field(ge=1)
+
+    @model_validator(mode="after")
+    def _validate_tier_containment(self) -> Self:
+        # The same two comparisons the configuration model makes, restated
+        # rather than delegated, because this type is reachable without that
+        # model (a test, a future operator route) and an inverted pair is not a
+        # stricter policy — it is a broken store.
+        if self.raw_payload_days > self.observation_days:
+            raise ValueError("raw_payload_days must not exceed observation_days")
+        if self.observation_days > self.structural_days:
+            raise ValueError("observation_days must not exceed structural_days")
+        return self
+
+    def snapshot(self) -> dict[str, int]:
+        """The policy as it is written into ``last_run_policy``.
+
+        **This shape is the contract** — Task 9 is its first writer, so what it
+        serialises is what every later reader may assume. It is a flat mapping
+        of the four field names to their integer values, and deliberately
+        nothing else: no timestamp (the row carries ``last_run_started_at`` and
+        ``last_run_finished_at`` beside it, and duplicating a clock into a
+        policy record invites the two to disagree), no derived cutoffs (they
+        are a function of the policy and the run's ``now``, so storing them
+        would freeze one reading of a value that is already recoverable), and
+        no schema version (a flat mapping of named integers has no shape to
+        migrate; a reader that finds an unknown key ignores it and one that
+        misses a known key reports it unknown, which is the same discipline
+        every other read model here follows).
+        """
+
+        return {
+            "raw_payload_days": self.raw_payload_days,
+            "observation_days": self.observation_days,
+            "structural_days": self.structural_days,
+            "cleanup_batch_size": self.cleanup_batch_size,
+        }
+
+    def payload_policy_label(self) -> str:
+        """The stamp written onto a payload tombstone's ``policy`` column.
+
+        Short enough for ``String(128)`` and readable without a decoder ring:
+        it names the rule that made the tombstone, not the whole policy, so an
+        operator reading an expired row is told which of the three tiers
+        deleted it and at what threshold.
+        """
+
+        return f"raw_payload_days={self.raw_payload_days}"
+
+
+class RetentionLastRun(BaseModel):
+    """When retention last ran, under which policy, and where it has reached.
+
+    The whole model is ``None`` when retention has **never run** — that is the
+    Constraint 2 half, and it is why this is a nested optional block rather than
+    four nullable fields on the health block: "no pass has ever happened" is one
+    fact, and spelling it as four separate ``None``s invites a consumer to
+    render three of them and miss the fourth.
+
+    Within a real run the fields are ``None`` for their own reasons.
+    ``finished_at`` is ``None`` for a pass that started and did not finish,
+    which is a genuine state (a crash, a kill, a deploy mid-sweep) and must not
+    be collapsed into "never run"; ``policy`` is ``None`` only for a run written
+    by something that recorded none.
+
+    ``observation_horizon_ingest_seq`` is not a per-run number: it is the
+    store's durable claim about how far Observation deletion has *completed*,
+    carried here because the only place an operator asks the question is beside
+    the last run that could have moved it. ``0`` is honest and means "nothing
+    deleted yet" — ``ingest_seq`` starts at 1.
+    """
+
+    model_config = ConfigDict(frozen=True)
+
+    started_at: datetime
+    finished_at: datetime | None = None
+    policy: dict[str, object] | None = None
+    observation_horizon_ingest_seq: int = Field(default=0, ge=0)
+
+
+class RetentionReport(BaseModel):
+    """What one ``run_retention`` pass actually did.
+
+    Counts are per-pass, never cumulative: a pass reports what *it* deleted, and
+    the durable record of where retention has reached is the retention state
+    row (its cursors and its horizon), not a number added up across passes.
+
+    ``payload_tombstoned`` counts payload **bodies** replaced by a tombstone,
+    not rows removed — tier 1 never deletes an ``ansich_payloads`` row, because
+    the row is what keeps "expired by policy" distinguishable from "missing,
+    which is corruption".
+
+    ``observations_deleted`` and ``structural_deleted`` are ``int | None``, and
+    the ``None`` is load-bearing rather than defensive: it means *that tier did
+    not run in this pass*, which is a different statement from "it ran and
+    deleted nothing". Reporting an unexecuted tier as ``0`` would be the
+    None-never-0 mistake in its most expensive form — an operator reading a
+    clean zero for a tier that never executed has been told the store is
+    smaller than it is.
+
+    ``batches`` counts committed batches across every tier that ran, which is
+    also the number of times the durable cursor advanced. ``resumed_from_cursor``
+    says this pass began from a cursor an earlier interrupted pass left behind,
+    so a short report is legible as "picking up" rather than as "nothing to do".
+
+    ``finished`` is the completeness claim and it is deliberately weak: it is
+    true only when every tier that ran walked its whole candidate set to the
+    end. A pass cut short by an error, or one that stopped on a batch boundary
+    it could not pass, reports ``False`` and the cursor says where to resume.
+
+    ``observation_horizon_ingest_seq`` is the horizon as it stood when the pass
+    returned. ``0`` is honest here and not a missing value: ``ingest_seq``
+    starts at 1, so zero means no Observation-tier deletion has ever completed.
+    """
+
+    model_config = ConfigDict(frozen=True)
+
+    payload_tombstoned: int = Field(ge=0)
+    observations_deleted: int | None = Field(default=None, ge=0)
+    structural_deleted: int | None = Field(default=None, ge=0)
+    batches: int = Field(ge=0)
+    resumed_from_cursor: bool
+    finished: bool
+    started_at: datetime
+    finished_at: datetime
+    observation_horizon_ingest_seq: int = Field(ge=0)
+
+
 class ReplaySelector(BaseModel):
     """Which Observations a replay aims at — the three filters, and nothing else.
 

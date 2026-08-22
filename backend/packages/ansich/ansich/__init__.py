@@ -31,12 +31,15 @@ from ansich.contracts import (
     RecordReceipt,
     ReplayReport,
     ReplaySelector,
+    RetentionLastRun,
+    RetentionPolicy,
+    RetentionReport,
     RetryOutcome,
     TaskLifecycleScope,
     TaskView,
     WriterHealth,
 )
-from ansich.errors import ActiveVersionError, StorageUnavailableError
+from ansich.errors import ActiveVersionError, PayloadExpiredError, StorageUnavailableError
 from ansich.evaluation import (
     EVALUATION_OBSERVATION_KIND,
     QUALITY_DIMENSIONS,
@@ -177,6 +180,7 @@ __all__ = [
     "ObservationEnvelope",
     "Producer",
     "ProducerHealth",
+    "PayloadExpiredError",
     "ProjectorHealth",
     "QUALITY_DIMENSIONS",
     "QualityBeliefView",
@@ -188,6 +192,9 @@ __all__ = [
     "ReplayReport",
     "ReplaySelector",
     "ResolvedBelief",
+    "RetentionLastRun",
+    "RetentionPolicy",
+    "RetentionReport",
     "RetryOutcome",
     "ScopeDescriptor",
     "ScoreScale",

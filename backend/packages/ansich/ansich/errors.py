@@ -14,10 +14,53 @@ from typing import Literal
 __all__ = [
     "ActiveVersionError",
     "ActiveVersionRefusal",
+    "PayloadExpiredError",
     "ReplayTargetError",
     "ReplayTargetRefusal",
     "StorageUnavailableError",
 ]
+
+
+class PayloadExpiredError(Exception):
+    """The body a read needed was deleted under the retention policy.
+
+    The third of the three payload states (plan ruling RC6), raised only by the
+    reads whose entire purpose is to return bytes — the raw evidence routes. It
+    is deliberately **not** how the projection, assessment and trend readers
+    learn about a tombstone: those degrade in place, because a raise on their
+    paths is a per-tick, Task-wide stall over a deletion somebody configured.
+    A route that has been asked for a body and has none has nothing to degrade
+    *to*, so there the honest answer is to say what happened and why.
+
+    It is separate from an absent row on purpose, and the difference is the
+    whole reason the tombstone exists. "Not found" says the evidence never was,
+    or was never recorded; this says it was recorded, it was read back for as
+    long as the policy kept it, and the policy expired it on a date this error
+    names. The transport maps it to **410 Gone** rather than 404 for exactly
+    that reason.
+
+    The lineage half travels with it — the digest, the size, when it went and
+    under which rule — because that is all a reader may still truthfully say
+    about the bytes, and saying nothing would leave an operator unable to tell a
+    retention outcome from a bug.
+    """
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        payload_id: str,
+        policy: str | None = None,
+        deleted_at: object | None = None,
+        sha256: str | None = None,
+        byte_size: int | None = None,
+    ) -> None:
+        super().__init__(message)
+        self.payload_id = payload_id
+        self.policy = policy
+        self.deleted_at = deleted_at
+        self.sha256 = sha256
+        self.byte_size = byte_size
 
 
 class StorageUnavailableError(Exception):
@@ -52,8 +95,20 @@ class StorageUnavailableError(Exception):
     * The receipt is **not** answered ``failed``. ``failed`` means "I know it
       was lost", while this condition is "I do not know whether this is a
       replay" — reporting ignorance as knowledge is the worse of the two lies.
-      No fourth ``EvaluationProjectionStatus`` value is minted for it either;
-      the receipt's vocabulary is unchanged.
+      No ``EvaluationProjectionStatus`` value is minted for it either.
+
+      **Updated 2026-08-22 (P11-C, plan ruling RC7)**, because that last clause
+      used to read "no *fourth* value ... the receipt's vocabulary is
+      unchanged" and half of it is now false: the vocabulary did gain a fourth
+      value, ``expired``, for a different condition. The reasoning above is not
+      weakened by it — it is the reason the two are kept apart. ``expired``
+      is a positive statement the store can make from its own durable record
+      (the retention horizon says a contiguous prefix of ``ingest_seq`` has
+      been deleted under policy), so it reports knowledge as knowledge. *This*
+      condition has no such record to appeal to: the read that would have told
+      us anything is the read that failed. A value minted here would have to
+      mean "unknown", and a receipt whose whole job is to answer a question
+      must not answer it with a fifth way of saying it did not.
     * The error is **not** swallowed so the write can proceed anyway. Skipping
       the dedupe would record a second Observation for the same evaluation and
       hand back a receipt pointing at it — a phantom id, and the worst of the

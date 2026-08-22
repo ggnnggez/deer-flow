@@ -32,6 +32,9 @@ from ansich.contracts import (
     ProducerHealth,
     RebuildOutcome,
     RecordReceipt,
+    RetentionLastRun,
+    RetentionPolicy,
+    RetentionReport,
     RetryOutcome,
     TaskLifecycleScope,
     TaskView,
@@ -1114,6 +1117,17 @@ class AnsichService:
         nothing will ever settle. A backend that cannot answer at all is the one
         exception: absence of a *reader* says nothing about the Observation, so
         the unknown keeps the pre-RA6 ``pending``.
+
+        **The one condition that inference gets wrong is retention** (plan ruling
+        RC7, FC-3). Projection jobs cascade from the Observation, so a deleted
+        Observation has no jobs, and "no jobs" would flip a once-accepted receipt
+        to ``failed`` the day the policy caught up with it. The backend answers
+        that case itself — it is the half that can consult the deletion horizon,
+        which is the store's own durable record of what it deleted — and returns
+        the fourth status, ``expired``. This layer deliberately does no
+        adjudication of its own there: it has no horizon to read, and a service
+        that guessed at "probably retention" from an absent row would be
+        inventing exactly the evidence the horizon exists to supply.
         """
 
         if not self.get_health().storage_available:
@@ -1842,6 +1856,58 @@ class AnsichService:
             return _as_retry_outcome(await retry_failed(task_id=task_id))
         async with projection_lock:
             return _as_retry_outcome(await retry_failed(task_id=task_id))
+
+    async def run_retention(
+        self,
+        policy: RetentionPolicy,
+        *,
+        now: datetime | None = None,
+    ) -> RetentionReport:
+        """Run one time-tiered retention pass against the store (spec §6).
+
+        A thin passthrough on purpose. Retention is entirely a storage
+        operation: it holds its own cross-worker advisory lock, batches with a
+        durable cursor and reads a policy it is handed, so there is nothing for
+        this layer to coordinate and nothing it could add but a second opinion.
+
+        In particular it does **not** take ``self._projection_lock``, and that
+        is a decision rather than an omission. The maintenance operations hold
+        it because they re-arm jobs wholesale and must not race this process's
+        own projector; retention re-arms nothing — it creates no job and
+        re-pends none (Global Constraint 4) — while a pass can legitimately run
+        for a long time, and holding the projection lock across it would stall
+        this worker's projector loop and every terminal barrier behind it for
+        the whole sweep.
+
+        ``now`` defaults to the current time and is injectable for the same
+        reason the backend takes it: every cutoff in the pass derives from one
+        value, and a caller that wants a reproducible pass supplies it.
+
+        Raises rather than degrading if the backend cannot run one. Retention is
+        an explicit operator action with a report as its whole product, so a
+        silent no-op would be the one outcome that cannot be acted on — this is
+        not a collection path and the fail-open rule (Global Constraint 1) does
+        not reach it.
+        """
+
+        run = getattr(self._backend, "run_retention", None)
+        if not callable(run):
+            raise RuntimeError("Ansich backend does not support retention")
+        return await run(policy, now=now if now is not None else datetime.now(UTC))
+
+    async def get_retention_last_run(self) -> RetentionLastRun | None:
+        """When retention last ran, or ``None`` if it never has.
+
+        ``None`` covers both "this backend has no retention" and "this store has
+        never had a pass", and folding them is correct here: neither is a run,
+        and the health block's own contract is that the field is absent until
+        one has happened (Global Constraint 2).
+        """
+
+        last_run = getattr(self._backend, "get_retention_last_run", None)
+        if not callable(last_run):
+            return None
+        return await last_run()
 
     async def list_failed_jobs(
         self,

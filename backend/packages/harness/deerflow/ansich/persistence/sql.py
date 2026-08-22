@@ -32,6 +32,9 @@ from ansich import (
     PossibleExposureItemView,
     Producer,
     RebuildOutcome,
+    RetentionLastRun,
+    RetentionPolicy,
+    RetentionReport,
     RetryOutcome,
     StepView,
     TaskScopesView,
@@ -141,7 +144,7 @@ from ansich.environment import (
     assess_environment_leak,
     assess_environment_pressure,
 )
-from ansich.errors import ActiveVersionError, ReplayTargetError, StorageUnavailableError
+from ansich.errors import ActiveVersionError, PayloadExpiredError, ReplayTargetError, StorageUnavailableError
 from ansich.evaluation import (
     EVALUATION_OBSERVATION_KIND,
     EvaluationProjectionStatus,
@@ -197,13 +200,14 @@ from ansich.usage import (
     child_task_contribution_for_tool_started,
     usage_contributions_for_observation,
 )
-from sqlalchemy import DateTime, and_, case, delete, func, or_, select, text, update
+from sqlalchemy import Column, DateTime, Table, and_, case, delete, func, or_, select, text, update
 from sqlalchemy.dialects.postgresql import insert as postgresql_insert
 from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 from sqlalchemy.exc import DisconnectionError, InterfaceError, OperationalError
 from sqlalchemy.exc import TimeoutError as SqlAlchemyTimeoutError
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from sqlalchemy.orm import aliased
+from sqlalchemy.sql.elements import ColumnElement
 
 from deerflow.ansich.persistence.models import (
     AnsichActiveTaskReadModelRow,
@@ -253,6 +257,7 @@ from deerflow.ansich.persistence.models import (
     AnsichRelationEvidenceRow,
     AnsichRelationRow,
     AnsichReleaseQualityStatsRow,
+    AnsichRetentionStateRow,
     AnsichScopeConclusionRow,
     AnsichScopeRow,
     AnsichStepRow,
@@ -1030,6 +1035,85 @@ _UNSETTLED_JOB_STATUSES = (*_CLAIMABLE_JOB_STATUSES, "processing", "failed")
 #: 2**63 so it is a valid signed bigint lock id. Changing it effectively
 #: releases the prior lock, so do not change it without coordinating.
 _PG_MAINTENANCE_LOCK_KEY = 0x0DEE_A115_C4A5_0027
+#: Stable advisory-lock key for a retention pass (``run_retention``), in the
+#: same mnemonic style as the maintenance key above and deliberately **not** the
+#: same value: ``0DEE`` marks it as DeerFlow's, ``A115`` reads as "ansich",
+#: ``DE1E`` as "delete", and ``0028`` is the revision that added the tombstone
+#: columns and the retention state row this work writes. Two separate keys
+#: because the two operations have opposite time profiles -- a sweep runs long
+#: and unattended, an operator remedy runs short and watched -- so one key would
+#: make every rebuild/retry queue behind whatever sweep was mid-pass and, past
+#: ``database.command_timeout``, fail the *remedy* loudly for a reason that has
+#: nothing to do with it. See ``_retention_lock`` for the correctness half
+#: (retention mints no jobs, maintenance deletes no evidence). It stays under
+#: 2**63 so it is a valid signed bigint lock id, and changing it effectively
+#: releases the prior lock, so do not change it without coordinating.
+_PG_RETENTION_LOCK_KEY = 0x0DEE_A115_DE1E_0028
+#: The retention state table holds exactly one row, and this is its id. A check
+#: constraint pins it in the schema; the constant is here so no reader has to
+#: spell the literal ``1`` and no writer can invent a second row by typo. "The
+#: horizon" is a definite article.
+_RETENTION_STATE_ID = 1
+#: Job statuses that mean *work still in flight for this Observation*.
+#:
+#: Deliberately ``_UNSETTLED_JOB_STATUSES`` **minus** ``failed``, and the
+#: difference is the whole point. Retention's payload tier refuses to expire a
+#: body a projector might still be about to read, which is what keeps the
+#: expired-evidence path off the ordinary claim loop; but a durably ``failed``
+#: job is settled, badly, and may stay that way for as long as nobody retries
+#: it. Counting it as in-flight would pin its payload out of retention forever —
+#: one poison job holding a body past its policy indefinitely — so it does not,
+#: and a retry that lands after the body expired settles as expired evidence
+#: instead (``_settle_expired_evidence_job``).
+_IN_FLIGHT_JOB_STATUSES = (*_CLAIMABLE_JOB_STATUSES, "processing")
+
+
+class _PayloadReferrer(NamedTuple):
+    """How one referrer of ``ansich_payloads`` ages the payloads it points at.
+
+    ``age_column`` is the referrer's own evidence timestamp — the column that
+    says when the thing holding this payload happened — and a payload is
+    eligible for tier 1 only when **every** referrer row pointing at it is older
+    than the cutoff. ``None`` means this referrer's payloads are excluded from
+    time retention altogether: any row at all blocks the tombstone.
+    """
+
+    age_column: str | None
+    reason: str
+
+
+#: Every ``ansich_payloads`` referrer, keyed by table, with the rule that ages
+#: it. The **set** of referrers is derived from ``Base.metadata`` at query time
+#: (``_payload_referrer_columns``) rather than restated here, so a schema change
+#: that adds one cannot silently narrow retention; what is declared here is the
+#: half metadata cannot answer, which is *which timestamp means "old"* for each.
+#: A derived referrer with no entry refuses the pass rather than defaulting,
+#: because both defaults are wrong: skipping it would expire bodies something
+#: still points at, and blocking on it would quietly stop retention.
+_PAYLOAD_REFERRER_TIERS: dict[str, _PayloadReferrer] = {
+    "ansich_observations": _PayloadReferrer(
+        age_column="occurred_at",
+        reason="The externalized payload of one Observation. Its age is the Observation's event time — when the thing happened — not its ingest time, because retention is a statement about how old the evidence is.",
+    ),
+    "ansich_content_blobs": _PayloadReferrer(
+        age_column="created_at",
+        reason="A deduplicated canonical body. It is content-addressed and shared, so it is aged by its own row rather than by any one Observation that referenced it; the blob is the evidence here.",
+    ),
+    "ansich_authorization_snapshots": _PayloadReferrer(
+        age_column="evaluated_at",
+        reason="One authorization decision's evidence, aged by when the decision was evaluated.",
+    ),
+    "ansich_agent_releases": _PayloadReferrer(
+        age_column=None,
+        reason=(
+            "**Excluded from time retention.** A release manifest is not per-run evidence but the immutable identity of a release: "
+            "``release_hash`` is derived from it, every release detail and comparison read returns it, and it is the only copy. Its "
+            "size is bounded by the manifest rather than by run volume, so it is not the growth this policy exists to bound, while "
+            "expiring it at ``raw_payload_days`` would blind every release read for any release older than a week — including "
+            "releases still bound to running Tasks. It goes when its release goes, row and all, in the structural tier."
+        ),
+    ),
+}
 #: The failures that mean *the adapter could not answer*, and which therefore
 #: cross the ``ansich`` package boundary as ``StorageUnavailableError``
 #: (controller ruling PB6). The set is chosen by that meaning rather than by a
@@ -1055,7 +1139,174 @@ _STORAGE_CANNOT_ANSWER = (
     DisconnectionError,
 )
 
+
+def _payload_referrer_columns() -> tuple[tuple[Table, Column], ...]:
+    """Every foreign key that points at ``ansich_payloads``, from the ORM.
+
+    Derived rather than declared, because the *set* is a fact about the schema
+    and the schema already states it: a column with a foreign key into
+    ``ansich_payloads`` is a referrer, and there is no second opinion to have.
+    Migration ``0028`` keeps a literal copy of the same list, and that is not a
+    contradiction — a migration must describe the schema at *its own* revision,
+    while retention runs against whatever the current one is. The two are pinned
+    against each other by a test rather than shared, so a later revision that
+    adds a referrer turns that pin red (decide whether ``0028``'s downgrade
+    should refuse for it too) while retention picks it up on its own instead of
+    silently expiring bodies something still points at.
+
+    Sorted by ``(table, column)`` so the generated SQL is identical between
+    processes and between runs — the same determinism Constraint 8 asks of every
+    traversal, applied to a predicate rather than to a lock order.
+    """
+
+    payloads = AnsichPayloadRow.__table__
+    referrers = [(table, foreign_key.parent) for table in Base.metadata.sorted_tables for foreign_key in table.foreign_keys if foreign_key.column.table is payloads]
+    return tuple(sorted(referrers, key=lambda item: (item[0].name, item[1].name)))
+
+
+def _payload_retention_condition(cutoff: datetime) -> ColumnElement[bool]:
+    """Which payload bodies tier 1 may replace with a tombstone.
+
+    Four things must hold, and each is a separate refusal:
+
+    * the row is live (``body`` present, no ``deleted_at``) — tombstoning a
+      tombstone would restamp somebody else's policy onto it;
+    * **no referrer row younger than the cutoff points at it.** One young
+      referrer is enough to skip the whole payload: a body two Observations
+      share is only expired when both are, and a partial answer here is the
+      difference between "old evidence" and "evidence somebody is still using";
+    * no referrer at all, for the families declared non-expirable;
+    * an **orphan** — a payload nothing references — is aged by its own
+      ``created_at`` instead. That fallback is deliberately *not* applied to a
+      referenced payload, and the distinction matters: ``created_at`` is an
+      ingest time, while the spec ages evidence by when it *happened*
+      (``occurred_at`` and its siblings). A backfilled Observation from a month
+      ago is expired evidence written today, and an ingest-time floor would keep
+      it for another week for no reason anybody could state. An orphan has no
+      event time to appeal to, so its own row is the only honest clock it has.
+
+    The referrer set comes from the ORM (``_payload_referrer_columns``); the
+    timestamp that means "old" for each comes from ``_PAYLOAD_REFERRER_TIERS``.
+    An undeclared referrer raises rather than defaulting — see that map for why
+    both possible defaults are wrong.
+    """
+
+    payloads = AnsichPayloadRow.__table__
+    clauses: list[ColumnElement[bool]] = [
+        payloads.c.body.isnot(None),
+        payloads.c.deleted_at.is_(None),
+    ]
+    referenced: list[ColumnElement[bool]] = []
+    for table, column in _payload_referrer_columns():
+        referrer = _PAYLOAD_REFERRER_TIERS.get(table.name)
+        if referrer is None:
+            raise RuntimeError(f"Ansich retention: {table.name}.{column.name} references ansich_payloads with no declared age policy; refusing to run a pass that would guess")
+        if referrer.age_column is None:
+            clauses.append(~select(1).select_from(table).where(column == payloads.c.payload_id).exists())
+            continue
+        age = table.c[referrer.age_column]
+        clauses.append(~select(1).select_from(table).where(column == payloads.c.payload_id, age > cutoff).exists())
+        referenced.append(select(1).select_from(table).where(column == payloads.c.payload_id).exists())
+    clauses.append(or_(payloads.c.created_at <= cutoff, *referenced))
+    observations = AnsichObservationRow.__table__
+    jobs = AnsichProjectionJobRow.__table__
+    # A body a projector may still be about to read is not expirable, whatever
+    # its age. This is what keeps the expired-evidence claim path
+    # (``_settle_expired_evidence_job``) off the ordinary loop: in steady state
+    # nothing tombstoned is still owed, so that path is reached only by a replay
+    # or rebuild that re-pends jobs for Observations whose payloads have since
+    # expired. ``failed`` is deliberately not in ``_IN_FLIGHT_JOB_STATUSES`` --
+    # see there.
+    clauses.append(
+        ~select(1)
+        .select_from(observations.join(jobs, jobs.c.obs_id == observations.c.obs_id))
+        .where(
+            observations.c.payload_ref_id == payloads.c.payload_id,
+            jobs.c.status.in_(_IN_FLIGHT_JOB_STATUSES),
+        )
+        .exists()
+    )
+    return and_(*clauses)
+
+
 logger = logging.getLogger(__name__)
+
+
+class _ObservationPayload(NamedTuple):
+    """One Observation's payload as a *state*, not a value (plan ruling RC6).
+
+    Two of the three states this can be in carry no bytes, and they mean
+    opposite things, so the caller has to be handed something it cannot read
+    without deciding which one it got:
+
+    * ``payload`` is a ``dict`` and ``expired`` is ``False`` — readable. An
+      empty dict here means the Observation genuinely carried nothing, which is
+      a fact about the Observation and not about retention.
+    * ``payload`` is ``None`` and ``expired`` is ``True`` — the body was deleted
+      under the retention policy. The lineage half is populated and is the whole
+      of what a reader may still say about the bytes: their digest, their size,
+      when they went and under which rule.
+
+    The third state — no payload row at all — is not representable here on
+    purpose. It is corruption, it raises, and giving it a value in this type
+    would invite a caller to handle it the way it handles a tombstone.
+
+    ``payload_ref_id`` is carried on the expired state so a reader that wants to
+    name the evidence (a log line, an operator-facing marker) does not have to
+    reach back to the Observation row for it.
+    """
+
+    payload: dict | None
+    expired: bool = False
+    payload_ref_id: str | None = None
+    sha256: str | None = None
+    byte_size: int | None = None
+    deleted_at: datetime | None = None
+    policy: str | None = None
+
+    @classmethod
+    def expired_from(cls, row: AnsichPayloadRow) -> _ObservationPayload:
+        """The expired state, read off a tombstoned ``ansich_payloads`` row."""
+
+        return cls(
+            payload=None,
+            expired=True,
+            payload_ref_id=row.payload_id,
+            sha256=row.sha256,
+            byte_size=row.byte_size,
+            deleted_at=None if row.deleted_at is None else _as_utc(row.deleted_at),
+            policy=row.policy,
+        )
+
+
+def _expired_payload_detail(row: AnsichPayloadRow) -> str:
+    """One line naming expired evidence, for a log line or an error trail.
+
+    Never the body, and never a guess at what it said — only the lineage the
+    tombstone kept, which is the whole of what a reader may still truthfully
+    say about the bytes.
+    """
+
+    deleted_at = None if row.deleted_at is None else _as_utc(row.deleted_at)
+    return f"payload {row.payload_id} expired under retention (policy={row.policy}, deleted_at={deleted_at}, sha256={row.sha256}, byte_size={row.byte_size})"
+
+
+def _payload_expired_error(row: AnsichPayloadRow, *, what: str) -> PayloadExpiredError:
+    """The typed refusal a raw-body read answers a tombstone with.
+
+    ``what`` names the thing that was asked for (an evaluation payload, a
+    ContentBlob) so the message reads as an answer to the question rather than
+    as an internal condition leaking out.
+    """
+
+    return PayloadExpiredError(
+        f"Ansich {what} {_expired_payload_detail(row)}",
+        payload_id=row.payload_id,
+        policy=row.policy,
+        deleted_at=None if row.deleted_at is None else _as_utc(row.deleted_at),
+        sha256=row.sha256,
+        byte_size=row.byte_size,
+    )
 
 
 class _ProjectionDependencyPending(RuntimeError):
@@ -2178,12 +2429,73 @@ class SqlAnsichBackend:
         resolved at all raises instead of degrading to the no-op: a lock is a
         safety device, and one that fails open would let two operators replay the
         same Observations with nothing in the logs to say so.
+
+        The mechanism below is shared with ``_retention_lock`` (P11-C, T9),
+        which holds a **different key** on the same machinery. Sharing it is
+        deliberate: every property this docstring claims -- the pinned
+        connection, the pre-acquire timeout disable, the rollback-before-unlock
+        ordering, the unlock-on-cancelled-acquire -- is a property of the
+        mechanism, and a second hand-written copy would be a second place for
+        them to drift apart.
+        """
+
+        async with self._advisory_lock(
+            _PG_MAINTENANCE_LOCK_KEY,
+            purpose="maintenance",
+            refusal="rebuild/retry",
+        ):
+            yield
+
+    @asynccontextmanager
+    async def _retention_lock(self) -> AsyncIterator[None]:
+        """Serialise retention passes across workers, on their own key.
+
+        Retention is a second single-operator operation, and it takes
+        ``_PG_RETENTION_LOCK_KEY`` rather than the maintenance key for a reason
+        that is about *cost*, not tidiness. A retention pass walks the whole
+        store in small batches and can legitimately run for a long time; a
+        rebuild or a failed-job retry is an operator standing at a terminal
+        waiting for an answer. Sharing one key would make every operator remedy
+        queue behind whatever sweep happened to be running, and
+        ``database.command_timeout`` would then turn that wait into a loud
+        failure of the *remedy* -- an operator told their retry failed because
+        something else was deleting old payloads. The two operations do not
+        contend for correctness either: retention never re-arms or mints a job
+        (Global Constraint 4), and the maintenance operations never delete
+        evidence.
+
+        What the separate key does **not** buy is freedom from the batch
+        transactions themselves: a retention batch and a rebuild can now run at
+        the same instant, and the ordinary row-level rules are what keep that
+        safe. That is why every batch here is small, why every traversal is
+        sorted (Constraint 8), and why the cursor is durable -- a pass that
+        loses a batch to a lock conflict resumes rather than restarting.
+        """
+
+        async with self._advisory_lock(
+            _PG_RETENTION_LOCK_KEY,
+            purpose="retention",
+            refusal="retention pass",
+        ):
+            yield
+
+    @asynccontextmanager
+    async def _advisory_lock(self, key: int, *, purpose: str, refusal: str) -> AsyncIterator[None]:
+        """The cross-worker advisory lock mechanism, keyed by the caller.
+
+        See ``_maintenance_lock`` for the full argument; this is its body,
+        parametrised so ``_retention_lock`` can hold a different key on the same
+        guarantees. ``purpose`` names the operation in the one log line this can
+        emit; ``refusal`` names what is being refused when the lock cannot be
+        established, because "refusing to run an unguarded rebuild/retry" and
+        "refusing to run an unguarded retention pass" are read by different
+        people at different times.
         """
 
         async with self._session_factory() as session:
             bind = session.bind
             if bind is None:
-                raise RuntimeError("Ansich maintenance lock cannot resolve the session's dialect; refusing to run an unguarded rebuild/retry")
+                raise RuntimeError(f"Ansich {purpose} lock cannot resolve the session's dialect; refusing to run an unguarded {refusal}")
             dialect_name = bind.dialect.name
         if dialect_name != "postgresql":
             yield
@@ -2201,7 +2513,7 @@ class SqlAnsichBackend:
         # test_maintenance_lock_refuses_a_bind_it_cannot_pin_a_connection_on``.
         connect = getattr(bind, "connect", None)
         if connect is None:
-            raise RuntimeError("Ansich maintenance lock cannot pin a connection on this bind; refusing to run an unguarded rebuild/retry")
+            raise RuntimeError(f"Ansich {purpose} lock cannot pin a connection on this bind; refusing to run an unguarded {refusal}")
         # A **connection**, not a session, and it is held for the whole
         # operation. An advisory lock is scoped to the *database session* that
         # took it, so the unlock has to reach that same backend -- and a
@@ -2227,7 +2539,7 @@ class SqlAnsichBackend:
             try:
                 await connection.execute(
                     text("SELECT pg_advisory_lock(:key)"),
-                    {"key": _PG_MAINTENANCE_LOCK_KEY},
+                    {"key": key},
                 )
                 yield
             finally:
@@ -2248,13 +2560,206 @@ class SqlAnsichBackend:
                 try:
                     await connection.execute(
                         text("SELECT pg_advisory_unlock(:key)"),
-                        {"key": _PG_MAINTENANCE_LOCK_KEY},
+                        {"key": key},
                     )
                 except Exception:  # noqa: BLE001
                     logger.warning(
-                        "ansich maintenance: pg_advisory_unlock raised; the connection close will release it",
+                        "ansich %s: pg_advisory_unlock raised; the connection close will release it",
+                        purpose,
                         exc_info=True,
                     )
+
+    # ------------------------------------------------------------------
+    # Time-tiered retention (spec §6)
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    async def _retention_state(session: AsyncSession) -> AnsichRetentionStateRow:
+        """The single retention row, created on first use.
+
+        Created rather than required, so a store that has never run retention
+        answers the horizon read without a migration-time seed. The created row
+        is all-``None`` cursors and a ``0`` horizon, which is the honest initial
+        state: nothing has been walked and nothing has been deleted.
+        """
+
+        state = await session.get(AnsichRetentionStateRow, _RETENTION_STATE_ID)
+        if state is None:
+            state = AnsichRetentionStateRow(id=_RETENTION_STATE_ID)
+            session.add(state)
+            await session.flush()
+        return state
+
+    async def observation_retention_horizon(self) -> int:
+        """The highest ``ingest_seq`` at or below which Observations are gone.
+
+        The read RC7's receipt resolution consults, and the reason the fourth
+        ``EvaluationProjectionStatus`` value can be answered at all.
+
+        **``0`` is a value, not a missing one.** ``ingest_seq`` starts at 1, so
+        zero means "no Observation-tier deletion has ever completed" — a
+        complete, positive answer — and a consumer that read it as "unknown"
+        and fell back to ``failed`` would reproduce the exact FC-3 flip the
+        horizon exists to prevent, on the store where it is *least* justified:
+        one where nothing has been deleted at all.
+        """
+
+        async with self._session_factory() as session:
+            horizon = await session.scalar(select(AnsichRetentionStateRow.observation_horizon_ingest_seq).where(AnsichRetentionStateRow.id == _RETENTION_STATE_ID))
+        return int(horizon or 0)
+
+    async def get_retention_last_run(self) -> RetentionLastRun | None:
+        """When retention last ran, under which policy, and where it has reached.
+
+        ``None`` means **never run** — no row, or a row no pass has ever started
+        (Global Constraint 2). It is not ``None`` for a pass that started and did
+        not finish: that is a real run with an honest ``finished_at`` of
+        ``None``, and collapsing the two would hide an interrupted sweep behind
+        the same answer as a store nobody has ever swept.
+        """
+
+        async with self._session_factory() as session:
+            state = await session.get(AnsichRetentionStateRow, _RETENTION_STATE_ID)
+            if state is None or state.last_run_started_at is None:
+                return None
+            return RetentionLastRun(
+                started_at=_as_utc(state.last_run_started_at),
+                finished_at=None if state.last_run_finished_at is None else _as_utc(state.last_run_finished_at),
+                policy=state.last_run_policy,
+                observation_horizon_ingest_seq=int(state.observation_horizon_ingest_seq or 0),
+            )
+
+    async def run_retention(self, policy: RetentionPolicy, *, now: datetime) -> RetentionReport:
+        """One time-tiered retention pass (spec §6, D6-3/D6-4).
+
+        Held under ``_retention_lock`` — its **own** advisory key, so an
+        operator's rebuild or failed-job retry never queues behind a sweep (see
+        ``_PG_RETENTION_LOCK_KEY``). Everything inside is small batches with a
+        durable cursor committed *in the same transaction as the work it
+        describes*, so a pass killed mid-tier resumes where it stopped instead
+        of restarting the scan or skipping the remainder, and nothing is counted
+        twice.
+
+        ``now`` is injected rather than read, because every cutoff in the pass is
+        derived from it and a pass whose tiers disagreed about "now" would delete
+        against two different policies.
+
+        **Global Constraint 4 (PB7) is held structurally, not by care.** This
+        module creates and re-pends no job of any kind: no ``AnsichProjectionJobRow``
+        and no ``AnsichAssessorJobRow`` is constructed, and no INSERT into either
+        table is issued, anywhere in the retention path. That is what keeps
+        ``min(unsettled ingest_seq)`` from ever moving *down* because of
+        retention, which is the precondition ``_is_staler_publish`` depends on
+        and the one a "re-project the expired range" shape would break
+        permanently. A test asserts it over the AST rather than trusting this
+        paragraph.
+
+        The report's ``observations_deleted`` and ``structural_deleted`` are
+        ``None`` here and that is deliberate: tiers 2 and 3 are not part of this
+        change, and reporting a tier that did not run as ``0`` would tell an
+        operator the store is smaller than it is.
+        """
+
+        started_at = _as_utc(now)
+        async with self._retention_lock():
+            # The run marker commits before any deletion, in its own
+            # transaction. A pass that dies mid-tier must still be legible as a
+            # run that started and did not finish -- writing the marker at the
+            # end would make a crashed sweep indistinguishable from one that
+            # never happened, and the cursor it left behind unexplainable.
+            async with self._session_factory() as session, session.begin():
+                state = await self._retention_state(session)
+                resumed_from_cursor = state.payload_cursor is not None
+                state.last_run_started_at = started_at
+                state.last_run_finished_at = None
+                state.last_run_policy = policy.snapshot()
+
+            payload_tombstoned, batches = await self._run_payload_retention_tier(policy, now=started_at)
+
+            finished_at = datetime.now(UTC)
+            async with self._session_factory() as session, session.begin():
+                state = await self._retention_state(session)
+                state.last_run_finished_at = finished_at
+                horizon = int(state.observation_horizon_ingest_seq or 0)
+
+        return RetentionReport(
+            payload_tombstoned=payload_tombstoned,
+            observations_deleted=None,
+            structural_deleted=None,
+            batches=batches,
+            resumed_from_cursor=resumed_from_cursor,
+            finished=True,
+            started_at=started_at,
+            finished_at=finished_at,
+            observation_horizon_ingest_seq=horizon,
+        )
+
+    async def _run_payload_retention_tier(self, policy: RetentionPolicy, *, now: datetime) -> tuple[int, int]:
+        """Tier 1: replace expired payload **bodies** with tombstones.
+
+        Returns ``(bodies tombstoned, batches committed)``.
+
+        The row is never deleted. ``body`` goes ``NULL``, ``deleted_at`` records
+        when and ``policy`` records under which rule, all three in one UPDATE so
+        the check constraint enforces the shape rather than this code promising
+        it; ``sha256`` and ``byte_size`` stay untouched as the tombstone's
+        lineage half. That is what lets every reader tell *expired by policy*
+        from *missing* — and only the second one stays loud (RC6).
+
+        Each batch is one transaction containing both the UPDATE and the cursor
+        advance, which is the whole of the resumability story: the cursor can
+        never claim a batch that rolled back, and a re-run resumes after the
+        last batch that really committed. The batch is ordered and bounded by
+        ``payload_id``, so the traversal is deterministic across processes
+        (Constraint 8) and two workers walking it take the same rows in the same
+        order.
+
+        On completing the walk the cursor is reset to ``None``. A payload that
+        becomes eligible *behind* the cursor mid-pass — its last young referrer
+        aged past the cutoff while the pass was running — is therefore picked up
+        by the next pass rather than by this one, which is the honest trade: a
+        cursor that jumped backwards to catch it could not terminate.
+        """
+
+        cutoff = now - timedelta(days=policy.raw_payload_days)
+        label = policy.payload_policy_label()
+        payloads = AnsichPayloadRow.__table__
+        tombstoned = 0
+        batches = 0
+        while True:
+            async with self._session_factory() as session, session.begin():
+                state = await self._retention_state(session)
+                condition = _payload_retention_condition(cutoff)
+                if state.payload_cursor is not None:
+                    condition = and_(condition, payloads.c.payload_id > state.payload_cursor)
+                candidates = list(
+                    (
+                        await session.execute(
+                            select(payloads.c.payload_id).where(condition).order_by(payloads.c.payload_id).limit(policy.cleanup_batch_size),
+                        )
+                    ).scalars()
+                )
+                if not candidates:
+                    state.payload_cursor = None
+                    break
+                # Already ascending from the ORDER BY; sorted again rather than
+                # assumed, because the traversal order is the property
+                # Constraint 8 asks for and a later edit to the query must not
+                # be able to take it away silently.
+                candidates.sort()
+                await session.execute(
+                    update(AnsichPayloadRow).where(AnsichPayloadRow.payload_id.in_(candidates)).values(body=None, deleted_at=now, policy=label),
+                )
+                state.payload_cursor = candidates[-1]
+                tombstoned += len(candidates)
+                batches += 1
+        logger.info(
+            "ansich retention: tier 1 tombstoned %d payload bod(y/ies) in %d batch(es) under %s",
+            tombstoned,
+            batches,
+            label,
+        )
+        return tombstoned, batches
 
     async def initialize_metrics(self) -> None:
         await self._refresh_failed_job_count()
@@ -2422,7 +2927,21 @@ class SqlAnsichBackend:
             blob = await session.get(AnsichContentBlobRow, blob_key)
             if blob is None:
                 raise RuntimeError("Ansich ContentBlob upsert did not produce a row")
-        existing_bytes = await self._content_blob_bytes(session, blob)
+        try:
+            existing_bytes = await self._content_blob_bytes(session, blob)
+        except PayloadExpiredError as expired:
+            # RC6 on the write side. The collision check exists to prove that
+            # two writers agreeing on a `blob_key` really agree on the bytes,
+            # and an expired body cannot be compared — but it does not have to
+            # be, because the tombstone kept exactly the two facts the check
+            # needs. Comparing the retained digest and size is the *same*
+            # assertion the byte comparison makes, made from lineage rather than
+            # from content, which is what the lineage half was retained for.
+            # Degrading to "assume they match" would let a genuine collision
+            # through unnoticed on any store old enough to have run retention.
+            if expired.sha256 != content_hash or expired.byte_size != len(content_bytes):
+                raise ValueError("Ansich ContentBlob key collision") from expired
+            return
         if existing_bytes != content_bytes:
             raise ValueError("Ansich ContentBlob key collision")
 
@@ -2433,6 +2952,23 @@ class SqlAnsichBackend:
             if claim is None:
                 break
             job_id, projector_name, observation, ingest_seq, attempt, lease_generation = claim
+            # RC6, the claim half. The claim hydrates, so after it an envelope
+            # carrying no payload *and* a payload reference means exactly one
+            # thing: the body was deleted under the retention policy and the row
+            # is a tombstone. (A live externalized row comes back hydrated with
+            # `payload_ref_id` cleared; a row that carried nothing comes back
+            # with an empty payload and no reference; a row whose payload is
+            # genuinely missing raised in the claim and never got here.)
+            if observation.payload is None and observation.payload_ref_id is not None:
+                if await self._settle_expired_evidence_job(
+                    job_id=job_id,
+                    projector_name=projector_name,
+                    observation=observation,
+                    lease_generation=lease_generation,
+                ):
+                    processed += 1
+                    self._watermark = ingest_seq if self._watermark is None else max(self._watermark, ingest_seq)
+                continue
             try:
                 context_metrics_changed = False
                 settled = False
@@ -2511,6 +3047,83 @@ class SqlAnsichBackend:
                     lease_generation=lease_generation,
                 )
         return processed
+
+    async def _settle_expired_evidence_job(
+        self,
+        *,
+        job_id: str,
+        projector_name: str,
+        observation: ObservationEnvelope,
+        lease_generation: int,
+    ) -> bool:
+        """Settle one projection job whose evidence expired under retention.
+
+        Returns whether this worker still owned the job (the ordinary
+        compare-and-set answer, so a taken-over row is not counted).
+
+        **Why ``completed`` and not ``failed`` (ruling RC6, this task's half).**
+        The job is settled in the only sense that word has here: nothing further
+        will ever be done with it, by anyone. What it is *not* is a failure --
+        no attempt went wrong, no retry can help, and the store is in exactly
+        the state the operator's own policy asked for. ``failed`` is the status
+        the ``projection_failure`` Alert producer counts and the failed-job
+        route lists, so using it would raise a critical-looking alarm about a
+        configured deletion, and every operator remedy (``retry``, a replay)
+        would re-collide with it forever. The other two candidates are worse:
+        leaving the row claimable stalls the whole claim order behind it,
+        because the claim is ordered by ``ingest_seq``; and projecting from an
+        empty payload fabricates a verdict out of nothing, which is the precise
+        thing the tombstone exists to prevent.
+
+        **What is recorded, and where.** ``last_error`` carries the tombstone's
+        own lineage line -- which payload, under which policy, when, and the
+        digest and size of the bytes that are gone. It is a deliberate reuse of
+        a column named for failures on a row that did not fail, and the reason
+        is that it is the one durable place a job carries prose: a settled job
+        with an empty ``last_error`` would say nothing at all, and inventing a
+        column for a rare policy outcome is not worth a migration. Nothing keys
+        on ``last_error``; the failed-job route reads it only for rows whose
+        status is ``failed``.
+
+        **Reachability.** In steady state this is unreachable, because tier 1
+        refuses to tombstone a payload whose Observation still has an unsettled
+        job (see ``_payload_retention_candidates``). What reaches it is a
+        *replay* or a rebuild that re-pends jobs for Observations whose payloads
+        have since expired -- and there the honest answer is precisely this one:
+        the replay cannot re-derive those rows, says so, and does not report a
+        failure an operator would try to fix.
+        """
+
+        async with self._session_factory() as session, session.begin():
+            detail = "ansich-retention: evidence expired"
+            if observation.payload_ref_id is not None:
+                payload_row = await session.get(AnsichPayloadRow, observation.payload_ref_id)
+                if payload_row is not None and payload_row.body is None:
+                    detail = f"ansich-retention: {_expired_payload_detail(payload_row)}"
+            settled = await self._complete_projection_job(
+                session,
+                job_id=job_id,
+                lease_generation=lease_generation,
+            )
+            if settled:
+                # Stamped **after** the completion, not before it: the
+                # completion write clears `last_error` (it is the ordinary
+                # "this settled cleanly" reset), so a detail written first would
+                # be erased by the statement meant to record it. Both are in one
+                # transaction, and it runs only when the compare-and-set said
+                # this worker still owned the row -- a job taken over is the new
+                # owner's to describe, not ours.
+                await session.execute(
+                    update(AnsichProjectionJobRow).where(AnsichProjectionJobRow.job_id == job_id).values(last_error=detail),
+                )
+        logger.debug(
+            "ansich retention: settled projection job %s (%s) for observation %s without projecting -- %s",
+            job_id,
+            projector_name,
+            observation.obs_id,
+            detail,
+        )
+        return settled
 
     def get_projection_metrics(self) -> dict[str, int | None]:
         lag_ms = 0
@@ -4007,12 +4620,27 @@ class SqlAnsichBackend:
             payload = observation_row.payload_json
             payload_ref_id = observation_row.payload_ref_id
             if payload is None and payload_ref_id is not None:
-                # A payload row that has gone missing still raises rather than
+                # A payload row that has gone *missing* still raises rather than
                 # degrading to an empty dict: an empty payload validates into a
                 # *different* verdict, so silence would fabricate one instead of
                 # reporting that the evidence cannot be read.
-                payload = await self._hydrated_observation_payload(session, observation_row)
-                payload_ref_id = None
+                #
+                # A payload the retention policy **expired** is the other case
+                # and must not raise (RC6): raising inside the claim rolls the
+                # claim back with no attempt charged, and because the claim
+                # orders by `ingest_seq`, one expired row that is the lowest
+                # claimable one stalls every projection in this process
+                # permanently and silently (F10-23's shape) -- for a deletion an
+                # operator configured on purpose. So the claim leaves the
+                # envelope in its un-hydrated shape (`payload=None` beside the
+                # tombstone's `payload_ref_id`), which is exactly what the cheap
+                # non-hydrating reads already return for an externalized row,
+                # and `project_pending` recognises that pair and settles the job
+                # without fabricating a projection from bytes nobody has.
+                state = await self._hydrated_observation_payload(session, observation_row)
+                if not state.expired:
+                    payload = state.payload
+                    payload_ref_id = None
             observation = self._observation_envelope(
                 observation_row,
                 payload=payload,
@@ -4771,8 +5399,8 @@ class SqlAnsichBackend:
     async def _hydrated_observation_payload(
         session: AsyncSession,
         row: AnsichObservationRow,
-    ) -> dict:
-        """One Observation's payload, with an externalized one read back.
+    ) -> _ObservationPayload:
+        """One Observation's payload, in one of RC6's three states.
 
         A payload over ``inline_payload_max_bytes`` is stored in
         ``ansich_payloads`` and the row keeps ``payload_json IS NULL``, so a
@@ -4782,30 +5410,55 @@ class SqlAnsichBackend:
         mirrored here; the assessor's raw-row read was the sibling F10-8 left
         open (F10-23).
 
-        A payload row that has gone missing raises rather than degrading to an
-        empty dict, for the same reason the claim path raises: an empty payload
-        would validate into a *different* verdict, so silence would fabricate a
-        conclusion instead of reporting that the evidence cannot be read.
+        **This returns a state, not a dict** (plan ruling RC6), and that is the
+        whole of the retention interface on the read side. Before retention
+        existed there were two outcomes — a payload, or a raise — and the raise
+        was correct for both of the conditions it covered. It is now correct
+        for only one of them:
+
+        * **present** — the body is there. ``payload`` is the decoded object.
+        * **expired** — the body was deleted under the retention policy and the
+          row is a tombstone. ``payload`` is ``None`` and the lineage half
+          (``sha256``, ``byte_size``, ``deleted_at``, ``policy``) says what the
+          bytes were, how many there were, when they went and under which rule.
+          This is a **policy outcome**, so it must not raise: keeping the raise
+          here would re-open F10-23's Task-wide poison stall — the claim orders
+          by ``ingest_seq``, so one expired row that is the lowest claimable one
+          stalls every projection in the process — for a deletion somebody
+          configured on purpose.
+        * **missing** — no ``ansich_payloads`` row at all. Still a loud
+          ``RuntimeError``, because a tombstone-less missing row is corruption
+          and nothing about retention makes it less so. Retention never deletes
+          a payload row; it empties one and stamps it.
+
+        The fourth possibility, a row carrying neither an inline payload nor a
+        reference, returns an empty dict and is deliberately **not** folded into
+        "expired" (T2's F6 note). It is reachable in history, it means "this
+        Observation carried nothing", and an expired payload means "this
+        Observation carried something we can no longer read" — a reader that
+        conflated them would report deleted evidence as absent evidence.
 
         The decode failure says "observation payload", and that wording is the
         deliberate one: the claim's own copy of this read used to say
         "projection payload", but what failed to decode is an Observation's
-        stored payload — the projector is only one of this helper's four
-        callers, and the assessor and the environment-history reader would have
-        been misdescribed by it.
+        stored payload — the projector is only one of this helper's callers, and
+        the assessor and the environment-history reader would have been
+        misdescribed by it.
         """
 
         if row.payload_json is not None:
-            return row.payload_json
+            return _ObservationPayload(payload=row.payload_json)
         if row.payload_ref_id is None:
-            return {}
+            return _ObservationPayload(payload={})
         payload = await session.get(AnsichPayloadRow, row.payload_ref_id)
         if payload is None:
             raise RuntimeError(f"Ansich payload disappeared: {row.payload_ref_id}")
+        if payload.body is None:
+            return _ObservationPayload.expired_from(payload)
         decoded = json.loads(payload.body.decode(payload.encoding))
         if not isinstance(decoded, dict):
             raise ValueError("Ansich observation payload must decode to an object")
-        return decoded
+        return _ObservationPayload(payload=decoded)
 
     @staticmethod
     def _scope_safety_evidence_subject(row: AnsichObservationRow) -> str | None:
@@ -4918,6 +5571,7 @@ class SqlAnsichBackend:
         )
         snapshots_by_tool: dict[str, dict[str, AuthorizationSnapshot]] = {}
         effects_by_tool: dict[str, dict[str, ToolEffect]] = {}
+        expired_evidence = 0
         for row in rows:
             # A re-judged ToolCall still needs its complete evidence, so only
             # rows that positively belong to an unaffected ToolCall are skipped;
@@ -4925,13 +5579,42 @@ class SqlAnsichBackend:
             if affected is not None and (subject := self._scope_safety_evidence_subject(row)) is not None and subject not in affected:
                 continue
             if row.kind.startswith("authorization."):
-                payload = await self._hydrated_observation_payload(session, row)
-                snapshot = AuthorizationSnapshot.model_validate(payload.get("snapshot"), strict=False)
+                state = await self._hydrated_observation_payload(session, row)
+                # RC6, the scope-safety half: **degrade, do not raise**. This
+                # read is the F10-23 poison site -- it runs on every assessment
+                # tick for the Task, so a raise here is a per-tick, Task-wide
+                # stall, and doing that over a deletion the operator configured
+                # would be the worst of both worlds. Skipping the row does not
+                # fabricate anything either: an authorization snapshot that is
+                # no longer readable contributes no snapshot, and
+                # ``assess_scope_safety`` reads a ToolCall with fewer snapshots
+                # as *less* verified, never as more. The direction is what makes
+                # the skip safe; the count below is what keeps it visible.
+                if state.expired or state.payload is None:
+                    expired_evidence += 1
+                    continue
+                snapshot = AuthorizationSnapshot.model_validate(state.payload.get("snapshot"), strict=False)
                 snapshots_by_tool.setdefault(snapshot.tool_call_id, {})[snapshot.snapshot_id] = snapshot
             elif row.kind.startswith("effect."):
-                payload = await self._hydrated_observation_payload(session, row)
-                effect = ToolEffect.model_validate(payload.get("effect"), strict=False)
+                state = await self._hydrated_observation_payload(session, row)
+                if state.expired or state.payload is None:
+                    expired_evidence += 1
+                    continue
+                effect = ToolEffect.model_validate(state.payload.get("effect"), strict=False)
                 effects_by_tool.setdefault(effect.tool_call_id, {})[effect.effect_id] = effect
+        if expired_evidence:
+            # DEBUG rather than a health field or an Alert: this is a
+            # consequence of a policy the operator set, and the *fact* that
+            # evidence expired is already durable in the tombstone rows. What is
+            # genuinely lost is the ability to re-derive an old conclusion, and
+            # the conclusions themselves are not rewritten here -- assessment is
+            # incremental, so a converged verdict stands rather than being
+            # re-judged into a weaker one by the expiry.
+            logger.debug(
+                "ansich scope-safety: %d evidence payload(s) for task %s expired under retention and were not re-read",
+                expired_evidence,
+                task_id,
+            )
         tool_call_ids = sorted(snapshots_by_tool.keys() | effects_by_tool.keys())
         return tuple(
             assess_scope_safety(
@@ -5978,6 +6661,19 @@ class SqlAnsichBackend:
         payload = await session.get(AnsichPayloadRow, row.manifest_payload_id)
         if payload is None:
             raise RuntimeError(f"Ansich AgentRelease manifest payload disappeared: {row.manifest_payload_id}")
+        if payload.body is None:
+            # RC6's expired state, at the one site where reaching it means
+            # something is wrong rather than something is working. A release
+            # manifest is declared **non-expirable** by the time tiers
+            # (``_PAYLOAD_REFERRER_TIERS``): it is not per-run evidence but the
+            # immutable identity of a release — ``release_hash`` is computed
+            # from it and every comparison reads it — and it is the only copy,
+            # while its size is bounded by the manifest rather than by run
+            # volume. It goes when its release goes, in the structural tier,
+            # row and all. So a tombstone here was not made by time retention,
+            # and the raise is deliberate: it is corruption or a manual
+            # deletion, and the message says which question to ask.
+            raise RuntimeError(f"Ansich AgentRelease manifest {_expired_payload_detail(payload)}; manifests are excluded from time retention, so this is not a policy outcome")
         decoded = json.loads(payload.body.decode(payload.encoding))
         return AgentReleaseManifest.model_validate(decoded)
 
@@ -6125,6 +6821,45 @@ class SqlAnsichBackend:
         ``retry`` (re-armed after a spent attempt), leased, or
         dependency-waiting — reads as ``pending``: the caller is being told the
         Observation has not landed yet, not why.
+
+        **The retention horizon is consulted here, and this is RA6's last rung**
+        (plan ruling RC7). Jobs are ``ON DELETE CASCADE`` from the Observation
+        they belong to (``models.py``), so deleting an Observation under the
+        retention policy silently takes its jobs with it — and the caller's
+        ladder reads "no jobs for an id you told me was accepted" as ``failed``,
+        because jobs commit in the same transaction as their Observation. That
+        inference is sound right up until retention exists, and then it flips a
+        once-accepted receipt to ``failed`` for evidence that expired exactly as
+        configured. That is FC-3's named harm: a false integrity alarm
+        manufactured out of a policy outcome, which erodes trust in every
+        receipt including the true ones.
+
+        The horizon is what makes the distinction answerable. It is the store's
+        own durable claim that Observation-tier deletion has *completed* over a
+        contiguous prefix, so when an accepted id is absent and the horizon has
+        moved, "deleted under policy" is a real explanation the store can point
+        at rather than a guess. Three cases, in order:
+
+        * the Observation is still there — nothing about retention applies, and
+          the answer is whatever its jobs say (or ``failed`` if it somehow has
+          none, unchanged);
+        * the Observation is gone and the horizon is ``0`` — ``0`` means
+          *nothing has ever been deleted*, so retention cannot be the
+          explanation and the pre-existing "absent means lost" answer stands;
+        * the Observation is gone and the horizon has moved — ``expired``.
+
+        **The imprecision in the third case is real and is the deliberate
+        direction.** The deleted row took its ``ingest_seq`` with it, so the
+        store cannot prove *this* id was in the deleted prefix rather than lost
+        some other way. What the ladder's own precondition supplies is that the
+        caller owns the id and the earlier rungs have already answered for every
+        row this process charged as lost — so by the time this rung runs, an
+        absent row on a store that has deleted a prefix is far better explained
+        by the deletion than by a loss nothing recorded. Choosing ``expired``
+        there trades a possible under-report of loss for the certainty of never
+        crying integrity over a configured deletion, and loss has three louder
+        reporting channels of its own (charged ranges, the ``observability.lost``
+        stream, the degradation Alert) while a flipped receipt has none.
         """
 
         async with self._session_factory() as session:
@@ -6137,8 +6872,13 @@ class SqlAnsichBackend:
                     )
                 ).scalars()
             )
-        if not statuses:
-            return None
+            if not statuses:
+                observation_exists = await session.scalar(select(AnsichObservationRow.ingest_seq).where(AnsichObservationRow.obs_id == obs_id))
+                if observation_exists is None:
+                    horizon = await session.scalar(select(AnsichRetentionStateRow.observation_horizon_ingest_seq).where(AnsichRetentionStateRow.id == _RETENTION_STATE_ID))
+                    if int(horizon or 0) > 0:
+                        return "expired"
+                return None
         if any(status == "failed" for status in statuses):
             return "failed"
         if all(status == "completed" for status in statuses):
@@ -6170,6 +6910,13 @@ class SqlAnsichBackend:
             payload = await session.get(AnsichPayloadRow, observation.payload_ref_id)
             if payload is None:
                 return None
+            if payload.body is None:
+                # RC6: "expired under policy" is not "not found". Folding it
+                # into the ``None`` above would answer 404 — "this evaluation
+                # has no payload" — for a body that was readable for as long as
+                # the policy kept it, which is the exact misreading the
+                # tombstone was added to prevent.
+                raise _payload_expired_error(payload, what="evaluation payload")
             decoded = json.loads(payload.body.decode(payload.encoding))
         return decoded if isinstance(decoded, dict) else None
 
@@ -7618,6 +8365,7 @@ class SqlAnsichBackend:
 
         window_start = datetime.now(UTC) - timedelta(minutes=window_minutes)
         points: list[EnvironmentHistoryPoint] = []
+        expired_points = 0
         async with self._session_factory() as session:
             rows = list(
                 (
@@ -7655,7 +8403,22 @@ class SqlAnsichBackend:
             # One point is kept per surviving row, and each payload is dropped
             # as soon as it has been read.
             for row in rows:
-                payload = await self._hydrated_observation_payload(session, row)
+                state = await self._hydrated_observation_payload(session, row)
+                if state.expired or state.payload is None:
+                    # RC6, the history half. A sample whose payload expired
+                    # under retention is **counted**, not skipped silently and
+                    # not rendered as a point: the series' own contract is that
+                    # a missing metric is absent rather than zero, so an expired
+                    # sample cannot become a value -- but leaving it entirely
+                    # unreported would make a deliberate deletion look exactly
+                    # like a Scope that never sampled, which is the one reading
+                    # this view exists to prevent. The count travels with the
+                    # window so the renderer can mark the stretch as expired
+                    # rather than break the line across it as an unexplained
+                    # gap.
+                    expired_points += 1
+                    continue
+                payload = state.payload
                 if payload.get("environment_scope") != environment_scope:
                     continue
                 metrics = payload.get("metrics")
@@ -7687,6 +8450,7 @@ class SqlAnsichBackend:
             window_minutes=window_minutes,
             truncated=truncated,
             points=tuple(points),
+            expired_points=expired_points,
         )
 
     async def get_task_tool_env_samples(self, task_id: str) -> TaskToolEnvSamplesView:
@@ -9917,6 +10681,10 @@ class SqlAnsichBackend:
                 payload = await session.get(AnsichPayloadRow, observation.payload_ref_id)
                 if payload is None:
                     return None
+                if payload.body is None:
+                    # RC6, same distinction as the evaluation payload read: a
+                    # 404 here would say the block never had a body.
+                    raise _payload_expired_error(payload, what="ContentBlock payload")
                 decoded = json.loads(payload.body.decode(payload.encoding))
                 if not isinstance(decoded, dict) or "body" not in decoded:
                     return None
@@ -10185,6 +10953,16 @@ class SqlAnsichBackend:
         payload = await session.get(AnsichPayloadRow, blob.payload_ref_id)
         if payload is None:
             raise ValueError(f"Ansich ContentBlob payload disappeared: {blob.payload_ref_id}")
+        if payload.body is None:
+            # RC6's third state, and the one raw-body reads *must* raise for:
+            # this function's entire contract is "the bytes", and a tombstone
+            # has none. The refusal is typed rather than a bare ``ValueError``
+            # so the route can answer 410 with the lineage instead of a 500 —
+            # "the policy expired this on that date" is a different answer from
+            # "something is wrong", and only one of them is true here. The write
+            # path (``_store_content_blob``'s collision check) catches it and
+            # compares the tombstone's digest instead of the bytes.
+            raise _payload_expired_error(payload, what="ContentBlob payload")
         return bytes(payload.body)
 
     @staticmethod
@@ -10943,6 +11721,16 @@ class SqlAnsichBackend:
                 # guarantee this INSERT precedes the FK-dependent one below;
                 # flush explicitly to enforce the order.
                 await session.flush()
+            elif manifest_payload.body is None:
+                # RC6 on the release write path. Manifests are excluded from
+                # time retention, so a tombstone here is not a policy outcome —
+                # but the immutability check still has to be answerable, and the
+                # tombstone kept exactly what answers it. Comparing the retained
+                # digest and size makes the same assertion the byte comparison
+                # makes; treating an unreadable body as "matches" would let a
+                # different manifest bind itself to an existing release id.
+                if manifest_payload.sha256 != hashlib.sha256(manifest_bytes).hexdigest() or manifest_payload.byte_size != len(manifest_bytes):
+                    raise ValueError("AgentRelease manifest payload is immutable")
             elif manifest_payload.body != manifest_bytes:
                 raise ValueError("AgentRelease manifest payload is immutable")
             row = AnsichAgentReleaseRow(

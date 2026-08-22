@@ -1,4 +1,5 @@
 from ansich import AnsichService
+from ansich.contracts import RetentionPolicy
 from ansich.environment import EnvironmentThresholds
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
@@ -185,6 +186,30 @@ def service_knobs_from_config(config) -> dict[str, object]:
     }
 
 
+def retention_policy_from_config(config) -> RetentionPolicy:
+    """Map ``AnsichRetentionConfig`` onto the framework-independent policy.
+
+    The seam exists because ``ansich`` must not import ``deerflow`` (the
+    package is framework-independent by contract), so ``run_retention`` names
+    its argument in its own vocabulary and the adapter layer converts once. One
+    named function rather than a splat at each call site, for the same reason
+    ``service_knobs_from_config`` is one: a new retention knob then has exactly
+    one place to be threaded through, and a caller that forgot one is not
+    expressible.
+
+    The containment rule is re-validated by the target model rather than trusted
+    from the source. Both models enforce it, which is not redundant: a
+    ``RetentionPolicy`` can be built without ever passing through configuration.
+    """
+
+    return RetentionPolicy(
+        raw_payload_days=config.raw_payload_days,
+        observation_days=config.observation_days,
+        structural_days=config.structural_days,
+        cleanup_batch_size=config.cleanup_batch_size,
+    )
+
+
 def environment_thresholds_from_config(assessors) -> EnvironmentThresholds:
     """Map ``AnsichAssessorConfig``'s ``environment_*`` knobs onto the rule model.
 
@@ -236,5 +261,6 @@ __all__ = [
     "create_embedded_ansich_service",
     "create_sql_ansich_service",
     "environment_thresholds_from_config",
+    "retention_policy_from_config",
     "service_knobs_from_config",
 ]

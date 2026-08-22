@@ -11,7 +11,7 @@ from typing import Literal
 from ansich.alerts import AlertWorkflowConflict
 from ansich.contracts import ControlValue, NamedVersion, Producer, TaskLifecycleScope
 from ansich.credentials import contains_credential_like_material
-from ansich.errors import StorageUnavailableError
+from ansich.errors import PayloadExpiredError, StorageUnavailableError
 from ansich.evaluation import (
     EvaluationDimension,
     EvaluationKind,
@@ -61,6 +61,35 @@ def _service_or_503(request: Request):
     if service is None:
         raise HTTPException(status_code=503, detail="Ansich is disabled or unavailable")
     return service
+
+
+def _expired_payload_410(exc: PayloadExpiredError, *, what: str) -> HTTPException:
+    """Answer a raw-body read whose evidence expired under retention with 410.
+
+    **410 Gone, not 404** (plan ruling RC6). The two are different answers and
+    the difference is the whole reason payload tombstones exist: 404 says this
+    evidence has no body — it never was recorded, or the id is wrong — while
+    this says it was recorded, it was readable for as long as the configured
+    policy kept it, and the policy expired it on the date in the response. A
+    reader told 404 goes looking for a bug; a reader told 410 reads the policy.
+
+    The body carries the tombstone's lineage half and nothing else: the digest,
+    the size, when it went and under which rule. That is the whole of what can
+    still be said truthfully about the bytes, and it is what lets an operator
+    tell a retention outcome from a deletion nobody configured.
+    """
+
+    return HTTPException(
+        status_code=410,
+        detail={
+            "message": f"Ansich {what} expired under the retention policy",
+            "payload_id": exc.payload_id,
+            "policy": exc.policy,
+            "deleted_at": exc.deleted_at.isoformat() if hasattr(exc.deleted_at, "isoformat") else exc.deleted_at,
+            "sha256": exc.sha256,
+            "byte_size": exc.byte_size,
+        },
+    )
 
 
 def _projection_status(service) -> dict:
@@ -1660,6 +1689,8 @@ async def get_evaluation_payload(obs_id: str, request: Request, response: Respon
     _ensure_queryable(service)
     try:
         payload = await service.get_evaluation_observation_payload(obs_id)
+    except PayloadExpiredError as expired:
+        raise _expired_payload_410(expired, what="evaluation payload") from expired
     except Exception as exc:
         raise HTTPException(
             status_code=503,
@@ -1967,6 +1998,8 @@ async def _get_tool_result_payload(
     result = results[-1]
     try:
         payload = await service.get_content_block_payload(result.content_block_id)
+    except PayloadExpiredError as expired:
+        raise _expired_payload_410(expired, what=f"ToolCall {role} payload") from expired
     except Exception as exc:
         raise HTTPException(
             status_code=503,
@@ -2033,6 +2066,8 @@ async def get_content_block_payload(block_id: str, request: Request, response: R
     _ensure_queryable(service)
     try:
         payload = await service.get_content_block_payload(block_id)
+    except PayloadExpiredError as expired:
+        raise _expired_payload_410(expired, what="ContentBlock payload") from expired
     except Exception as exc:
         raise HTTPException(
             status_code=503,

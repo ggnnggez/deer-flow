@@ -89,7 +89,7 @@ from datetime import UTC, datetime, timedelta
 import pytest
 import sqlalchemy as sa
 from alembic import command as alembic_command
-from ansich import AnsichService, AuthorizationSnapshot, ObservationEnvelope, Producer, ReplayReport, ReplaySelector, new_id
+from ansich import AnsichService, AuthorizationSnapshot, ObservationEnvelope, Producer, ReplayReport, ReplaySelector, RetentionPolicy, new_id
 from ansich.assessment.scope_safety import SCOPE_SAFETY_ASSESSOR
 from ansich.belief.resolver import DEFAULT_RESOLVER
 from ansich.errors import ActiveVersionError
@@ -111,6 +111,7 @@ from deerflow.ansich.persistence.models import (
     AnsichAssessorJobRow,
     AnsichAssessorWatermarkRow,
     AnsichObservationRow,
+    AnsichPayloadRow,
     AnsichProjectionJobRow,
     AnsichScopeConclusionRow,
     AnsichTaskHeartbeatRow,
@@ -2111,3 +2112,118 @@ async def test_activate_version_writes_row_and_audit_atomically_on_postgres() ->
             assert int(await session.scalar(sa.select(sa.func.count()).select_from(AnsichObservationRow)) or 0) == 2
         assert await worker_b.backend.get_active_resolver() == DEFAULT_RESOLVER
         assert await worker_b.backend.validate_active_versions() == ()
+
+
+# ===========================================================================
+# 12. Time-tiered retention against a live projector
+# ===========================================================================
+
+
+async def test_retention_tombstones_payloads_beside_a_live_claimer_on_postgres() -> None:
+    """One retention pass on worker A while worker B is claiming and projecting.
+
+    This is the case SQLite structurally cannot answer, and it is what the two
+    devices in the retention path exist for. The **distinct advisory key**
+    (`_PG_RETENTION_LOCK_KEY`) means the sweep never blocks — a shared key would
+    have put it in the same queue as every rebuild and retry, which on a real
+    server is a wait bounded only by `database.command_timeout`. The **sorted,
+    id-bounded batch** means two processes touching `ansich_payloads` walk it in
+    the same order, which is the difference the tier already demonstrated
+    between two workers finishing and PostgreSQL aborting one as a deadlock.
+
+    The scripted interleave is the point rather than the drive-by concurrency:
+    worker B claims a job — committing `processing` in its own transaction, the
+    invariant the whole claim protocol rests on — and *then* worker A sweeps.
+    The claimed job's payload must survive, because a projector that is about to
+    read a body has to find one; every other expired payload must go. That is
+    the in-flight guard proved against a genuinely concurrent claimer rather
+    than against a status this test wrote itself.
+
+    Two limits are deliberate and stated here rather than discovered later. The
+    pass runs to completion while B holds its claim, so what this shows is that
+    the two do not *contend*, not that a batch and a claim were interleaved
+    statement by statement — the payload tier takes no row lock a claim could
+    queue behind, which is exactly why there is nothing finer to script. And the
+    horizon is untouched throughout: tier 1 does not move it, so its value here
+    is `0` for the honest reason rather than by accident.
+    """
+
+    async with _two_workers(inline_payload_max_bytes=1) as (_url, worker_a, worker_b):
+        task_id = new_id()
+        envelopes = [
+            _task_created(task_id, source_id="run-retention"),
+            _heartbeat(task_id, run_id="run-retention", ordinal=1, offset_seconds=0),
+            _heartbeat(task_id, run_id="run-retention", ordinal=2, offset_seconds=1),
+            _heartbeat(task_id, run_id="run-retention", ordinal=3, offset_seconds=2),
+        ]
+        assert await worker_a.backend.persist_and_project(envelopes) == len(envelopes)
+        await _settle_everything(worker_a, worker_b)
+
+        async with worker_a.sessions() as session:
+            payload_ids = set((await session.execute(sa.select(AnsichPayloadRow.payload_id))).scalars())
+        assert len(payload_ids) == len(envelopes), "every payload must have been externalized"
+
+        # Re-pend one Observation's jobs so B has something real to claim, and
+        # let B claim it. The claim commits `processing` in its own transaction,
+        # so A's sweep genuinely sees an in-flight job rather than a status the
+        # test wrote for it.
+        async with worker_a.sessions() as session, session.begin():
+            pinned_obs_id = await session.scalar(sa.select(AnsichObservationRow.obs_id).where(AnsichObservationRow.kind == "task.heartbeat").order_by(AnsichObservationRow.ingest_seq.desc()).limit(1))
+            pinned_payload_id = await session.scalar(sa.select(AnsichObservationRow.payload_ref_id).where(AnsichObservationRow.obs_id == pinned_obs_id))
+            # Exactly **one** job, so the claim below is deterministic: the claim
+            # predicate takes the lowest claimable row store-wide, and re-pending a
+            # whole Observation's fan-out would leave the test asserting about
+            # whichever sibling won.
+            pinned_job_id = await session.scalar(sa.select(AnsichProjectionJobRow.job_id).where(AnsichProjectionJobRow.obs_id == pinned_obs_id).order_by(AnsichProjectionJobRow.job_id).limit(1))
+            await session.execute(sa.update(AnsichProjectionJobRow).where(AnsichProjectionJobRow.job_id == pinned_job_id).values(status="pending", attempts=0, lease_owner=None, lease_expires_at=None, available_at=datetime.now(UTC)))
+        claim = await worker_b.backend._claim_projection_job()
+        assert claim is not None and claim[0] == pinned_job_id
+        async with worker_a.sessions() as session:
+            assert await session.scalar(sa.select(AnsichProjectionJobRow.status).where(AnsichProjectionJobRow.job_id == claim[0])) == "processing", "the claim must be committed before the sweep runs, or this proves nothing"
+
+        report = await asyncio.wait_for(
+            worker_a.backend.run_retention(
+                RetentionPolicy(raw_payload_days=7, observation_days=30, structural_days=90, cleanup_batch_size=2),
+                now=_OCCURRED_AT + timedelta(days=10),
+            ),
+            timeout=30,
+        )
+
+        assert report.finished is True
+        assert report.payload_tombstoned == len(payload_ids) - 1
+        assert report.batches >= 1
+        assert report.observation_horizon_ingest_seq == 0
+
+        async with worker_b.sessions() as session:
+            rows = {row.payload_id: row for row in (await session.execute(sa.select(AnsichPayloadRow))).scalars()}
+        assert rows[pinned_payload_id].body is not None, "a body a live claimer is about to read must survive the sweep"
+        assert rows[pinned_payload_id].deleted_at is None
+        for payload_id, row in rows.items():
+            if payload_id == pinned_payload_id:
+                continue
+            assert row.body is None
+            assert row.policy == "raw_payload_days=7"
+            assert row.sha256 and row.byte_size, "the lineage half is retained on the real dialect too"
+
+        # B settles the job it was holding, on a body the sweep left in place.
+        async with worker_b.sessions() as session, session.begin():
+            assert await worker_b.backend._complete_projection_job(session, job_id=claim[0], lease_generation=claim[-1])
+
+        # The non-vacuous half: a claim taken *after* the sweep still hydrates.
+        # The row assertions above say the bytes are on disk; this says a
+        # projector can still read them, which is the property the in-flight
+        # guard exists for. An expired payload would come back as the
+        # un-hydrated pair (`payload=None` beside a `payload_ref_id`) and settle
+        # without projecting.
+        async with worker_a.sessions() as session, session.begin():
+            await session.execute(sa.update(AnsichProjectionJobRow).where(AnsichProjectionJobRow.job_id == pinned_job_id).values(status="pending", attempts=0, lease_owner=None, lease_expires_at=None, available_at=datetime.now(UTC)))
+        second = await worker_b.backend._claim_projection_job()
+        assert second is not None and second[0] == pinned_job_id
+        assert second[2].payload is not None
+        assert second[2].payload_ref_id is None
+        async with worker_b.sessions() as session, session.begin():
+            assert await worker_b.backend._complete_projection_job(session, job_id=second[0], lease_generation=second[-1])
+
+        await _settle_everything(worker_a, worker_b)
+        async with worker_a.sessions() as session:
+            assert await session.scalar(sa.select(AnsichProjectionJobRow.status).where(AnsichProjectionJobRow.job_id == pinned_job_id)) == "completed"

@@ -206,6 +206,16 @@ class EnvironmentHistoryView(_FrozenModel):
     renderer must not interpolate across. ``truncated`` says the window held
     more surviving points than ``max_points`` and the **newest** ones were
     kept.
+
+    ``expired_points`` counts samples in the window whose payload body was
+    deleted under the retention policy (plan ruling RC6). They are **not**
+    points and never become values — the series' rule that missing is not zero
+    holds for them too — but they are not silently dropped either: without the
+    count, a stretch a policy deliberately expired would be indistinguishable
+    from a Scope that simply never sampled, and the renderer would break its
+    line across an unexplained gap. It is counted **before** ``max_points``
+    truncation, so it describes the whole window rather than the kept tail; the
+    number is a property of the query's range, not of what survived the cap.
     """
 
     scope_id: str
@@ -214,6 +224,7 @@ class EnvironmentHistoryView(_FrozenModel):
     window_minutes: int = Field(ge=1)
     truncated: bool = False
     points: tuple[EnvironmentHistoryPoint, ...] = ()
+    expired_points: int = Field(default=0, ge=0)
 
 
 class ToolEnvSampleView(_FrozenModel):

@@ -131,7 +131,12 @@ in one script: the read-model digest computed on the asyncpg dialect and equal
 across two replays, a peer worker's `assess_operations` committing inside the
 mint's open transaction, the re-pend's bulk `UPDATE … IN (subquery)` skipping a
 genuinely claimable row out of a concurrent claimer's way, and `--replace`
-followed by a re-replace with an unchanged digest.
+followed by a re-replace with an unchanged digest. P11-C's retention tier adds
+one more: a `run_retention` pass on one worker while the other holds a committed
+claim, which is where the distinct advisory key and the sorted, id-bounded batch
+are worth anything — the sweep does not queue behind the claimer, the claimed
+job's payload survives while every other expired body is tombstoned with its
+lineage retained, and a claim taken *after* the sweep still hydrates.
 It is **not** a Postgres run of the whole suite:
 everything outside `tests/integration/` still runs on SQLite only.
 
@@ -2371,6 +2376,98 @@ under **enforced** foreign keys (`tests/ansich/conftest.py` leaves
 really executed (asserted by reading the row back *inside* the doomed
 transaction, so a two-transaction implementation could not pass), and the
 `String(128)` bound PostgreSQL raises on and SQLite ignores.
+
+**P11-C retention, tier 1: payload tombstones and the three reader states**
+(spec §6's D6-3/D6-4, plan rulings RC6/RC7). `SqlAnsichBackend.run_retention(policy,
+*, now)` is the time-tiered sweep. It holds **its own** advisory key
+(`sql.py::_PG_RETENTION_LOCK_KEY`, distinct from the maintenance key) because a
+sweep runs long and unattended while a rebuild or a failed-job retry is an
+operator waiting at a terminal: one shared key would queue every remedy behind
+whatever sweep was mid-pass and, past `database.command_timeout`, fail the
+*remedy* loudly for an unrelated reason. The two do not contend for correctness
+either — **retention creates and re-pends no job of any kind**, which is how
+Global Constraint 4 (PB7) is held here, and it is pinned over the AST rather
+than promised in prose: a retention path that "re-projected" an expired range
+would lower `min(unsettled ingest_seq)` and freeze the active-Task read model
+permanently, silently, for Tasks that have since stopped.
+
+Tier 1 replaces expired payload **bodies** with tombstones and never deletes the
+row: `body` goes NULL beside `deleted_at` and `policy` in one UPDATE (the
+`0028` check constraint enforces the shape), while `sha256`/`byte_size` are
+retained as the lineage half. Each batch is `cleanup_batch_size` rows, ordered
+and bounded by `payload_id`, and its cursor advance commits **in the same
+transaction as the UPDATE it describes** — that is the whole of the
+resumability story, and it is why a pass killed mid-tier resumes rather than
+restarting or skipping. On completing the walk the cursor resets to `None`; a
+payload that becomes eligible *behind* the cursor mid-pass is picked up by the
+next pass, because a cursor that jumped backwards could not terminate.
+
+Eligibility is derived, not declared: the **set** of `ansich_payloads` referrers
+comes from `Base.metadata` (`_payload_referrer_columns`), so a schema change
+that adds one cannot silently narrow retention, while `_PAYLOAD_REFERRER_TIERS`
+declares the half metadata cannot answer — which timestamp means "old" for each
+table. A payload with **any** referrer younger than the cutoff is skipped
+whole, an orphan is aged by its own `created_at` (referenced payloads
+deliberately are not: `created_at` is an ingest time and the spec ages evidence
+by when it happened), and an undeclared referrer refuses the pass rather than
+defaulting. **AgentRelease manifests are excluded from time retention
+entirely** — a manifest is the immutable identity of a release rather than
+per-run evidence, `release_hash` is derived from it, and its size is bounded by
+the manifest rather than by run volume; it goes with its release, row and all.
+A payload whose Observation still has an *in-flight* projection job is also
+skipped, which keeps the expired-evidence claim path off the ordinary loop;
+`failed` is deliberately not in `_IN_FLIGHT_JOB_STATUSES`, or one poison job
+would pin its evidence past its policy forever.
+
+**Every reader now distinguishes three payload states, and only one of them is
+loud** (RC6). `_hydrated_observation_payload` returns an `_ObservationPayload`
+rather than a dict: *present*, *expired by policy*, or — still a
+`RuntimeError` — *missing*, because a tombstone-less missing row is corruption
+and retention empties rows rather than deleting them. A row carrying neither an
+inline payload nor a reference keeps its own `{}` answer and is **not** folded
+into expired (T2's F6 note): "carried nothing" and "carried something nobody can
+read" are different facts. The degrade differs by site because the cost differs.
+The **claim** leaves the envelope un-hydrated and `project_pending` settles that
+job `completed` with the tombstone's lineage stamped into `last_error` — not
+`failed`, which is what the `projection_failure` Alert counts and would raise a
+critical-looking alarm about a configured deletion that every operator remedy
+would then re-collide with; and not left claimable, which would stall *all*
+projection in the process behind it, since the claim is ordered by `ingest_seq`.
+In steady state that path is unreachable (the in-flight guard above); what
+reaches it is a replay or rebuild re-pending jobs for evidence that has since
+expired. **Scope safety** skips the row and counts it, because that read runs
+every assessment tick and a raise there is F10-23's Task-wide stall — the skip
+fabricates nothing, since fewer authorization snapshots read as *less* verified.
+**Environment history** counts `expired_points` beside its series: an expired
+sample cannot become a value (missing is not zero) but reporting nothing would
+make a deliberate deletion look like a Scope that never sampled. The **raw-body
+routes** are the one family that raises, because they have nothing to degrade
+to: `ansich.errors.PayloadExpiredError` carries the lineage and the router
+answers **410 Gone**, never 404 — "it was readable until the policy expired it"
+is a different answer from "it never was". Two write paths compare the retained
+digest instead of the bytes (the ContentBlob collision check and the
+AgentRelease manifest immutability check), which is the same assertion made from
+lineage rather than content.
+
+**The retention horizon is what stops receipts flipping** (RC7, FC-3).
+`ansich_retention_state.observation_horizon_ingest_seq` is the store's durable
+claim that Observation-tier deletion has *completed* over a contiguous prefix,
+and `0` is a value rather than a missing one — `ingest_seq` starts at 1, so zero
+means nothing has ever been deleted. `get_observation_projection_status`
+consults it as RA6's last rung: jobs cascade from their Observation, so a
+deleted Observation has no jobs, and the pre-existing "no jobs for an accepted
+id means `failed`" inference would turn a configured deletion into a false
+integrity alarm. Present Observation → unchanged; absent with horizon `0` →
+unchanged (`failed`, presumed lost); absent with a moved horizon → the **fourth**
+`EvaluationProjectionStatus` value, `expired`, minted in the same change that
+updated `errors.py`'s no-fourth-value record. The residual imprecision is
+deliberate and one-directional: the deleted row took its `ingest_seq` with it, so
+"in the deleted prefix" is an inference — but the ladder's earlier rungs have
+already answered for everything this process charged as lost, loss has three
+louder channels of its own, and a flipped receipt has none.
+`DatabaseHealth.retention_last_run` and tiers 2/3 are **not** in this change:
+`RetentionReport.observations_deleted`/`.structural_deleted` are `None`, which
+means *that tier did not run*, not that it ran and deleted nothing.
 
 **Workspace change review**: `packages/harness/deerflow/workspace_changes/`
 captures a pre-run and post-run snapshot of the thread-owned `workspace` and

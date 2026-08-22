@@ -34,7 +34,31 @@ EvaluationSubjectType = Literal[
     "content_block",
     "agent_release",
 ]
-EvaluationProjectionStatus = Literal["pending", "applied", "failed"]
+#: Where one accepted evaluation Observation stands, answered by RA6's ladder.
+#:
+#: * ``pending`` — still queued, in a writer's hands, or holding claimable
+#:   projection jobs. It has not landed *yet*.
+#: * ``applied`` — every projection job for it completed.
+#: * ``failed`` — it is durably lost, or a job for it has durably failed. Both
+#:   are conditions an operator can act on: a retry, or a re-record.
+#: * ``expired`` — it landed, and the evidence has since been **deleted under
+#:   the retention policy**. This is the fourth value, minted by P11-C's
+#:   retention work (plan ruling RC7), and it exists because the other three
+#:   cannot say this without lying. ``failed`` would report a deliberate,
+#:   configured deletion as an integrity incident — the FC-3 flip, where a
+#:   once-accepted write starts reading as lost the day retention catches up
+#:   with it — and ``pending`` would promise a landing that nothing will ever
+#:   deliver. ``applied`` is equally wrong: the read models it built may
+#:   themselves have been swept.
+#:
+#: **What the fourth value deliberately did *not* get minted for**, because the
+#: two conditions look similar and are not: a *storage-unavailable* replay
+#: lookup (F10-25) stays outside this vocabulary entirely. That condition is
+#: "I could not read", which is ignorance, while ``expired`` is a positive
+#: statement about the store's own recorded history — the retention horizon.
+#: Reporting ignorance as knowledge is the mistake ``ansich.errors`` records at
+#: length, and it is unchanged by this addition.
+EvaluationProjectionStatus = Literal["pending", "applied", "failed", "expired"]
 
 #: The named semantic dimensions every evaluated subject is reported against.
 #: They are always present in a quality Belief read: a dimension nothing has
