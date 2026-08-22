@@ -74,6 +74,8 @@ from deerflow.ansich.persistence.models import (
 )
 from deerflow.ansich.persistence.sql import (
     _HARD_DELETE_OWNER_SCOPE_KINDS,
+    _HARD_DELETE_PROTECTED_ENTITY_TYPES,
+    _HARD_DELETE_PROTECTED_PIN_EDGES,
     _PAYLOAD_REFERRER_TIERS,
     _PG_MAINTENANCE_LOCK_KEY,
     _PG_RETENTION_LOCK_KEY,
@@ -3874,10 +3876,168 @@ def test_the_batch_counter_ignores_a_transaction_that_deleted_nothing():
     counts.rollback_batch()
     counts.commit_batch()
     assert (counts.batches, counts.observations, counts.payloads) == (1, 0, 2), "a rolled-back transaction leaves neither counts nor a batch"
-    # `audit_refs` is a subset of `observations` and must not be double-counted
-    # into the deleted total the batch check compares.
-    counts.audit_refs += 1
-    assert counts.deleted_total() == counts.tasks + counts.observations + counts.payloads + counts.projections + counts.relations + counts.read_models
+    # `deleted_total` is live: `_advance_deletion_horizon` gates the one-way
+    # deliberate-deletion mark on it. So the property that matters is that
+    # `audit_refs` — a **subset** of `observations` — cannot move it, or an
+    # erasure that deleted only audit rows would count them twice and a refused
+    # one could stamp the mark off a number that describes nothing.
+    before = counts.deleted_total()
+    counts.audit_refs += 5
+    assert counts.deleted_total() == before, "audit_refs is a subset of observations and must not enter the total"
+    counts.observations += 3
+    assert counts.deleted_total() == before + 3
+    assert _HardDeleteCounts().deleted_total() == 0, "a fresh counter has deleted nothing, which is what gates the mark"
+
+
+@pytest.mark.anyio
+async def test_a_pin_no_product_action_can_clear_is_refused_before_anything_is_deleted(hard_delete_backend):
+    """Review finding N1: an erasure that cannot end must not begin.
+
+    ``blocked`` says *"clear this and re-run"*, and that is a real remedy when
+    the pinning entity is another ``owner``/``thread`` Scope. It is no remedy at
+    all when the pinning entity's own erasure is refused **by type** — the host
+    Scope (``host_scope``), a shared-kind Scope (``shared_scope_kind``), an
+    AgentRelease (no erasure path exists). In those shapes an operator who
+    started would get most of the owner erased and a refusal nothing in the
+    product can clear, so the shape is detected up front and refused with its
+    own reason.
+
+    Both type-refused Scope shapes are exercised, because they fail for
+    different reasons and a guard that caught only one would look right.
+    """
+
+    backend, sessions = hard_delete_backend
+    store = await _build_hard_delete_store(backend)
+    workspace_ref = "/srv/shared"
+    pinning = [
+        ObservationEnvelope.scope_snapshotted(
+            task_id=store.root_id,
+            run_id="run-doomed",
+            occurred_at=_RETENTION_OCCURRED_AT,
+            scope_kind="workspace",
+            external_ref=workspace_ref,
+            relation_role="sandbox_boundary",
+            source_event_id=f"run:run-doomed:scope:workspace:{store.root_id}",
+        )
+    ]
+    assert await backend.persist_and_project(pinning) == 1
+    await _settle_retention(backend)
+    before = await _observation_task_ids(sessions, store.doomed_tasks)
+
+    with pytest.raises(HardDeleteError) as refusal:
+        await backend.hard_delete_scope(store.scope_id, batch_size=2)
+
+    assert refusal.value.reason == "unsatisfiable_pin", "a shared-kind pin must be refused up front, not discovered mid-erasure"
+    assert refusal.value.blocker == "ansich_scopes.created_obs_id"
+    assert refusal.value.report is None, "nothing was deleted, so there is no partial report to carry"
+    # The whole point: the store is exactly as it was.
+    assert await _observation_task_ids(sessions, store.doomed_tasks) == before
+    assert await _referential_orphans(sessions) == []
+    async with sessions() as session:
+        assert await session.get(AnsichScopeRow, store.scope_id) is not None
+        assert await session.get(AnsichEntityRow, store.root_id) is not None
+
+    # And erasing the pinning Scope is refused by type, which is what makes the
+    # pin unsatisfiable rather than merely inconvenient.
+    with pytest.raises(HardDeleteError) as remedy:
+        await backend.hard_delete_scope(scope_entity_id("workspace", scope_reference_hash("workspace", workspace_ref)))
+    assert remedy.value.reason == "shared_scope_kind"
+
+
+@pytest.mark.anyio
+async def test_a_host_scope_pin_is_refused_up_front_too(hard_delete_backend):
+    """The other type-refused shape (N1), on its own store."""
+
+    backend, sessions = hard_delete_backend
+    store = await _build_hard_delete_store(backend)
+    pinning = [
+        ObservationEnvelope.scope_snapshotted(
+            task_id=store.root_id,
+            run_id="run-doomed",
+            occurred_at=_RETENTION_OCCURRED_AT,
+            scope_kind="host",
+            external_ref=backend._hostname,
+            relation_role="sandbox_boundary",
+            source_event_id=f"run:run-doomed:scope:host:{store.root_id}",
+        )
+    ]
+    assert await backend.persist_and_project(pinning) == 1
+    await _settle_retention(backend)
+    before = await _observation_task_ids(sessions, store.doomed_tasks)
+
+    with pytest.raises(HardDeleteError) as refusal:
+        await backend.hard_delete_scope(store.scope_id, batch_size=2)
+
+    assert refusal.value.reason == "unsatisfiable_pin"
+    assert host_scope_id(backend._hostname) in str(refusal.value)
+    assert await _observation_task_ids(sessions, store.doomed_tasks) == before
+
+
+@pytest.mark.anyio
+async def test_the_protected_pin_check_covers_every_protected_type_not_just_the_named_two(hard_delete_backend):
+    """The pressure test's latent gap: the filter, not the naming map.
+
+    ``_HARD_DELETE_PROTECTED_PIN_EDGES`` exists to make the reported edge
+    actionable, and an earlier form used it as the *filter* too — so a protected
+    entity of any other type (a Task belonging to a different Scope that
+    discovered one of these Observations) fell through the check, was deferred,
+    and let a later run report success with the erased owner's Observation still
+    standing. Restricting the check back to the map's keys reproduces exactly
+    that, which is what makes this the regression rather than a restatement.
+    """
+
+    backend, sessions = hard_delete_backend
+    store = await _build_hard_delete_store(backend)
+    async with sessions() as session:
+        doomed_obs = str(await session.scalar(select(AnsichObservationRow.obs_id).where(AnsichObservationRow.task_id == store.root_id).order_by(AnsichObservationRow.ingest_seq)))
+        foreign_task_entity = str(await session.scalar(select(AnsichEntityRow.entity_id).where(AnsichEntityRow.entity_id == store.neighbour_id)))
+        # A protected type that is *not* in the naming map, pinning one of the
+        # doomed Task's Observations from outside the run's condemned set.
+        await session.execute(update(AnsichEntityRow).where(AnsichEntityRow.entity_id == foreign_task_entity).values(discovered_obs_id=doomed_obs))
+        await session.commit()
+
+        assert await SqlAnsichBackend._hard_delete_protected_pin(session, store.scope_id, frozenset({store.root_id, store.child_id}), [doomed_obs]) is not None
+        # Excluded when the run is going to delete it anyway, which is the only
+        # exemption the filter has.
+        assert await SqlAnsichBackend._hard_delete_protected_pin(session, store.scope_id, frozenset({foreign_task_entity, store.root_id, store.child_id}), [doomed_obs]) is None
+    assert "task" in _HARD_DELETE_PROTECTED_ENTITY_TYPES
+    assert "task" not in _HARD_DELETE_PROTECTED_PIN_EDGES, "the map is a naming table; a type missing from it must still be caught"
+
+
+@pytest.mark.anyio
+async def test_an_erasure_that_removed_nothing_leaves_no_deliberate_deletion_mark(hard_delete_backend):
+    """Review finding N2: the mark is one-way, so it must be earned.
+
+    ``observation_cursor`` makes **every** absent id on this store read
+    ``expired`` from then on. An earlier form stamped it from the *attempted*
+    batch watermark, so a pass that deferred everything — deleting nothing —
+    still left the mark behind and flipped every receipt for good. The gate is
+    two-part and both halves are asserted: a positive mark, and rows this
+    erasure really removed.
+    """
+
+    backend, sessions = hard_delete_backend
+    store = await _build_hard_delete_store(backend)
+    async with sessions() as session:
+        absent = str(await session.scalar(select(AnsichObservationRow.obs_id).where(AnsichObservationRow.task_id == store.root_id).order_by(AnsichObservationRow.ingest_seq)))
+        highest = int(await session.scalar(select(func.max(AnsichObservationRow.ingest_seq))))
+    counts = _HardDeleteCounts()
+
+    async with sessions() as session, session.begin():
+        await backend._advance_deletion_horizon(session, counts, highest)
+
+    async with sessions() as session:
+        state = await session.get(AnsichRetentionStateRow, 1)
+        assert state.observation_cursor is None, "a pass that deleted nothing must not stamp a deliberate-deletion mark"
+    assert await backend.get_observation_projection_status(absent) != "expired"
+
+    # And the same call, once something really went, does stamp it.
+    counts.absorb({"ansich_observations": 1}, 0)
+    async with sessions() as session, session.begin():
+        await backend._advance_deletion_horizon(session, counts, highest)
+    async with sessions() as session:
+        state = await session.get(AnsichRetentionStateRow, 1)
+    assert int(state.observation_cursor or 0) == highest
 
 
 def _hd_admin_user() -> User:

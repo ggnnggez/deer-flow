@@ -2726,14 +2726,33 @@ which is a column on the surviving row and names nothing an operator can act on
 (F4), and both carry the counts already committed (F7) so a caller cannot read
 `blocked` as "nothing happened".
 
-**The residual that shape leaves is a mutual pin, and it is loud rather than
-silent.** When two Scopes' provenance runs through the *same* Task — each
-holding one of its Observations — neither can be erased, because freeing either
-pin needs the Task gone and the Task needs both pins gone. Every attempt is a
-typed refusal naming the edge; nothing is stranded and nothing is half-reported.
-v1 has no multi-Scope erasure to resolve it with, which is the registered next
-step. Three entity types are never taken by the satellite sweep: another
-`Scope`, an `agent_release`, and `task` (owned by the Task loop).
+**A pin no product action can clear is refused *before the erasure starts*,
+with its own reason** (`unsatisfiable_pin`, review finding N1). `blocked` says
+"clear this and re-run", and that remedy is real when the pinning entity is
+another `owner`/`thread` Scope. It is no remedy at all when the pinning entity's
+own erasure is refused **by type** — the host Scope (`host_scope`), a
+shared-kind Scope (`shared_scope_kind`), or an `agent_release` (no erasure path
+exists) — and a Task that first reported any of those is the *ordinary* shape,
+not an exotic one. So a pre-flight join over the doomed Tasks' discovered
+entities detects it and refuses up front, naming the pinning entity and saying
+plainly that this build cannot clear it: an erasure that cannot end must not
+begin. The predicate is derived from the same two constants the refusals
+themselves read, so widening `_HARD_DELETE_OWNER_SCOPE_KINDS` or adding an
+AgentRelease erasure narrows it automatically.
+
+**What remains after that is the mutual pin, and it is loud rather than
+silent.** When two `owner`/`thread` Scopes' provenance runs through the *same*
+Task — each holding one of its Observations — each is individually erasable by
+type, so the pre-flight lets them through, and then neither completes: freeing
+either pin needs the Task gone and the Task needs both pins gone. Every attempt
+is a `blocked` refusal naming the edge; nothing is stranded and nothing is
+half-reported. **Both shapes are v1 limitations with the same resolution — a
+multi-Scope erasure or a pin transfer — and neither is in this build.** That is
+registered for the batch's flip pass rather than left in a report. Three entity
+types are never taken by the satellite sweep: another `Scope`, an
+`agent_release`, and `task` (owned by the Task loop); the phase-5 pin check
+refuses on **any** of them the run will not itself delete, since restricting it
+to the two that have a pretty edge name let a foreign Task entity fall through.
 
 **The eighth family — `raw-read audit 中受保护引用` — was adjudicated as privacy
 deletion, and the split is by subject.** A §7 audit row whose target belonged to
@@ -2773,7 +2792,11 @@ row — inflating it would make tier 2 skip live Observations forever. With any
 survivor **below** the erased range the minimum cannot move, and the receipt read
 the erased rows as `failed`: the exact FC-3 flip, in the direction only this path
 can cause. `ansich_retention_state.observation_cursor` is where that is now
-recorded, and it is not a repurposing — T9 left the column unwritten with the
+recorded — **gated on rows this erasure actually removed**, because the mark is
+one-way (once written, every absent id on the store reads `expired`) and an
+earlier form stamped it from the *attempted* batch watermark, so a refused pass
+that deleted nothing flipped every receipt for good (N2). It is not a
+repurposing — T9 left the column unwritten with the
 note that *"a future non-contiguous Observation tier would need that column"*,
 and this is that deleter. It holds the highest `ingest_seq` a non-contiguous
 deliberate deletion has removed, it is monotone, and **nothing walks from it**,
@@ -2804,7 +2827,7 @@ Observations, and reporting the ruling separately is what makes it auditable.
 `payloads` counts rows deleted outright, never tombstoned: there is no reader
 left to tell "expired by policy" from "missing". Refusals are typed
 (`ansich.errors.HardDeleteError` with a `HardDeleteRefusal` reason and a
-`blocker` naming `table.column`), five of them answered before anything is
+`blocker` naming `table.column`), six of them answered before anything is
 deleted; the route maps `unknown_scope` to 404 and the rest to 409, and a
 `blocked` 409 carries the partial report.
 

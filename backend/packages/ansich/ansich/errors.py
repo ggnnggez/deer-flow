@@ -332,6 +332,15 @@ class ActiveVersionError(ValueError):
 #:   ``RESTRICT``, so the database would refuse it anyway); the remedy is to
 #:   delete the children first. Answered as a refusal rather than as an
 #:   ``IntegrityError`` because a caller cannot branch on a driver error.
+#: * ``unsatisfiable_pin`` — an Observation of this Scope's Tasks is pinned by a
+#:   protected Entity whose **own** erasure this build refuses by type: the host
+#:   ``Scope``, a shared-kind ``Scope``, or an ``AgentRelease`` (which has no
+#:   erasure path at all). ``blocked`` says *"clear this and re-run"* and that
+#:   remedy is real for a foreign ``owner``/``thread`` Scope; here every route is
+#:   closed, so the erasure is refused **before it starts** rather than half-run.
+#:   A distinct reason because the two ask different things of an operator: one
+#:   is an action, the other is a v1 product limitation. Resolving it needs a
+#:   multi-Scope erasure or a pin transfer, neither of which this build has.
 #: * ``blocked`` — a row **outside** this Scope's reach still points at a row
 #:   inside it, so completing the erasure would either orphan that row or
 #:   delete data belonging to somebody else. :attr:`HardDeleteError.blocker`
@@ -343,6 +352,7 @@ HardDeleteRefusal = Literal[
     "host_scope",
     "shared_scope_kind",
     "parent_scope",
+    "unsatisfiable_pin",
     "blocked",
 ]
 
@@ -351,10 +361,10 @@ class HardDeleteError(ValueError):
     """An owner/thread hard delete cannot be completed (spec §6 D6-2).
 
     A ``ValueError`` for the same reason :class:`ReplayTargetError` is one: with
-    the first four reasons the store is fine and the *request* names something
-    this operation must not touch. Those four are answered **before anything is
-    deleted**, from cheap indexed reads, so a refused request costs the caller
-    nothing but the answer.
+    every reason but ``blocked`` the store is fine and the *request* names
+    something this operation must not touch, or cannot finish. All of those are
+    answered **before anything is deleted**, from cheap indexed reads, so a
+    refused request costs the caller nothing but the answer.
 
     ``blocked`` is the exception and the docstring must not hide it. A hard
     delete commits in batches — that is what keeps a large thread's erasure off

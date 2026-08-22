@@ -3950,13 +3950,13 @@ class SqlAnsichBackend:
         counts = _HardDeleteCounts()
         async with self._maintenance_lock(), self._retention_lock():
             async with self._session_factory() as session:
-                await self._refuse_undeletable_scope_row(scope_id, session)
-            async with self._session_factory() as session:
+                await self._refuse_undeletable_scope_row(session, scope_id)
                 task_order = await self._hard_delete_task_order(session, scope_id)
+                await self._refuse_unsatisfiable_pins(session, scope_id, task_order)
             deferred: set[str] = set()
             blocked: list[str] = []
             for task_id in task_order:
-                task_deferred, task_blocked = await self._hard_delete_task(scope_id, task_id, size=size, counts=counts)
+                task_deferred, task_blocked = await self._hard_delete_task(scope_id, task_id, condemned=frozenset(task_order), size=size, counts=counts)
                 deferred |= task_deferred
                 blocked.extend(task_blocked)
             await self._hard_delete_scope_row(scope_id, task_order, deferred, blocked, size=size, counts=counts)
@@ -3995,7 +3995,7 @@ class SqlAnsichBackend:
             )
 
     @staticmethod
-    async def _refuse_undeletable_scope_row(scope_id: str, session: AsyncSession | None = None) -> None:
+    async def _refuse_undeletable_scope_row(session: AsyncSession, scope_id: str) -> None:
         """The three refusals that read the store, answered **under the locks**.
 
         All three are cheap indexed reads and all three are typed rather than
@@ -4029,8 +4029,6 @@ class SqlAnsichBackend:
         here rather than assumed of the caller.
         """
 
-        if session is None:
-            raise RuntimeError("Ansich hard delete: the scope-row refusals need a session")
         scope = await session.get(AnsichScopeRow, scope_id)
         if scope is None:
             raise HardDeleteError(
@@ -4053,6 +4051,91 @@ class SqlAnsichBackend:
                 scope_id=scope_id,
                 blocker=f"{AnsichScopeRow.__tablename__}.parent_scope_id",
             )
+
+    async def _refuse_unsatisfiable_pins(self, session: AsyncSession, scope_id: str, task_order: Sequence[str]) -> None:
+        """Refuse **before** starting an erasure that cannot end (finding N1).
+
+        A doomed Task's Observation that first-discovered a protected Entity
+        pins that Observation, and the erasure's answer is ``blocked`` with the
+        pinning entity's own edge named -- "remove it and re-run". That remedy
+        is real when the pin is another ``owner``/``thread`` Scope: the operator
+        erases it with this same API. It is **not real at all** when the pinning
+        entity's own erasure is refused *by type*:
+
+        * the **host** ``Scope`` -- ``host_scope``, this process's anchor;
+        * a ``workspace``/``sandbox``/``authorization``/``external_origin``
+          ``Scope`` -- ``shared_scope_kind``, shared across owners;
+        * an ``agent_release`` -- immutable release identity, which this API has
+          no erasure path for at all.
+
+        In those shapes every route is closed, and a caller who started anyway
+        would get most of an owner erased and a refusal that no in-product
+        action can clear. So the shape is detected **up front**, from the same
+        derived join the satellite sweep uses, and refused with its own reason:
+        an erasure that cannot end must not begin.
+
+        ``unsatisfiable_pin`` is deliberately a *different* reason from
+        ``blocked`` even though both name a pin, because the remedies are
+        different in kind: ``blocked`` says "clear this and re-run", and this
+        one says "v1 has no way to clear this" -- a product limitation an
+        operator must be told about rather than left to discover by trying.
+
+        The check is one indexed join over the doomed Tasks' Observations. It
+        cannot be complete against a concurrent projector minting a new Scope
+        mid-erasure; that residual lands on the ordinary ``blocked`` path, which
+        is the same place the ``parent_scope`` race lands.
+        """
+
+        if not task_order:
+            return
+        entities = AnsichEntityRow.__table__
+        observations = AnsichObservationRow.__table__
+        scopes = AnsichScopeRow.__table__
+        host = host_scope_id(self._hostname)
+        discovered = entities.join(observations, observations.c.obs_id == entities.c.discovered_obs_id).outerjoin(scopes, scopes.c.entity_id == entities.c.entity_id)
+        rows = sorted(
+            await session.execute(
+                select(entities.c.entity_id, entities.c.entity_type, scopes.c.scope_kind)
+                .select_from(discovered)
+                .where(
+                    observations.c.task_id.in_(sorted(task_order)),
+                    entities.c.entity_type.in_(sorted(_HARD_DELETE_PROTECTED_ENTITY_TYPES)),
+                    entities.c.entity_id.not_in([scope_id, *sorted(task_order)]),
+                )
+                .order_by(entities.c.entity_id),
+            )
+        )
+        for entity_id, entity_type, scope_kind in rows:
+            why = self._unsatisfiable_pin_reason(str(entity_id), str(entity_type), None if scope_kind is None else str(scope_kind), host)
+            if why is None:
+                continue
+            raise HardDeleteError(
+                f"Ansich hard delete refused: an Observation of Scope {scope_id}'s Tasks is pinned by {entity_type} {entity_id}, {why}; this build has no way to clear that pin, so the erasure could not be finished once started",
+                reason="unsatisfiable_pin",
+                scope_id=scope_id,
+                blocker=_HARD_DELETE_PROTECTED_PIN_EDGES.get(str(entity_type), f"{entities.name}.discovered_obs_id"),
+            )
+
+    @staticmethod
+    def _unsatisfiable_pin_reason(entity_id: str, entity_type: str, scope_kind: str | None, host_scope: str) -> str | None:
+        """Why this protected pin can never be cleared, or ``None`` if it can.
+
+        The three answers mirror the refusals a caller would hit trying to erase
+        the pinning entity itself, which is what makes this a *derived*
+        statement about the product rather than a second opinion: change
+        ``_HARD_DELETE_OWNER_SCOPE_KINDS`` or add an AgentRelease erasure and
+        this predicate follows.
+        """
+
+        if entity_type == "agent_release":
+            return "which is an immutable release identity with no erasure path in this build"
+        if entity_type != "scope":
+            return None
+        if entity_id == host_scope:
+            return "which is this process's host Scope and is refused as host_scope"
+        if scope_kind is not None and scope_kind not in _HARD_DELETE_OWNER_SCOPE_KINDS:
+            return f"which is a {scope_kind!r} Scope and is refused as shared_scope_kind"
+        return None
 
     @staticmethod
     async def _hard_delete_task_order(session: AsyncSession, scope_id: str) -> tuple[str, ...]:
@@ -4117,7 +4200,7 @@ class SqlAnsichBackend:
             depths[str(descendant_id)] = int(depth or 0)
         return tuple(sorted(ordered, key=lambda task_id: (-depths[task_id], task_id)))
 
-    async def _hard_delete_task(self, scope_id: str, task_id: str, *, size: int, counts: _HardDeleteCounts) -> tuple[set[str], list[str]]:
+    async def _hard_delete_task(self, scope_id: str, task_id: str, *, condemned: frozenset[str], size: int, counts: _HardDeleteCounts) -> tuple[set[str], list[str]]:
         """Erase one Task, in the five phases the schema forces.
 
         ``ansich_observations`` carries **no** foreign key to ``ansich_tasks``
@@ -4185,12 +4268,13 @@ class SqlAnsichBackend:
                     report=counts.report(),
                 )
             counts.absorb(*await self._apply_plan_and_reclaim(session, plan))
-            counts.commit_batch()
+        counts.commit_batch()
         blocked.extend(await self._hard_delete_satellites(task_id, size=size, counts=counts))
 
         deferred: set[str] = set()
         watermark = 0
         while True:
+            exhausted = False
             async with self._session_factory() as session, session.begin():
                 batch = list(
                     await session.execute(
@@ -4198,12 +4282,26 @@ class SqlAnsichBackend:
                     )
                 )
                 if not batch:
-                    break
-                batch.sort(key=lambda row: row[0])
-                deferred |= await self._hard_delete_observations(session, [(str(row[1]), str(row[2])) for row in batch], counts=counts, blocked=hints)
-                watermark = int(batch[-1][0])
-                await self._advance_deletion_horizon(session, counts, watermark)
-                counts.commit_batch()
+                    exhausted = True
+                else:
+                    batch.sort(key=lambda row: row[0])
+                    postponed = await self._hard_delete_observations(session, [(str(row[1]), str(row[2])) for row in batch], counts=counts, blocked=hints)
+                    deferred |= postponed
+                    watermark = int(batch[-1][0])
+                    # **What was deleted, not what was attempted.** The batch
+                    # watermark is the cursor this loop resumes from and includes
+                    # every row it deferred; handing it to the horizon would let a
+                    # pass that removed nothing still stamp a deliberate-deletion
+                    # mark, and that mark flips every absent-id receipt to
+                    # `expired` for good (finding N2).
+                    deleted_high = max((int(row[0]) for row in batch if str(row[1]) not in postponed), default=0)
+                    await self._advance_deletion_horizon(session, counts, deleted_high)
+            if exhausted:
+                break
+            # After the ``async with`` block, so a commit that failed cannot
+            # leave a batch counted (N4): the counter is a report of durable
+            # work, and this is the only place that knows the write landed.
+            counts.commit_batch()
 
         async with self._session_factory() as session, session.begin():
             blocked_by = []
@@ -4222,8 +4320,8 @@ class SqlAnsichBackend:
                     select(observations.c.ingest_seq, observations.c.obs_id, observations.c.kind).where(observations.c.task_id == task_id).order_by(observations.c.ingest_seq),
                 )
             )
-            highest = max((int(row[0]) for row in remaining), default=watermark)
             still = await self._hard_delete_observations(session, [(str(row[1]), str(row[2])) for row in remaining], counts=counts, blocked=hints)
+            highest = max((int(row[0]) for row in remaining if str(row[1]) not in still), default=0)
             # **A deferral is only legitimate when the target Scope is what
             # pins it**, because the final phase deletes that Scope and takes
             # the row with it. A *protected foreign* Entity — another owner's
@@ -4234,7 +4332,7 @@ class SqlAnsichBackend:
             # attempt it. Refusing here instead rolls this Task's Entity delete
             # back with the raise, so the Task, its membership edge and the
             # Scope all survive and the whole erasure stays re-runnable.
-            pin = await self._hard_delete_protected_pin(session, scope_id, sorted(still))
+            pin = await self._hard_delete_protected_pin(session, scope_id, condemned, sorted(still))
             if pin is not None:
                 counts.rollback_batch()
                 raise HardDeleteError(
@@ -4246,34 +4344,43 @@ class SqlAnsichBackend:
                 )
             deferred |= still
             await self._advance_deletion_horizon(session, counts, highest)
-            counts.commit_batch()
+        counts.commit_batch()
         return deferred, blocked
 
     @staticmethod
-    async def _hard_delete_protected_pin(session: AsyncSession, scope_id: str, obs_ids: Sequence[str]) -> str | None:
+    async def _hard_delete_protected_pin(session: AsyncSession, scope_id: str, condemned: frozenset[str], obs_ids: Sequence[str]) -> str | None:
         """The removable edge, when a **protected** Entity is what pins these rows.
 
-        Only two Entity types can pin an Observation that this erasure will
-        never free: a ``Scope`` other than the target, and an ``agent_release``.
-        (The third protected type, ``task``, is one of this run's own and goes
-        with the loop.) Anything else the Task loop defers is pinned by the
-        target Scope, which the final phase deletes.
+        The filter is *"a protected Entity this run is not going to delete"* and
+        nothing narrower. An earlier form enumerated two types by name and read
+        the edge out of a map, so an entity of any other protected type -- a
+        Task belonging to a different Scope that happened to discover one of
+        these Observations -- fell through the check entirely, deferred, and let
+        a later run report success with an Observation of the erased owner still
+        standing. The types this run *will* free are exactly two and both are
+        known here: the target Scope, and the Tasks in its own order.
 
-        Returns the pin's own edge rather than
-        ``ansich_entities.discovered_obs_id``, because the latter is a column on
-        the row that is *surviving* and names nothing an operator can remove.
+        ``_HARD_DELETE_PROTECTED_PIN_EDGES`` is now only a **naming** table --
+        it makes the answer say ``ansich_scopes.created_obs_id`` instead of the
+        surviving row's ``ansich_entities.discovered_obs_id`` -- so a type
+        missing from it degrades the message rather than the refusal.
         """
 
         if not obs_ids:
             return None
         entities = AnsichEntityRow.__table__
-        rows = sorted(await session.execute(select(entities.c.entity_id, entities.c.entity_type).where(entities.c.discovered_obs_id.in_(list(obs_ids)))))
+        rows = sorted(
+            await session.execute(
+                select(entities.c.entity_id, entities.c.entity_type).where(
+                    entities.c.discovered_obs_id.in_(list(obs_ids)),
+                    entities.c.entity_type.in_(sorted(_HARD_DELETE_PROTECTED_ENTITY_TYPES)),
+                )
+            )
+        )
         for entity_id, entity_type in rows:
-            if str(entity_id) == scope_id:
+            if str(entity_id) == scope_id or str(entity_id) in condemned:
                 continue
-            edge = _HARD_DELETE_PROTECTED_PIN_EDGES.get(str(entity_type))
-            if edge is not None:
-                return edge
+            return _HARD_DELETE_PROTECTED_PIN_EDGES.get(str(entity_type), f"{entities.name}.discovered_obs_id")
         return None
 
     async def _hard_delete_satellites(self, task_id: str, *, size: int, counts: _HardDeleteCounts) -> list[str]:
@@ -4296,6 +4403,7 @@ class SqlAnsichBackend:
         blocked: list[str] = []
         cursor: str | None = None
         while True:
+            exhausted = False
             async with self._session_factory() as session, session.begin():
                 discovered = entities.join(observations, observations.c.obs_id == entities.c.discovered_obs_id)
                 statement = select(entities.c.entity_id).select_from(discovered).where(observations.c.task_id == task_id, entities.c.entity_type.not_in(sorted(_HARD_DELETE_PROTECTED_ENTITY_TYPES)))
@@ -4303,28 +4411,32 @@ class SqlAnsichBackend:
                     statement = statement.where(entities.c.entity_id > cursor)
                 batch = sorted((await session.execute(statement.order_by(entities.c.entity_id).limit(size))).scalars())
                 if not batch:
-                    return blocked
-                # The batch is planned as one root set first, and that is a
-                # deliberate difference from tier 3's one-Entity-per-plan rule.
-                # There the question is "may this Entity go yet", and a batch
-                # plan would let one Entity's blocking referrer be satisfied by
-                # another's presence. Here every Entity in the batch *is* going,
-                # so mutual pins inside the batch are exactly what the plan
-                # should resolve; the per-Entity fallback below exists only to
-                # find out which one a genuine outside referrer is pointing at.
-                plan = await _plan_cascade(session, root=entities, root_column="entity_id", root_values=batch)
-                if plan is not None:
-                    counts.absorb(*await self._apply_plan_and_reclaim(session, plan))
+                    exhausted = True
                 else:
-                    for entity_id in batch:
-                        blocked_by: list[str] = []
-                        one = await _plan_cascade(session, root=entities, root_column="entity_id", root_values=[entity_id], blocked_by=blocked_by)
-                        if one is None:
-                            blocked.extend(blocked_by)
-                            continue
-                        counts.absorb(*await self._apply_plan_and_reclaim(session, one))
-                cursor = batch[-1]
-                counts.commit_batch()
+                    # The batch is planned as one root set first, and that is a
+                    # deliberate difference from tier 3's one-Entity-per-plan
+                    # rule. There the question is "may this Entity go yet", and a
+                    # batch plan would let one Entity's blocking referrer be
+                    # satisfied by another's presence. Here every Entity in the
+                    # batch *is* going, so mutual pins inside the batch are
+                    # exactly what the plan should resolve; the per-Entity
+                    # fallback below exists only to find out which one a genuine
+                    # outside referrer is pointing at.
+                    plan = await _plan_cascade(session, root=entities, root_column="entity_id", root_values=batch)
+                    if plan is not None:
+                        counts.absorb(*await self._apply_plan_and_reclaim(session, plan))
+                    else:
+                        for entity_id in batch:
+                            blocked_by: list[str] = []
+                            one = await _plan_cascade(session, root=entities, root_column="entity_id", root_values=[entity_id], blocked_by=blocked_by)
+                            if one is None:
+                                blocked.extend(blocked_by)
+                                continue
+                            counts.absorb(*await self._apply_plan_and_reclaim(session, one))
+                    cursor = batch[-1]
+            if exhausted:
+                return blocked
+            counts.commit_batch()
 
     async def _hard_delete_observations(
         self,
@@ -4482,8 +4594,8 @@ class SqlAnsichBackend:
                     blocker=blocker,
                     report=counts.report(),
                 )
-            await self._advance_deletion_horizon(session, counts, max((int(row[0]) for row in rows), default=0))
-            counts.commit_batch()
+            await self._advance_deletion_horizon(session, counts, max((int(row[0]) for row in rows if str(row[1]) not in still), default=0))
+        counts.commit_batch()
 
     @staticmethod
     async def _hard_delete_actionable_blocker(session: AsyncSession, obs_ids: Sequence[str], proximate: Sequence[str]) -> str | None:
@@ -4597,7 +4709,14 @@ class SqlAnsichBackend:
         lowest = await session.scalar(select(func.min(observations.c.ingest_seq)))
         candidate = int(lowest) - 1 if lowest is not None else counts.highest_ingest_seq
         state.observation_horizon_ingest_seq = max(int(state.observation_horizon_ingest_seq or 0), candidate)
-        if counts.highest_ingest_seq > 0:
+        # **The deliberate-deletion mark is gated on a deletion having happened**
+        # (finding N2), and on both halves of that: a positive mark, and rows
+        # this erasure really removed. The mark is one-way -- once written, every
+        # absent id on this store reads `expired` forever -- so an erasure that
+        # was refused having removed nothing must not leave one behind. The
+        # horizon above needs no such gate: `min(surviving) - 1` is a true
+        # statement about the rows whatever this pass did.
+        if counts.highest_ingest_seq > 0 and counts.deleted_total() > 0:
             state.observation_cursor = max(int(state.observation_cursor or 0), counts.highest_ingest_seq)
 
     async def initialize_metrics(self) -> None:
