@@ -9,6 +9,7 @@ import {
   formatAnsichCount,
   formatAnsichLag,
   formatAnsichSequence,
+  formatAnsichTimestamp,
   getDatabaseHealthPresentation,
   type AnsichActiveVersionRow,
   type AnsichDatabaseHealthBadge,
@@ -215,6 +216,77 @@ export function AnsichObservabilityHealthPanel({
                 ))}
               </tbody>
             </table>
+          </div>
+        )}
+      </div>
+
+      <div className="rounded-lg border">
+        <div className="flex flex-wrap items-center gap-2 border-b px-4 py-3">
+          <h3 className="text-sm font-medium">{copy.retention}</h3>
+          <AnsichMetricHelp description={copy.metricDescriptions.retention} />
+        </div>
+        {/* Three states, and the first two are both `null` on the wire — which
+            is why `reachable` is checked before the row, never instead of it.
+            An unreadable store knows nothing; a reachable one that has never
+            been swept is an ordinary store, because retention is driven by a
+            caller rather than by the store itself. */}
+        {!database.reachable ? (
+          <p className="text-muted-foreground p-4 text-sm">
+            {copy.retentionUnknown}
+          </p>
+        ) : database.retentionLastRun === null ? (
+          <p className="text-muted-foreground p-4 text-sm">
+            {copy.retentionNeverRun}
+          </p>
+        ) : (
+          <div className="space-y-3 p-4">
+            <div className="grid gap-3 sm:grid-cols-2 lg:grid-cols-3">
+              <Metric
+                label={copy.retentionStartedAt}
+                value={formatAnsichTimestamp(
+                  database.retentionLastRun.startedAt,
+                  locale,
+                )}
+                description={copy.metricDescriptions.retentionStartedAt}
+              />
+              <Metric
+                label={copy.retentionFinishedAt}
+                value={
+                  database.retentionLastRun.finishedAt === null
+                    ? copy.retentionUnfinished
+                    : formatAnsichTimestamp(
+                        database.retentionLastRun.finishedAt,
+                        locale,
+                      )
+                }
+                description={copy.metricDescriptions.retentionFinishedAt}
+                unknown={database.retentionLastRun.unfinished}
+              />
+              <Metric
+                label={copy.retentionHorizon}
+                value={formatAnsichCount(
+                  database.retentionLastRun.horizon,
+                  locale,
+                )}
+                description={copy.metricDescriptions.retentionHorizon}
+              />
+            </div>
+            {database.retentionLastRun.policy.length > 0 ? (
+              <div className="flex flex-wrap items-center gap-1.5">
+                <span className="text-muted-foreground text-xs">
+                  {copy.retentionPolicy}
+                </span>
+                {database.retentionLastRun.policy.map((entry) => (
+                  <Badge
+                    key={entry}
+                    variant="outline"
+                    className="font-mono text-xs"
+                  >
+                    {entry}
+                  </Badge>
+                ))}
+              </div>
+            ) : null}
           </div>
         )}
       </div>

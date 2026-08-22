@@ -260,6 +260,35 @@ answers with one entry per component — so the panel renders `null` as an expli
 "unknown while the store cannot be read" line, never as "no components". No alert
 type was invented for any of this and no exhaustive switch changed.
 
+The panel's last block is **retention**: when the last time-tiered pass ran,
+whether it finished, how far Observation deletion has reached, and the policy
+that pass ran under. It has **three** states and only two of them come from the
+field, which is why `reachable` is checked before `retentionLastRun` and never
+instead of it: an unreadable store knows nothing, while a reachable store nobody
+has ever swept answers `null` because retention is driven by a caller rather
+than by the store — an ordinary state, not a fault. Rendering "retention has
+never run" for an outage would report a fault as a configuration. Within a real
+pass, `finished_at: null` means a pass started and no completion was recorded (a
+crash, a kill, a deploy mid-sweep) and is rendered as "did not finish", not
+folded into "never run". `observation_horizon_ingest_seq` is not a per-pass
+number but the store's durable claim about completed deletion, and `0` is a
+value — ingest sequences start at 1. The policy snapshot is rendered from the
+*pass* rather than from current configuration, because the configuration may
+have changed since, and its chips are sorted by key so two reads never reorder
+them. The copy also states the convergence property, because it is the thing an
+operator would otherwise misread: retention converges over repeated passes
+rather than in one, so a store that still has rows to expire after a pass is
+normal and not stuck.
+
+Environment trends render `expired_points` beside the sparkline's point count
+(`ansichExpiredPointCount`). An expired sample is **not** a point and never
+becomes a value — missing is not zero — but reporting nothing would make a
+deliberate deletion look like a Scope that never sampled, and the reader would
+take the gap in the line for an outage. The count is over the whole window
+rather than the kept tail, so it can legitimately exceed the points drawn, and a
+backend that predates the field sends no key at all: absent reads as none, never
+as unknown, so the annotation simply does not appear.
+
 **Known issue on that page (pre-existing, not introduced by the lens, and
 deliberately left alone):** the Operations page renders the selected lens's query
 error *instead of* the whole `<Tabs>` block — including the `TabsList` — so while

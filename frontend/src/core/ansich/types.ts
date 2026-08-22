@@ -312,6 +312,38 @@ export interface AnsichDatabaseHealth {
    * versions" would report an outage as a configuration.
    */
   active_versions: AnsichActiveVersion[] | null;
+  /**
+   * The last time-tiered retention pass, or `null`.
+   *
+   * The one field in this block whose `null` is **not** only "unknown": a
+   * reachable store that nobody has ever swept answers `null` because there is
+   * nothing to report. Retention is driven by a caller, not by the store, so
+   * "never run" is an ordinary state and not a fault. An `unreachable` block
+   * answers `null` too, which is why `status` — never this field alone — is
+   * what decides which sentence to render.
+   */
+  retention_last_run: AnsichRetentionLastRun | null;
+}
+
+/**
+ * When retention last ran, under which policy, and how far deletion has got.
+ *
+ * `finished_at` is `null` for a pass that started and did not finish — a crash,
+ * a kill, a deploy mid-sweep. That is a real state and must not be rendered the
+ * same as "never run", which is the absence of this whole object.
+ *
+ * `observation_horizon_ingest_seq` is not a per-pass number: it is the store's
+ * durable claim about how far Observation deletion has *completed*, carried
+ * here because the only place an operator asks is beside the last pass that
+ * could have moved it. `0` is honest and means nothing has been deleted yet —
+ * ingest sequences start at 1.
+ */
+export interface AnsichRetentionLastRun {
+  started_at: string;
+  finished_at: string | null;
+  /** The four policy fields the pass ran under; `null` if none was recorded. */
+  policy: Record<string, unknown> | null;
+  observation_horizon_ingest_seq: number;
 }
 
 /**
@@ -1097,6 +1129,13 @@ export interface AnsichEnvironmentHistoryResponse {
   // Oldest first. A sample that never reported this metric is absent, never
   // present as a 0 — a gap here is an honest gap, not a zero reading.
   points: AnsichEnvironmentHistoryPoint[];
+  // Samples in the window whose payload body was deleted under the retention
+  // policy. They are not points and never become values, but they are not
+  // silently dropped either: without this count a stretch a policy deliberately
+  // expired would be indistinguishable from a Scope that simply never sampled.
+  // Counted before `max_points` truncation, so it describes the whole window.
+  // Optional because a backend that predates the field sends no key at all.
+  expired_points?: number;
 }
 
 export interface AnsichToolEnvSample {

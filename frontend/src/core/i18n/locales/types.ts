@@ -488,6 +488,14 @@ export interface Translations {
         activated_expired: string;
         activated_unaudited: string;
       };
+      retention: string;
+      retentionUnknown: string;
+      retentionNeverRun: string;
+      retentionStartedAt: string;
+      retentionFinishedAt: string;
+      retentionUnfinished: string;
+      retentionHorizon: string;
+      retentionPolicy: string;
       metricDescriptions: {
         databaseLag: string;
         databaseFailedJobs: string;
@@ -499,6 +507,10 @@ export interface Translations {
         processFailedJobs: string;
         processLag: string;
         activeVersions: string;
+        retention: string;
+        retentionStartedAt: string;
+        retentionFinishedAt: string;
+        retentionHorizon: string;
       };
     };
     snapshotRequests: string;
@@ -567,6 +579,7 @@ export interface Translations {
     environmentBeliefs: string;
     environmentTrend: string;
     environmentTrendTruncated: string;
+    environmentTrendExpired: string;
     environmentPerCommand: string;
     environmentPerCommandOrderNote: string;
     environmentFdPeak: string;

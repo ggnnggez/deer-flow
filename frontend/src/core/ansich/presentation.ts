@@ -643,6 +643,27 @@ export interface AnsichActiveVersionRow {
   activatedBy: string | null;
 }
 
+/**
+ * How many samples in a history window had their evidence expired by retention.
+ *
+ * A separate function rather than `?? 0` at the call site because the fallback
+ * is load-bearing in both directions and easy to get backwards. A backend that
+ * predates the counter sends no key at all, and a *missing* count is not
+ * evidence of expired samples — so it reads as none, and the renderer draws no
+ * annotation rather than an alarming `undefined`. A real `0` reads the same
+ * way, which is correct: nothing expired in this window. What the count must
+ * never do is become a *point* — an expired sample has no value, and missing
+ * is not zero.
+ */
+export function ansichExpiredPointCount(
+  history: { expired_points?: number } | null | undefined,
+): number {
+  const count = history?.expired_points;
+  return typeof count === "number" && Number.isFinite(count) && count > 0
+    ? count
+    : 0;
+}
+
 export interface AnsichDatabaseHealthPresentation {
   reachable: boolean;
   projectors: AnsichProjectorRow[];
@@ -668,8 +689,45 @@ export interface AnsichDatabaseHealthPresentation {
    * build knows.
    */
   activeVersions: AnsichActiveVersionRow[] | null;
+  /**
+   * The last retention pass, or `null` for "no pass is known".
+   *
+   * `null` covers two different facts on purpose, because the panel already
+   * has the field that tells them apart: an unreadable store knows nothing,
+   * and a reachable store may simply never have been swept. Callers must read
+   * `reachable` first — rendering "retention has never run" for an outage
+   * would report a fault as a configuration.
+   */
+  retentionLastRun: AnsichRetentionLastRunRow | null;
   /** Unreadable storage, or any durably failed job. */
   attention: boolean;
+}
+
+/** The last retention pass, shaped for the panel. */
+export interface AnsichRetentionLastRunRow {
+  startedAt: string;
+  /** `null` for a pass that started and did not finish — a real state. */
+  finishedAt: string | null;
+  /**
+   * True when a pass started and no completion was ever recorded. Named rather
+   * than derived at the call site because "still running" and "died mid-sweep"
+   * are the same row: the panel says a pass did not finish and lets the
+   * timestamp beside it say how long ago that was.
+   */
+  unfinished: boolean;
+  /**
+   * The policy the pass ran under, as `name=value` pairs in a stable order.
+   * The stored snapshot is a flat mapping of the four policy fields, and it is
+   * rendered from the *pass* rather than from current configuration precisely
+   * because the configuration may have changed since. Empty when the row
+   * recorded none.
+   */
+  policy: string[];
+  /**
+   * How far Observation deletion has completed. `0` is a value — ingest
+   * sequences start at 1 — and means nothing has been deleted yet.
+   */
+  horizon: number;
 }
 
 /**
@@ -686,6 +744,7 @@ const UNREADABLE_DATABASE_HEALTH: AnsichDatabaseHealthPresentation = {
   settledThrough: null,
   outstanding: null,
   activeVersions: null,
+  retentionLastRun: null,
   attention: true,
 };
 Object.freeze(UNREADABLE_DATABASE_HEALTH.projectors);
@@ -758,6 +817,22 @@ export function getDatabaseHealthPresentation(
           activatedAt: entry.activated_at,
           activatedBy: entry.activated_by,
         }))
+      : null,
+    // Null-safe the same way `activeVersions` is: an absent field, an explicit
+    // `null`, or a backend that predates retention all yield `null` rather than
+    // a fabricated pass. The policy snapshot is rendered in key order so two
+    // reads of the same row never reorder, and a non-object snapshot yields no
+    // pairs instead of `[object Object]`.
+    retentionLastRun: database.retention_last_run
+      ? {
+          startedAt: database.retention_last_run.started_at,
+          finishedAt: database.retention_last_run.finished_at,
+          unfinished: database.retention_last_run.finished_at === null,
+          policy: Object.entries(database.retention_last_run.policy ?? {})
+            .sort(([left], [right]) => left.localeCompare(right))
+            .map(([key, value]) => `${key}=${String(value)}`),
+          horizon: database.retention_last_run.observation_horizon_ingest_seq,
+        }
       : null,
     settledThrough,
     outstanding: projectors.reduce((total, row) => total + row.outstanding, 0),

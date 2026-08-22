@@ -606,6 +606,16 @@ export const enUS: Translations = {
         activated_expired: "activated, audit expired",
         activated_unaudited: "activated, never audited",
       },
+      retention: "Retention",
+      retentionUnknown:
+        "When retention last ran is unknown while the store cannot be read.",
+      retentionNeverRun:
+        "No retention pass has ever run against this store. Nothing has been expired or deleted; a pass is started by an operator or a scheduled caller, not by the store itself.",
+      retentionStartedAt: "Last pass started",
+      retentionFinishedAt: "Last pass finished",
+      retentionUnfinished: "did not finish",
+      retentionHorizon: "Deleted through",
+      retentionPolicy: "Ran under",
       metricDescriptions: {
         databaseLag:
           "How old the oldest job still owed is, measured from the Observation it is waiting on. It answers how far behind the backlog is, not how long ago anything last arrived.",
@@ -625,6 +635,14 @@ export const enUS: Translations = {
           "Failed jobs this worker has seen for itself. It is advisory: other workers' failures are not in it, so compare it with the authoritative count above.",
         processLag:
           "The collector's own lag inside this process, separate from how far behind the stored backlog is.",
+        retention:
+          "The last time-tiered retention pass: when it ran, whether it completed, and how far Observation deletion has got. Retention runs in tiers that expire payload bodies first, then Observations, then structural rows, and it converges over repeated passes rather than in one — a store that still has rows to expire after a pass is normal, not stuck.",
+        retentionStartedAt:
+          "When the last pass began. It is written before any deletion, so a pass that crashed is still legible as a pass that started.",
+        retentionFinishedAt:
+          "When the last pass completed. “Did not finish” means a pass started and no completion was recorded — a crash, a kill, or a deploy mid-sweep — and is deliberately not shown the same way as a store nobody has ever swept.",
+        retentionHorizon:
+          "The ingest sequence at or below which Observation deletion is complete and contiguous. It is what lets a receipt for a deleted Observation answer “expired” instead of being mistaken for a lost write. Zero means nothing has been deleted yet — sequences start at 1.",
         activeVersions:
           "Which version of each versioned component is authoritative. A component nobody has switched runs the build's own default and is marked as such — the store records deviations, so no stored row is a complete answer rather than a missing one. A switch is a deliberate, audited command; “audit expired” means the switch happened and its evidence has since aged out under retention, while “never audited” means no evidence was ever recorded and is the one state worth asking about.",
       },
@@ -702,6 +720,7 @@ export const enUS: Translations = {
     environmentTrend: "Last 60 minutes",
     environmentTrendTruncated:
       "Too many samples; only the most recent stretch is shown.",
+    environmentTrendExpired: "Samples whose evidence expired",
     environmentPerCommand: "Per command",
     environmentPerCommandOrderNote:
       "The x axis is command execution order, not a time axis.",

@@ -1,6 +1,7 @@
 import { describe, expect, it } from "@rstest/core";
 
 import {
+  ansichExpiredPointCount,
   coverageBadge,
   environmentBeliefBadge,
   environmentScopeBadge,
@@ -73,5 +74,26 @@ describe("environment presentation", () => {
     );
     expect(unknown.label).toBe("未知");
     expect(unknown.tone).toBe("neutral");
+  });
+});
+
+describe("ansichExpiredPointCount", () => {
+  it("reads an absent counter as none rather than as unknown", () => {
+    // A backend that predates the counter sends no key at all, and a missing
+    // count is not evidence that anything expired — so the renderer draws no
+    // annotation instead of an alarming `undefined`.
+    expect(ansichExpiredPointCount(undefined)).toBe(0);
+    expect(ansichExpiredPointCount(null)).toBe(0);
+    expect(ansichExpiredPointCount({})).toBe(0);
+  });
+
+  it("carries a real count through, and a real zero as zero", () => {
+    expect(ansichExpiredPointCount({ expired_points: 3 })).toBe(3);
+    expect(ansichExpiredPointCount({ expired_points: 0 })).toBe(0);
+  });
+
+  it("refuses a value that is not a finite count", () => {
+    expect(ansichExpiredPointCount({ expired_points: Number.NaN })).toBe(0);
+    expect(ansichExpiredPointCount({ expired_points: -1 })).toBe(0);
   });
 });

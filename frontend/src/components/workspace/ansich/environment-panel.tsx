@@ -11,6 +11,7 @@ import {
   useAnsichTaskToolEnvSamples,
 } from "@/core/ansich/hooks";
 import {
+  ansichExpiredPointCount,
   coverageBadge,
   environmentBeliefBadge,
   environmentScopeBadge,
@@ -292,10 +293,18 @@ function MetricTrend({
   const limit = query.data.points[query.data.points.length - 1]?.limit ?? null;
   const first = points[0]!.value;
   const last = points[points.length - 1]!.value;
+  // Samples whose payload body was deleted under the retention policy. They are
+  // deliberately *not* points — an expired sample cannot become a value, and
+  // missing is not zero — but reporting nothing would make a deliberate
+  // deletion look like a Scope that never sampled, and the reader would take
+  // the gap in the line as an outage. Counted over the whole window rather than
+  // the kept tail, so it can legitimately exceed the points drawn.
+  const expired = ansichExpiredPointCount(query.data);
   const title = [
     `${metric} · ${t.ansich.environmentTrend}`,
     `${points.length} · ${formatMetricValue(metric, first)} → ${formatMetricValue(metric, last)}`,
     query.data.truncated ? t.ansich.environmentTrendTruncated : null,
+    expired > 0 ? `${t.ansich.environmentTrendExpired}: ${expired}` : null,
   ]
     .filter(Boolean)
     .join(" · ");

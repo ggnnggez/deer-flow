@@ -587,7 +587,24 @@ export const zhCN: Translations = {
         activated_expired: "已切换，审计记录已过期",
         activated_unaudited: "已切换，从未留下审计",
       },
+      retention: "保留策略",
+      retentionUnknown: "存储读不到时，保留策略上次运行的时间是未知的。",
+      retentionNeverRun:
+        "这个存储从未运行过保留清理。没有任何数据被过期或删除；清理由运维或定时调用发起，存储自身不会主动发起。",
+      retentionStartedAt: "上次运行开始",
+      retentionFinishedAt: "上次运行结束",
+      retentionUnfinished: "未完成",
+      retentionHorizon: "已删除至",
+      retentionPolicy: "运行时策略",
       metricDescriptions: {
+        retention:
+          "上一次分层保留清理：何时运行、是否跑完、Observation 删除推进到哪里。清理按层进行，先过期 payload 正文，再删 Observation，最后删结构行；它靠多次运行逐步收敛，而不是一次跑完——一次运行之后仍有待过期的数据是正常的，不代表卡住。",
+        retentionStartedAt:
+          "上次运行的开始时间。它在任何删除之前写入，因此中途崩溃的那次运行仍然可以被读出是“开始过”。",
+        retentionFinishedAt:
+          "上次运行的完成时间。“未完成”表示运行开始过但没有记录完成——崩溃、被杀、或部署打断——它与“从未清理过的存储”是刻意区分开的两件事。",
+        retentionHorizon:
+          "Observation 删除已经完整且连续覆盖到的 ingest 序号。正是它让指向已删除 Observation 的回执能回答“已过期”，而不会被误判成写入丢失。0 是有意义的取值——序号从 1 开始，因此 0 表示尚未删除任何数据。",
         databaseLag:
           "最早一条仍然欠着的任务、按它等待的那条 Observation 计算出的年龄。它回答的是积压落后多远，而不是最近一次有数据到达是多久以前。",
         databaseFailedJobs:
@@ -676,6 +693,7 @@ export const zhCN: Translations = {
     environmentBeliefs: "评估状态",
     environmentTrend: "近 60 分钟趋势",
     environmentTrendTruncated: "采样点过多，仅展示最近的一段",
+    environmentTrendExpired: "证据已按保留策略过期的采样点",
     environmentPerCommand: "逐命令",
     environmentPerCommandOrderNote: "横轴为命令执行顺序，不是时间轴",
     environmentFdPeak: "fd 峰值",

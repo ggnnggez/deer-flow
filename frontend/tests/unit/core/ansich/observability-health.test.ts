@@ -60,6 +60,7 @@ function reachable(
         audit_obs_id: "3f2504e0-4f89-41d3-9a0c-0305e82c3301",
       },
     ],
+    retention_last_run: null,
     ...overrides,
   };
 }
@@ -286,6 +287,7 @@ describe("getDatabaseHealthPresentation", () => {
       failed_jobs: null,
       stale_completion_count: null,
       active_versions: null,
+      retention_last_run: null,
     });
     expect(view.reachable).toBe(false);
     expect(view.projectors).toEqual([]);
@@ -426,5 +428,69 @@ describe("getDatabaseHealthPresentation", () => {
     expect(view.outstanding).toBe(0);
     expect(view.settledThrough).toBe(88);
     expect(view.lagMs).toBe(0);
+  });
+});
+
+describe("getDatabaseHealthPresentation retention", () => {
+  it("keeps “never swept” and “could not be read” apart through `reachable`", () => {
+    // Both answer `null`, and the panel must not render either of them from
+    // this field alone: retention is driven by a caller, so a reachable store
+    // nobody has swept is ordinary, while an unreadable one knows nothing.
+    expect(
+      getDatabaseHealthPresentation(reachable()).retentionLastRun,
+    ).toBeNull();
+    expect(getDatabaseHealthPresentation(reachable()).reachable).toBe(true);
+    expect(
+      getDatabaseHealthPresentation(undefined).retentionLastRun,
+    ).toBeNull();
+    expect(getDatabaseHealthPresentation(undefined).reachable).toBe(false);
+  });
+
+  it("projects a finished pass with its policy in a stable order", () => {
+    const view = getDatabaseHealthPresentation(
+      reachable({
+        retention_last_run: {
+          started_at: "2026-08-22T09:00:00Z",
+          finished_at: "2026-08-22T09:04:00Z",
+          policy: {
+            observation_days: 30,
+            raw_payload_days: 7,
+            cleanup_batch_size: 500,
+            structural_days: 90,
+          },
+          observation_horizon_ingest_seq: 4211,
+        },
+      }),
+    );
+    expect(view.retentionLastRun?.unfinished).toBe(false);
+    expect(view.retentionLastRun?.horizon).toBe(4211);
+    // Sorted by key rather than by insertion order, so two reads of the same
+    // row never reorder the chips under the reader.
+    expect(view.retentionLastRun?.policy).toEqual([
+      "cleanup_batch_size=500",
+      "observation_days=30",
+      "raw_payload_days=7",
+      "structural_days=90",
+    ]);
+  });
+
+  it("marks a pass that started and never finished, and keeps zero a value", () => {
+    // A crash, a kill, or a deploy mid-sweep. It is a real state and must not
+    // read as “never run”, which is the absence of the whole block. The
+    // horizon of 0 beside it is honest: ingest sequences start at 1.
+    const view = getDatabaseHealthPresentation(
+      reachable({
+        retention_last_run: {
+          started_at: "2026-08-22T09:00:00Z",
+          finished_at: null,
+          policy: null,
+          observation_horizon_ingest_seq: 0,
+        },
+      }),
+    );
+    expect(view.retentionLastRun?.unfinished).toBe(true);
+    expect(view.retentionLastRun?.finishedAt).toBeNull();
+    expect(view.retentionLastRun?.policy).toEqual([]);
+    expect(view.retentionLastRun?.horizon).toBe(0);
   });
 });
