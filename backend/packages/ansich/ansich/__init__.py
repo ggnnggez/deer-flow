@@ -70,7 +70,7 @@ from ansich.lineage import (
     PossibleExposureItemView,
     PossibleExposureView,
 )
-from ansich.operator import OperatorAuditActionType, TaskOperatorActionType
+from ansich.operator import RAW_PAYLOAD_READ_ACTION, OperatorAuditActionType, TaskOperatorActionType
 from ansich.quality import (
     ComparisonReason,
     ComparisonStatus,
@@ -123,6 +123,7 @@ __all__ = [
     "ActiveVersionMismatch",
     "ActiveVersionOrigin",
     "Assessment",
+    "RAW_PAYLOAD_READ_ACTION",
     "OperatorAuditActionType",
     "TaskOperatorActionType",
     "AlertCondition",

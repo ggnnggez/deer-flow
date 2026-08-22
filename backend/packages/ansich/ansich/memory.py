@@ -11,7 +11,7 @@ from ansich.compression import (
     ContextCompressionView,
 )
 from ansich.context_state import ContextStateDelta, ContextStateItem, ContextStateView, materialize_context_state
-from ansich.contracts import ControlBelief, ControlValue, NamedVersion, ObservationEnvelope, TaskLifecycleScope, TaskView, control_values_for_lifecycle_scope
+from ansich.contracts import ANSICH_BOOTSTRAP_TASK_ID, ControlBelief, ControlValue, NamedVersion, ObservationEnvelope, TaskLifecycleScope, TaskView, control_values_for_lifecycle_scope
 from ansich.control import should_select_control_candidate
 from ansich.environment import (
     EnvironmentHistoryView,
@@ -100,6 +100,62 @@ class InMemoryAnsichBackend:
             self._project(observation)
             processed += 1
         return processed
+
+    async def record_raw_read_audit(
+        self,
+        *,
+        status: Literal["requested", "succeeded", "failed"],
+        read_id: str,
+        actor: str,
+        target_kind: str,
+        target_id: str,
+        purpose: str | None = None,
+        request_correlation_id: str | None = None,
+        outcome: str | None = None,
+        http_status: int | None = None,
+        served_byte_size: int | None = None,
+    ) -> str:
+        """The §7 audit row, written straight into this backend's store.
+
+        It exists here for the same reason every other read does: a caller that
+        holds this backend must be able to exercise the whole path. What it is
+        **not** is durability — this store is a list in a process, so "the audit
+        landed" means exactly as much here as every other write to it does, and
+        a deployment that wants the §7 guarantee runs a SQL backend
+        (``database.backend: memory`` already surfaces ``status=failed``).
+
+        The subject follows RC8's rule as far as this backend can honour it:
+        the Task that emitted an Observation about the target when there is
+        one, else the bootstrap sentinel. There is deliberately no Scope arm —
+        this backend projects no Scope entities, so a host-Scope subject would
+        name something that does not exist here.
+        """
+
+        owning_task_id: str | None = None
+        if target_kind != "agent_release":
+            for observation in reversed(self._observations):
+                if observation.subject_id == target_id or observation.obs_id == target_id:
+                    if observation.task_id != ANSICH_BOOTSTRAP_TASK_ID:
+                        owning_task_id = observation.task_id
+                    break
+        audit = ObservationEnvelope.raw_payload_read(
+            status=status,
+            read_id=read_id,
+            actor=actor,
+            target_kind=target_kind,
+            target_id=target_id,
+            occurred_at=datetime.now(UTC),
+            task_id=owning_task_id if owning_task_id is not None else ANSICH_BOOTSTRAP_TASK_ID,
+            subject_type="task",
+            subject_id=owning_task_id if owning_task_id is not None else ANSICH_BOOTSTRAP_TASK_ID,
+            purpose=purpose,
+            request_correlation_id=request_correlation_id,
+            outcome=outcome,
+            http_status=http_status,
+            served_byte_size=served_byte_size,
+        )
+        self._observations.append(audit)
+        return audit.obs_id
 
     async def get_task(self, task_id: str) -> TaskView | None:
         task = self._tasks.get(task_id)

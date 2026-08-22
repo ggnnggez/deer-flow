@@ -250,6 +250,20 @@ describe("Ansich API", () => {
     ]);
   });
 
+  it("reads a raw ContentBlock body with no-store, like every other raw route", async () => {
+    // The server audits every raw-body read and answers `no-store`; a client
+    // cache would hand back a body no audit row accounts for. This was the one
+    // raw fetch in the file missing the option.
+    mockedFetch.mockResolvedValue(jsonResponse({ payload: { body: {} } }));
+
+    await fetchAnsichContentPayload("block-1");
+
+    expect(mockedFetch).toHaveBeenCalledWith(
+      expect.stringContaining("/api/ansich/content-blocks/block-1/payload"),
+      { cache: "no-store" },
+    );
+  });
+
   it("loads lineage, possible exposure, snapshot, and compression details lazily by identifier", async () => {
     mockedFetch.mockResolvedValue(jsonResponse({}));
     const identifier = "lineage/id with spaces";

@@ -169,6 +169,11 @@ class AnsichConfig(BaseModel):
         ge=1,
         description="startup-only: Largest accepted evaluation record payload; larger submissions are rejected rather than truncated.",
     )
+    raw_read_max_bytes: int = Field(
+        default=1_048_576,
+        ge=1,
+        description="startup-only: Largest raw payload body one audited admin read may return; a larger body is refused with 413 and the refusal is audited.",
+    )
     environment_probe_enabled: bool = Field(
         default=True,
         description="startup-only: Enable environment probe collection.",

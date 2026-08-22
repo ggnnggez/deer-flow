@@ -649,6 +649,11 @@ export async function fetchAnsichContentPayload(
 ): Promise<AnsichContentPayloadResponse> {
   const response = await fetch(
     ansichUrl(`/content-blocks/${encodeURIComponent(blockId)}/payload`),
+    // Raw bodies are audited, one-shot reads: the server answers `no-store`
+    // and this is the client half of the same rule. It was the one raw fetch
+    // in this file without it, so an HTTP cache could serve a body the audit
+    // trail has no row for.
+    { cache: "no-store" },
   );
   if (!response.ok) {
     await throwAnsichApiError(

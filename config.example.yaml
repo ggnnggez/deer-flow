@@ -1860,6 +1860,10 @@ ansich:
   # Evaluation submissions larger than this are rejected rather than truncated,
   # so an expected/actual body cannot silently lose its evidence.
   evaluation_max_payload_bytes: 262144
+  # Every read of a raw payload body goes through the four audited admin
+  # endpoints, and a body larger than this is refused (413) rather than served.
+  # The refusal is audited like any other outcome, so the attempt is on record.
+  raw_read_max_bytes: 1048576
   # Enable OS-level environment sampling (fd/io/disk/pressure) as a second
   # Ansich evidence source, subject to sandbox/host Scopes rather than Tasks.
   environment_probe_enabled: true

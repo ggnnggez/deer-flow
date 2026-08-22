@@ -15,10 +15,35 @@ __all__ = [
     "ActiveVersionError",
     "ActiveVersionRefusal",
     "PayloadExpiredError",
+    "RawReadAuditUnavailableError",
     "ReplayTargetError",
     "ReplayTargetRefusal",
     "StorageUnavailableError",
 ]
+
+
+class RawReadAuditUnavailableError(Exception):
+    """The §7 access audit for one raw-payload read could not be persisted.
+
+    **This is the batch's one documented inversion of the project-wide
+    fail-open rule** (plan Global Constraint 1, spec:114). Everywhere else in
+    Ansich a collection failure degrades and the product keeps working, because
+    losing evidence about a run is worse than nothing but far better than
+    breaking the run. Here the evidence *is* the control: an admin read of a
+    raw body whose audit row did not land is an unaccountable disclosure, and
+    the only way to keep the promise "every raw read is audited" is to refuse
+    the read. Its caller answers **503 and does not read the payload** — and
+    the routes that raise it say so in a comment naming this section, so nobody
+    later "fixes" the inversion back to fail-open.
+
+    Raised for both halves of "cannot persist": a backend with no audit writer
+    at all (a service that cannot record the access must not serve it either),
+    and a writer that raised. The two are the same statement to the caller —
+    *this read is not audited* — and the route treats them identically.
+
+    It says nothing about the payload, which by construction was never read:
+    the requested-audit write happens before the store is asked for the body.
+    """
 
 
 class PayloadExpiredError(Exception):

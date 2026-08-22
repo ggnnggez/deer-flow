@@ -33,9 +33,10 @@ from typing import Literal, get_args, get_origin
 import pytest
 from ansich import ObservationEnvelope, ReplayReport, ReplaySelector, new_id
 from ansich.belief.resolver import DEFAULT_RESOLVER, RESOLVER_V1, BeliefAssertion, resolve_current_belief
-from ansich.contracts import ActiveVersion, NamedVersion, ObservationKind
+from ansich.contracts import ANSICH_BOOTSTRAP_TASK_ID, ActiveVersion, NamedVersion, ObservationKind
 from ansich.errors import ActiveVersionError, ReplayTargetError
 from ansich.operator import OperatorAuditActionType, TaskOperatorActionType
+from ansich.safety import host_scope_id
 from pydantic import ValidationError
 from sqlalchemy import UniqueConstraint, func, select, update
 from sqlalchemy.dialects import sqlite
@@ -2318,6 +2319,13 @@ class TestActivationWritesTheRowAndItsAuditTogether:
         "the audit row was live inside this transaction and went away with
         it". A two-transaction implementation cannot satisfy that: its first
         commit would already be durable when this fires.
+
+        The injection is **narrowed to the active-version row's own lookup**
+        because that is the ``get`` this test means. T12's subject resolution
+        (RC8) added an earlier ``session.get`` for the host ``Scope``, which
+        runs *before* the audit row is added — exploding there would fire the
+        injection at a point where nothing has been written yet and quietly
+        turn this into the weaker test F2 replaced.
         """
 
         sql_backend, sessions = backend
@@ -2325,6 +2333,8 @@ class TestActivationWritesTheRowAndItsAuditTogether:
         original_get = AsyncSession.get
 
         async def exploding_get(self: AsyncSession, *args: object, **kwargs: object) -> object:
+            if not args or args[0] is not AnsichActiveVersionRow:
+                return await original_get(self, *args, **kwargs)  # type: ignore[arg-type]
             seen_inside_transaction.append(int(await self.scalar(select(func.count()).select_from(AnsichObservationRow)) or 0))
             raise RuntimeError("killed after the audit flush, before the commit")
 
@@ -2437,6 +2447,88 @@ class TestActivationWritesTheRowAndItsAuditTogether:
         )
         async with sessions() as session:
             assert (await session.scalar(select(func.count()).select_from(AnsichProjectionJobRow))) == 0
+
+
+class TestTheActivationAuditTakesTheFamilySubject:
+    """T6 wrote the sentinel unconditionally; T12 unified the family (RC8).
+
+    The rule both members of ``OperatorAuditActionType`` now share is "the host
+    ``Scope`` when this store has one, else the bootstrap sentinel". T6's
+    reasoning for the sentinel was that the CLI writer never runs the
+    collector's bootstrap mint — true, and beside the point: it cannot *mint*
+    the Scope, but it holds a session and can *ask*, which is what the handle
+    rule asks for. So the sentinel is now the answer for a store that has no
+    host Scope rather than the answer for this writer.
+    """
+
+    @pytest.mark.anyio
+    async def test_without_a_host_scope_the_audit_keeps_the_bootstrap_sentinel(
+        self,
+        backend: tuple[SqlAnsichBackend, async_sessionmaker],
+    ) -> None:
+        sql_backend, sessions = backend
+
+        activated = await sql_backend.activate_version(
+            component_kind="resolver",
+            component_name=RESOLVER_COMPONENT_NAME,
+            version=RESOLVER_V1.version,
+            actor="operator",
+        )
+
+        async with sessions() as session:
+            observation = await session.scalar(select(AnsichObservationRow).where(AnsichObservationRow.obs_id == activated.audit_obs_id))
+        assert observation is not None
+        assert observation.subject_type == "task"
+        assert observation.subject_id == ANSICH_BOOTSTRAP_TASK_ID
+        assert observation.task_id == ANSICH_BOOTSTRAP_TASK_ID
+
+    @pytest.mark.anyio
+    async def test_with_a_host_scope_the_audit_subjects_it(
+        self,
+        backend: tuple[SqlAnsichBackend, async_sessionmaker],
+    ) -> None:
+        """The Scope is asked for, not assumed — and the Task field stays the sentinel.
+
+        That last part is what keeps these rows away from the assessor family:
+        ``ansich_assessor_jobs.subject_id`` is FK-bound to ``ansich_tasks``, and
+        ``_assessors_for_observation`` refuses the sentinel outright.
+        """
+
+        sql_backend, sessions = backend
+        hostname = sql_backend._hostname
+        await sql_backend.persist_and_project(
+            [
+                ObservationEnvelope.scope_snapshotted(
+                    task_id=ANSICH_BOOTSTRAP_TASK_ID,
+                    run_id=host_scope_id(hostname),
+                    occurred_at=_OCCURRED_AT,
+                    scope_kind="host",
+                    external_ref=hostname,
+                    relation_role=None,
+                    source_event_id=f"ansich:host-scope:{hostname[:200]}",
+                    producer_name="ansich-bootstrap",
+                    producer_version="1",
+                    producer_instance_id="local",
+                )
+            ]
+        )
+        await _settle(sql_backend)
+
+        activated = await sql_backend.activate_version(
+            component_kind="resolver",
+            component_name=RESOLVER_COMPONENT_NAME,
+            version=RESOLVER_V1.version,
+            actor="operator",
+        )
+
+        async with sessions() as session:
+            observation = await session.scalar(select(AnsichObservationRow).where(AnsichObservationRow.obs_id == activated.audit_obs_id))
+            jobs = await session.scalar(select(func.count()).select_from(AnsichProjectionJobRow).where(AnsichProjectionJobRow.obs_id == activated.audit_obs_id))
+        assert observation is not None
+        assert observation.subject_type == "scope"
+        assert observation.subject_id == host_scope_id(hostname)
+        assert observation.task_id == ANSICH_BOOTSTRAP_TASK_ID
+        assert jobs == 0
 
 
 class TestTheLatchIsNeverSetWithoutItsPointer:

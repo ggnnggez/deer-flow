@@ -23,10 +23,23 @@ TaskOperatorActionType = Literal["interrupt", "rollback"]
 #: row can ever have. RC8's discriminator machinery is a separate concern and
 #: is not required to add a member here.
 #:
-#: ``activate_version`` is the first member (an audited active-version switch,
-#: written by ``activate_version()`` in the SQL backend). The raw-payload-read
-#: audit adds its own member beside it; neither task claims the other's value.
-OperatorAuditActionType = Literal["activate_version"]
+#: ``activate_version`` is an audited active-version switch, written by
+#: ``activate_version()`` in the SQL backend. ``raw_payload_read`` is one
+#: admin read of one raw body through the four §7 endpoints, written by
+#: ``record_raw_read_audit()`` beside it.
+#:
+#: **Both members are subjected the same way** (RC8, unified): the owning Task
+#: when the thing read belongs to one, else the host ``Scope`` when this store
+#: has one, else ``ANSICH_BOOTSTRAP_TASK_ID``. The envelope validator's
+#: Scope arm admits a Scope subject for exactly this family and refuses it for
+#: :data:`TaskOperatorActionType`, whose members always have a Task.
+OperatorAuditActionType = Literal["activate_version", "raw_payload_read"]
+
+#: The audited read of one raw payload body (§7). Annotated rather than written
+#: as a bare string at the two write sites, so the Literal above does
+#: structural work: a test asserts the value that lands in the payload is one
+#: of its members.
+RAW_PAYLOAD_READ_ACTION: OperatorAuditActionType = "raw_payload_read"
 
 
 class OperatorActionView(BaseModel):

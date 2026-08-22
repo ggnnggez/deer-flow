@@ -479,7 +479,7 @@ Localhost persistence deliberately reads the direct request `Host` and ignores `
 | **Models** (`/api/models`) | `GET /` - list models; `GET /{name}` - model details |
 | **Features** (`/api/features`) | `GET /` - report config-gated feature availability (`agents_api.enabled`, `browser_control.enabled`) for frontend UI gating |
 | **Console** (`/api/console`) | Read-only cross-thread observability for the current user (the data layer for an operations dashboard or external monitoring): `GET /stats` - headline counters (runs/threads/agents/tokens/cost); `GET /runs` - paginated run history joined with thread titles (per-run cost); `GET /usage` - zero-filled daily token series + per-model breakdown with spend. Queries `runs`/`threads_meta` directly as a reporting layer (no new `RunStore` methods); requires a SQL database backend — returns 503 on `database.backend: memory`. Real-cost estimation reads optional `models[*].pricing` (`currency`, `input_per_million`, `output_per_million`, `input_cache_hit_per_million`; `ModelConfig` is `extra="allow"`, so no schema change) and prices each run from its `token_usage_by_model` input/output split. Pricing is **cache-aware**: `RunJournal` accumulates prompt-cache hits from `usage_metadata.input_token_details.cache_read` into a sparse `cache_read_tokens` bucket key (also threaded through `SubagentTokenCollector` → `record_external_llm_usage_records`), and cache-hit input tokens are billed at `input_cache_hit_per_million` (omitted → billed at the miss price, a conservative upper bound). Legacy rows fall back to run-level totals at `model_name`; unpriced models yield `cost: null` and cost fields are null when no pricing is configured |
-| **Ansich** (`/api/ansich`) | Admin-only developer/operator Agent observability, gated by startup-only `ansich.enabled`. Task reads include evidence-backed Control/behavior Beliefs, lifecycle/Step/system-operation history, physical LLM attempts, ordered ContextSnapshot/ToolCall accountability, Task-scoped context-compression inventory, bounded ContentBlock lineage, active-task/local-or-inclusive Usage/Budget reads with source breakdown, typed parent/child Task tree navigation, Alert list/detail/workflow plus interrupt/rollback proxy actions, and immutable AgentRelease bindings/comparison/provider drift. Tool/raw/visible payloads and complete sanitized release manifests stay on separate logged `no-store` endpoints; lineage/snapshot/compression, release detail, and alert-list reads are metadata/preview-only. `GET /health` remains process-local and readable when SQL storage is unavailable; projection reads return 503 with the same health summary when storage is unavailable. Failed-job diagnostics (`GET/POST /operations/failed-jobs*`) list and detail currently-failing projection/assessor jobs with their full attempt-error history and support Task-batch retry (first HTTP exposure of the existing non-destructive `retry_failed_projections`). Phase 10 adds the evaluation surface: `POST /evaluations` records one external evaluation (requires `Idempotency-Key`, validates that the subject exists and is the declared Entity type — 404/422 otherwise — and rejects a canonical payload over `ansich.evaluation_max_payload_bytes` with 413), returning the observation id plus `projection_status=pending|applied|failed` without waiting for projection; `GET /tasks/{task_id}/evaluations` returns the Task's five-dimension quality Beliefs (unassessed dimensions included) alongside its recorded evaluations, `GET /steps/{step_id}/evaluations` the Step-scoped rows, and `GET /agent-releases/{release_id}/quality?cohort=` the aggregated `(cohort, dimension)` cells. `GET /agent-releases/compare` gains the same `cohort` parameter and an additive `quality` block whose per-dimension `comparison_status`/`reason` is machine-readable, and `POST /operations/alerts/{alert_id}/dismiss` accepts an optional `semantic_override` that records one human quality assertion beside the workflow write. Evaluation `expected`/`actual`/`rationale` bodies never appear in those lists and load only through the logged `no-store` `GET /evaluations/{obs_id}/payload` route. |
+| **Ansich** (`/api/ansich`) | Admin-only developer/operator Agent observability, gated by startup-only `ansich.enabled`. Task reads include evidence-backed Control/behavior Beliefs, lifecycle/Step/system-operation history, physical LLM attempts, ordered ContextSnapshot/ToolCall accountability, Task-scoped context-compression inventory, bounded ContentBlock lineage, active-task/local-or-inclusive Usage/Budget reads with source breakdown, typed parent/child Task tree navigation, Alert list/detail/workflow plus interrupt/rollback proxy actions, and immutable AgentRelease bindings/comparison/provider drift. Tool/raw/visible payloads and complete sanitized release manifests stay on separate `no-store` endpoints whose every read is audited fail-closed (§7: the access row is committed before the body is read, and a 503 with nothing read if it cannot be); lineage/snapshot/compression, release detail, and alert-list reads are metadata/preview-only. `GET /health` remains process-local and readable when SQL storage is unavailable; projection reads return 503 with the same health summary when storage is unavailable. Failed-job diagnostics (`GET/POST /operations/failed-jobs*`) list and detail currently-failing projection/assessor jobs with their full attempt-error history and support Task-batch retry (first HTTP exposure of the existing non-destructive `retry_failed_projections`). Phase 10 adds the evaluation surface: `POST /evaluations` records one external evaluation (requires `Idempotency-Key`, validates that the subject exists and is the declared Entity type — 404/422 otherwise — and rejects a canonical payload over `ansich.evaluation_max_payload_bytes` with 413), returning the observation id plus `projection_status=pending|applied|failed` without waiting for projection; `GET /tasks/{task_id}/evaluations` returns the Task's five-dimension quality Beliefs (unassessed dimensions included) alongside its recorded evaluations, `GET /steps/{step_id}/evaluations` the Step-scoped rows, and `GET /agent-releases/{release_id}/quality?cohort=` the aggregated `(cohort, dimension)` cells. `GET /agent-releases/compare` gains the same `cohort` parameter and an additive `quality` block whose per-dimension `comparison_status`/`reason` is machine-readable, and `POST /operations/alerts/{alert_id}/dismiss` accepts an optional `semantic_override` that records one human quality assertion beside the workflow write. Evaluation `expected`/`actual`/`rationale` bodies never appear in those lists and load only through the audited `no-store` `GET /evaluations/{obs_id}/payload` route. |
 | **MCP** (`/api/mcp`) | `GET /config` - get config; `PUT /config` - update config (saves to extensions_config.json) |
 | **Skills** (`/api/skills`) | `GET /` - list skills; `GET /{name}` - details; `PUT /{name}` - update enabled; `POST /install` - install from .skill archive (accepts standard optional frontmatter like `version`, `author`, `compatibility`); `POST /reload` - admin-only process-local prompt-cache invalidation after trusted external filesystem changes |
 | **Memory** (`/api/memory`) | `GET /` - memory data; `POST /reload` - force reload; `GET /config` - config; `GET /status` - config + data |
@@ -2763,6 +2763,102 @@ along: that file's traversal-order test drove its setup with `_drain_projections
 and now uses `_settle_projections`, which is F10-34's known one-line remedy —
 `project_pending` returning 0 means "nothing claimable right now", not "nothing
 owed", and a job inside its retry backoff is invisible to it.
+
+**P11-C raw-payload read audit — the batch's one fail-closed site** (spec §7).
+Four admin routes return a raw body: `GET /agent-releases/{id}/manifest`,
+`GET /evaluations/{obs_id}/payload`, `GET /tool-calls/{id}/raw-result` and
+`/visible-result`, and `GET /content-blocks/{id}/payload`. Each one now runs
+**admin gate → subject resolution → durable requested-audit write → read →
+terminal audit**, and the ordering is the contract rather than a style: the
+access record is committed *before* the store is asked for the body, so a
+failure to write it can still refuse the read. **That refusal is the documented
+inversion of the project-wide fail-open rule** — everywhere else in Ansich a
+collection failure degrades and the product keeps working, because losing
+evidence about a run is worse than nothing but far better than breaking the run;
+here the evidence *is* the control, and an unauditable read is exactly the
+disclosure it exists to prevent. Every fail-closed line carries a comment naming
+§7 so nobody later "fixes" it back. The blast radius is deliberately one family:
+a store whose audit writer is broken keeps answering every metadata and
+inventory route, pinned by a test.
+
+The audit rows are `operator.action_requested` plus one
+`operator.action_succeeded`/`_failed`, carrying
+`payload.action_type="raw_payload_read"` — the second member of
+`ansich.operator.OperatorAuditActionType`, beside `activate_version` (RC8; the
+recorded spec deviation is that the field is `action_type`, not `action_kind`).
+The payload is spec:112's list and nothing else: actor user id, target kind and
+id, purpose, request correlation, and the envelope's timestamp. **Never the
+body** — `served_byte_size` is a length, and the shape has nowhere to put
+content. `purpose` is an optional bounded query parameter; the correlation is
+the bound trace id (`deerflow.trace_context`) or, when trace correlation is off,
+the raw inbound `X-Trace-Id`, bounded and recorded as received.
+
+**`source_event_id` keys on a per-read id, and that is load bearing** (H7-D):
+the producer dedupe is `(producer, instance_id, source_event_id)`, so a key
+built from `(actor, payload)` would silently absorb the *second* read of one
+payload by one actor — the one an auditor most wants. A read id plus the status
+also keeps the two rows of one read distinct from each other.
+
+**The writes are synchronous backend writes, never `record()`** (RC9). The
+collector queue is fail-open by construction — it accepts, it may drop, and it
+answers before anything is durable — so it is structurally incapable of
+confirming persistence. `AnsichService.audit_raw_payload_read` is therefore the
+**one fail-closed passthrough** in a file full of fail-open ones: a backend with
+no audit writer and a writer that raised are the same statement to the caller,
+`RawReadAuditUnavailableError`, and the route answers 503 with the payload
+untouched. `SqlAnsichBackend.record_raw_read_audit` writes through
+`_add_observation_row` — the same path `activate_version` uses, and deliberately
+**not** `persist_and_project`, whose dedupe collides by *silently skipping*: on
+an audit row a silent skip is an audit gap, while a plain INSERT under the
+unique index raises and becomes a refused read.
+
+**The subject is unified across the whole family** (RC8, and it moves T6's row):
+the owning Task when the thing read belongs to one — resolved from
+`ansich_tool_calls.task_id`, or from the ContentBlock's / evaluation
+Observation's `task_id` — else the host `Scope` when the store has one, else
+`ANSICH_BOOTSTRAP_TASK_ID`. `SqlAnsichBackend._process_audit_subject` is the one
+implementation and `activate_version` now calls it too: T6 wrote the sentinel
+unconditionally on the reasoning that the replay CLI never runs the collector's
+bootstrap mint, which is true about *minting* and beside the point about
+*asking* — the CLI holds a session, so the handle rule (`_existing_host_scope_id`,
+never `AnsichService.host_scope_id`) applies there as everywhere else. The
+`contracts.py` envelope validator gained the matching Scope arm, admitted only
+for this Literal family and only beside the bootstrap sentinel in `task_id`; a
+Scope subject on `interrupt`/`rollback`, or beside a real `task_id`, is refused.
+`task_id` staying the sentinel is what keeps these rows away from the assessor
+family, and `operator.action_*` is in no projector's kind list, so an audited
+read mints no job below any continuity mark (Global Constraint 4).
+
+Outcomes are a closed vocabulary and only one of them means bytes crossed the
+wire: `served` (the sole `succeeded` row), `not_found`, `expired`,
+`read_failed`, `oversize`, `denied_not_admin`. **A 410 from T9a's payload
+tombstone audits as `failed`/`expired`, not as a success** — the read was
+attempted and the store answered it, but nothing was disclosed, so "who obtained
+bytes" stays answerable from one field. **A denial writes one terminal row and
+no pair**, because no read was attempted; and the denial audit is best-effort
+where the requested row is not, since a denial discloses nothing and failing it
+twice would protect nobody. The **terminal** row degrades to a WARNING for the
+same asymmetry: by then the access is durably recorded and refusing the response
+would report a served read as an error while serving it anyway.
+
+`ansich.raw_read_max_bytes` (default 1 MiB, startup-only like the rest of the
+section, snapshotted into `app.state.ansich_raw_read_settings` beside the
+evaluation knobs) bounds one response; over it the read is refused with 413 and
+the refusal is audited. Bulk raw export stays out of scope (spec:118). Every
+answer these four routes can give carries `Cache-Control: no-store` — the 403,
+404, 410, 413 and 503 included — and a payload whose declared content type is
+not JSON also gets `Content-Disposition: attachment`, the artifacts router's
+rule applied one layer in. `require_admin_user` now **returns** the user it
+authorized so the audited actor is the same object the authorization decision
+was made against; the two `str(getattr(user, "id", "unknown"))` idioms in this
+router are gone. Frontend: `fetchAnsichContentPayload` was the one raw fetch
+without `{cache: "no-store"}` and now has it; all four raw reads stay in click
+handlers with local state and never enter TanStack. Tests:
+`tests/ansich/test_raw_read_audit.py` (the fail-closed 503 with an instrumented
+read path proving zero touch, metadata routes readable through the same failure,
+denial without reading, every outcome, both subject arms and the garbage the
+validator refuses, per-read uniqueness, the size limit, the headers) and
+`tests/ansich/test_replay.py::TestTheActivationAuditTakesTheFamilySubject`.
 
 **Workspace change review**: `packages/harness/deerflow/workspace_changes/`
 captures a pre-run and post-run snapshot of the thread-owned `workspace` and

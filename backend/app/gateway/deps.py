@@ -75,6 +75,27 @@ def snapshot_ansich_evaluation_settings(ansich_config: AnsichConfig | None) -> A
     )
 
 
+@dataclass(frozen=True, slots=True)
+class AnsichRawReadSettings:
+    """Startup snapshot of the §7 raw-read knob, for the same reason as above.
+
+    Kept apart from :class:`AnsichEvaluationSettings` rather than added to it:
+    they bound different things (what may be *written* into an evaluation
+    record vs. what may be *served* out of a raw body) and one of them is a
+    security limit, so a future change to either should not have to reason
+    about the other's callers.
+    """
+
+    max_bytes: int
+
+
+def snapshot_ansich_raw_read_settings(ansich_config: AnsichConfig | None) -> AnsichRawReadSettings:
+    """Freeze the audited raw-read size limit (defaults when absent)."""
+
+    config = ansich_config if ansich_config is not None else AnsichConfig()
+    return AnsichRawReadSettings(max_bytes=config.raw_read_max_bytes)
+
+
 def _browser_tools_enabled_in_config(config: AppConfig) -> bool:
     """Return whether process-local agentic browser sessions are configured."""
     get_tool_config = getattr(config, "get_tool_config", None)
@@ -332,6 +353,7 @@ async def langgraph_runtime(app: FastAPI, startup_config: AppConfig) -> AsyncGen
         app.state.ansich_service = None
         ansich_config = getattr(config, "ansich", None)
         app.state.ansich_evaluation_settings = snapshot_ansich_evaluation_settings(ansich_config)
+        app.state.ansich_raw_read_settings = snapshot_ansich_raw_read_settings(ansich_config)
         if ansich_config is not None:
             try:
                 from deerflow.ansich import create_embedded_ansich_service
@@ -594,8 +616,18 @@ async def get_current_user_from_request(request: Request):
     return user
 
 
-async def require_admin_user(request: Request, *, detail: str) -> None:
-    """Require the authenticated caller to be an admin user.
+async def require_admin_user(request: Request, *, detail: str):
+    """Require the authenticated caller to be an admin user, and return them.
+
+    **The return value is the strict actor identity**, and it exists because a
+    route that has to *record who acted* cannot re-derive it safely: the two
+    idioms that grew in the Ansich router (``request.state.user`` with an
+    ``"unknown"`` fallback) both answer "unknown" on exactly the composition
+    this function's own fallback exists to handle — a router mounted without
+    ``AuthMiddleware``, where the user is resolved here and never stamped on
+    the request. Returning the object this check already holds makes the actor
+    the same value the authorization decision was made against. Callers that
+    only need the gate keep ignoring it.
 
     ``AuthMiddleware`` normally stamps ``request.state.user`` before the request
     reaches a router. Falling back to the strict dependency keeps the route safe
@@ -614,6 +646,7 @@ async def require_admin_user(request: Request, *, detail: str) -> None:
 
     if getattr(user, "system_role", None) != "admin":
         raise HTTPException(status_code=403, detail=detail)
+    return user
 
 
 async def get_optional_user_from_request(request: Request):

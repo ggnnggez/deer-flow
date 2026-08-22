@@ -2139,6 +2139,13 @@ async def test_activate_version_writes_row_and_audit_atomically_on_postgres() ->
         seen_inside_transaction: list[int] = []
 
         async def exploding_get(self: AsyncSession, *args: object, **kwargs: object) -> object:
+            # Narrowed to the active-version row's own lookup, which is the
+            # `get` this injection means. T12's subject resolution (RC8) added
+            # an earlier `session.get` for the host `Scope`, and exploding there
+            # would fire before the audit row exists — turning a rollback proof
+            # into a "nothing was written" tautology.
+            if not args or args[0] is not AnsichActiveVersionRow:
+                return await original_get(self, *args, **kwargs)  # type: ignore[arg-type]
             seen_inside_transaction.append(int(await self.scalar(sa.select(sa.func.count()).select_from(AnsichObservationRow)) or 0))
             raise RuntimeError("killed after the audit flush, before the commit")
 

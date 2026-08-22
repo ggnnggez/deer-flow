@@ -9,6 +9,7 @@ from collections.abc import Callable, Iterable
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from threading import Lock
+from typing import Literal
 from weakref import ReferenceType, WeakMethod, ref
 
 from ansich.alerts.views import AlertDetailView, AlertSummaryView, BeliefAssertionView
@@ -46,6 +47,7 @@ from ansich.environment import (
     TaskToolEnvSamplesView,
     ToolEnvironmentSampleView,
 )
+from ansich.errors import RawReadAuditUnavailableError
 from ansich.evaluation import (
     QUALITY_DIMENSIONS,
     EvaluationProjectionStatus,
@@ -728,6 +730,58 @@ class AnsichService:
             # went away, not a database that did.
             logger.debug("Ansich database health read failed", exc_info=True)
             return DatabaseHealth(status="unreachable")
+
+    async def audit_raw_payload_read(
+        self,
+        *,
+        status: Literal["requested", "succeeded", "failed"],
+        read_id: str,
+        actor: str,
+        target_kind: str,
+        target_id: str,
+        purpose: str | None = None,
+        request_correlation_id: str | None = None,
+        outcome: str | None = None,
+        http_status: int | None = None,
+        served_byte_size: int | None = None,
+    ) -> str:
+        """Record one §7 raw-read audit row, **synchronously and fail-closed**.
+
+        **The one fail-closed passthrough in this file, and the inversion is
+        deliberate** (plan ruling RC9, spec:114). Every other optional-backend
+        passthrough here answers ``None`` or a default when the backend cannot
+        do the thing; this one raises
+        :class:`~ansich.errors.RawReadAuditUnavailableError`, and its caller
+        turns that into a 503 with the payload unread. Do not "fix" it to match
+        its neighbours: an unaudited raw read is the failure this control
+        exists to prevent, and a degraded return value here would produce
+        exactly that while looking healthy.
+
+        **Never ``record()``.** The collector queue is fail-open by
+        construction — it accepts, it may drop under capacity, and it answers
+        before anything is durable — so it is structurally incapable of telling
+        this caller that the audit landed. The write goes straight to the
+        backend and this method returns only after the backend committed.
+        """
+
+        writer = getattr(self._backend, "record_raw_read_audit", None)
+        if not callable(writer):
+            raise RawReadAuditUnavailableError("this Ansich backend cannot persist a raw-read access audit")
+        try:
+            return await writer(
+                status=status,
+                read_id=read_id,
+                actor=actor,
+                target_kind=target_kind,
+                target_id=target_id,
+                purpose=purpose,
+                request_correlation_id=request_correlation_id,
+                outcome=outcome,
+                http_status=http_status,
+                served_byte_size=served_byte_size,
+            )
+        except Exception as exc:
+            raise RawReadAuditUnavailableError("the Ansich raw-read access audit could not be persisted") from exc
 
     async def get_active_versions(self) -> tuple[ActiveVersion, ...] | None:
         """Which version of every versioned component the store says runs.

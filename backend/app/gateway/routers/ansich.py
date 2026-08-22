@@ -5,13 +5,15 @@ import hashlib
 import json
 import logging
 import posixpath
+from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import Literal
+from urllib.parse import quote
 
 from ansich.alerts import AlertWorkflowConflict
 from ansich.contracts import ControlValue, NamedVersion, Producer, TaskLifecycleScope
 from ansich.credentials import contains_credential_like_material
-from ansich.errors import PayloadExpiredError, StorageUnavailableError
+from ansich.errors import PayloadExpiredError, RawReadAuditUnavailableError, StorageUnavailableError
 from ansich.evaluation import (
     EvaluationDimension,
     EvaluationKind,
@@ -20,6 +22,7 @@ from ansich.evaluation import (
     EvaluationVerdict,
     ScoreScale,
 )
+from ansich.ids import new_id
 from ansich.quality import compare_release_quality
 from ansich.release import (
     AgentRelease,
@@ -32,13 +35,16 @@ from pydantic import BaseModel, ConfigDict, Field
 
 from app.gateway.deps import (
     AnsichEvaluationSettings,
+    AnsichRawReadSettings,
     get_current_user_from_request,
     get_run_manager,
     require_admin_user,
     snapshot_ansich_evaluation_settings,
+    snapshot_ansich_raw_read_settings,
 )
 from deerflow.runtime.runs.manager import CancelOutcome
 from deerflow.runtime.runs.schemas import RunStatus
+from deerflow.trace_context import get_current_trace_id
 
 router = APIRouter(prefix="/api/ansich", tags=["ansich"])
 _ADMIN_REQUIRED = "Ansich developer/operator observability requires an admin account."
@@ -54,6 +60,23 @@ _BENCHMARK_EVALUATION_KINDS: frozenset[str] = frozenset({"benchmark_assertion", 
 #: Used only when a request arrives on an app whose lifespan captured nothing —
 #: router tests and alternative ASGI compositions. Production always snapshots.
 _DEFAULT_EVALUATION_SETTINGS = snapshot_ansich_evaluation_settings(None)
+_DEFAULT_RAW_READ_SETTINGS = snapshot_ansich_raw_read_settings(None)
+#: Every response of the four §7 raw-body routes carries it, on the refusals as
+#: well as on the served body: a 410 is heuristically cacheable, and a 403 or a
+#: 413 still names an id somebody asked for.
+_NO_STORE: dict[str, str] = {"Cache-Control": "no-store"}
+#: Bound on the audited free-text ``purpose``. Over it the request is refused by
+#: FastAPI's own validation (422) before the handler runs, which reads nothing.
+RAW_READ_PURPOSE_MAX_LENGTH = 200
+#: Bound on the caller-supplied request correlation copied into the audit row.
+_RAW_READ_CORRELATION_MAX_LENGTH = 200
+#: The one place the ``purpose`` parameter is declared, so the four routes
+#: cannot drift on its name, its optionality or its bound.
+_RAW_READ_PURPOSE = Query(
+    default=None,
+    max_length=RAW_READ_PURPOSE_MAX_LENGTH,
+    description="Why this raw body is being read; recorded in the access audit, never interpreted.",
+)
 
 
 def _service_or_503(request: Request):
@@ -63,7 +86,7 @@ def _service_or_503(request: Request):
     return service
 
 
-def _expired_payload_410(exc: PayloadExpiredError, *, what: str, request: Request) -> HTTPException:
+def _expired_payload_410(exc: PayloadExpiredError, *, what: str, actor: str) -> HTTPException:
     """Answer a raw-body read whose evidence expired under retention with 410.
 
     **410 Gone, not 404** (plan ruling RC6). The two are different answers and
@@ -89,16 +112,18 @@ def _expired_payload_410(exc: PayloadExpiredError, *, what: str, request: Reques
     evidence, so the exposure is small — but "never polled, never cached,
     always logged" is this family's stated discipline and it should be true.
     The actor line is the "always logged" half, for the same reason: a read
-    that was refused is still a read that was attempted.
+    that was refused is still a read that was attempted. It takes the audited
+    actor (the object ``require_admin_user`` authorized) rather than re-deriving
+    one from the request, so the log line and the §7 audit row cannot name
+    different people for the same refusal.
     """
 
-    user = getattr(request.state, "user", None)
     logger.info(
         "Ansich raw payload read refused: evidence expired under retention",
         extra={
             "ansich_payload_id": exc.payload_id,
             "ansich_retention_policy": exc.policy,
-            "ansich_actor_id": str(getattr(user, "id", "unknown")),
+            "ansich_actor_id": actor,
         },
     )
     return HTTPException(
@@ -124,6 +149,270 @@ def _evaluation_settings(request: Request) -> AnsichEvaluationSettings:
 
     settings = getattr(request.app.state, "ansich_evaluation_settings", None)
     return settings if settings is not None else _DEFAULT_EVALUATION_SETTINGS
+
+
+def _raw_read_settings(request: Request) -> AnsichRawReadSettings:
+    """Return the startup snapshot of the raw-read size limit (never a live read)."""
+
+    settings = getattr(request.app.state, "ansich_raw_read_settings", None)
+    return settings if settings is not None else _DEFAULT_RAW_READ_SETTINGS
+
+
+def _raw_read_actor(user) -> str:
+    """The audited actor id, strict.
+
+    ``require_admin_user`` hands back the very object it authorized, so the
+    ``"unknown"`` fallback is unreachable on the allowed path and survives only
+    for the denial row, where the caller may not have been stamped.
+    """
+
+    identity = getattr(user, "id", None)
+    return "unknown" if identity is None else str(identity)
+
+
+def _request_correlation_id(request: Request) -> str | None:
+    """The request correlation spec:112 asks the audit to carry.
+
+    The bound trace id first (``deerflow.trace_context``, which the Gateway's
+    ``TraceMiddleware`` sets from a valid inbound ``X-Trace-Id`` or mints), and
+    the raw inbound header as the fallback — because trace correlation is gated
+    on ``logging.enhance.enabled`` and an operator who left it off still sends
+    the header. The fallback value is caller-supplied text, so it is bounded
+    and recorded exactly as received: it correlates a request, it authenticates
+    nothing.
+    """
+
+    correlation = get_current_trace_id() or request.headers.get("X-Trace-Id")
+    if not correlation:
+        return None
+    return correlation[:_RAW_READ_CORRELATION_MAX_LENGTH]
+
+
+@dataclass
+class _RawReadAudit:
+    """One in-flight audited read: its identity, and its terminal row."""
+
+    service: object
+    read_id: str
+    actor: str
+    target_kind: str
+    target_id: str
+    purpose: str | None
+    correlation_id: str | None
+
+    async def finish(self, *, outcome: str, http_status: int, served_byte_size: int | None = None) -> None:
+        """Record how the read ended. Degrades to a WARNING, deliberately.
+
+        The asymmetry with the requested row is the point. That row is the
+        access record and is written *before* the body is touched, so refusing
+        the read when it fails costs nothing that was already disclosed. By the
+        time this runs the read has happened and is on record with an actor, a
+        target and a time; failing the response now would report a served read
+        as an error while disclosing it anyway. So the outcome half degrades and
+        says so — an audit trail that knows a read happened but not how it ended
+        is strictly better than one that lies about either.
+        """
+
+        try:
+            await self.service.audit_raw_payload_read(  # type: ignore[attr-defined]
+                status="succeeded" if outcome == "served" else "failed",
+                read_id=self.read_id,
+                actor=self.actor,
+                target_kind=self.target_kind,
+                target_id=self.target_id,
+                purpose=self.purpose,
+                request_correlation_id=self.correlation_id,
+                outcome=outcome,
+                http_status=http_status,
+                served_byte_size=served_byte_size,
+            )
+        except Exception:
+            logger.warning(
+                "Ansich raw-read outcome could not be audited; the access itself is on record",
+                extra={
+                    "ansich_target_kind": self.target_kind,
+                    "ansich_target_id": self.target_id,
+                    "ansich_actor_id": self.actor,
+                    "ansich_raw_read_outcome": outcome,
+                },
+                exc_info=True,
+            )
+
+
+async def _admin_raw_reader(
+    request: Request,
+    *,
+    target_kind: str,
+    target_id: str,
+    purpose: str | None,
+):
+    """The admin gate for a raw-body read: **a denial is audited, not read.**
+
+    Spec:113 in one sentence — a refused request enters the audit trail, and
+    nothing may read the payload in order to record that refusal. Both halves
+    are structural here: this runs before any service read, and what it writes
+    is one terminal ``operator.action_failed`` row rather than a
+    requested/terminal pair, because no read was ever attempted.
+
+    **The denial audit is best-effort and that is not a hole in the fail-closed
+    rule.** The rule protects *disclosure*: an unaudited read must not happen.
+    A denial discloses nothing, so refusing the request a second time because
+    its refusal could not be recorded would trade a logged gap for an outage
+    while protecting nobody. The gap is logged at WARNING.
+    """
+
+    try:
+        return await require_admin_user(request, detail=_ADMIN_REQUIRED)
+    except HTTPException as denied:
+        service = getattr(request.app.state, "ansich_service", None)
+        if denied.status_code == 403 and service is not None:
+            user = getattr(request.state, "user", None)
+            try:
+                await service.audit_raw_payload_read(
+                    status="failed",
+                    read_id=new_id(),
+                    actor=_raw_read_actor(user),
+                    target_kind=target_kind,
+                    target_id=target_id,
+                    purpose=purpose,
+                    request_correlation_id=_request_correlation_id(request),
+                    outcome="denied_not_admin",
+                    http_status=denied.status_code,
+                )
+            except Exception:
+                logger.warning(
+                    "Ansich raw-read denial could not be audited",
+                    extra={"ansich_target_kind": target_kind, "ansich_target_id": target_id},
+                    exc_info=True,
+                )
+        raise HTTPException(
+            status_code=denied.status_code,
+            detail=denied.detail,
+            headers={**(denied.headers or {}), **_NO_STORE},
+        ) from denied
+
+
+async def _open_audited_raw_read(
+    request: Request,
+    *,
+    target_kind: str,
+    target_id: str,
+    purpose: str | None,
+) -> tuple[object, _RawReadAudit]:
+    """Admin gate, then subject resolution, then the durable requested audit.
+
+    The order is the whole contract (plan ruling RC9): the caller is
+    authorized, the audit row for the attempt is **committed**, and only then
+    does the route ask the store for a body. Every step before the return
+    reads ids and health, never a payload.
+
+    A caller that gets past here has an audit row on disk saying it did.
+    """
+
+    user = await _admin_raw_reader(request, target_kind=target_kind, target_id=target_id, purpose=purpose)
+    try:
+        service = _service_or_503(request)
+        _ensure_queryable(service)
+    except HTTPException as unavailable:
+        # These two refuse before there is anything to audit — a disabled
+        # service and an unreadable store both mean no body was fetched and
+        # none could have been recorded — but they are still answers these
+        # routes give, and "every answer from this family is `no-store`" is a
+        # rule worth being able to state without exceptions.
+        raise HTTPException(
+            status_code=unavailable.status_code,
+            detail=unavailable.detail,
+            headers={**(unavailable.headers or {}), **_NO_STORE},
+        ) from unavailable
+    audit = _RawReadAudit(
+        service=service,
+        read_id=new_id(),
+        actor=_raw_read_actor(user),
+        target_kind=target_kind,
+        target_id=target_id,
+        purpose=purpose,
+        correlation_id=_request_correlation_id(request),
+    )
+    try:
+        await service.audit_raw_payload_read(
+            status="requested",
+            read_id=audit.read_id,
+            actor=audit.actor,
+            target_kind=target_kind,
+            target_id=target_id,
+            purpose=purpose,
+            request_correlation_id=audit.correlation_id,
+        )
+    except RawReadAuditUnavailableError as unavailable:
+        # §7 FAIL-CLOSED — the batch's ONE documented inversion of the
+        # project-wide fail-open rule (spec:114, plan Global Constraint 1).
+        # Everything else Ansich collects degrades quietly rather than break a
+        # caller; here the audit *is* the security control, so a read whose
+        # access record did not land must not happen. Do not "fix" this into a
+        # warning: the payload has not been touched at this point, and the
+        # whole value of that ordering is that this branch can still refuse.
+        logger.warning(
+            "Ansich raw payload read refused: the access audit could not be persisted",
+            extra={"ansich_target_kind": target_kind, "ansich_target_id": target_id, "ansich_actor_id": audit.actor},
+            exc_info=True,
+        )
+        raise HTTPException(
+            status_code=503,
+            detail={
+                "message": "Ansich raw payload read refused: the access audit could not be persisted",
+                "projection_status": _projection_status(service),
+            },
+            headers=_NO_STORE,
+        ) from unavailable
+    return service, audit
+
+
+def _raw_read_byte_size(document: object) -> int:
+    """The size of what would cross the wire, measured on the serialized body."""
+
+    return len(json.dumps(document, default=str, ensure_ascii=False).encode("utf-8"))
+
+
+async def _enforce_raw_read_limit(request: Request, audit: _RawReadAudit, *, document: object) -> int:
+    """Refuse a body over ``ansich.raw_read_max_bytes`` — 413, audited.
+
+    The limit is on the **response**, which is why it is measured after the
+    store answered rather than guessed from a column: bulk raw export is out of
+    scope for v1 (spec:118) and this is what keeps a single read from becoming
+    one. The refusal is a first-class audited outcome, so an operator who tried
+    to pull a 40 MiB tool result is on record as having tried.
+    """
+
+    size = _raw_read_byte_size(document)
+    limit = _raw_read_settings(request).max_bytes
+    if size > limit:
+        await audit.finish(outcome="oversize", http_status=413, served_byte_size=None)
+        raise HTTPException(
+            status_code=413,
+            detail={
+                "message": "Ansich raw payload is larger than ansich.raw_read_max_bytes",
+                "byte_size": size,
+                "limit_bytes": limit,
+            },
+            headers=_NO_STORE,
+        )
+    return size
+
+
+def _apply_raw_read_headers(response: Response, *, content_type: str | None, filename: str) -> None:
+    """``no-store`` always; ``attachment`` for anything that is not JSON.
+
+    The artifacts router's precedent, applied one layer in. The body travels
+    inside a JSON document, so a browser will not render it directly — but the
+    declared content type is attacker-influenced data that came out of a tool
+    result, and the rule there ("active content is a download, never a render")
+    is cheap to keep true here rather than argued away per content type.
+    """
+
+    response.headers.update(_NO_STORE)
+    normalized = (content_type or "").split(";", 1)[0].strip().lower()
+    if normalized and normalized != "application/json" and not normalized.endswith("+json"):
+        response.headers["Content-Disposition"] = f"attachment; filename*=UTF-8''{quote(filename)}"
 
 
 def _ensure_queryable(service) -> None:
@@ -403,37 +692,44 @@ async def get_agent_release_manifest(
     release_id: str,
     request: Request,
     response: Response,
+    purpose: str | None = _RAW_READ_PURPOSE,
 ) -> dict:
-    """Return the complete sanitized manifest through an audited, non-cached path."""
+    """Return the complete sanitized manifest through an audited, non-cached path.
 
-    await require_admin_user(request, detail=_ADMIN_REQUIRED)
-    service = _service_or_503(request)
-    _ensure_queryable(service)
+    One of the four §7 raw-body routes: admin, subject-resolved, audited before
+    the read and again after it, ``no-store`` on every answer it can give.
+    """
+
+    service, audit = await _open_audited_raw_read(
+        request,
+        target_kind="agent_release",
+        target_id=release_id,
+        purpose=purpose,
+    )
     try:
         detail = await service.get_agent_release(release_id)
     except Exception as exc:
+        await audit.finish(outcome="read_failed", http_status=503)
         raise HTTPException(
             status_code=503,
             detail={
                 "message": "Ansich AgentRelease manifest query failed",
                 "projection_status": _projection_status(service),
             },
+            headers=_NO_STORE,
         ) from exc
     if detail is None:
-        raise HTTPException(status_code=404, detail="Ansich AgentRelease not found")
-    user = getattr(request.state, "user", None)
+        await audit.finish(outcome="not_found", http_status=404)
+        raise HTTPException(status_code=404, detail="Ansich AgentRelease not found", headers=_NO_STORE)
+    manifest = detail.manifest.model_dump(mode="json")
+    served_byte_size = await _enforce_raw_read_limit(request, audit, document=manifest)
     logger.info(
         "Ansich raw AgentRelease manifest accessed",
-        extra={
-            "ansich_release_id": release_id,
-            "ansich_actor_id": str(getattr(user, "id", "unknown")),
-        },
+        extra={"ansich_release_id": release_id, "ansich_actor_id": audit.actor},
     )
-    response.headers["Cache-Control"] = "no-store"
-    return {
-        "release_id": release_id,
-        "manifest": detail.manifest.model_dump(mode="json"),
-    }
+    _apply_raw_read_headers(response, content_type="application/json", filename=f"{release_id}.json")
+    await audit.finish(outcome="served", http_status=200, served_byte_size=served_byte_size)
+    return {"release_id": release_id, "manifest": manifest}
 
 
 @router.get("/agent-releases/{release_id}/quality")
@@ -1699,40 +1995,50 @@ async def list_step_evaluations(step_id: str, request: Request) -> dict:
 
 
 @router.get("/evaluations/{obs_id}/payload")
-async def get_evaluation_payload(obs_id: str, request: Request, response: Response) -> dict:
+async def get_evaluation_payload(
+    obs_id: str,
+    request: Request,
+    response: Response,
+    purpose: str | None = _RAW_READ_PURPOSE,
+) -> dict:
     """Return one evaluation Observation's full payload after an explicit read.
 
     The list endpoints project metadata only; ``expected``/``actual``/
     ``rationale`` are bodies and follow the same rule as raw Tool and
-    ContentBlock payloads — never polled, never cached, always logged.
+    ContentBlock payloads — never polled, never cached, always audited (§7).
     """
 
-    await require_admin_user(request, detail=_ADMIN_REQUIRED)
-    service = _service_or_503(request)
-    _ensure_queryable(service)
+    service, audit = await _open_audited_raw_read(
+        request,
+        target_kind="evaluation",
+        target_id=obs_id,
+        purpose=purpose,
+    )
     try:
         payload = await service.get_evaluation_observation_payload(obs_id)
     except PayloadExpiredError as expired:
-        raise _expired_payload_410(expired, what="evaluation payload", request=request) from expired
+        await audit.finish(outcome="expired", http_status=410)
+        raise _expired_payload_410(expired, what="evaluation payload", actor=audit.actor) from expired
     except Exception as exc:
+        await audit.finish(outcome="read_failed", http_status=503)
         raise HTTPException(
             status_code=503,
             detail={
                 "message": "Ansich evaluation payload query failed",
                 "projection_status": _projection_status(service),
             },
+            headers=_NO_STORE,
         ) from exc
     if payload is None:
-        raise HTTPException(status_code=404, detail="Ansich evaluation payload not found")
-    user = getattr(request.state, "user", None)
+        await audit.finish(outcome="not_found", http_status=404)
+        raise HTTPException(status_code=404, detail="Ansich evaluation payload not found", headers=_NO_STORE)
+    served_byte_size = await _enforce_raw_read_limit(request, audit, document=payload)
     logger.info(
         "Ansich evaluation payload accessed",
-        extra={
-            "ansich_evaluation_obs_id": obs_id,
-            "ansich_actor_id": str(getattr(user, "id", "unknown")),
-        },
+        extra={"ansich_evaluation_obs_id": obs_id, "ansich_actor_id": audit.actor},
     )
-    response.headers["Cache-Control"] = "no-store"
+    _apply_raw_read_headers(response, content_type="application/json", filename=f"{obs_id}.json")
+    await audit.finish(outcome="served", http_status=200, served_byte_size=served_byte_size)
     return {"evaluation_obs_id": obs_id, "payload": payload}
 
 
@@ -2007,36 +2313,65 @@ async def _get_tool_result_payload(
     role: str,
     request: Request,
     response: Response,
+    purpose: str | None,
 ) -> dict:
-    await require_admin_user(request, detail=_ADMIN_REQUIRED)
-    service = _service_or_503(request)
-    _ensure_queryable(service)
-    tool_call = await _tool_call_or_404(service, tool_call_id)
+    """The shared body of the two ToolCall raw-body routes (§7).
+
+    The ToolCall lookup that used to run before anything else now runs
+    **after** the requested-audit row is committed. That is not a reordering
+    for its own sake: the audit's subject resolution already asked the store
+    who owns this ToolCall, so doing the metadata read first would have put a
+    store read ahead of the access record for no gain, and an id that resolves
+    to nothing is exactly the probe an auditor wants to see recorded.
+    """
+
+    service, audit = await _open_audited_raw_read(
+        request,
+        target_kind="tool_call",
+        target_id=tool_call_id,
+        purpose=purpose,
+    )
+    try:
+        tool_call = await _tool_call_or_404(service, tool_call_id)
+    except HTTPException as failed:
+        await audit.finish(
+            outcome="not_found" if failed.status_code == 404 else "read_failed",
+            http_status=failed.status_code,
+        )
+        raise HTTPException(status_code=failed.status_code, detail=failed.detail, headers=_NO_STORE) from failed
     results = tool_call.raw_results if role == "raw" else tool_call.visible_results
     if not results:
+        await audit.finish(outcome="not_found", http_status=404)
         raise HTTPException(
             status_code=404,
             detail=f"Ansich ToolCall {role} result not found",
+            headers=_NO_STORE,
         )
     result = results[-1]
     try:
         payload = await service.get_content_block_payload(result.content_block_id)
     except PayloadExpiredError as expired:
-        raise _expired_payload_410(expired, what=f"ToolCall {role} payload", request=request) from expired
+        await audit.finish(outcome="expired", http_status=410)
+        raise _expired_payload_410(expired, what=f"ToolCall {role} payload", actor=audit.actor) from expired
     except Exception as exc:
+        await audit.finish(outcome="read_failed", http_status=503)
         raise HTTPException(
             status_code=503,
             detail={
                 "message": f"Ansich {role} tool result query failed",
                 "projection_status": _projection_status(service),
             },
+            headers=_NO_STORE,
         ) from exc
     if payload is None:
+        await audit.finish(outcome="not_found", http_status=404)
         raise HTTPException(
             status_code=404,
             detail=f"Ansich ToolCall {role} payload not found",
+            headers=_NO_STORE,
         )
-    user = getattr(request.state, "user", None)
+    document = payload.model_dump(mode="json")
+    served_byte_size = await _enforce_raw_read_limit(request, audit, document=document)
     logger.info(
         "Ansich %s tool result accessed",
         role,
@@ -2044,13 +2379,18 @@ async def _get_tool_result_payload(
             "ansich_tool_call_id": tool_call_id,
             "ansich_block_id": result.content_block_id,
             "ansich_result_role": role,
-            "ansich_actor_id": str(getattr(user, "id", "unknown")),
+            "ansich_actor_id": audit.actor,
         },
     )
-    response.headers["Cache-Control"] = "no-store"
+    _apply_raw_read_headers(
+        response,
+        content_type=getattr(payload, "content_type", None),
+        filename=f"{result.content_block_id}.{role}",
+    )
+    await audit.finish(outcome="served", http_status=200, served_byte_size=served_byte_size)
     return {
         f"{role}_result": result.model_dump(mode="json"),
-        f"{role}_payload": payload.model_dump(mode="json"),
+        f"{role}_payload": document,
     }
 
 
@@ -2059,12 +2399,14 @@ async def get_tool_raw_result(
     tool_call_id: str,
     request: Request,
     response: Response,
+    purpose: str | None = _RAW_READ_PURPOSE,
 ) -> dict:
     return await _get_tool_result_payload(
         tool_call_id=tool_call_id,
         role="raw",
         request=request,
         response=response,
+        purpose=purpose,
     )
 
 
@@ -2073,41 +2415,56 @@ async def get_tool_visible_result(
     tool_call_id: str,
     request: Request,
     response: Response,
+    purpose: str | None = _RAW_READ_PURPOSE,
 ) -> dict:
     return await _get_tool_result_payload(
         tool_call_id=tool_call_id,
         role="visible",
         request=request,
         response=response,
+        purpose=purpose,
     )
 
 
 @router.get("/content-blocks/{block_id}/payload")
-async def get_content_block_payload(block_id: str, request: Request, response: Response) -> dict:
-    await require_admin_user(request, detail=_ADMIN_REQUIRED)
-    service = _service_or_503(request)
-    _ensure_queryable(service)
+async def get_content_block_payload(
+    block_id: str,
+    request: Request,
+    response: Response,
+    purpose: str | None = _RAW_READ_PURPOSE,
+) -> dict:
+    """Return one ContentBlock's raw body (§7): audited, bounded, ``no-store``."""
+
+    service, audit = await _open_audited_raw_read(
+        request,
+        target_kind="content_block",
+        target_id=block_id,
+        purpose=purpose,
+    )
     try:
         payload = await service.get_content_block_payload(block_id)
     except PayloadExpiredError as expired:
-        raise _expired_payload_410(expired, what="ContentBlock payload", request=request) from expired
+        await audit.finish(outcome="expired", http_status=410)
+        raise _expired_payload_410(expired, what="ContentBlock payload", actor=audit.actor) from expired
     except Exception as exc:
+        await audit.finish(outcome="read_failed", http_status=503)
         raise HTTPException(
             status_code=503,
             detail={"message": "Ansich raw payload query failed", "projection_status": _projection_status(service)},
+            headers=_NO_STORE,
         ) from exc
     if payload is None:
-        raise HTTPException(status_code=404, detail="Ansich ContentBlock payload not found")
-    user = getattr(request.state, "user", None)
+        await audit.finish(outcome="not_found", http_status=404)
+        raise HTTPException(status_code=404, detail="Ansich ContentBlock payload not found", headers=_NO_STORE)
+    document = payload.model_dump(mode="json")
+    served_byte_size = await _enforce_raw_read_limit(request, audit, document=document)
     logger.info(
         "Ansich raw content payload accessed",
-        extra={
-            "ansich_block_id": block_id,
-            "ansich_actor_id": str(getattr(user, "id", "unknown")),
-        },
+        extra={"ansich_block_id": block_id, "ansich_actor_id": audit.actor},
     )
-    response.headers["Cache-Control"] = "no-store"
-    return {"payload": payload.model_dump(mode="json")}
+    _apply_raw_read_headers(response, content_type=getattr(payload, "content_type", None), filename=f"{block_id}.raw")
+    await audit.finish(outcome="served", http_status=200, served_byte_size=served_byte_size)
+    return {"payload": document}
 
 
 @router.get("/content-blocks/{block_id}/lineage")

@@ -456,6 +456,11 @@ ACTIVE_VERSION_ACTOR_MAX_LENGTH: int = AnsichActiveVersionRow.__table__.c.activa
 #: written payload's value is one of the Literal's members — otherwise widening
 #: that Literal would be a coordination that changes nothing anybody reads.
 ACTIVATE_VERSION_ACTION: OperatorAuditActionType = "activate_version"
+#: What a §7 audit row may name as the thing that was read. ``agent_release``
+#: resolves to no Task on purpose: a release manifest is the identity of a
+#: build rather than one Task's evidence, so its audit takes the process
+#: subject.
+RAW_READ_TARGET_KINDS: frozenset[str] = frozenset({"agent_release", "content_block", "evaluation", "tool_call"})
 #: Caveats an operator should see *before* activating a version this build can
 #: run but should probably not be asked to. Keyed ``(kind, name, version)``.
 #:
@@ -4363,6 +4368,45 @@ class SqlAnsichBackend:
             )
         return actor
 
+    async def _process_audit_subject(self, session: AsyncSession) -> tuple[str, Literal["task", "scope"], str]:
+        """``(task_id, subject_type, subject_id)`` for one process-scoped audit row.
+
+        **The one subject rule the whole ``OperatorAuditActionType`` family
+        follows** (plan ruling RC8, unified by T12): the host ``Scope`` when
+        this store has one, else ``ANSICH_BOOTSTRAP_TASK_ID``. Both members —
+        the active-version switch and the raw-payload read — call this, so the
+        family cannot end up with two shapes for one question.
+
+        **The Scope arm asks the database, never a process property.** That is
+        the handle rule (``_existing_host_scope_id``): the pure
+        :func:`ansich.safety.host_scope_id` gives an *address*, and only the row
+        makes it an entity. The rule applies here even though
+        ``ansich_observations.subject_id`` carries no foreign key that would
+        catch a mistake — an audit row pointing at an entity nobody minted is
+        exactly the "never fabricate audit state" failure, and it costs one
+        indexed ``session.get`` to not make it.
+
+        **The sentinel arm is not a degradation to apologise for.** It states
+        "this Observation has no Task entity", which is *true*, and it is what
+        the replay CLI writes on a store where no Gateway has ever run and
+        therefore no host Scope exists. The CLI never mints one (T6's finding);
+        what changed is that it now *asks*, so an operator switching a version
+        on a store a Gateway does share gets the Scope subject rather than the
+        sentinel by construction.
+
+        Nothing Task-scoped follows from either arm: ``operator.action_*`` is in
+        no projector's kind list, so no projection job is minted, and
+        ``_assessors_for_observation`` refuses the whole assessor family for the
+        sentinel — which both arms keep as ``task_id``. So a row written here
+        creates no job below any continuity mark and the PB7 read-model delete
+        (Global Constraint 4) does not apply to it.
+        """
+
+        scope_id = await self._existing_host_scope_id(session)
+        if scope_id is None:
+            return ANSICH_BOOTSTRAP_TASK_ID, "task", ANSICH_BOOTSTRAP_TASK_ID
+        return ANSICH_BOOTSTRAP_TASK_ID, "scope", scope_id
+
     @staticmethod
     def _activation_observation(
         *,
@@ -4372,27 +4416,30 @@ class SqlAnsichBackend:
         actor: str,
         activation_id: str,
         occurred_at: datetime,
+        task_id: str,
+        subject_type: Literal["task", "scope"],
+        subject_id: str,
     ) -> ObservationEnvelope:
         """The ``operator.action_succeeded`` row that audits one switch.
 
-        **Subjected to the bootstrap Task sentinel**, not to a host ``Scope``,
-        and that is a deliberate choice between two imperfect options. An
-        activation is a process-level fact with no Task, which is the shape
-        ``observability.lost`` files against the host Scope — but a Scope
-        *subject* is only honest when the Scope entity exists, and
-        ``AnsichService.host_scope_id``'s own docstring says addressing it is
-        not the same as it being there. The writer here is a short-lived CLI
-        process that never runs the collector's bootstrap mint, so it would be
-        writing an audit row subjected to an entity it did not check for and
-        cannot create. ``ANSICH_BOOTSTRAP_TASK_ID`` states "this Observation
-        has no Task entity" explicitly and is legal precisely because
-        ``ansich_observations.task_id`` carries no foreign key.
+        **The subject is resolved by** :meth:`_process_audit_subject`, which is
+        the same rule the raw-read audit follows — the host ``Scope`` when this
+        store has one, else the bootstrap sentinel. The original version of this
+        method took the sentinel unconditionally, on the reasoning that the
+        writer is a short-lived CLI process that never runs the collector's
+        bootstrap mint and would therefore be naming an entity it neither
+        checked for nor can create. That reasoning was right about the mint and
+        wrong about the question: the CLI cannot *mint* the Scope, but it holds
+        a session and can *ask* whether one is there, which is the handle rule
+        as written. So the sentinel is now the answer for a store with no host
+        Scope rather than the answer for this writer.
 
-        Nothing Task-scoped follows from it: ``operator.action_*`` is in no
-        projector's kind list, so no projection job is minted, and
-        ``_assessors_for_observation`` refuses the whole assessor family for
-        the sentinel. So this row creates no job below any continuity mark and
-        the PB7 read-model delete (Global Constraint 4) does not apply.
+        Nothing Task-scoped follows from it in either shape: ``task_id`` stays
+        the sentinel, ``operator.action_*`` is in no projector's kind list, so
+        no projection job is minted, and ``_assessors_for_observation`` refuses
+        the whole assessor family for the sentinel. So this row creates no job
+        below any continuity mark and the PB7 read-model delete (Global
+        Constraint 4) does not apply.
 
         ``source_event_id`` follows the operator-action idempotency shape and
         is **unique per activation** rather than per component: re-activating
@@ -4407,9 +4454,9 @@ class SqlAnsichBackend:
             kind="operator.action_succeeded",
             occurred_at=occurred_at,
             recorded_at=occurred_at,
-            task_id=ANSICH_BOOTSTRAP_TASK_ID,
-            subject_type="task",
-            subject_id=ANSICH_BOOTSTRAP_TASK_ID,
+            task_id=task_id,
+            subject_type=subject_type,
+            subject_id=subject_id,
             producer=Producer(
                 name="ansich-active-version",
                 version="1",
@@ -4485,15 +4532,21 @@ class SqlAnsichBackend:
         )
         activation_id = new_id()
         occurred_at = datetime.now(UTC)
-        observation = self._activation_observation(
-            component_kind=component_kind,
-            component_name=component_name,
-            version=version,
-            actor=actor,
-            activation_id=activation_id,
-            occurred_at=occurred_at,
-        )
         async with self._session_factory() as session, session.begin():
+            # Inside the transaction that writes the row, so the subject is
+            # resolved against the same store state the audit describes.
+            audit_task_id, subject_type, subject_id = await self._process_audit_subject(session)
+            observation = self._activation_observation(
+                component_kind=component_kind,
+                component_name=component_name,
+                version=version,
+                actor=actor,
+                activation_id=activation_id,
+                occurred_at=occurred_at,
+                task_id=audit_task_id,
+                subject_type=subject_type,
+                subject_id=subject_id,
+            )
             self._add_observation_row(session, observation)
             # Flush the Observation before the row that points at it: the FK is
             # `ON DELETE SET NULL` against `ansich_observations.obs_id`, and an
@@ -4537,6 +4590,119 @@ class SqlAnsichBackend:
                 audit_recorded=True,
             ),
         )
+
+    async def _raw_read_owning_task(
+        self,
+        session: AsyncSession,
+        *,
+        target_kind: str,
+        target_id: str,
+    ) -> str | None:
+        """The Task that owns the thing a §7 read named, or ``None``.
+
+        One indexed lookup per read, and it is a **metadata** read by
+        construction: the columns are ids and foreign keys, never a payload
+        body, so resolving the subject before the audit does not read the thing
+        the audit is about. That ordering is what lets a denied or 503'd read
+        still be audited without ever touching the body.
+
+        A target nothing owns — an unknown id, a release manifest, a row whose
+        Observation carries the bootstrap sentinel — answers ``None`` and the
+        caller falls back to the process subject. An unknown id is deliberately
+        **not** an error here: an admin probing an id that does not exist is
+        exactly the access an auditor wants recorded, and refusing to audit it
+        would make the 404 the only trace.
+        """
+
+        if target_kind == "tool_call":
+            task_id = await session.scalar(select(AnsichToolCallRow.task_id).where(AnsichToolCallRow.entity_id == target_id))
+        elif target_kind == "content_block":
+            task_id = await session.scalar(
+                select(AnsichObservationRow.task_id)
+                .join(
+                    AnsichContentBlockRow,
+                    AnsichContentBlockRow.payload_obs_id == AnsichObservationRow.obs_id,
+                )
+                .where(AnsichContentBlockRow.entity_id == target_id)
+            )
+        elif target_kind == "evaluation":
+            task_id = await session.scalar(select(AnsichObservationRow.task_id).where(AnsichObservationRow.obs_id == target_id))
+        else:
+            return None
+        if task_id is None or task_id == ANSICH_BOOTSTRAP_TASK_ID:
+            return None
+        return str(task_id)
+
+    async def record_raw_read_audit(
+        self,
+        *,
+        status: Literal["requested", "succeeded", "failed"],
+        read_id: str,
+        actor: str,
+        target_kind: str,
+        target_id: str,
+        purpose: str | None = None,
+        request_correlation_id: str | None = None,
+        outcome: str | None = None,
+        http_status: int | None = None,
+        served_byte_size: int | None = None,
+    ) -> str:
+        """Write one §7 raw-read audit row and commit it. Raises on failure.
+
+        **Fail-closed by contract** (plan ruling RC9, spec:114 — the batch's one
+        documented inversion of the fail-open rule). This method's caller reads
+        a raw body only if it returns, so everything here is written to be loud:
+        an unreachable store, a violated constraint and a refused subject all
+        raise, and the service turns any of them into
+        :class:`~ansich.errors.RawReadAuditUnavailableError` and then a 503 with
+        the payload unread.
+
+        **It is a synchronous backend write, never ``record()``.** The
+        collector queue accepts fail-open and answers before anything is
+        durable, so it cannot tell a caller the audit landed.
+
+        **The insert path is deliberately the same one ``activate_version``
+        uses, and not** ``persist_and_project`` (review carry W2). That path
+        would run this row through the producer dedupe, whose collision
+        behaviour is a **silent skip** — on an audit row a silent skip is an
+        audit gap, the one failure mode this control cannot have. Here the row
+        goes in through ``_add_observation_row``: a duplicate
+        ``(producer, instance_id, source_event_id)`` hits the unique index and
+        raises, which the fail-closed path above turns into a refused read. And
+        it cannot collide in the first place — ``read_id`` is minted per request
+        and the status is in the key, so the two rows of one read are distinct
+        from each other and from every other read's, including a second read of
+        the same payload by the same actor (H7-D).
+        """
+
+        if target_kind not in RAW_READ_TARGET_KINDS:
+            raise ValueError(f"unknown raw-read audit target kind: {target_kind!r}")
+        occurred_at = datetime.now(UTC)
+        async with self._session_factory() as session, session.begin():
+            owning_task_id = await self._raw_read_owning_task(session, target_kind=target_kind, target_id=target_id)
+            if owning_task_id is not None:
+                task_id, subject_type, subject_id = owning_task_id, "task", owning_task_id
+            else:
+                task_id, subject_type, subject_id = await self._process_audit_subject(session)
+            observation = ObservationEnvelope.raw_payload_read(
+                status=status,
+                read_id=read_id,
+                actor=actor,
+                target_kind=target_kind,
+                target_id=target_id,
+                occurred_at=occurred_at,
+                task_id=task_id,
+                subject_type=subject_type,
+                subject_id=subject_id,
+                purpose=purpose,
+                request_correlation_id=request_correlation_id,
+                outcome=outcome,
+                http_status=http_status,
+                served_byte_size=served_byte_size,
+            )
+            self._add_observation_row(session, observation)
+            await session.flush()
+        return observation.obs_id
 
     async def validate_active_versions(self) -> tuple[ActiveVersionMismatch, ...] | None:
         """Every stored row this build can no longer honour. Never raises.

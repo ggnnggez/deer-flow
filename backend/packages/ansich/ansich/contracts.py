@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from datetime import UTC, datetime
-from typing import Literal, Self
+from typing import Literal, Self, get_args
 from uuid import UUID
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
@@ -308,8 +308,35 @@ class ObservationEnvelope(BaseModel):
             raise ValueError("budget observation subject must identify task_id")
         elif self.kind.startswith("operator.alert_") and self.subject_type != "alert":
             raise ValueError("Alert workflow observation subject_type must be alert")
-        elif self.kind.startswith("operator.action_") and (self.subject_type != "task" or self.subject_id != self.task_id):
-            raise ValueError("Operator action observation subject must identify task_id")
+        elif self.kind.startswith("operator.action_"):
+            if self.subject_type == "scope":
+                # RC8's Scope arm, and it is deliberately narrow. An operator
+                # action that targets one Task keeps the Task subject it always
+                # had; this admits the *process*-scoped family
+                # (`OperatorAuditActionType`) — an active-version switch, an
+                # audited raw-payload read of something no Task owns — whose
+                # only honest subject is the host `Scope`.
+                #
+                # Two things are required together and neither is decorative.
+                # The Task field must be the bootstrap sentinel, because a real
+                # `task_id` beside a Scope subject would be a row claiming both
+                # at once and no reader could tell which one it is about. And
+                # the action type must be a member of the process-scoped family:
+                # `interrupt`/`rollback` own an `ansich_operator_actions` row
+                # keyed by a Task, so a Scope-subjected one would be an audit of
+                # an action the ledger cannot hold.
+                from ansich.operator import OperatorAuditActionType
+
+                if self.task_id != ANSICH_BOOTSTRAP_TASK_ID:
+                    raise ValueError("Scope-subjected operator action must carry the bootstrap Task sentinel")
+                # Guarded on `payload is not None` like every other validating
+                # branch in this method (F10-29): an externalized payload reads
+                # back as `None` plus a `payload_ref_id`, and validating a
+                # fabricated `{}` here would refuse a row that is merely large.
+                if self.payload is not None and self.payload.get("action_type") not in get_args(OperatorAuditActionType):
+                    raise ValueError("only a process-scoped operator action may subject a Scope")
+            elif self.subject_type != "task" or self.subject_id != self.task_id:
+                raise ValueError("Operator action observation subject must identify task_id")
         elif self.kind == "scope.snapshotted":
             if self.subject_type != "scope":
                 raise ValueError("scope observation subject_type must be scope")
@@ -640,6 +667,94 @@ class ObservationEnvelope(BaseModel):
                 "producer_name": lost_producer_name,
                 "producer_instance_id": lost_producer_instance_id,
             },
+        )
+
+    @classmethod
+    def raw_payload_read(
+        cls,
+        *,
+        status: Literal["requested", "succeeded", "failed"],
+        read_id: str,
+        actor: str,
+        target_kind: str,
+        target_id: str,
+        occurred_at: datetime,
+        task_id: str,
+        subject_type: Literal["task", "scope"],
+        subject_id: str,
+        purpose: str | None = None,
+        request_correlation_id: str | None = None,
+        outcome: str | None = None,
+        http_status: int | None = None,
+        served_byte_size: int | None = None,
+        producer_name: str = "ansich-raw-read-audit",
+        producer_version: str = "1",
+        producer_instance_id: str = "gateway",
+    ) -> Self:
+        """One row of the §7 raw-read audit trail. **Never carries the body.**
+
+        The payload is exactly spec:112's list — who read, which payload, why,
+        which request, and when (the envelope's ``occurred_at``) — plus the
+        outcome fields the terminal row adds. The bytes that were read are the
+        one thing this must not contain, and the shape enforces it by having
+        nowhere to put them: ``served_byte_size`` is a length, not content.
+
+        **Two rows per read, keyed by one ``read_id``.** The
+        ``requested`` row is written and committed *before* the store is asked
+        for the body (RC9's audit-then-read), the terminal row after. Both keys
+        carry the read id, which is fresh per request (H7-D), so the same actor
+        reading the same payload twice produces two independent pairs rather
+        than one deduped row — the producer dedupe is keyed on
+        ``(producer, instance, source_event_id)`` and a deterministic
+        ``(actor, payload)`` key would silently absorb the second read, which is
+        the one an auditor most wants to see.
+
+        **The subject follows the thing read** (RC8): the owning Task when the
+        payload belongs to one, else the host ``Scope``, else — on a store with
+        no minted Scope — the bootstrap sentinel, which states "this Observation
+        has no Task entity" rather than pointing at an entity nobody made. The
+        caller resolves it, because only the store knows.
+        """
+
+        from ansich.operator import RAW_PAYLOAD_READ_ACTION
+
+        payload: dict[str, object] = {
+            "action_type": RAW_PAYLOAD_READ_ACTION,
+            "status": status,
+            "read_id": read_id,
+            "actor": actor,
+            "target_kind": target_kind,
+            "target_id": target_id,
+            "purpose": purpose,
+            "request_correlation_id": request_correlation_id,
+        }
+        if outcome is not None:
+            payload["outcome"] = outcome
+        if http_status is not None:
+            payload["http_status"] = http_status
+        if served_byte_size is not None:
+            payload["served_byte_size"] = served_byte_size
+        return cls(
+            kind=f"operator.action_{status}",  # type: ignore[arg-type]
+            occurred_at=occurred_at,
+            recorded_at=occurred_at,
+            task_id=task_id,
+            subject_type=subject_type,
+            subject_id=subject_id,
+            producer=Producer(
+                name=producer_name,
+                version=producer_version,
+                instance_id=producer_instance_id,
+            ),
+            # Unique per read *and* per row of the pair, so neither the
+            # requested row nor its terminal can be absorbed as a duplicate.
+            source_event_id=f"raw-read:{read_id}:{status}",
+            # The read id, not the trace id: `correlation_id` is a canonical
+            # identity field here and an inbound `X-Trace-Id` is caller-supplied
+            # text of any shape. The request correlation the spec asks for rides
+            # in the payload, where it can be recorded exactly as received.
+            correlation_id=read_id,
+            payload=payload,
         )
 
     @classmethod
