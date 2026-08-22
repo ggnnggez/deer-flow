@@ -242,6 +242,42 @@ async def _settle(sql_backend: SqlAnsichBackend, *, rounds: int = 5) -> int:
     return replayed
 
 
+async def _replay_until_settled(
+    sql_backend: SqlAnsichBackend,
+    *,
+    projector_name: str,
+    projector_version: str,
+    selector: ReplaySelector,
+    passes: int = 5,
+) -> ReplayReport:
+    """Drive ``execute_replay`` until nothing is owed -- ``rebuild_until_settled``'s shape.
+
+    ``execute_replay`` is itself bounded, but its rounds run back to back
+    *inside one call*, and a dependency-deferred job is parked behind a 250ms
+    ``available_at`` that no amount of tight looping can reach. So one pass can
+    exhaust its rounds and still return ``unsettled == 1``, and a caller that
+    reads that single pass as completeness is making the F10-26 mistake one
+    level up -- exactly what the pass's own docstring warns its ``unsettled``
+    cannot be read as.
+
+    Each pass here is therefore a **separate** call, the same reason
+    ``rebuild_until_settled`` re-calls ``rebuild_projections`` rather than
+    looping inside it: a fresh pass releases and re-takes the maintenance lock
+    and does real work in between, which is what lets the deferred job become
+    claimable. A replay is idempotent, so a re-drive costs work and never
+    correctness. Exhausting ``passes`` is reported, not raised -- the last
+    report comes back with ``unsettled`` still non-zero and the caller's own
+    assertion is what fails, carrying the number with it.
+    """
+
+    report = await execute_replay(sql_backend, projector_name=projector_name, projector_version=projector_version, selector=selector)
+    for _ in range(max(passes, 1) - 1):
+        if report.unsettled == 0:
+            return report
+        report = await execute_replay(sql_backend, projector_name=projector_name, projector_version=projector_version, selector=selector)
+    return report
+
+
 async def _row_counts(sessions: async_sessionmaker) -> dict[str, int]:
     """Row counts for every ``ansich_*`` table — the dry-run write detector."""
 
@@ -919,16 +955,22 @@ class TestExecuteReplay:
     ) -> None:
         """Spec §11's determinism acceptance, and both halves of it matter.
 
-        The digests must be equal *and* both passes must have reached
-        ``unsettled == 0`` through the bounded loop. Equality alone would be
-        satisfiable by two identically-incomplete runs, which is the F10-26
-        mistake wearing the digest's clothes -- so the completeness half is
-        asserted first.
+        The digests must be equal *and* both drives must have reached
+        ``unsettled == 0``. Equality alone would be satisfiable by two
+        identically-incomplete runs, which is the F10-26 mistake wearing the
+        digest's clothes -- so the completeness half is asserted first.
+
+        Each drive is ``_replay_until_settled``, not a single ``execute_replay``
+        call. A single call's rounds run back to back inside one pass and a
+        dependency-deferred job sits behind a 250ms backoff none of them can
+        reach, so trusting one pass's ``unsettled`` as completeness is the same
+        mistake one level up -- and it was sighted here, red at
+        ``second.unsettled == 1`` under suite load (registered under F10-26).
         """
 
         sql_backend, _ = backend
-        first = await execute_replay(sql_backend, projector_name="task-heartbeat", projector_version="1", selector=ReplaySelector())
-        second = await execute_replay(sql_backend, projector_name="task-heartbeat", projector_version="1", selector=ReplaySelector())
+        first = await _replay_until_settled(sql_backend, projector_name="task-heartbeat", projector_version="1", selector=ReplaySelector())
+        second = await _replay_until_settled(sql_backend, projector_name="task-heartbeat", projector_version="1", selector=ReplaySelector())
 
         assert first.unsettled == 0
         assert second.unsettled == 0
