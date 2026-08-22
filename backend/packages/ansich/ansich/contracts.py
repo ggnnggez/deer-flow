@@ -1058,6 +1058,91 @@ class ProjectorHealth(BaseModel):
     complete_through: int | None = None
 
 
+#: Where one component's running version came from, and how well the switch is
+#: evidenced. One enum rather than two fields because the four values are the
+#: four rows of ``AnsichActiveVersionRow``'s latch contract plus the absent-row
+#: case, and splitting them into "origin" and "audit status" would invite the
+#: combination the schema's CHECK forbids (evidence on a row nobody activated).
+#:
+#: * ``code_default`` — no row. The build's own default is what runs, and that
+#:   is a complete answer rather than a missing one: the table records
+#:   *deviations*. Nothing was activated, so nothing is owed an audit.
+#: * ``activated_audited`` — a row, its audit Observation still in the store.
+#: * ``activated_expired`` — a row whose audit Observation existed and has since
+#:   aged out under retention (the FK's ``ON DELETE SET NULL`` fired, the latch
+#:   survived). The selection is intact; only the evidence pointer is gone.
+#: * ``activated_unaudited`` — a row written while the audit write was degraded,
+#:   so no Observation was ever recorded for it. This is the one value that
+#:   should prompt a question, and it is why the latch exists: without it this
+#:   state and ``activated_expired`` are the same NULL.
+ActiveVersionOrigin = Literal[
+    "code_default",
+    "activated_audited",
+    "activated_expired",
+    "activated_unaudited",
+]
+
+
+class ActiveVersion(BaseModel):
+    """Which version of one versioned component this store says is authoritative.
+
+    Reported for **every** component the build knows, not only the ones with a
+    row: a component with no row is reported at its ``code_default_version``
+    with ``origin="code_default"``. Omitting it would make an operator infer the
+    default from its absence, and an absent entry is exactly what an unreadable
+    block looks like — the same conflation ``None``-never-zero exists to
+    prevent one level up.
+
+    ``active_version`` and ``code_default_version`` are both carried because
+    "what runs" and "what would run untouched" are different questions and an
+    operator reading a switch needs both. They are legitimately equal: an
+    operator may activate the version that is already the default, which leaves
+    a row (and an audit trail) saying so.
+
+    ``activated_at`` / ``activated_by`` / ``audit_obs_id`` are ``None`` for a
+    code default because nobody activated it — never epoch-zero, never an empty
+    string. On an activated row ``audit_obs_id`` may still be ``None``, and
+    :data:`ActiveVersionOrigin` is what says which of the two reasons applies.
+    """
+
+    model_config = ConfigDict(frozen=True)
+
+    component_kind: Literal["projector", "resolver"]
+    component_name: str
+    active_version: str
+    code_default_version: str
+    origin: ActiveVersionOrigin
+    activated_at: datetime | None = None
+    activated_by: str | None = None
+    audit_obs_id: str | None = None
+
+
+class ActiveVersionMismatch(BaseModel):
+    """One active-version row this build can no longer honour.
+
+    Produced by ``validate_active_versions()`` at ``start()`` and **never
+    raised**: a row naming a version this build does not know is a deployment
+    fact, not a corrupt store, and the reader it affects already has an honest
+    fallback (the code default). Crashing the process over it would turn a
+    degraded-but-working deployment into an outage, so the helper reports and
+    the caller decides.
+
+    ``reason`` reuses :data:`~ansich.errors.ActiveVersionRefusal`'s vocabulary
+    on purpose: the same three questions the writer asked are the ones a later
+    start re-asks, and the answers mean the same thing. What changed between
+    the two moments is the *build*, not the request — a row that was legal when
+    written is a mismatch after a rollback — which is why validating once at
+    the write is not enough.
+    """
+
+    model_config = ConfigDict(frozen=True)
+
+    component_kind: str
+    component_name: str
+    active_version: str
+    reason: Literal["unknown_component_kind", "unknown_component", "unknown_version"]
+
+
 class DatabaseHealth(BaseModel):
     """Database-side projection truth, merged into ``GET /health`` at the route.
 
@@ -1087,6 +1172,15 @@ class DatabaseHealth(BaseModel):
     ``stale_completion_count`` is the one field here that is **not** database
     truth: it is the reporting worker's own count of writes dropped because the
     job had been taken over.
+
+    ``active_versions`` follows the same ``None``-means-unknown rule as the
+    numbers, and it is the field where the distinction is easiest to get wrong:
+    an **empty tuple is impossible**, because a reachable store always reports
+    one entry per component the build knows (a component with no row is
+    reported at its code default). So ``None`` is "nobody could read this" and
+    a list is the whole answer; there is no third state where the block is
+    readable and the list is legitimately empty, and a consumer that renders
+    ``None`` as "no versions" is reporting an outage as a configuration.
     """
 
     model_config = ConfigDict(frozen=True)
@@ -1096,6 +1190,7 @@ class DatabaseHealth(BaseModel):
     lag_ms: int | None = None
     failed_jobs: int | None = None
     stale_completion_count: int | None = None
+    active_versions: tuple[ActiveVersion, ...] | None = None
 
 
 class AnsichHealth(BaseModel):

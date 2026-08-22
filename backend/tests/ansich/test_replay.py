@@ -32,8 +32,9 @@ from typing import Literal, get_args, get_origin
 
 import pytest
 from ansich import ObservationEnvelope, ReplayReport, ReplaySelector, new_id
+from ansich.belief.resolver import DEFAULT_RESOLVER, RESOLVER_V1
 from ansich.contracts import ObservationKind
-from ansich.errors import ReplayTargetError
+from ansich.errors import ActiveVersionError, ReplayTargetError
 from pydantic import ValidationError
 from sqlalchemy import UniqueConstraint, func, select, update
 from sqlalchemy.dialects import sqlite
@@ -44,6 +45,9 @@ from deerflow.ansich.persistence import models as models_module
 from deerflow.ansich.persistence import sql as sql_module
 from deerflow.ansich.persistence.models import (
     AnsichActiveTaskReadModelRow,
+    AnsichActiveVersionRow,
+    AnsichBeliefAssertionRow,
+    AnsichCurrentBeliefRow,
     AnsichObservationRow,
     AnsichProjectionJobRow,
     AnsichProjectorVersionRow,
@@ -65,7 +69,11 @@ from deerflow.ansich.persistence.sql import (
     _REPLACE_PROVEN_PROJECTORS,
     _REPLAYABLE_VERSIONS,
     _SHARED_REBUILT_TABLES,
+    ACTIVE_VERSION_CACHE_TTL_SECONDS,
+    ACTIVE_VERSION_COMPONENT_KINDS,
+    RESOLVER_COMPONENT_NAME,
     SqlAnsichBackend,
+    _active_version_registry,
     _cascade_delete_closure,
     _projectors_for_kind,
     _replay_observation_condition,
@@ -2104,3 +2112,755 @@ class TestKnownDefectIsNamedAtTheSurfaceAnOperatorDrives:
         monkeypatch.setattr(replay_cli, "run", fake_run)
         assert replay_cli.main(["--projector", "task-heartbeat", "--version", "1"]) == 0
         assert capsys.readouterr().err == ""
+
+
+# ---------------------------------------------------------------------------
+# Active versions (spec §5, plan ruling RC5)
+# ---------------------------------------------------------------------------
+
+
+def _assertion_row(
+    *,
+    assertion_id: str,
+    subject_id: str,
+    authority_class: str,
+    value: str,
+    offset_seconds: int,
+) -> AnsichBeliefAssertionRow:
+    return AnsichBeliefAssertionRow(
+        assertion_id=assertion_id,
+        subject_id=subject_id,
+        field_name="control",
+        value_json={"value": value},
+        as_of=_OCCURRED_AT + timedelta(seconds=offset_seconds),
+        asserted_at=_OCCURRED_AT + timedelta(seconds=offset_seconds),
+        source_name="test-source",
+        source_version="1",
+        assessor_name="test-assessor",
+        assessor_version="1",
+        config_hash="0" * 64,
+        authority_class=authority_class,
+        fidelity_class="hard",
+        confidence=None,
+    )
+
+
+class TestAbsentRowMeansTheCodeDefault:
+    """The table records *deviations*, so an empty one is a complete answer.
+
+    Both halves are here because either alone is satisfiable by a bug. The
+    structural half pins that the declared defaults are the registries' own
+    answers rather than a second copy; the behavioural half pins that a store
+    with no rows reports every component at that default rather than reporting
+    nothing.
+    """
+
+    def test_the_declared_default_is_what_this_build_runs_untouched(self) -> None:
+        registry = _active_version_registry()
+        live = dict(_PROJECTORS)
+        for projector_name, live_version in live.items():
+            versions, code_default = registry[("projector", projector_name)]
+            # The default is the LIVE version, not the replayable set's first
+            # member: with no row present, live ingest is what happens.
+            assert code_default == live_version
+            assert versions == _REPLAYABLE_VERSIONS[projector_name]
+            assert code_default in versions
+        versions, code_default = registry[("resolver", RESOLVER_COMPONENT_NAME)]
+        assert code_default == DEFAULT_RESOLVER.version
+        assert set(versions) == {RESOLVER_V1.version, DEFAULT_RESOLVER.version}
+
+    def test_every_registered_component_has_a_kind_the_table_admits(self) -> None:
+        registry = _active_version_registry()
+        assert {kind for kind, _name in registry} <= set(ACTIVE_VERSION_COMPONENT_KINDS)
+        # F10-30's eleven: ten projectors plus the one resolver family. A new
+        # versioned component must arrive here deliberately rather than by
+        # accident, because activating one this list does not carry is refused.
+        assert len(registry) == 11
+
+    @pytest.mark.anyio
+    async def test_an_empty_table_reports_every_component_at_its_code_default(
+        self,
+        backend: tuple[SqlAnsichBackend, async_sessionmaker],
+    ) -> None:
+        sql_backend, _sessions = backend
+
+        active = await sql_backend.get_active_versions()
+
+        registry = _active_version_registry()
+        assert len(active) == len(registry)
+        for entry in active:
+            code_default = registry[(entry.component_kind, entry.component_name)][1]
+            assert entry.origin == "code_default"
+            assert entry.active_version == code_default
+            assert entry.code_default_version == code_default
+            # Never epoch-zero, never a fabricated actor: nobody activated it.
+            assert entry.activated_at is None
+            assert entry.activated_by is None
+            assert entry.audit_obs_id is None
+
+    @pytest.mark.anyio
+    async def test_the_resolver_consulted_with_no_row_is_the_code_constant(
+        self,
+        backend: tuple[SqlAnsichBackend, async_sessionmaker],
+    ) -> None:
+        sql_backend, sessions = backend
+        async with sessions() as session:
+            assert await sql_backend._active_resolver(session) == DEFAULT_RESOLVER
+
+
+class TestActivationWritesTheRowAndItsAuditTogether:
+    @pytest.mark.anyio
+    async def test_a_switch_writes_both_and_stamps_the_latch_beside_the_pointer(
+        self,
+        backend: tuple[SqlAnsichBackend, async_sessionmaker],
+    ) -> None:
+        sql_backend, sessions = backend
+
+        activated = await sql_backend.activate_version(
+            component_kind="resolver",
+            component_name=RESOLVER_COMPONENT_NAME,
+            version=RESOLVER_V1.version,
+            actor="operator@example.com",
+        )
+
+        assert activated.active_version == RESOLVER_V1.version
+        assert activated.code_default_version == DEFAULT_RESOLVER.version
+        assert activated.origin == "activated_audited"
+        assert activated.activated_by == "operator@example.com"
+        async with sessions() as session:
+            row = await session.get(AnsichActiveVersionRow, ("resolver", RESOLVER_COMPONENT_NAME))
+            assert row is not None
+            assert row.active_version == RESOLVER_V1.version
+            # Pointer and latch together — the contract's second row.
+            assert row.audit_obs_id == activated.audit_obs_id
+            assert bool(row.audit_recorded) is True
+            observation = await session.scalar(select(AnsichObservationRow).where(AnsichObservationRow.obs_id == row.audit_obs_id))
+            assert observation is not None
+            assert observation.kind == "operator.action_succeeded"
+            assert observation.payload_json is not None
+            assert observation.payload_json["action_type"] == "activate_version"
+            assert observation.payload_json["actor"] == "operator@example.com"
+            assert observation.payload_json["active_version"] == RESOLVER_V1.version
+
+    @pytest.mark.anyio
+    async def test_a_failure_between_the_two_writes_leaves_neither(
+        self,
+        backend: tuple[SqlAnsichBackend, async_sessionmaker],
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Injected between the Observation insert and the row insert.
+
+        The Observation is added and flushed first (the FK needs it), so this
+        is precisely the window a crash would land in. If the two writes were
+        not one transaction, this store would come back holding an audit of a
+        switch that never took effect.
+        """
+
+        sql_backend, sessions = backend
+        original = SqlAnsichBackend._add_observation_row
+        calls: list[str] = []
+
+        def exploding(session: object, observation: object) -> None:
+            calls.append("added")
+            original(session, observation)  # type: ignore[arg-type]
+            raise RuntimeError("killed between the audit and the row")
+
+        monkeypatch.setattr(SqlAnsichBackend, "_add_observation_row", staticmethod(exploding))
+
+        with pytest.raises(RuntimeError, match="killed between"):
+            await sql_backend.activate_version(
+                component_kind="resolver",
+                component_name=RESOLVER_COMPONENT_NAME,
+                version=RESOLVER_V1.version,
+                actor="operator",
+            )
+
+        assert calls == ["added"]
+        async with sessions() as session:
+            assert (await session.scalar(select(func.count()).select_from(AnsichActiveVersionRow))) == 0
+            assert (await session.scalar(select(func.count()).select_from(AnsichObservationRow))) == 0
+
+    @pytest.mark.anyio
+    async def test_re_activation_overwrites_the_row_and_mints_a_second_audit(
+        self,
+        backend: tuple[SqlAnsichBackend, async_sessionmaker],
+    ) -> None:
+        """UPSERT semantics: the table is a current selection, not a history.
+
+        The history is the Observation stream, which is append-only — so a
+        second switch replaces the pointer and leaves both audit rows standing.
+        """
+
+        sql_backend, sessions = backend
+        first = await sql_backend.activate_version(
+            component_kind="resolver",
+            component_name=RESOLVER_COMPONENT_NAME,
+            version=RESOLVER_V1.version,
+            actor="first-operator",
+        )
+        second = await sql_backend.activate_version(
+            component_kind="resolver",
+            component_name=RESOLVER_COMPONENT_NAME,
+            version=DEFAULT_RESOLVER.version,
+            actor="second-operator",
+        )
+
+        assert second.audit_obs_id != first.audit_obs_id
+        async with sessions() as session:
+            assert (await session.scalar(select(func.count()).select_from(AnsichActiveVersionRow))) == 1
+            row = await session.get(AnsichActiveVersionRow, ("resolver", RESOLVER_COMPONENT_NAME))
+            assert row is not None
+            assert row.active_version == DEFAULT_RESOLVER.version
+            assert row.activated_by == "second-operator"
+            assert row.audit_obs_id == second.audit_obs_id
+            assert bool(row.audit_recorded) is True
+            audits = list((await session.execute(select(AnsichObservationRow).where(AnsichObservationRow.kind == "operator.action_succeeded"))).scalars())
+            assert {audit.obs_id for audit in audits} == {first.audit_obs_id, second.audit_obs_id}
+
+    @pytest.mark.anyio
+    async def test_the_audit_row_mints_no_projection_or_assessor_work(
+        self,
+        backend: tuple[SqlAnsichBackend, async_sessionmaker],
+    ) -> None:
+        """No job below any continuity mark, so PB7's delete does not apply.
+
+        ``operator.action_*`` is in no projector's kind list and the assessor
+        family refuses the bootstrap sentinel outright. Both facts are load
+        bearing: a job minted here would need the active-Task read-model delete
+        that ``mint_replay_jobs`` performs, and this call performs none.
+        """
+
+        sql_backend, sessions = backend
+        await sql_backend.activate_version(
+            component_kind="resolver",
+            component_name=RESOLVER_COMPONENT_NAME,
+            version=RESOLVER_V1.version,
+            actor="operator",
+        )
+        async with sessions() as session:
+            assert (await session.scalar(select(func.count()).select_from(AnsichProjectionJobRow))) == 0
+
+
+class TestTheLatchIsNeverSetWithoutItsPointer:
+    """The schema stops the pointer-without-latch half; nothing stops this one.
+
+    A latch set true on a row that never had an audit Observation renders as
+    ``activated_expired`` — "the evidence aged out under retention" — on a row
+    whose evidence never existed. The CHECK constraint cannot express it (a
+    genuinely expired row is exactly that shape), so the writer's discipline is
+    the only guard and it is pinned here in two ways.
+    """
+
+    def test_the_schema_still_refuses_a_pointer_with_no_latch(self) -> None:
+        constraints = {constraint.name for constraint in AnsichActiveVersionRow.__table__.constraints}
+        assert "ck_ansich_active_version_audit_pointer_latched" in constraints
+
+    def test_the_writer_sets_the_two_fields_in_the_same_statement(self) -> None:
+        """A source-level pin, because a run cannot prove an absence.
+
+        Every write of ``audit_recorded`` in the whole adapter must live in
+        ``activate_version`` and must be accompanied, in the *same* statement
+        group, by a write of ``audit_obs_id`` to the audit Observation's id —
+        never to ``None`` and never to a bare constant.
+        """
+
+        source = Path(sql_module.__file__).read_text(encoding="utf-8")
+        tree = ast.parse(source)
+        writer: ast.AsyncFunctionDef | None = None
+        for node in ast.walk(tree):
+            if isinstance(node, ast.AsyncFunctionDef) and node.name == "activate_version":
+                writer = node
+        assert writer is not None
+
+        def latch_writes(scope: ast.AST) -> int:
+            """Writes of the latch onto the row, ignoring reads of it.
+
+            A keyword counts only inside an ``AnsichActiveVersionRow(...)``
+            construction; ``_ActiveVersionRecord(audit_recorded=row....)`` is
+            the read side and must not be mistaken for a write.
+            """
+
+            found = 0
+            for node in ast.walk(scope):
+                if isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and node.func.id == "AnsichActiveVersionRow":
+                    found += sum(1 for keyword in node.keywords if keyword.arg == "audit_recorded")
+                elif isinstance(node, ast.Assign):
+                    for target in node.targets:
+                        if isinstance(target, ast.Attribute) and target.attr == "audit_recorded":
+                            found += 1
+            return found
+
+        # Nothing outside the writer touches the latch at all.
+        assert latch_writes(tree) == latch_writes(writer)
+        assert latch_writes(writer) > 0
+
+        # Inside the writer, the constructor keyword form and the update form
+        # each set the pointer to `observation.obs_id` beside the latch.
+        constructor_keywords = [{keyword.arg for keyword in node.keywords} for node in ast.walk(writer) if isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and node.func.id == "AnsichActiveVersionRow"]
+        assert constructor_keywords, "the writer must insert through the row model"
+        for keywords in constructor_keywords:
+            assert {"audit_obs_id", "audit_recorded"} <= keywords
+
+        pointer_sources = [node.value for node in ast.walk(writer) if isinstance(node, ast.Assign) and any(isinstance(target, ast.Attribute) and target.attr == "audit_obs_id" for target in node.targets)]
+        assert pointer_sources, "the writer must update the pointer on re-activation"
+        for value in pointer_sources:
+            assert isinstance(value, ast.Attribute) and value.attr == "obs_id"
+
+    @pytest.mark.anyio
+    async def test_an_expired_pointer_still_reads_as_audited_once(
+        self,
+        backend: tuple[SqlAnsichBackend, async_sessionmaker],
+    ) -> None:
+        """Retention clears the pointer; the latch outlives it, so the row
+        reads ``activated_expired`` rather than ``activated_unaudited``."""
+
+        sql_backend, sessions = backend
+        await sql_backend.activate_version(
+            component_kind="resolver",
+            component_name=RESOLVER_COMPONENT_NAME,
+            version=RESOLVER_V1.version,
+            actor="operator",
+        )
+        async with sessions() as session:
+            await session.execute(update(AnsichActiveVersionRow).values(audit_obs_id=None))
+            await session.commit()
+        sql_backend.invalidate_active_version_cache()
+
+        entry = next(item for item in await sql_backend.get_active_versions() if item.component_kind == "resolver")
+        assert entry.origin == "activated_expired"
+        assert entry.audit_obs_id is None
+        assert entry.active_version == RESOLVER_V1.version
+
+    @pytest.mark.anyio
+    async def test_a_row_that_was_never_audited_says_so(
+        self,
+        backend: tuple[SqlAnsichBackend, async_sessionmaker],
+    ) -> None:
+        """The degraded-audit case, which the latch is what makes legible."""
+
+        sql_backend, sessions = backend
+        async with sessions() as session:
+            session.add(
+                AnsichActiveVersionRow(
+                    component_kind="resolver",
+                    component_name=RESOLVER_COMPONENT_NAME,
+                    active_version=RESOLVER_V1.version,
+                    activated_at=_OCCURRED_AT,
+                    activated_by="degraded-writer",
+                    audit_obs_id=None,
+                    audit_recorded=False,
+                )
+            )
+            await session.commit()
+
+        entry = next(item for item in await sql_backend.get_active_versions() if item.component_kind == "resolver")
+        assert entry.origin == "activated_unaudited"
+
+
+class TestUnknownActivationTargetsAreRefusedTyped:
+    @pytest.mark.parametrize(
+        ("component_kind", "component_name", "version", "reason"),
+        [
+            ("assessor", "anything", "1", "unknown_component_kind"),
+            ("projector", "task-imaginary", "1", "unknown_component"),
+            ("projector", "task-step", "9", "unknown_version"),
+            ("resolver", "someone-elses-resolver", "1.0.0", "unknown_component"),
+            ("resolver", "ansich-default", "3.0.0", "unknown_version"),
+        ],
+    )
+    @pytest.mark.anyio
+    async def test_the_refusal_carries_a_reason_and_writes_nothing(
+        self,
+        backend: tuple[SqlAnsichBackend, async_sessionmaker],
+        component_kind: str,
+        component_name: str,
+        version: str,
+        reason: str,
+    ) -> None:
+        sql_backend, sessions = backend
+
+        with pytest.raises(ActiveVersionError) as caught:
+            await sql_backend.activate_version(
+                component_kind=component_kind,
+                component_name=component_name,
+                version=version,
+                actor="operator",
+            )
+
+        assert caught.value.reason == reason
+        assert caught.value.component_kind == component_kind
+        assert caught.value.version == version
+        async with sessions() as session:
+            assert (await session.scalar(select(func.count()).select_from(AnsichActiveVersionRow))) == 0
+            assert (await session.scalar(select(func.count()).select_from(AnsichObservationRow))) == 0
+
+    @pytest.mark.anyio
+    async def test_an_unattributed_switch_is_refused_before_anything_is_written(
+        self,
+        backend: tuple[SqlAnsichBackend, async_sessionmaker],
+    ) -> None:
+        """An anonymous switch is not an audited one."""
+
+        sql_backend, sessions = backend
+
+        with pytest.raises(ValueError, match="needs an actor"):
+            await sql_backend.activate_version(
+                component_kind="resolver",
+                component_name=RESOLVER_COMPONENT_NAME,
+                version=RESOLVER_V1.version,
+                actor="   ",
+            )
+
+        async with sessions() as session:
+            assert (await session.scalar(select(func.count()).select_from(AnsichObservationRow))) == 0
+
+    def test_every_refusal_reason_is_reachable(self) -> None:
+        """The literal and the branches that raise it stay in step."""
+
+        from ansich.errors import ActiveVersionRefusal
+
+        assert set(get_args(ActiveVersionRefusal)) == {
+            "unknown_component_kind",
+            "unknown_component",
+            "unknown_version",
+        }
+
+
+class TestTheResolverReadConsultsTheRow:
+    async def _resolve(self, sql_backend: SqlAnsichBackend, sessions: async_sessionmaker, subject_id: str) -> str:
+        async with sessions() as session:
+            await sql_backend._resolve_current_assessment(session, subject_id=subject_id, field_name="control")
+            await session.commit()
+        async with sessions() as session:
+            current = await session.get(AnsichCurrentBeliefRow, (subject_id, "control"))
+            assert current is not None
+            return current.resolver_version
+
+    @pytest.mark.anyio
+    async def test_the_active_row_decides_which_resolver_selects_the_belief(
+        self,
+        backend: tuple[SqlAnsichBackend, async_sessionmaker],
+    ) -> None:
+        """A resolution result that differs, not merely a different argument.
+
+        The resolver that selected a Belief is stored on the current-Belief
+        row, so switching the active version changes what a later reader is
+        told about how this Belief was chosen — which is the whole point of a
+        versioned resolver.
+        """
+
+        sql_backend, sessions = backend
+        subject_id = new_id()
+        async with sessions() as session:
+            session.add(_assertion_row(assertion_id=new_id(), subject_id=subject_id, authority_class="deterministic", value="running", offset_seconds=0))
+            session.add(_assertion_row(assertion_id=new_id(), subject_id=subject_id, authority_class="configured_rule", value="created", offset_seconds=1))
+            await session.commit()
+
+        assert await self._resolve(sql_backend, sessions, subject_id) == DEFAULT_RESOLVER.version
+
+        await sql_backend.activate_version(
+            component_kind="resolver",
+            component_name=RESOLVER_COMPONENT_NAME,
+            version=RESOLVER_V1.version,
+            actor="operator",
+        )
+
+        assert await self._resolve(sql_backend, sessions, subject_id) == RESOLVER_V1.version
+
+    @pytest.mark.anyio
+    async def test_a_version_this_build_cannot_run_falls_back_rather_than_raising(
+        self,
+        backend: tuple[SqlAnsichBackend, async_sessionmaker],
+    ) -> None:
+        """The rollback case: the row was legal when written, this build is not.
+
+        Raising here would land inside an assessor's transaction and stop every
+        Belief write in the process, so the read falls back to the code default
+        and the mismatch is reported at the next start instead.
+        """
+
+        sql_backend, sessions = backend
+        async with sessions() as session:
+            session.add(
+                AnsichActiveVersionRow(
+                    component_kind="resolver",
+                    component_name=RESOLVER_COMPONENT_NAME,
+                    active_version="99.0.0",
+                    activated_at=_OCCURRED_AT,
+                    activated_by="a-build-that-is-gone",
+                    audit_obs_id=None,
+                    audit_recorded=True,
+                )
+            )
+            await session.commit()
+
+        async with sessions() as session:
+            assert await sql_backend._active_resolver(session) == DEFAULT_RESOLVER
+
+
+class TestTheReaderCacheIsInvalidatedByItsOwnWrite:
+    @pytest.mark.anyio
+    async def test_the_writing_process_never_reads_its_own_switch_as_untaken(
+        self,
+        backend: tuple[SqlAnsichBackend, async_sessionmaker],
+    ) -> None:
+        sql_backend, sessions = backend
+        # Warm the cache on the empty table first, so a stale hit would be
+        # visible rather than merely possible.
+        assert await sql_backend.get_active_versions()
+
+        await sql_backend.activate_version(
+            component_kind="resolver",
+            component_name=RESOLVER_COMPONENT_NAME,
+            version=RESOLVER_V1.version,
+            actor="operator",
+        )
+
+        entry = next(item for item in await sql_backend.get_active_versions() if item.component_kind == "resolver")
+        assert entry.active_version == RESOLVER_V1.version
+        async with sessions() as session:
+            assert await sql_backend._active_resolver(session) == RESOLVER_V1
+
+    @pytest.mark.anyio
+    async def test_a_peers_write_is_not_seen_until_this_readers_cache_expires(
+        self,
+        backend: tuple[SqlAnsichBackend, async_sessionmaker],
+    ) -> None:
+        """The cross-worker staleness window, asserted rather than assumed.
+
+        A second backend over the same store stands in for a second worker. Its
+        switch is durable immediately and this reader keeps its cached answer
+        until the TTL lapses — which is the documented bound, not a defect, and
+        is why the constant is finite.
+        """
+
+        sql_backend, sessions = backend
+        peer = SqlAnsichBackend(sessions)
+        assert await sql_backend.get_active_versions()
+
+        await peer.activate_version(
+            component_kind="resolver",
+            component_name=RESOLVER_COMPONENT_NAME,
+            version=RESOLVER_V1.version,
+            actor="the-other-worker",
+        )
+
+        stale = next(item for item in await sql_backend.get_active_versions() if item.component_kind == "resolver")
+        assert stale.origin == "code_default"
+
+        # Age this reader's cache past the bound rather than sleeping through it.
+        sql_backend._active_version_cache_at -= ACTIVE_VERSION_CACHE_TTL_SECONDS + 1
+        fresh = next(item for item in await sql_backend.get_active_versions() if item.component_kind == "resolver")
+        assert fresh.active_version == RESOLVER_V1.version
+        assert fresh.activated_by == "the-other-worker"
+
+
+class TestStartupValidationReportsWithoutRaising:
+    @pytest.mark.anyio
+    async def test_a_clean_store_returns_an_empty_tuple_not_none(
+        self,
+        backend: tuple[SqlAnsichBackend, async_sessionmaker],
+    ) -> None:
+        sql_backend, _sessions = backend
+        await sql_backend.activate_version(
+            component_kind="projector",
+            component_name="task-step",
+            version="1",
+            actor="operator",
+        )
+
+        assert await sql_backend.validate_active_versions() == ()
+
+    @pytest.mark.anyio
+    async def test_rows_this_build_no_longer_knows_come_back_typed(
+        self,
+        backend: tuple[SqlAnsichBackend, async_sessionmaker],
+    ) -> None:
+        sql_backend, sessions = backend
+        async with sessions() as session:
+            session.add_all(
+                [
+                    AnsichActiveVersionRow(
+                        component_kind="projector",
+                        component_name="task-step",
+                        active_version="7",
+                        activated_at=_OCCURRED_AT,
+                        activated_by="old-build",
+                        audit_obs_id=None,
+                        audit_recorded=True,
+                    ),
+                    AnsichActiveVersionRow(
+                        component_kind="projector",
+                        component_name="task-retired",
+                        active_version="1",
+                        activated_at=_OCCURRED_AT,
+                        activated_by="old-build",
+                        audit_obs_id=None,
+                        audit_recorded=True,
+                    ),
+                    AnsichActiveVersionRow(
+                        component_kind="assessor",
+                        component_name="whatever",
+                        active_version="1",
+                        activated_at=_OCCURRED_AT,
+                        activated_by="old-build",
+                        audit_obs_id=None,
+                        audit_recorded=True,
+                    ),
+                ]
+            )
+            await session.commit()
+
+        mismatches = await sql_backend.validate_active_versions()
+
+        assert mismatches is not None
+        assert {(item.component_name, item.reason) for item in mismatches} == {
+            ("task-step", "unknown_version"),
+            ("task-retired", "unknown_component"),
+            ("whatever", "unknown_component_kind"),
+        }
+
+    @pytest.mark.anyio
+    async def test_an_unreadable_store_answers_none_rather_than_clean(
+        self,
+        backend: tuple[SqlAnsichBackend, async_sessionmaker],
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """``None`` and ``()`` are different claims and must stay different.
+
+        Reporting an unreadable store as "no mismatches" is the one answer that
+        would let a rolled-back deploy start clean while nobody had looked.
+        """
+
+        sql_backend, _sessions = backend
+
+        def exploding() -> object:
+            raise RuntimeError("storage is down")
+
+        monkeypatch.setattr(sql_backend, "_session_factory", exploding)
+
+        assert await sql_backend.validate_active_versions() is None
+
+    @pytest.mark.anyio
+    async def test_a_mismatched_row_does_not_disappear_from_the_health_list(
+        self,
+        backend: tuple[SqlAnsichBackend, async_sessionmaker],
+    ) -> None:
+        """The list is registry-driven, so an unknown component is absent from
+        it — and that is exactly why validation is a separate surface."""
+
+        sql_backend, sessions = backend
+        async with sessions() as session:
+            session.add(
+                AnsichActiveVersionRow(
+                    component_kind="projector",
+                    component_name="task-retired",
+                    active_version="1",
+                    activated_at=_OCCURRED_AT,
+                    activated_by="old-build",
+                    audit_obs_id=None,
+                    audit_recorded=True,
+                )
+            )
+            await session.commit()
+
+        listed = {(entry.component_kind, entry.component_name) for entry in await sql_backend.get_active_versions()}
+        assert ("projector", "task-retired") not in listed
+        mismatches = await sql_backend.validate_active_versions()
+        assert mismatches is not None
+        assert [item.component_name for item in mismatches] == ["task-retired"]
+
+
+class TestActiveVersionCli:
+    def test_the_subcommands_stand_beside_the_replay_arguments(self) -> None:
+        parser = replay_cli.build_parser()
+
+        replay = parser.parse_args(["--projector", "task-heartbeat", "--version", "1"])
+        assert replay.command is None
+
+        activate = parser.parse_args(
+            [
+                "activate",
+                "--component-kind",
+                "resolver",
+                "--component-name",
+                "ansich-default",
+                "--version",
+                "1.0.0",
+                "--actor",
+                "operator",
+            ]
+        )
+        assert (activate.command, activate.component_kind, activate.component_name, activate.version, activate.actor) == (
+            "activate",
+            "resolver",
+            "ansich-default",
+            "1.0.0",
+            "operator",
+        )
+        assert parser.parse_args(["versions"]).command == "versions"
+
+    def test_a_replay_without_its_two_arguments_is_refused_rather_than_run(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        """They stopped being ``required=True`` so the subcommands could exist;
+        the requirement itself did not go away."""
+
+        async def unreachable(args: object, selector: object) -> ReplayReport:
+            raise AssertionError("the replay must not run without a target")
+
+        monkeypatch.setattr(replay_cli, "run", unreachable)
+        assert replay_cli.main([]) == 2
+        assert "--projector" in capsys.readouterr().err
+
+    def test_a_refused_activation_exits_two_and_names_the_reason(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        async def refusing(args: object) -> object:
+            raise ActiveVersionError(
+                "nope",
+                reason="unknown_version",
+                component_kind="projector",
+                component_name="task-step",
+                version="9",
+            )
+
+        monkeypatch.setattr(replay_cli, "run_activate", refusing)
+        assert replay_cli.main(["activate", "--component-kind", "projector", "--component-name", "task-step", "--version", "9", "--actor", "operator"]) == 2
+        assert "unknown_version" in capsys.readouterr().err
+
+    def test_the_listing_marks_a_code_default_apart_from_a_switch(self) -> None:
+        from ansich.contracts import ActiveVersion
+
+        rendered = replay_cli.render_versions(
+            (
+                ActiveVersion(
+                    component_kind="projector",
+                    component_name="task-step",
+                    active_version="1",
+                    code_default_version="1",
+                    origin="code_default",
+                ),
+                ActiveVersion(
+                    component_kind="resolver",
+                    component_name="ansich-default",
+                    active_version="1.0.0",
+                    code_default_version="2.0.0",
+                    origin="activated_audited",
+                    activated_at=_OCCURRED_AT,
+                    activated_by="operator",
+                    audit_obs_id=new_id(),
+                ),
+            ),
+            output_format="text",
+        )
+
+        assert "projector/task-step: 1 (code default)" in rendered
+        assert "resolver/ansich-default: 1.0.0 (activated_audited, by operator)" in rendered
+        # The executable set is on the listing too: an operator deciding what
+        # to activate should not have to read the source to find out.
+        assert "known: 1.0.0, 2.0.0" in rendered

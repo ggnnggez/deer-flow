@@ -1,4 +1,6 @@
 import type {
+  AnsichActiveVersion,
+  AnsichActiveVersionOrigin,
   AnsichAlertType,
   AnsichDatabaseHealth,
   AnsichHealth,
@@ -619,6 +621,28 @@ export interface AnsichProjectorRow {
   attention: boolean;
 }
 
+/** One versioned component's row in the Observability health panel. */
+export interface AnsichActiveVersionRow {
+  /** `kind/name` — stable across reads, unique per component. */
+  key: string;
+  kind: AnsichActiveVersion["component_kind"];
+  name: string;
+  /** What runs. */
+  version: string;
+  /** What would run with no stored row. */
+  codeDefault: string;
+  origin: AnsichActiveVersionOrigin;
+  /**
+   * True only when no row was activated at all. Kept beside `origin` rather
+   * than derived at each call site, because "runs the default version" and "is
+   * the code default" are different facts: an operator may deliberately
+   * activate the version that is already the default.
+   */
+  isCodeDefault: boolean;
+  activatedAt: string | null;
+  activatedBy: string | null;
+}
+
 export interface AnsichDatabaseHealthPresentation {
   reachable: boolean;
   projectors: AnsichProjectorRow[];
@@ -637,6 +661,13 @@ export interface AnsichDatabaseHealthPresentation {
   settledThrough: number | null;
   /** Total unsettled jobs across projectors; unknown when unreadable. */
   outstanding: number | null;
+  /**
+   * Which version of each versioned component this store says runs, code
+   * defaults included. `null` when the block could not be read; never `[]`,
+   * because a reachable store always answers with one entry per component the
+   * build knows.
+   */
+  activeVersions: AnsichActiveVersionRow[] | null;
   /** Unreadable storage, or any durably failed job. */
   attention: boolean;
 }
@@ -654,6 +685,7 @@ const UNREADABLE_DATABASE_HEALTH: AnsichDatabaseHealthPresentation = {
   staleCompletions: null,
   settledThrough: null,
   outstanding: null,
+  activeVersions: null,
   attention: true,
 };
 Object.freeze(UNREADABLE_DATABASE_HEALTH.projectors);
@@ -711,6 +743,22 @@ export function getDatabaseHealthPresentation(
     lagMs: database.lag_ms,
     failedJobs: database.failed_jobs,
     staleCompletions: database.stale_completion_count,
+    // Null-safe by construction: a backend that predates this field, or one
+    // whose block carried `null`, yields `null` rather than an empty list, and
+    // the panel renders that as unknown rather than as "no components".
+    activeVersions: database.active_versions
+      ? database.active_versions.map((entry) => ({
+          key: `${entry.component_kind}/${entry.component_name}`,
+          kind: entry.component_kind,
+          name: entry.component_name,
+          version: entry.active_version,
+          codeDefault: entry.code_default_version,
+          origin: entry.origin,
+          isCodeDefault: entry.origin === "code_default",
+          activatedAt: entry.activated_at,
+          activatedBy: entry.activated_by,
+        }))
+      : null,
     settledThrough,
     outstanding: projectors.reduce((total, row) => total + row.outstanding, 0),
     // `null` is unknown, never zero — so an unreadable count warrants attention

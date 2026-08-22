@@ -10,6 +10,7 @@ import {
   formatAnsichLag,
   formatAnsichSequence,
   getDatabaseHealthPresentation,
+  type AnsichActiveVersionRow,
   type AnsichDatabaseHealthBadge,
   type AnsichProjectorRow,
 } from "@/core/ansich/presentation";
@@ -180,6 +181,44 @@ export function AnsichObservabilityHealthPanel({
         )}
       </div>
 
+      <div className="rounded-lg border">
+        <div className="flex flex-wrap items-center gap-2 border-b px-4 py-3">
+          <h3 className="text-sm font-medium">{copy.activeVersions}</h3>
+          <AnsichMetricHelp
+            description={copy.metricDescriptions.activeVersions}
+          />
+        </div>
+        {/* `null` is unknown, never "no components": a reachable store always
+            answers with one entry per component this build knows, so an empty
+            list is not a state the block can be in. */}
+        {database.activeVersions === null ? (
+          <p className="text-muted-foreground p-4 text-sm">
+            {copy.activeVersionsUnknown}
+          </p>
+        ) : (
+          <div className="overflow-x-auto">
+            <table className="w-full text-left text-sm">
+              <thead className="text-muted-foreground text-xs">
+                <tr>
+                  <th className="px-4 py-2 font-medium">{copy.component}</th>
+                  <th className="px-4 py-2 font-medium">
+                    {copy.activeVersion}
+                  </th>
+                  <th className="px-4 py-2 font-medium">
+                    {copy.codeDefaultVersion}
+                  </th>
+                </tr>
+              </thead>
+              <tbody>
+                {database.activeVersions.map((row) => (
+                  <ActiveVersionRow key={row.key} row={row} copy={copy} />
+                ))}
+              </tbody>
+            </table>
+          </div>
+        )}
+      </div>
+
       {/* The process half stays readable when the store is not — mirroring the
           endpoint, which answers with the process block either way. It is
           labelled as this worker's own view so it is never mistaken for the
@@ -211,6 +250,56 @@ export function AnsichObservabilityHealthPanel({
         />
       </div>
     </section>
+  );
+}
+
+/**
+ * One versioned component's row.
+ *
+ * The origin label carries the whole point of the row: a component nobody has
+ * switched is marked as running the code default rather than being rendered
+ * identically to one that deliberately activated the same version, and the two
+ * degraded-audit states are kept apart because "the evidence expired" and
+ * "there never was any" are different answers to "was this switch authorised".
+ */
+function ActiveVersionRow({
+  row,
+  copy,
+}: {
+  row: AnsichActiveVersionRow;
+  copy: ReturnType<typeof useI18n>["t"]["ansich"]["observabilityHealth"];
+}) {
+  return (
+    <tr className="border-t">
+      <td className="px-4 py-2">
+        <div className="font-mono text-xs font-medium">{row.name}</div>
+        <div className="text-muted-foreground font-mono text-xs">
+          {row.kind}
+        </div>
+      </td>
+      <td className="px-4 py-2">
+        <div className="font-mono tabular-nums">{row.version}</div>
+        <div
+          className={cn(
+            "text-xs",
+            row.origin === "activated_unaudited"
+              ? "text-destructive"
+              : "text-muted-foreground",
+          )}
+        >
+          {copy.activeVersionOrigin[row.origin]}
+          {row.activatedBy ? ` · ${row.activatedBy}` : null}
+        </div>
+      </td>
+      <td
+        className={cn(
+          "px-4 py-2 font-mono tabular-nums",
+          row.isCodeDefault && "text-muted-foreground",
+        )}
+      >
+        {row.codeDefault}
+      </td>
+    </tr>
   );
 }
 

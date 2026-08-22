@@ -2194,6 +2194,12 @@ async def get_health(request: Request) -> dict:
     exists for: when storage is down the ``database`` block reads
     ``unreachable`` and every process-side field is still served in full. This
     stays the one Ansich route that answers while storage cannot.
+
+    The merge is a **whole-block passthrough**, deliberately: additive fields
+    on ``DatabaseHealth`` (``active_versions`` is the current one) reach the
+    client without a second edit here, and — more importantly — a block's
+    reachability and its contents can never be assembled from two different
+    reads and disagree.
     """
 
     await require_admin_user(request, detail=_ADMIN_REQUIRED)

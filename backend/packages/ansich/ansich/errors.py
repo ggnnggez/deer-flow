@@ -11,7 +11,13 @@ from __future__ import annotations
 
 from typing import Literal
 
-__all__ = ["ReplayTargetError", "ReplayTargetRefusal", "StorageUnavailableError"]
+__all__ = [
+    "ActiveVersionError",
+    "ActiveVersionRefusal",
+    "ReplayTargetError",
+    "ReplayTargetRefusal",
+    "StorageUnavailableError",
+]
 
 
 class StorageUnavailableError(Exception):
@@ -148,3 +154,59 @@ class ReplayTargetError(ValueError):
         self.reason: ReplayTargetRefusal = reason
         self.projector_name = projector_name
         self.projector_version = projector_version
+
+
+#: Why an activation was refused. A sibling of :data:`ReplayTargetRefusal` and
+#: written for the same reason: each refusal has a different remedy, and a
+#: caller must be able to branch on it without matching prose.
+#:
+#: * ``unknown_component_kind`` — the kind is not one this build versions.
+#:   Exactly two are: ``projector`` and ``resolver``. Fix the request.
+#: * ``unknown_component`` — the kind is real and no component of that kind
+#:   carries this name in this build (a typo, or a projector that does not
+#:   exist yet). Fix the request, or deploy the build that has it.
+#: * ``unknown_version`` — the component is real and this build does not know
+#:   the version asked for. Deploy the build that does; activating a version
+#:   this process cannot execute would leave a row every reader has to
+#:   fall back from.
+ActiveVersionRefusal = Literal[
+    "unknown_component_kind",
+    "unknown_component",
+    "unknown_version",
+]
+
+
+class ActiveVersionError(ValueError):
+    """The requested activation names something this build does not know.
+
+    Raised *before* anything is written — no row, no audit Observation — so a
+    refusal costs the caller nothing but the answer, exactly as
+    :class:`ReplayTargetError` does for a replay target. It is a ``ValueError``
+    for the same reason: the store is fine, the request names something this
+    build cannot honour.
+
+    **Why validation is a refusal rather than a warning.** An active-version
+    row is read by processes that are not this one, and the reader's only
+    honest response to a version it cannot execute is to fall back to the code
+    default — which is to say, to ignore the operator's deliberate action while
+    reporting that it took effect. Refusing at the write keeps the row's
+    meaning ("some build runs this") true at the moment it is made, and
+    :func:`validate_active_versions` re-asks the same question at every later
+    start, because a build can be rolled back underneath a row that was legal
+    when it was written.
+    """
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        reason: ActiveVersionRefusal,
+        component_kind: str,
+        component_name: str,
+        version: str,
+    ) -> None:
+        super().__init__(message)
+        self.reason: ActiveVersionRefusal = reason
+        self.component_kind = component_kind
+        self.component_name = component_name
+        self.version = version

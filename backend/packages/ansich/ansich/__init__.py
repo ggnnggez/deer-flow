@@ -14,6 +14,9 @@ from ansich.compression import (
 )
 from ansich.context_state import ContextStateDelta, ContextStateItem, ContextStateView
 from ansich.contracts import (
+    ActiveVersion,
+    ActiveVersionMismatch,
+    ActiveVersionOrigin,
     AnsichHealth,
     ControlBelief,
     DatabaseHealth,
@@ -33,7 +36,7 @@ from ansich.contracts import (
     TaskView,
     WriterHealth,
 )
-from ansich.errors import StorageUnavailableError
+from ansich.errors import ActiveVersionError, StorageUnavailableError
 from ansich.evaluation import (
     EVALUATION_OBSERVATION_KIND,
     QUALITY_DIMENSIONS,
@@ -111,6 +114,10 @@ from ansich.usage import (
 )
 
 __all__ = [
+    "ActiveVersion",
+    "ActiveVersionError",
+    "ActiveVersionMismatch",
+    "ActiveVersionOrigin",
     "Assessment",
     "AlertCondition",
     "AlertEpisode",

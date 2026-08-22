@@ -251,12 +251,67 @@ export interface AnsichProjectorHealth {
  * this block that is not database truth at all: it is the reporting worker's
  * own count of writes dropped because the job had been taken over.
  */
+/**
+ * Where one component's running version came from, and how well the switch is
+ * evidenced.
+ *
+ * - `code_default` — no stored row. The build's own default runs; nobody
+ *   activated anything, so nothing is owed an audit. This is the ordinary
+ *   state, not a missing one: the table records *deviations* from the default.
+ * - `activated_audited` — a deliberate switch with its audit Observation still
+ *   in the store.
+ * - `activated_expired` — a deliberate switch whose audit Observation has aged
+ *   out under retention. The selection stands; only the evidence pointer is
+ *   gone.
+ * - `activated_unaudited` — the row was written while the audit write was
+ *   degraded, so no Observation was ever recorded. This is the one value that
+ *   should prompt a question.
+ */
+export type AnsichActiveVersionOrigin =
+  | "code_default"
+  | "activated_audited"
+  | "activated_expired"
+  | "activated_unaudited";
+
+/**
+ * Which version of one versioned component the store says is authoritative.
+ *
+ * Reported for every component the build knows, including those with no stored
+ * row — such a component appears at its `code_default_version` with
+ * `origin: "code_default"`. Both versions are carried because "what runs" and
+ * "what would run untouched" are different questions, and they are legitimately
+ * equal (an operator may deliberately activate the version that is already the
+ * default, which leaves a row and an audit trail saying so).
+ *
+ * `activated_at` / `activated_by` / `audit_obs_id` are `null` for a code
+ * default because nobody activated it — never an epoch date, never a
+ * placeholder actor.
+ */
+export interface AnsichActiveVersion {
+  component_kind: "projector" | "resolver";
+  component_name: string;
+  active_version: string;
+  code_default_version: string;
+  origin: AnsichActiveVersionOrigin;
+  activated_at: string | null;
+  activated_by: string | null;
+  audit_obs_id: string | null;
+}
+
 export interface AnsichDatabaseHealth {
   status: "reachable" | "unreachable";
   projectors: AnsichProjectorHealth[];
   lag_ms: number | null;
   failed_jobs: number | null;
   stale_completion_count: number | null;
+  /**
+   * `null` means the block could not be read, exactly like the numbers above.
+   * An **empty array is impossible**: a reachable store always answers with one
+   * entry per component the build knows, so there is no state where the block
+   * is readable and the list is legitimately empty. Rendering `null` as "no
+   * versions" would report an outage as a configuration.
+   */
+  active_versions: AnsichActiveVersion[] | null;
 }
 
 /**

@@ -2183,6 +2183,111 @@ serialized against A's *own* active-Task sweep by construction — the pause fir
 on the re-pend, which runs before `_clear_frozen_active_task_rows` — so that
 particular contention is **not** what this test shows.
 
+**P11-C active versions** (spec §5's D5-7, plan ruling RC5). Which version of a
+versioned component is authoritative is a **database row**
+(`ansich_active_versions`, migration `0028`), never config: a config field would
+be startup-only, which contradicts the "explicit, audited management action" the
+spec asks for, and would silently reinterpret history on deploy. An **absent row
+means the code default**, so the table records *deviations* and an empty table is
+a complete answer rather than a missing one.
+
+The **only writer** is the replay CLI's `activate` subcommand
+(`python -m deerflow.ansich.replay_cli activate --component-kind K
+--component-name N --version V --actor WHO`), which reaches
+`SqlAnsichBackend.activate_version`. It refuses an unknown kind, name or version
+with a typed `ansich.errors.ActiveVersionError`
+(`unknown_component_kind` / `unknown_component` / `unknown_version`) *before*
+writing anything — the row's meaning ("some build runs this") has to be true at
+the moment it is made, because the only honest thing a reader can do with a
+version it cannot execute is ignore it. Refusing at the write is not enough on
+its own, which is why validation is re-asked at every start (below): a build can
+be rolled back underneath a row that was legal when written.
+
+**The row and its audit Observation are written in one transaction.** A crash
+between them must leave neither: a row with no audit is an unaccountable version
+switch, and an audit with no row is an audit of something that did not happen.
+The audit is an `operator.action_succeeded` carrying
+`payload.action_type="activate_version"` — a member of the new
+`ansich.operator.OperatorAuditActionType` family (process-scoped operator actions
+that own no `ansich_operator_actions` ledger row, kept apart from
+`TaskOperatorActionType`'s `interrupt`/`rollback`, whose `OperatorActionView` has
+a required `task_id` no process-level action can have). It is subjected to
+`ANSICH_BOOTSTRAP_TASK_ID` rather than to the host `Scope`, deliberately: the
+writer is a short-lived CLI process that never runs the collector's bootstrap
+mint, so a Scope subject would point at an entity it neither checked for nor can
+create (`AnsichService.host_scope_id`'s own warning). Nothing Task-scoped follows
+— `operator.action_*` is in no projector's kind list and the assessor family
+refuses the sentinel — so the call mints **no job below any continuity mark** and
+Global Constraint 4's active-Task read-model delete does not apply to it.
+`source_event_id` is unique per activation (the activation id is in the key), so
+re-activating the same version is a second audited action rather than a
+producer-dedupe no-op. Re-activation is an **UPSERT**: the table is a current
+selection keyed by `(kind, name)`, the history is the append-only Observation
+stream.
+
+**The pointer and the latch move together.** `audit_recorded` is set `True` in
+the same statement that sets `audit_obs_id`, and never unset, which is what lets
+a later `NULL` pointer mean "the evidence aged out under retention" rather than
+"there never was any" (a degraded audit write is a legitimate outcome, so a row
+genuinely can be born pointer-less). The schema's CHECK forbids
+pointer-without-latch; it structurally *cannot* forbid latch-without-pointer,
+because a genuinely expired row is exactly that shape — so that half is the
+writer's obligation and is pinned by an AST test asserting every latch write in
+the adapter lives in `activate_version` beside a pointer write of
+`observation.obs_id`.
+
+**Readers cache per process, and the staleness is bounded rather than absent.**
+`_active_version_overrides` caches the rows for
+`ACTIVE_VERSION_CACHE_TTL_SECONDS` (30) and `activate_version` invalidates its
+own process's cache after commit, so the switching process never reads its switch
+as untaken and every other worker converges within one TTL of its next read. In
+between, two workers of one deployment legitimately run different resolver
+versions — which is tolerable only because it is *recorded*:
+`ansich_current_beliefs.resolver_name/_version` stamps which resolver selected
+each Belief, so the split is legible afterwards instead of silent.
+
+**One live consult exists, and it is the Belief resolver.**
+`_resolve_current_assessment` passes `await self._active_resolver(session)` where
+it used to pass the `DEFAULT_RESOLVER` constant; an absent row yields that same
+constant, so an empty table behaves identically. A version this build cannot
+execute **falls back to the code default with a warning rather than raising** —
+the raise would land inside an assessor's transaction and stop every Belief write
+in the process for as long as the stale row stood. The **projector half of
+"active" is deliberately not consulted by live ingest**: `project_pending`'s
+dispatch branches on `projector_name` alone and is blind to the version, and
+`persist_and_project` fans out to `_PROJECTORS`, so an activated projector
+version is consumed by replay and §9 reporting and by nothing on the ingest path.
+Wiring it in would mean teaching the dispatch to discriminate first, or every
+switch would silently keep running v1 while claiming v2.
+
+`validate_active_versions()` is the startup-validation helper (D8-5, consumed by
+the shutdown/startup task). It **never raises** — a mismatch has a working
+fallback at the read, and crashing over a rolled-back deploy would turn a
+degraded-but-working deployment into an outage — and it answers three states, not
+two: `()` means read and clean, a tuple of `ActiveVersionMismatch` means read and
+these rows are unhonourable, and `None` means the rows could not be read at all.
+Collapsing `None` into `()` would report an unreadable store as a clean one at
+exactly the moment a caller is deciding whether the deployment is sound.
+`AnsichService.get_active_versions()` / `.validate_active_versions()` are the
+fail-open passthroughs (a backend without the method answers `None`); the service
+deliberately does **not** call validation from `start()`, because where in
+`start()` it runs and what a mismatch costs belongs to the startup task.
+
+Health carries it: `DatabaseHealth.active_versions` is
+`tuple[ActiveVersion, ...] | None`, folded in by the backend itself so the
+block's reachability and its version list cannot be assembled from two reads and
+disagree, and reaching the client through `GET /api/ansich/health`'s existing
+whole-block passthrough. **An empty list is impossible** — a reachable store
+always answers with one entry per component the build knows, code defaults
+included — so `None` means unreadable and nothing else. The CLI's second
+subcommand, `versions`, is the read-only listing of the same three facts (what
+runs, the code default, the executable set). Tests:
+`tests/ansich/test_replay.py` (registry defaults, atomicity under an injected
+failure, the latch pins, typed refusals, UPSERT with a new audit, the resolver
+consult and its fallback, cache invalidation and the cross-worker window,
+validation's three states, the CLI) and `tests/ansich/test_database_health.py`
+(the health field and its route merge).
+
 **Workspace change review**: `packages/harness/deerflow/workspace_changes/`
 captures a pre-run and post-run snapshot of the thread-owned `workspace` and
 `outputs` directories. `runtime/runs/worker.py` performs the filesystem scan via

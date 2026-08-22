@@ -18,6 +18,8 @@ from ansich.compression import ContextCompressionSummaryView, ContextCompression
 from ansich.context_state import ContextStateView
 from ansich.contracts import (
     ANSICH_BOOTSTRAP_TASK_ID,
+    ActiveVersion,
+    ActiveVersionMismatch,
     AnsichHealth,
     ControlValue,
     DatabaseHealth,
@@ -721,6 +723,56 @@ class AnsichService:
             # went away, not a database that did.
             logger.debug("Ansich database health read failed", exc_info=True)
             return DatabaseHealth(status="unreachable")
+
+    async def get_active_versions(self) -> tuple[ActiveVersion, ...] | None:
+        """Which version of every versioned component the store says runs.
+
+        ``None`` when the backend cannot answer at all — including a backend
+        that has no such method (the in-memory one). It is the same
+        unknown-never-empty rule ``DatabaseHealth.active_versions`` carries,
+        and for the same reason: a reachable store always answers with one
+        entry per component the build knows, so an empty tuple is not a state
+        this can legitimately be in.
+
+        Note that ``GET /health``'s block does **not** go through here — the
+        backend folds the list into :class:`DatabaseHealth` itself, so the
+        block's reachability and its version list can never disagree. This is
+        the standalone read, for a caller that wants the list without the
+        health round trip.
+        """
+
+        provider = getattr(self._backend, "get_active_versions", None)
+        if not callable(provider):
+            return None
+        try:
+            return await provider()
+        except Exception:
+            logger.debug("Ansich active-version read failed", exc_info=True)
+            return None
+
+    async def validate_active_versions(self) -> tuple[ActiveVersionMismatch, ...] | None:
+        """Active-version rows this build can no longer honour. Never raises.
+
+        The startup-validation half of ruling RC5, kept fail-open at every
+        level: the backend does not raise, and a backend that cannot answer (or
+        does not implement it) yields ``None`` rather than a claim. ``()``
+        means "read, and every row is honourable"; ``None`` means "not read".
+
+        Deliberately **not** called from ``start()`` here. The shutdown/startup
+        sequencing task owns where in ``start()`` this runs and what a mismatch
+        costs — a log line, a health degradation, or nothing — and building
+        that decision into this method would make it un-overridable by the one
+        caller entitled to make it.
+        """
+
+        provider = getattr(self._backend, "validate_active_versions", None)
+        if not callable(provider):
+            return None
+        try:
+            return await provider()
+        except Exception:
+            logger.debug("Ansich active-version validation failed", exc_info=True)
+            return None
 
     def register_persistence_listener(
         self,

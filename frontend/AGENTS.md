@@ -244,6 +244,22 @@ state: the badge answers "does an operator need to look", and an unreadable coun
 answers yes exactly as a nonzero one does. `unreadable` stays separate because
 there the *whole* block is unknown, not one number in it.
 
+The panel also renders the store's **active versions**: one row per versioned
+component the build knows, with what runs, what would run untouched (the code
+default), and where the running version came from. A component nobody has
+switched is explicitly marked as running the code default rather than rendered
+identically to one that deliberately activated the same version — the backend
+records *deviations*, so no stored row is a complete answer, not a missing one.
+The origin has four states and the two degraded ones stay apart because they
+answer "was this switch authorised" differently: `activated_expired` means the
+switch happened and its audit Observation has since aged out under retention,
+while `activated_unaudited` means no evidence was ever recorded and is the one
+state rendered in the destructive tone. `active_versions` is `null` when the
+block could not be read and **never** an empty array — a reachable store always
+answers with one entry per component — so the panel renders `null` as an explicit
+"unknown while the store cannot be read" line, never as "no components". No alert
+type was invented for any of this and no exhaustive switch changed.
+
 **Known issue on that page (pre-existing, not introduced by the lens, and
 deliberately left alone):** the Operations page renders the selected lens's query
 error *instead of* the whole `<Tabs>` block — including the `TabsList` — so while

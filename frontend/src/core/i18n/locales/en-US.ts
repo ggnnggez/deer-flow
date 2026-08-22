@@ -594,6 +594,18 @@ export const enUS: Translations = {
       collectorStatus: "Collector status",
       processFailedJobs: "Failed jobs seen here",
       processLag: "Collector lag",
+      activeVersions: "Active versions",
+      component: "Component",
+      activeVersion: "Running",
+      codeDefaultVersion: "Code default",
+      activeVersionsUnknown:
+        "Which versions are running is unknown while the store cannot be read.",
+      activeVersionOrigin: {
+        code_default: "code default",
+        activated_audited: "activated",
+        activated_expired: "activated, audit expired",
+        activated_unaudited: "activated, never audited",
+      },
       metricDescriptions: {
         databaseLag:
           "How old the oldest job still owed is, measured from the Observation it is waiting on. It answers how far behind the backlog is, not how long ago anything last arrived.",
@@ -613,6 +625,8 @@ export const enUS: Translations = {
           "Failed jobs this worker has seen for itself. It is advisory: other workers' failures are not in it, so compare it with the authoritative count above.",
         processLag:
           "The collector's own lag inside this process, separate from how far behind the stored backlog is.",
+        activeVersions:
+          "Which version of each versioned component is authoritative. A component nobody has switched runs the build's own default and is marked as such — the store records deviations, so no stored row is a complete answer rather than a missing one. A switch is a deliberate, audited command; “audit expired” means the switch happened and its evidence has since aged out under retention, while “never audited” means no evidence was ever recorded and is the one state worth asking about.",
       },
     },
     snapshotRequests: "Snapshot requests",

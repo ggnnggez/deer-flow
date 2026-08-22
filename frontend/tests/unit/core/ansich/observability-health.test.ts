@@ -38,6 +38,28 @@ function reachable(
     lag_ms: 1_200,
     failed_jobs: 3,
     stale_completion_count: 0,
+    active_versions: [
+      {
+        component_kind: "projector",
+        component_name: "task-structural",
+        active_version: "1",
+        code_default_version: "1",
+        origin: "code_default",
+        activated_at: null,
+        activated_by: null,
+        audit_obs_id: null,
+      },
+      {
+        component_kind: "resolver",
+        component_name: "ansich-default",
+        active_version: "1.0.0",
+        code_default_version: "2.0.0",
+        origin: "activated_audited",
+        activated_at: "2026-08-22T09:00:00Z",
+        activated_by: "operator@example.com",
+        audit_obs_id: "3f2504e0-4f89-41d3-9a0c-0305e82c3301",
+      },
+    ],
     ...overrides,
   };
 }
@@ -263,6 +285,7 @@ describe("getDatabaseHealthPresentation", () => {
       lag_ms: null,
       failed_jobs: null,
       stale_completion_count: null,
+      active_versions: null,
     });
     expect(view.reachable).toBe(false);
     expect(view.projectors).toEqual([]);
@@ -271,6 +294,10 @@ describe("getDatabaseHealthPresentation", () => {
     expect(view.staleCompletions).toBeNull();
     expect(view.settledThrough).toBeNull();
     expect(view.outstanding).toBeNull();
+    // `null`, never `[]`: an empty list would read as "this store runs no
+    // versioned components", which is a configuration claim about a block
+    // nobody could read.
+    expect(view.activeVersions).toBeNull();
     // Unreadable is itself the incident: it must not read as a clean store.
     expect(view.attention).toBe(true);
   });
@@ -287,6 +314,77 @@ describe("getDatabaseHealthPresentation", () => {
     expect(view.failedJobs).toBeNull();
     expect(view.staleCompletions).toBeNull();
     expect(view.projectors).toEqual([]);
+    expect(view.activeVersions).toBeNull();
+  });
+
+  it("marks a component nobody switched as running the code default", () => {
+    const rows = getDatabaseHealthPresentation(reachable()).activeVersions;
+    expect(rows).not.toBeNull();
+    const projector = rows!.find((row) => row.kind === "projector")!;
+    expect(projector.key).toBe("projector/task-structural");
+    expect(projector.isCodeDefault).toBe(true);
+    expect(projector.origin).toBe("code_default");
+    expect(projector.version).toBe(projector.codeDefault);
+    // Nobody activated it, so there is no actor and no timestamp to show —
+    // never a placeholder name, never an epoch date.
+    expect(projector.activatedBy).toBeNull();
+    expect(projector.activatedAt).toBeNull();
+  });
+
+  it("keeps a deliberate switch apart from the default it deviates from", () => {
+    const rows = getDatabaseHealthPresentation(reachable()).activeVersions!;
+    const resolver = rows.find((row) => row.kind === "resolver")!;
+    expect(resolver.isCodeDefault).toBe(false);
+    expect(resolver.version).toBe("1.0.0");
+    expect(resolver.codeDefault).toBe("2.0.0");
+    expect(resolver.activatedBy).toBe("operator@example.com");
+  });
+
+  it("renders a missing active-version field as unknown rather than empty", () => {
+    // A backend that predates the field, or a block whose read failed: either
+    // way the panel must say "unknown", not "no components".
+    const view = getDatabaseHealthPresentation(
+      reachable({ active_versions: null }),
+    );
+    expect(view.reachable).toBe(true);
+    expect(view.activeVersions).toBeNull();
+  });
+
+  it("keeps the two degraded audit states distinguishable", () => {
+    // "The evidence expired under retention" and "there never was any" are
+    // different answers to whether the switch was authorised, and the latch
+    // column exists precisely so they do not collapse into one.
+    const rows = getDatabaseHealthPresentation(
+      reachable({
+        active_versions: [
+          {
+            component_kind: "resolver",
+            component_name: "ansich-default",
+            active_version: "1.0.0",
+            code_default_version: "2.0.0",
+            origin: "activated_expired",
+            activated_at: "2026-08-22T09:00:00Z",
+            activated_by: "operator",
+            audit_obs_id: null,
+          },
+          {
+            component_kind: "projector",
+            component_name: "task-step",
+            active_version: "1",
+            code_default_version: "1",
+            origin: "activated_unaudited",
+            activated_at: "2026-08-22T09:00:00Z",
+            activated_by: "operator",
+            audit_obs_id: null,
+          },
+        ],
+      }),
+    ).activeVersions!;
+    expect(rows.map((row) => row.origin)).toEqual([
+      "activated_expired",
+      "activated_unaudited",
+    ]);
+    expect(rows.every((row) => row.isCodeDefault)).toBe(false);
   });
 
   it("treats an absent block the same as an unreadable one", () => {

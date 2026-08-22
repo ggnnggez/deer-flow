@@ -862,6 +862,88 @@ def test_an_unreachable_database_block_reports_unknown_rather_than_zero():
     assert unreachable.failed_jobs is None
     assert unreachable.stale_completion_count is None
     assert unreachable.projectors == ()
+    # `None`, never `()`: a reachable store always answers with one entry per
+    # component this build knows, so an empty list is not a state the block can
+    # legitimately be in and rendering it as "no versions" would report an
+    # outage as a configuration.
+    assert unreachable.active_versions is None
+
+
+@pytest.mark.anyio
+async def test_the_database_block_carries_every_component_at_its_running_version(tmp_path):
+    """The §9 debt: which version of what is actually running, in health.
+
+    Absent rows are reported as code defaults rather than omitted, because an
+    omitted entry is what an unreadable block looks like.
+    """
+
+    backend, _sessions, engine = await _backend(tmp_path, "active-versions.db")
+    try:
+        before = await backend.get_database_health()
+        assert before.active_versions is not None
+        assert {entry.origin for entry in before.active_versions} == {"code_default"}
+        resolver_before = next(entry for entry in before.active_versions if entry.component_kind == "resolver")
+        assert resolver_before.active_version == resolver_before.code_default_version
+
+        await backend.activate_version(
+            component_kind="resolver",
+            component_name="ansich-default",
+            version="1.0.0",
+            actor="operator@example.com",
+        )
+
+        after = await backend.get_database_health()
+        assert after.active_versions is not None
+        resolver_after = next(entry for entry in after.active_versions if entry.component_kind == "resolver")
+        assert resolver_after.active_version == "1.0.0"
+        assert resolver_after.code_default_version == "2.0.0"
+        assert resolver_after.origin == "activated_audited"
+        assert resolver_after.activated_by == "operator@example.com"
+        assert resolver_after.audit_obs_id is not None
+        # Every other component is still at its default; a switch is scoped to
+        # the row it names.
+        assert {entry.origin for entry in after.active_versions if entry.component_kind == "projector"} == {"code_default"}
+    finally:
+        await engine.dispose()
+
+
+@pytest.mark.anyio
+async def test_a_service_without_the_backend_method_answers_none_rather_than_empty():
+    """The in-memory backend has no active-version row and says so honestly."""
+
+    service = AnsichService.in_memory()
+
+    assert await service.get_active_versions() is None
+    assert await service.validate_active_versions() is None
+
+
+@pytest.mark.anyio
+async def test_health_carries_the_active_versions_through_the_route_merge(tmp_path):
+    """The route hands the whole `database` block through, this field included."""
+
+    engine = create_async_engine(f"sqlite+aiosqlite:///{tmp_path / 'active-version-route.db'}")
+    session_factory = async_sessionmaker(engine, expire_on_commit=False)
+    async with engine.begin() as connection:
+        await connection.run_sync(Base.metadata.create_all)
+    service = create_sql_ansich_service(session_factory, operations_assessment_interval_ms=60_000)
+    only_test_driven_assessments(service)
+    await service.start()
+    app = make_authed_test_app(user_factory=admin_user)
+    app.state.ansich_service = service
+    app.include_router(ansich_router.router)
+    try:
+        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+            response = await client.get("/api/ansich/health")
+    finally:
+        await service.stop()
+        await engine.dispose()
+
+    assert response.status_code == 200
+    block = response.json()["database"]
+    assert block["status"] == "reachable"
+    names = {(entry["component_kind"], entry["component_name"]) for entry in block["active_versions"]}
+    assert ("resolver", "ansich-default") in names
+    assert ("projector", "task-step") in names
 
 
 def _resolved(value):

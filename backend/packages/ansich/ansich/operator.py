@@ -5,13 +5,36 @@ from typing import Literal
 
 from pydantic import BaseModel, ConfigDict
 
+#: Operator actions that target one Task and own a durable
+#: ``ansich_operator_actions`` row: the request is idempotency-keyed, elected,
+#: and terminalized, and the row is what a retry replays.
+TaskOperatorActionType = Literal["interrupt", "rollback"]
+
+#: Operator actions that target the **process**, not a Task, and therefore own
+#: no ledger row: their whole record is the audit Observation. They are carried
+#: in that Observation's ``payload["action_type"]`` under the same
+#: ``operator.action_*`` kinds, which is what makes one audit read find both
+#: families.
+#:
+#: The split is not cosmetic. A member of this family has no ``task_id`` to be
+#: keyed by, no concurrent-request election to win, and nothing for a retry to
+#: replay — putting it in :data:`TaskOperatorActionType` would widen
+#: :class:`OperatorActionView` (whose ``task_id`` is required) into a shape no
+#: row can ever have. RC8's discriminator machinery is a separate concern and
+#: is not required to add a member here.
+#:
+#: ``activate_version`` is the first member (an audited active-version switch,
+#: written by ``activate_version()`` in the SQL backend). The raw-payload-read
+#: audit adds its own member beside it; neither task claims the other's value.
+OperatorAuditActionType = Literal["activate_version"]
+
 
 class OperatorActionView(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True, strict=True)
 
     action_id: str
     task_id: str
-    action_type: Literal["interrupt", "rollback"]
+    action_type: TaskOperatorActionType
     idempotency_key: str
     status: Literal["requested", "succeeded", "failed"]
     requested_obs_id: str | None = None

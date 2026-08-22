@@ -576,6 +576,17 @@ export const zhCN: Translations = {
       collectorStatus: "采集器状态",
       processFailedJobs: "本机所见失败任务",
       processLag: "采集器滞后",
+      activeVersions: "生效版本",
+      component: "组件",
+      activeVersion: "正在运行",
+      codeDefaultVersion: "代码默认",
+      activeVersionsUnknown: "存储读不到时，哪些版本正在运行是未知的。",
+      activeVersionOrigin: {
+        code_default: "代码默认",
+        activated_audited: "已切换",
+        activated_expired: "已切换，审计记录已过期",
+        activated_unaudited: "已切换，从未留下审计",
+      },
       metricDescriptions: {
         databaseLag:
           "最早一条仍然欠着的任务、按它等待的那条 Observation 计算出的年龄。它回答的是积压落后多远，而不是最近一次有数据到达是多久以前。",
@@ -593,6 +604,8 @@ export const zhCN: Translations = {
         processFailedJobs:
           "本 worker 自己看到的失败任务数。它只是参考：其它 worker 的失败不在其中，请与上方的权威口径对照。",
         processLag: "本进程内采集器自身的滞后，与存储侧积压落后多远是两回事。",
+        activeVersions:
+          "每个带版本的组件当前以哪个版本为准。没有人切换过的组件跑的就是本次构建的默认版本，并会被明确标出——这张表记录的是“偏离默认”，因此没有存储行本身就是一个完整答案，而不是缺失。切换是一次显式且被审计的操作；“审计记录已过期”指切换确实发生过、其证据后来按保留策略老化掉了，而“从未留下审计”指压根没有写下证据，是唯一值得追问的状态。",
       },
     },
     snapshotRequests: "快照请求",

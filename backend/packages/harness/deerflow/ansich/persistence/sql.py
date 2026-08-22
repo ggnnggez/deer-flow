@@ -92,6 +92,7 @@ from ansich.assessment.tool_frequency import (
 )
 from ansich.belief.resolver import (
     DEFAULT_RESOLVER,
+    RESOLVER_V1,
     BeliefAssertion,
     resolve_current_belief,
 )
@@ -108,6 +109,9 @@ from ansich.compression import CompressionDisposition
 from ansich.context_state import context_state_hash, materialize_context_state
 from ansich.contracts import (
     ANSICH_BOOTSTRAP_TASK_ID,
+    ActiveVersion,
+    ActiveVersionMismatch,
+    ActiveVersionOrigin,
     ControlValue,
     DatabaseHealth,
     LostRange,
@@ -136,7 +140,7 @@ from ansich.environment import (
     assess_environment_leak,
     assess_environment_pressure,
 )
-from ansich.errors import ReplayTargetError, StorageUnavailableError
+from ansich.errors import ActiveVersionError, ReplayTargetError, StorageUnavailableError
 from ansich.evaluation import (
     EVALUATION_OBSERVATION_KIND,
     EvaluationProjectionStatus,
@@ -202,6 +206,7 @@ from sqlalchemy.orm import aliased
 
 from deerflow.ansich.persistence.models import (
     AnsichActiveTaskReadModelRow,
+    AnsichActiveVersionRow,
     AnsichAgentReleaseComponentRow,
     AnsichAgentReleaseRow,
     AnsichAlertEvidenceRow,
@@ -415,6 +420,77 @@ _REPLAYABLE_VERSIONS: dict[str, tuple[str, ...]] = {
 #: else, which is the failure ``not_executable`` exists to catch *before* a
 #: replay has minted a job that can only ever fail.
 _EXECUTABLE_PROJECTOR_NAMES = frozenset(name for name, _ in _PROJECTORS)
+#: The two component kinds ``ansich_active_versions`` versions, in the order a
+#: listing renders them. A third kind is a schema-visible addition (the column
+#: is a bare ``String(32)``) and must be added here *and* to
+#: ``_active_version_registry`` together, or a row of that kind would validate
+#: into the table and then read back as ``unknown_component_kind`` forever.
+ACTIVE_VERSION_COMPONENT_KINDS: tuple[str, ...] = ("projector", "resolver")
+#: The Belief resolver's component name. There is exactly one resolver family
+#: (``ansich-default``) and its two versions are module constants rather than a
+#: registry, so the name is taken from the constant rather than restated —
+#: renaming the resolver must not silently orphan its active-version row.
+RESOLVER_COMPONENT_NAME = DEFAULT_RESOLVER.name
+#: How long a reader's cached active-version map is trusted before it is read
+#: again. It is the **cross-worker convergence bound** and that is the whole
+#: reason it is not ``None``: see ``get_active_versions``.
+ACTIVE_VERSION_CACHE_TTL_SECONDS = 30.0
+
+
+def _active_version_registry() -> dict[tuple[str, str], tuple[tuple[str, ...], str]]:
+    """``(kind, name) -> (versions this build knows, the code default)``.
+
+    Derived from the two registries that already exist rather than restated,
+    because a restatement is a second place to forget. Projectors take their
+    known set from ``_REPLAYABLE_VERSIONS`` (what an operator may aim a replay
+    at, which is exactly the set a build can execute) and their default from
+    ``_PROJECTORS`` (what live ingest actually fans out to). The resolver takes
+    both from ``ansich.belief.resolver``'s module constants.
+
+    **The projector default is the live-registry version, and it has to be**:
+    "absent row ⇒ code default" is only true if the default names what the
+    build does with no row present, and with no row present live ingest mints
+    jobs for ``_PROJECTORS``. Taking the default from ``_REPLAYABLE_VERSIONS``
+    (say, its first or highest member) would name a version that may exist only
+    to be replayed against — the split between those two structures is
+    deliberate (plan ruling RC2) and collapsing it here would undo it.
+    """
+
+    live_projector_versions = dict(_PROJECTORS)
+    registry: dict[tuple[str, str], tuple[tuple[str, ...], str]] = {}
+    for projector_name, versions in _REPLAYABLE_VERSIONS.items():
+        default = live_projector_versions.get(projector_name)
+        if default is None:
+            # A replayable projector that live ingest does not run has no
+            # "what happens with no row" answer, so it is not selectable.
+            # Unreachable today (the two tuples name the same ten pairs) and
+            # skipped rather than raised, because a build that grows a
+            # replay-only projector should not fail to start over it.
+            continue
+        registry[("projector", projector_name)] = (versions, default)
+    registry[("resolver", RESOLVER_COMPONENT_NAME)] = (
+        (RESOLVER_V1.version, DEFAULT_RESOLVER.version),
+        DEFAULT_RESOLVER.version,
+    )
+    return registry
+
+
+def _known_resolver_versions() -> dict[str, NamedVersion]:
+    """The resolver ``NamedVersion`` a stored version string resolves back to.
+
+    The stored row carries a version and nothing else, and
+    ``resolve_current_belief`` takes a ``NamedVersion`` — so this is the one
+    place the two are joined, rather than each read site constructing a
+    ``NamedVersion(name=..., version=row.active_version)`` and thereby
+    accepting any string the table happens to hold.
+    """
+
+    return {
+        RESOLVER_V1.version: RESOLVER_V1,
+        DEFAULT_RESOLVER.version: DEFAULT_RESOLVER,
+    }
+
+
 #: Everything ``rebuild_projections()`` deletes before replaying, in an order
 #: that respects the foreign keys between these tables (children first).
 #:
@@ -965,6 +1041,26 @@ class _AssessorClaim(NamedTuple):
     attempts: int
     lease_generation: int
     pre_claim_watermark: int | None
+
+
+class _ActiveVersionRecord(NamedTuple):
+    """One ``ansich_active_versions`` row, detached from its session.
+
+    Plain values rather than the ORM row, because this is what the per-process
+    cache holds and a cached ORM instance outlives the session it was loaded
+    in: the next attribute read would either hit a closed session or, worse,
+    silently re-load and turn a cache into a query.
+
+    ``audit_recorded`` and ``audit_obs_id`` are carried **together and
+    unmodified** — reading them apart is exactly what the latch exists to
+    prevent (``AnsichActiveVersionRow``'s four-row contract table).
+    """
+
+    active_version: str
+    activated_at: datetime
+    activated_by: str
+    audit_obs_id: str | None
+    audit_recorded: bool
 
 
 class _DatabaseProjectionSnapshot(NamedTuple):
@@ -1959,6 +2055,13 @@ class SqlAnsichBackend:
         self._latest_projected_at: datetime | None = None
         self._last_loss_scan_warning_at: float | None = None
         self._suppressed_loss_scan_warning_count = 0
+        # The per-process active-version cache and the monotonic instant it was
+        # filled. ``None`` means "not read yet", which is deliberately not the
+        # same as "read and found nothing" — the latter is an empty dict, and
+        # an empty table is a complete answer (every component at its code
+        # default). See ``get_active_versions`` for the staleness contract.
+        self._active_version_cache: dict[tuple[str, str], _ActiveVersionRecord] | None = None
+        self._active_version_cache_at: float = 0.0
         self._context_metrics = {
             "snapshot_count": 0,
             "snapshot_item_count": 0,
@@ -2380,13 +2483,479 @@ class SqlAnsichBackend:
         """
 
         snapshot = await self._database_projection_snapshot()
+        # A second read rather than a column on the snapshot: the snapshot's
+        # other consumer (`_refresh_active_task_read_model`) has no use for
+        # this, and the read is served from the per-process cache for all but
+        # one call in `ACTIVE_VERSION_CACHE_TTL_SECONDS`. A raise here reaches
+        # `AnsichService.get_database_health`'s blanket handler and answers
+        # `unreachable` with every field `None`, `active_versions` included —
+        # which is the honest answer and the one Constraint 2 requires.
+        active_versions = await self.get_active_versions()
         return DatabaseHealth(
             status="reachable",
             projectors=snapshot.projectors,
             lag_ms=snapshot.lag_ms,
             failed_jobs=snapshot.failed_jobs,
             stale_completion_count=self._stale_completion_count,
+            active_versions=active_versions,
         )
+
+    # ------------------------------------------------------------------
+    # Active versions (spec §5, plan ruling RC5)
+    # ------------------------------------------------------------------
+
+    def invalidate_active_version_cache(self) -> None:
+        """Drop this process's cached active-version map.
+
+        Called by ``activate_version`` after its transaction commits, so the
+        writing process never reads its own switch as not-yet-taken. It is a
+        separate public method rather than an inlined assignment because a test
+        (and a future operator tool) needs to force a re-read without writing.
+        """
+
+        self._active_version_cache = None
+        self._active_version_cache_at = 0.0
+
+    async def _active_version_overrides(
+        self,
+        session: AsyncSession,
+    ) -> dict[tuple[str, str], _ActiveVersionRecord]:
+        """The active-version rows, cached per process for a bounded interval.
+
+        Reads through the caller's ``session`` when the cache is cold or stale,
+        so a consult that is already inside a transaction (the Belief resolver's
+        is) costs no second connection.
+
+        **What the cache means across workers, stated exactly.** The cache is
+        per process. A switch is visible immediately in the process that made
+        it (``activate_version`` invalidates its own cache in the same call),
+        and in every *other* worker no later than
+        ``ACTIVE_VERSION_CACHE_TTL_SECONDS`` after that worker's last read —
+        "its next read cycle" being the first consult that finds the entry
+        expired and re-queries. Between those two moments two workers of one
+        deployment legitimately run **different** versions of the same
+        component.
+
+        That window is accepted rather than closed, and the reason it is
+        tolerable is that it is *recorded*: every resolution stamps the resolver
+        that selected it into ``ansich_current_beliefs.resolver_name/_version``,
+        so a Belief written during the split says which version wrote it, and
+        an operator comparing two rows sees the switch rather than inferring it.
+        The alternatives were worse — a per-read query puts a round trip on the
+        Belief write path, and a cache with no expiry would leave every worker
+        that did not perform the switch on the old version until it restarted,
+        which is the failure mode ruling RC5 rejected config for in the first
+        place.
+
+        A ``None`` cache means "not read yet"; an empty dict means "read, and
+        the table is empty", which is a complete answer (every component at its
+        code default) and is cached like any other.
+        """
+
+        now = time.monotonic()
+        cached = self._active_version_cache
+        if cached is not None and now - self._active_version_cache_at < ACTIVE_VERSION_CACHE_TTL_SECONDS:
+            return cached
+        rows = list((await session.execute(select(AnsichActiveVersionRow))).scalars())
+        overrides = {
+            (row.component_kind, row.component_name): _ActiveVersionRecord(
+                active_version=row.active_version,
+                activated_at=_as_utc(row.activated_at),
+                activated_by=row.activated_by,
+                audit_obs_id=row.audit_obs_id,
+                audit_recorded=bool(row.audit_recorded),
+            )
+            for row in rows
+        }
+        self._active_version_cache = overrides
+        self._active_version_cache_at = now
+        return overrides
+
+    @staticmethod
+    def _active_version_view(
+        *,
+        component_kind: str,
+        component_name: str,
+        code_default: str,
+        record: _ActiveVersionRecord | None,
+    ) -> ActiveVersion:
+        """One component's entry, absent row included.
+
+        The absent case is the whole point of the table's design and is
+        rendered rather than skipped: no row means the code default runs, and
+        every timestamp/actor/evidence field is ``None`` because nobody
+        activated anything — never epoch-zero, never ``"system"``.
+        """
+
+        if record is None:
+            return ActiveVersion(
+                component_kind=cast(Literal["projector", "resolver"], component_kind),
+                component_name=component_name,
+                active_version=code_default,
+                code_default_version=code_default,
+                origin="code_default",
+            )
+        # The latch and the pointer are read together, exactly as the model's
+        # contract table says. `audit_recorded and audit_obs_id is None` is the
+        # one combination that needs a column to be legible at all.
+        origin: ActiveVersionOrigin
+        if not record.audit_recorded:
+            origin = "activated_unaudited"
+        elif record.audit_obs_id is None:
+            origin = "activated_expired"
+        else:
+            origin = "activated_audited"
+        return ActiveVersion(
+            component_kind=cast(Literal["projector", "resolver"], component_kind),
+            component_name=component_name,
+            active_version=record.active_version,
+            code_default_version=code_default,
+            origin=origin,
+            activated_at=record.activated_at,
+            activated_by=record.activated_by,
+            audit_obs_id=record.audit_obs_id,
+        )
+
+    def _merge_active_versions(
+        self,
+        overrides: Mapping[tuple[str, str], _ActiveVersionRecord],
+    ) -> tuple[ActiveVersion, ...]:
+        """Every component this build knows, at whatever version it runs.
+
+        Driven by the **code registry**, not by the rows: a component with no
+        row is an entry at its code default, and a row for a component the code
+        no longer knows is deliberately *not* an entry here. That second
+        omission is not a silent drop — ``validate_active_versions`` is the
+        surface that reports it, and reporting it as a health entry would mean
+        inventing a ``code_default_version`` for a component that has none.
+        """
+
+        registry = _active_version_registry()
+        entries = [
+            self._active_version_view(
+                component_kind=component_kind,
+                component_name=component_name,
+                code_default=code_default,
+                record=overrides.get((component_kind, component_name)),
+            )
+            for (component_kind, component_name), (_versions, code_default) in registry.items()
+        ]
+        kind_order = {kind: index for index, kind in enumerate(ACTIVE_VERSION_COMPONENT_KINDS)}
+        entries.sort(key=lambda entry: (kind_order.get(entry.component_kind, len(kind_order)), entry.component_name))
+        return tuple(entries)
+
+    async def get_active_versions(self) -> tuple[ActiveVersion, ...]:
+        """Which version of every versioned component this store says runs.
+
+        Always the full list, never only the rows: see
+        :meth:`_merge_active_versions`. Reads through the per-process cache,
+        with the staleness contract written at :meth:`_active_version_overrides`
+        — a caller that needs the store's answer *now* (an operator tool, a
+        test) calls :meth:`invalidate_active_version_cache` first.
+        """
+
+        async with self._session_factory() as session:
+            overrides = await self._active_version_overrides(session)
+        return self._merge_active_versions(overrides)
+
+    async def _active_resolver(self, session: AsyncSession) -> NamedVersion:
+        """The Belief resolver this store's current selection says to use.
+
+        Absent row ⇒ ``DEFAULT_RESOLVER``, which is the code default and the
+        constant every caller passed before this row existed.
+
+        **Fail-open on a version this build cannot execute**, deliberately.
+        ``resolve_current_belief`` raises on an unknown resolver version, and
+        that raise would land inside an assessor's transaction — turning one
+        stale row into a Task-wide Belief-write failure across every subject,
+        for as long as the row stands. Falling back to the code default keeps
+        Beliefs being written and keeps them honest, because the resolver that
+        actually selected each one is stamped into the current-Belief row. The
+        row is not ignored quietly: the fallback logs, and
+        :meth:`validate_active_versions` reports the same row at every start.
+
+        The write side refuses such a version outright, so reaching this branch
+        means the build changed under a row that was legal when it was written
+        — a rollback, most likely — which is a deployment fact this process
+        cannot fix by crashing.
+        """
+
+        overrides = await self._active_version_overrides(session)
+        record = overrides.get(("resolver", RESOLVER_COMPONENT_NAME))
+        if record is None:
+            return DEFAULT_RESOLVER
+        resolver = _known_resolver_versions().get(record.active_version)
+        if resolver is None:
+            logger.warning(
+                "Ansich active resolver version %s is not known to this build; falling back to %s",
+                record.active_version,
+                DEFAULT_RESOLVER.version,
+            )
+            return DEFAULT_RESOLVER
+        return resolver
+
+    def _validate_activation_request(
+        self,
+        *,
+        component_kind: str,
+        component_name: str,
+        version: str,
+    ) -> None:
+        """Refuse an activation this build could not honour, before any write.
+
+        The three refusals are asked in the order their remedies differ — a bad
+        kind is a different mistake from a bad name, which is a different
+        mistake from a version this deploy cannot run — and each carries the
+        typed reason rather than prose, so the CLI maps it to an exit code.
+        """
+
+        registry = _active_version_registry()
+        if component_kind not in ACTIVE_VERSION_COMPONENT_KINDS:
+            raise ActiveVersionError(
+                f"unknown component kind {component_kind!r}; this build versions {', '.join(ACTIVE_VERSION_COMPONENT_KINDS)}",
+                reason="unknown_component_kind",
+                component_kind=component_kind,
+                component_name=component_name,
+                version=version,
+            )
+        entry = registry.get((component_kind, component_name))
+        if entry is None:
+            known = ", ".join(sorted(name for kind, name in registry if kind == component_kind))
+            raise ActiveVersionError(
+                f"unknown {component_kind} {component_name!r}; this build knows: {known}",
+                reason="unknown_component",
+                component_kind=component_kind,
+                component_name=component_name,
+                version=version,
+            )
+        versions, _code_default = entry
+        if version not in versions:
+            raise ActiveVersionError(
+                f"{component_kind} {component_name} has no version {version!r} in this build; known versions: {', '.join(versions)}",
+                reason="unknown_version",
+                component_kind=component_kind,
+                component_name=component_name,
+                version=version,
+            )
+
+    @staticmethod
+    def _activation_observation(
+        *,
+        component_kind: str,
+        component_name: str,
+        version: str,
+        actor: str,
+        activation_id: str,
+        occurred_at: datetime,
+    ) -> ObservationEnvelope:
+        """The ``operator.action_succeeded`` row that audits one switch.
+
+        **Subjected to the bootstrap Task sentinel**, not to a host ``Scope``,
+        and that is a deliberate choice between two imperfect options. An
+        activation is a process-level fact with no Task, which is the shape
+        ``observability.lost`` files against the host Scope — but a Scope
+        *subject* is only honest when the Scope entity exists, and
+        ``AnsichService.host_scope_id``'s own docstring says addressing it is
+        not the same as it being there. The writer here is a short-lived CLI
+        process that never runs the collector's bootstrap mint, so it would be
+        writing an audit row subjected to an entity it did not check for and
+        cannot create. ``ANSICH_BOOTSTRAP_TASK_ID`` states "this Observation
+        has no Task entity" explicitly and is legal precisely because
+        ``ansich_observations.task_id`` carries no foreign key.
+
+        Nothing Task-scoped follows from it: ``operator.action_*`` is in no
+        projector's kind list, so no projection job is minted, and
+        ``_assessors_for_observation`` refuses the whole assessor family for
+        the sentinel. So this row creates no job below any continuity mark and
+        the PB7 read-model delete (Global Constraint 4) does not apply.
+
+        ``source_event_id`` follows the operator-action idempotency shape and
+        is **unique per activation** rather than per component: re-activating
+        the same version is a second deliberate action and deserves its own
+        audit row, so the activation id is in the key. Making it deterministic
+        per ``(component, version)`` would have the producer dedupe silently
+        absorb the second switch and leave the row's ``activated_at`` pointing
+        at an Observation that describes the first.
+        """
+
+        return ObservationEnvelope(
+            kind="operator.action_succeeded",
+            occurred_at=occurred_at,
+            recorded_at=occurred_at,
+            task_id=ANSICH_BOOTSTRAP_TASK_ID,
+            subject_type="task",
+            subject_id=ANSICH_BOOTSTRAP_TASK_ID,
+            producer=Producer(
+                name="ansich-active-version",
+                version="1",
+                instance_id=actor[:128],
+            ),
+            source_event_id=f"active-version:{component_kind}:{component_name}:{version}:{activation_id}",
+            correlation_id=activation_id,
+            payload={
+                "action_type": "activate_version",
+                "status": "succeeded",
+                "component_kind": component_kind,
+                "component_name": component_name,
+                "active_version": version,
+                "actor": actor,
+                "activation_id": activation_id,
+            },
+        )
+
+    async def activate_version(
+        self,
+        *,
+        component_kind: str,
+        component_name: str,
+        version: str,
+        actor: str,
+    ) -> ActiveVersion:
+        """Record which version of one component is authoritative, audited.
+
+        The **only** writer of ``ansich_active_versions`` (plan ruling RC5).
+        Validation happens first and refuses with a typed
+        :class:`~ansich.errors.ActiveVersionError` before anything is written,
+        so a bad request costs nothing.
+
+        **The row and its audit Observation are written in one transaction**,
+        and that is the property to preserve above any other here. A crash
+        between them must leave *neither*: a row with no audit is an
+        unaccountable version switch (the state this whole design exists to
+        prevent), and an audit with no row is an audit of something that did
+        not happen. One ``session.begin()`` covers both, so the kill window is
+        the commit itself.
+
+        **The pointer and the latch are set together**, per
+        ``AnsichActiveVersionRow``'s contract: ``audit_recorded=True`` in the
+        same statement that sets ``audit_obs_id``. The latch is never unset by
+        anyone, which is what lets a later ``NULL`` pointer mean "the evidence
+        aged out" rather than "there never was any". The schema's CHECK forbids
+        a pointer without a latch; it structurally cannot forbid a latch
+        without a pointer (a legitimately expired row is exactly that), so
+        *never writing that combination* is this method's obligation and is
+        pinned by a test rather than by the database.
+
+        **Re-activation is an UPSERT and overwrites in place.** The table is a
+        current-selection map keyed by ``(kind, name)``, not a history: the
+        history is the audit Observation stream, which is append-only, so a
+        second activation replaces the pointer, the timestamp and the actor and
+        mints a **new** Observation beside the old one. Nothing is lost that
+        was not already duplicated.
+        """
+
+        self._validate_activation_request(
+            component_kind=component_kind,
+            component_name=component_name,
+            version=version,
+        )
+        # An anonymous switch is not an audited one, and the actor is carried
+        # in two places (the row and the Observation's producer identity), so
+        # it is checked here rather than left to `Producer`'s `min_length` —
+        # which would refuse it too, with a message about a field the caller
+        # never named.
+        actor = actor.strip()
+        if not actor:
+            raise ValueError("an active-version switch needs an actor; an unattributed switch is not an audited one")
+        activation_id = new_id()
+        occurred_at = datetime.now(UTC)
+        observation = self._activation_observation(
+            component_kind=component_kind,
+            component_name=component_name,
+            version=version,
+            actor=actor,
+            activation_id=activation_id,
+            occurred_at=occurred_at,
+        )
+        async with self._session_factory() as session, session.begin():
+            self._add_observation_row(session, observation)
+            # Flush the Observation before the row that points at it: the FK is
+            # `ON DELETE SET NULL` against `ansich_observations.obs_id`, and an
+            # autoflush ordering that inserted the pointer first would violate
+            # it on any connection with foreign keys enforced.
+            await session.flush()
+            existing = await session.get(AnsichActiveVersionRow, (component_kind, component_name))
+            if existing is None:
+                session.add(
+                    AnsichActiveVersionRow(
+                        component_kind=component_kind,
+                        component_name=component_name,
+                        active_version=version,
+                        activated_at=occurred_at,
+                        activated_by=actor,
+                        audit_obs_id=observation.obs_id,
+                        audit_recorded=True,
+                    )
+                )
+            else:
+                existing.active_version = version
+                existing.activated_at = occurred_at
+                existing.activated_by = actor
+                existing.audit_obs_id = observation.obs_id
+                existing.audit_recorded = True
+            await session.flush()
+        # After the commit, never before: a cache dropped inside the
+        # transaction would be refilled by a concurrent read in this process
+        # with the pre-commit state and then trusted for the whole TTL.
+        self.invalidate_active_version_cache()
+        _versions, code_default = _active_version_registry()[(component_kind, component_name)]
+        return self._active_version_view(
+            component_kind=component_kind,
+            component_name=component_name,
+            code_default=code_default,
+            record=_ActiveVersionRecord(
+                active_version=version,
+                activated_at=occurred_at,
+                activated_by=actor,
+                audit_obs_id=observation.obs_id,
+                audit_recorded=True,
+            ),
+        )
+
+    async def validate_active_versions(self) -> tuple[ActiveVersionMismatch, ...] | None:
+        """Every stored row this build can no longer honour. Never raises.
+
+        Consumed by ``start()``'s validation step (D8-5). It is a **report**,
+        not a gate: each mismatch already has a working fallback at the read
+        (the code default), so the caller decides whether that warrants a log,
+        a health degradation, or nothing. Raising here would turn a rolled-back
+        deploy into a process that will not start.
+
+        ``None`` is the third answer and is not the same as ``()``: it means
+        the rows could not be read at all, so nothing is claimed either way.
+        ``()`` means the rows were read and every one of them is honourable.
+        Collapsing the two would report an unreadable store as a clean one at
+        exactly the moment a caller is deciding whether the deployment is sound.
+        """
+
+        try:
+            async with self._session_factory() as session:
+                rows = list((await session.execute(select(AnsichActiveVersionRow))).scalars())
+        except Exception:
+            logger.warning("Ansich active-version validation could not read the store", exc_info=True)
+            return None
+        registry = _active_version_registry()
+        mismatches: list[ActiveVersionMismatch] = []
+        for row in sorted(rows, key=lambda item: (item.component_kind, item.component_name)):
+            if row.component_kind not in ACTIVE_VERSION_COMPONENT_KINDS:
+                reason: Literal["unknown_component_kind", "unknown_component", "unknown_version"] = "unknown_component_kind"
+            else:
+                entry = registry.get((row.component_kind, row.component_name))
+                if entry is None:
+                    reason = "unknown_component"
+                elif row.active_version not in entry[0]:
+                    reason = "unknown_version"
+                else:
+                    continue
+            mismatches.append(
+                ActiveVersionMismatch(
+                    component_kind=row.component_kind,
+                    component_name=row.component_name,
+                    active_version=row.active_version,
+                    reason=reason,
+                )
+            )
+        return tuple(mismatches)
 
     async def _database_projection_snapshot(self) -> _DatabaseProjectionSnapshot:
         """The one query set behind both the health block and the read-model stamp.
@@ -4646,7 +5215,21 @@ class SqlAnsichBackend:
                     }
                 )
             )
-        resolved = resolve_current_belief(assertions, resolver=DEFAULT_RESOLVER)
+        # The one live consult of the active-version row (RC5). Absent row ⇒
+        # `DEFAULT_RESOLVER`, which is the constant this line passed before the
+        # row existed, so a store with an empty table behaves identically.
+        #
+        # **The projector half of "active" is deliberately not consulted
+        # anywhere in live ingest.** `project_pending`'s dispatch branches on
+        # `projector_name` alone and is blind to the version (T3's recorded
+        # fact), and `persist_and_project` fans a new Observation out to
+        # `_PROJECTORS` — the live registry — not to whatever a row selects.
+        # So an activated projector version is consumed today by replay and by
+        # §9 reporting, and by nothing on the ingest path. Wiring it in here
+        # would be a much larger change than a row lookup: it would have to
+        # teach the dispatch to discriminate first, or every switch would
+        # silently keep running v1 while claiming v2.
+        resolved = resolve_current_belief(assertions, resolver=await self._active_resolver(session))
         current = await session.get(
             AnsichCurrentBeliefRow,
             (subject_id, field_name),

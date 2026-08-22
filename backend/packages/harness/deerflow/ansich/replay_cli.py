@@ -44,6 +44,23 @@ same collision, so the defect is named on stderr before the pass and again
 beside a non-clean report. It is a warning rather than a refusal because the
 same command is correct on a store where those Observations have never been
 projected.
+
+**Two subcommands stand beside the replay**, and they are here rather than on a
+route for the same reason the replay is (spec §5): they are deliberate operator
+actions from a shell, not something a request should trigger.
+
+* ``activate --component-kind K --component-name N --version V --actor WHO`` is
+  the **only** writer of ``ansich_active_versions``. It refuses an unknown
+  kind, name or version before writing anything, and writes the selection row
+  and its audit Observation in one transaction — spec §5's "explicit,
+  audited management action" is that pairing, not the row alone. Exit ``0`` on
+  success, ``2`` on refusal or an unavailable store.
+* ``versions`` lists, read-only, every versioned component this build knows:
+  what is active now (a row, or the code default when there is none), the code
+  default, and the versions this build can execute.
+
+An absent row means the code default, so ``activate`` records *deviations* and
+an empty table is a complete answer rather than a missing one.
 """
 
 from __future__ import annotations
@@ -54,16 +71,27 @@ import json
 import sys
 from datetime import UTC, datetime
 
-from ansich import ReplayReport, ReplaySelector
-from ansich.errors import ReplayTargetError
+from ansich import ActiveVersion, ReplayReport, ReplaySelector
+from ansich.errors import ActiveVersionError, ReplayTargetError
 from pydantic import ValidationError
 
-from deerflow.ansich.persistence.sql import _NON_IDEMPOTENT_PROJECTORS, SqlAnsichBackend
+from deerflow.ansich.persistence.sql import (
+    _NON_IDEMPOTENT_PROJECTORS,
+    ACTIVE_VERSION_COMPONENT_KINDS,
+    SqlAnsichBackend,
+    _active_version_registry,
+)
 from deerflow.ansich.replay import DEFAULT_MAX_ROUNDS, execute_replay, plan_replay
 from deerflow.config import get_app_config
 from deerflow.persistence.engine import close_engine, get_session_factory, init_engine_from_config
 
-__all__ = ["build_parser", "exit_code", "main", "selector_from_args"]
+__all__ = [
+    "build_parser",
+    "exit_code",
+    "main",
+    "render_versions",
+    "selector_from_args",
+]
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -71,8 +99,15 @@ def build_parser() -> argparse.ArgumentParser:
         prog="python -m deerflow.ansich.replay_cli",
         description="Re-derive one Ansich projector's read models over a slice of Observation history.",
     )
-    parser.add_argument("--projector", required=True, help="Projector name to replay, e.g. task-step")
-    parser.add_argument("--version", required=True, help="Projector version this build should run")
+    # `--projector`/`--version` are **not** `required=True` even though a
+    # replay needs both. Subcommands share this parser, and argparse enforces a
+    # top-level required option before it ever reaches the subparser, so
+    # `activate ...` would be refused for missing `--projector`. The
+    # requirement is therefore checked in `main` for the replay path only,
+    # which keeps `python -m ... --projector X --version 1` working exactly as
+    # before and lets the subcommands stand beside it.
+    parser.add_argument("--projector", help="Projector name to replay, e.g. task-step")
+    parser.add_argument("--version", help="Projector version this build should run")
     parser.add_argument("--task-id", help="Restrict the target set to one Task")
     parser.add_argument("--occurred-from", help="ISO-8601 start of an occurred_at window (naive values are read as UTC)")
     parser.add_argument("--occurred-to", help="ISO-8601 end of an occurred_at window")
@@ -86,6 +121,29 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--max-rounds", type=int, default=DEFAULT_MAX_ROUNDS, help="Bounded drain-then-recount rounds before reporting what is still owed")
     parser.add_argument("--format", choices=["json", "text"], default="json")
+
+    subcommands = parser.add_subparsers(dest="command")
+    activate = subcommands.add_parser(
+        "activate",
+        help="Record which version of one versioned component is authoritative, and audit the switch.",
+        description=(
+            "Switch a versioned component's active version. This is the ONLY writer of the active-version row: "
+            "the row and its audit Observation are written in one transaction, so a switch is never unaccounted for. "
+            "An absent row means the code default, so this command records deviations from it."
+        ),
+    )
+    activate.add_argument("--component-kind", required=True, choices=list(ACTIVE_VERSION_COMPONENT_KINDS), help="Which family of versioned component to switch")
+    activate.add_argument("--component-name", required=True, help="The component's name, e.g. task-step or ansich-default")
+    activate.add_argument("--version", required=True, help="The version to make authoritative; refused unless this build knows it")
+    activate.add_argument("--actor", required=True, help="Who is taking this action; recorded on the row and in the audit Observation")
+    activate.add_argument("--format", choices=["json", "text"], default="json")
+
+    versions = subcommands.add_parser(
+        "versions",
+        help="List what is active now, what the code default is, and which versions this build can execute.",
+        description=("Read-only. Lists every versioned component this build knows: the version currently active (a stored row, or the code default when there is none), the code default itself, and the executable set."),
+    )
+    versions.add_argument("--format", choices=["json", "text"], default="json")
     return parser
 
 
@@ -214,8 +272,119 @@ async def run(args: argparse.Namespace, selector: ReplaySelector) -> ReplayRepor
         await close_engine()
 
 
+def render_versions(active: tuple[ActiveVersion, ...], *, output_format: str) -> str:
+    """The ``versions`` listing: what runs, what would run, what could run.
+
+    Three columns rather than one because they answer three different
+    questions, and an operator about to switch something needs all three: the
+    active version (with where it came from), the code default that a row's
+    absence would fall back to, and the executable set an ``activate`` would be
+    checked against. A row whose ``origin`` is ``code_default`` is marked as
+    such rather than being rendered identically to a row that deliberately
+    activated the same version.
+    """
+
+    registry = _active_version_registry()
+    rows = [
+        {
+            "component_kind": entry.component_kind,
+            "component_name": entry.component_name,
+            "active_version": entry.active_version,
+            "code_default_version": entry.code_default_version,
+            "origin": entry.origin,
+            "activated_at": None if entry.activated_at is None else entry.activated_at.isoformat(),
+            "activated_by": entry.activated_by,
+            "audit_obs_id": entry.audit_obs_id,
+            "known_versions": list(registry[(entry.component_kind, entry.component_name)][0]),
+        }
+        for entry in active
+    ]
+    if output_format == "json":
+        return json.dumps({"components": rows}, indent=2, sort_keys=True)
+    lines = []
+    for row in rows:
+        marker = " (code default)" if row["origin"] == "code_default" else f" ({row['origin']}, by {row['activated_by']})"
+        lines.append(f"{row['component_kind']}/{row['component_name']}: {row['active_version']}{marker}")
+        lines.append(f"    code default: {row['code_default_version']}    known: {', '.join(row['known_versions'])}")
+    return "\n".join(lines)
+
+
+async def run_activate(args: argparse.Namespace) -> ActiveVersion:
+    """Open the store, write the switch and its audit together, close it again."""
+
+    config = get_app_config()
+    await init_engine_from_config(config.database)
+    try:
+        session_factory = get_session_factory()
+        if session_factory is None:
+            raise RuntimeError("Ansich version activation needs a SQL database; `database.backend: memory` stores no active-version row")
+        backend = SqlAnsichBackend(session_factory)
+        return await backend.activate_version(
+            component_kind=args.component_kind,
+            component_name=args.component_name,
+            version=args.version,
+            actor=args.actor,
+        )
+    finally:
+        await close_engine()
+
+
+async def run_versions(_args: argparse.Namespace) -> tuple[ActiveVersion, ...]:
+    """Read the current selection, code defaults included."""
+
+    config = get_app_config()
+    await init_engine_from_config(config.database)
+    try:
+        session_factory = get_session_factory()
+        if session_factory is None:
+            raise RuntimeError("Ansich version listing needs a SQL database; `database.backend: memory` stores no active-version row")
+        return await SqlAnsichBackend(session_factory).get_active_versions()
+    finally:
+        await close_engine()
+
+
+def _main_activate(args: argparse.Namespace) -> int:
+    try:
+        activated = asyncio.run(run_activate(args))
+    except ActiveVersionError as error:
+        print(f"activation refused ({error.reason}): {error}", file=sys.stderr)
+        return 2
+    except RuntimeError as error:
+        print(f"activation unavailable: {error}", file=sys.stderr)
+        return 2
+    if args.format == "json":
+        print(json.dumps(activated.model_dump(mode="json"), indent=2, sort_keys=True))
+    else:
+        print(f"activated:  {activated.component_kind}/{activated.component_name} -> {activated.active_version}")
+        print(f"code default: {activated.code_default_version}")
+        print(f"origin:     {activated.origin}")
+        print(f"audit:      {activated.audit_obs_id or '(none)'}")
+    return 0
+
+
+def _main_versions(args: argparse.Namespace) -> int:
+    try:
+        active = asyncio.run(run_versions(args))
+    except RuntimeError as error:
+        print(f"version listing unavailable: {error}", file=sys.stderr)
+        return 2
+    print(render_versions(active, output_format=args.format))
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
+    command = getattr(args, "command", None)
+    if command == "activate":
+        return _main_activate(args)
+    if command == "versions":
+        return _main_versions(args)
+    # The replay path. Its two arguments are checked here rather than through
+    # `required=True` so the subcommands above can be reached at all; see
+    # `build_parser`.
+    if not args.projector or not args.version:
+        print("replay needs --projector and --version (or use a subcommand: activate, versions)", file=sys.stderr)
+        return 2
     try:
         selector = selector_from_args(args)
     except (ValidationError, ValueError) as error:

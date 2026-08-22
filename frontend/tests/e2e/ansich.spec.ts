@@ -1951,6 +1951,28 @@ const DATABASE_HEALTH = {
   lag_ms: 1_200,
   failed_jobs: 1_234,
   stale_completion_count: 7,
+  active_versions: [
+    {
+      component_kind: "projector",
+      component_name: "task-structural",
+      active_version: "1",
+      code_default_version: "1",
+      origin: "code_default",
+      activated_at: null,
+      activated_by: null,
+      audit_obs_id: null,
+    },
+    {
+      component_kind: "resolver",
+      component_name: "ansich-default",
+      active_version: "1.0.0",
+      code_default_version: "2.0.0",
+      origin: "activated_audited",
+      activated_at: "2026-08-22T09:00:00Z",
+      activated_by: "operator@example.com",
+      audit_obs_id: "3f2504e0-4f89-41d3-9a0c-0305e82c3301",
+    },
+  ],
 };
 
 test("operations observability lens reports the store's own projection ledger", async ({
@@ -2060,6 +2082,7 @@ test("observability lens renders an unreadable store as unknown, never as zero",
           lag_ms: null,
           failed_jobs: null,
           stale_completion_count: null,
+          active_versions: null,
         },
       }),
     }),

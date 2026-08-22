@@ -477,6 +477,17 @@ export interface Translations {
       collectorStatus: string;
       processFailedJobs: string;
       processLag: string;
+      activeVersions: string;
+      component: string;
+      activeVersion: string;
+      codeDefaultVersion: string;
+      activeVersionsUnknown: string;
+      activeVersionOrigin: {
+        code_default: string;
+        activated_audited: string;
+        activated_expired: string;
+        activated_unaudited: string;
+      };
       metricDescriptions: {
         databaseLag: string;
         databaseFailedJobs: string;
@@ -487,6 +498,7 @@ export interface Translations {
         collectorStatus: string;
         processFailedJobs: string;
         processLag: string;
+        activeVersions: string;
       };
     };
     snapshotRequests: string;
