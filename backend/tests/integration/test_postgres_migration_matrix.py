@@ -475,15 +475,34 @@ async def test_the_0028_downgrade_refuses_a_referenced_tombstone_on_postgres() -
                 )
             )
 
-        with pytest.raises(RuntimeError, match="still referenced"):
+        # A second referrer on the SAME payload: the refusal counts blocked
+        # payloads, not references, so this must not change the number.
+        async with engine.begin() as conn:
+            await conn.execute(
+                sa.text(
+                    "INSERT INTO ansich_observations (obs_id, schema_version, kind, occurred_at, recorded_at, task_id, subject_type, subject_id, "
+                    "fidelity_class, producer_name, producer_version, producer_instance_id, producer_seq, source_event_id, correlation_id, payload_ref_id) "
+                    "VALUES ('obs-pg-ref-2', 1, 'operator.action_succeeded', now(), now(), 'task-pg-ref', 'scope', 'scope-pg-ref', 'hard', "
+                    "'test-retention', '1', 'test-instance', 2, 'source:obs-pg-ref-2', 'corr:obs-pg-ref-2', 'payload-pg-referenced')"
+                )
+            )
+            # State a retention pass would have earned, so the survival
+            # assertions below have something real to be about.
+            await conn.execute(sa.text("INSERT INTO ansich_retention_state (id, observation_horizon_ingest_seq) VALUES (1, 4242)"))
+
+        with pytest.raises(RuntimeError, match=r"1 tombstoned payload row\(s\)"):
             await _downgrade(engine, PRE_RETENTION_REVISION)
 
-        # The refusal aborts the migration transaction, so nothing was lost and
-        # the schema is still at head.
+        # Nothing was lost and the schema is still at head. On this dialect the
+        # transaction would have covered it anyway; the guard runs before any
+        # destructive statement because SQLite's DDL autocommits and would not.
         assert await _alembic_version(engine) == _get_head_revision()
+        assert {"ansich_retention_state", "ansich_active_versions"} <= await _table_names(engine)
         async with engine.connect() as conn:
             remaining = (await conn.execute(sa.text("SELECT COUNT(*) FROM ansich_payloads WHERE payload_id = 'payload-pg-referenced'"))).scalar()
+            horizon = (await conn.execute(sa.text("SELECT observation_horizon_ingest_seq FROM ansich_retention_state"))).scalar()
         assert remaining == 1
+        assert horizon == 4242
 
 
 # ---------------------------------------------------------------------------

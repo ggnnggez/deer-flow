@@ -768,8 +768,14 @@ async def test_the_downgrade_refuses_a_referenced_tombstone_on_sqlite(tmp_path: 
     the tool that was supposed to refuse. The pre-flight query is what makes
     both dialects behave the same way.
 
-    The raise aborts the migration transaction, so the refusal is also
-    all-or-nothing: the tombstone is still there afterwards.
+    **And it must run before anything destructive, which is what this test
+    actually pins.** pysqlite opens no transaction for DDL, so a raise is not a
+    rollback here: every statement the downgrade had already issued stays
+    applied. With the guard positioned after the two ``_drop_table`` calls, a
+    refused downgrade permanently destroyed the retention cursors, the deletion
+    horizon and every operator version selection — while reporting that it had
+    changed nothing. So the assertions below are not decoration: they are the
+    difference between a guard and a guard that runs too late.
     """
     engine = create_async_engine(_sqlite_url(tmp_path))
     try:
@@ -794,14 +800,36 @@ async def test_the_downgrade_refuses_a_referenced_tombstone_on_sqlite(tmp_path: 
                     "'test-instance', 1, 'source:obs-ref', 'corr:obs-ref', 'payload-referenced')"
                 )
             )
+            # State a retention pass would have earned: a horizon that is not 0,
+            # and an operator's version selection with its audit latch.
+            await conn.execute(sa.text("INSERT INTO ansich_retention_state (id, observation_horizon_ingest_seq, payload_cursor) VALUES (1, 4242, 'payload-cursor-1')"))
+            await conn.execute(
+                sa.text(
+                    "INSERT INTO ansich_active_versions (component_kind, component_name, active_version, activated_at, activated_by, audit_recorded) "
+                    "VALUES ('resolver', 'ansich-default', '2.0.0', '2026-08-22 12:00:00+00:00', 'operator@example.com', 1)"
+                )
+            )
 
         with pytest.raises(RuntimeError, match="still referenced"):
             await asyncio.to_thread(alembic_command.downgrade, cfg, PRE_RETENTION_REVISION)
 
         # Nothing was destroyed on the way to the refusal.
+        tables = await _table_names(engine)
+        assert "ansich_retention_state" in tables, "a refused downgrade must not drop the retention state"
+        assert "ansich_active_versions" in tables, "a refused downgrade must not drop operator version selections"
+
         async with engine.connect() as conn:
             remaining = (await conn.execute(sa.text("SELECT COUNT(*) FROM ansich_payloads WHERE payload_id = 'payload-referenced'"))).scalar()
+            state = (await conn.execute(sa.text("SELECT observation_horizon_ingest_seq, payload_cursor FROM ansich_retention_state"))).one()
+            active = (await conn.execute(sa.text("SELECT active_version, audit_recorded FROM ansich_active_versions"))).one()
         assert remaining == 1
+        # The horizon in particular: recreating it empty would read as 0 —
+        # "nothing deleted yet" — which is a lie once a pass has run, and one
+        # that makes receipt resolution answer `failed` for expired evidence.
+        assert state.observation_horizon_ingest_seq == 4242
+        assert state.payload_cursor == "payload-cursor-1"
+        assert active.active_version == "2.0.0"
+        assert bool(active.audit_recorded) is True
     finally:
         await engine.dispose()
 

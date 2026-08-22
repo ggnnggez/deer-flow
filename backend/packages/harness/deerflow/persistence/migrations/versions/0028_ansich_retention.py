@@ -36,6 +36,9 @@ makes:
   value in the one place where the difference is the whole question. The check
   forbids the fourth combination (a pointer without the latch).
 
+- One data step, and the reason it is here rather than in code: it deletes
+  every ``ansich_active_task_read_model`` row.
+
 Deploy cost
 -----------
 
@@ -61,8 +64,12 @@ The nullability drop on the same column is catalog-only on PostgreSQL
 (instant); on SQLite both it and the CHECK are one table recreate, which copies
 the table.
 
-- One data step, and the reason it is here rather than in code: it deletes
-  every ``ansich_active_task_read_model`` row.
+A note for the next revision author, because SQLite makes it non-obvious: a
+revision in this chain **can half-apply**. pysqlite opens no transaction for
+DDL, so each statement autocommits there and a later raise leaves the earlier
+ones applied — an alembic revision is atomic on PostgreSQL and is not here. Put
+guards and refusals before the first destructive statement, not after; this
+revision's downgrade is ordered that way for exactly that reason.
 
 The data step (F10-32)
 ----------------------
@@ -273,29 +280,68 @@ def _referenced_tombstone_count() -> int:
 
     A missing referrer table is not an error: this revision can run against a
     database that predates one of them.
+
+    Counts *payloads*, not references: the referrer clauses are OR-ed inside one
+    query rather than summed per table, so a payload two Observations point at is
+    one blocked row and the refusal message says so. Summing would inflate the
+    number an operator then goes looking for.
     """
     inspector = sa.inspect(op.get_bind())
     if not inspector.has_table(_PAYLOADS_TABLE):
         return 0
-    total = 0
-    for table, column in _PAYLOAD_REFERRERS:
-        if not inspector.has_table(table):
-            continue
-        total += (
-            op.get_bind()
-            .execute(
-                sa.text(
-                    f"SELECT COUNT(*) FROM {_PAYLOADS_TABLE} p "  # noqa: S608 -- table/column names are module constants, never input
-                    f"WHERE p.body IS NULL AND EXISTS (SELECT 1 FROM {table} r WHERE r.{column} = p.payload_id)"
-                )
+    present = [(table, column) for table, column in _PAYLOAD_REFERRERS if inspector.has_table(table)]
+    if not present:
+        return 0
+    clauses = " OR ".join(f"EXISTS (SELECT 1 FROM {table} r WHERE r.{column} = p.payload_id)" for table, column in present)
+    return (
+        op.get_bind()
+        .execute(
+            sa.text(
+                f"SELECT COUNT(*) FROM {_PAYLOADS_TABLE} p WHERE p.body IS NULL AND ({clauses})"  # noqa: S608 -- table/column names are module constants, never input
             )
-            .scalar()
-            or 0
         )
-    return total
+        .scalar()
+        or 0
+    )
 
 
 def downgrade() -> None:
+    # THE REFUSAL RUNS FIRST, AND THE ORDER IS THE MECHANISM.
+    #
+    # The pre-0028 schema cannot express an expired payload, so tombstones cannot
+    # survive the downgrade. Deleting them is the honest option — the alternative,
+    # writing an empty body, would resurrect the row as a *readable* payload and
+    # let a reader validate ``{}`` into a verdict the evidence never supported.
+    # Deleting one that something still points at is a different matter, and this
+    # refusal is explicit rather than delegated because the FK only covers one of
+    # the two dialects (see ``_referenced_tombstone_count``).
+    #
+    # What makes the refusal safe is that nothing destructive has happened yet —
+    # NOT transactional rollback, which is exactly what is unavailable here.
+    # pysqlite opens no transaction for DDL, so each statement below autocommits
+    # on SQLite: a raise after the two ``_drop_table`` calls would refuse the
+    # downgrade while having permanently destroyed ``ansich_retention_state``
+    # (every tier cursor and the deletion horizon) and ``ansich_active_versions``
+    # (operator selections and their audit latches), reporting that nothing
+    # changed. Re-upgrading would recreate them empty, and an empty horizon reads
+    # as 0 — "nothing has been deleted yet" — which after a real retention pass
+    # is a lie that makes receipt resolution answer ``failed`` for evidence that
+    # expired under policy.
+    #
+    # So the guard's position is load-bearing on SQLite and merely tidy on
+    # PostgreSQL. The general rule for this chain, which SQLite's DDL autocommit
+    # makes non-obvious: a revision CAN half-apply there, so guards go first and
+    # destructive statements last.
+    referenced = _referenced_tombstone_count()
+    if referenced:
+        raise RuntimeError(
+            f"0028 downgrade refused: {referenced} tombstoned payload row(s) in {_PAYLOADS_TABLE} are still referenced. "
+            "The pre-0028 schema cannot express an expired payload, so downgrading would either drop rows that "
+            "are still pointed at (dangling references) or resurrect them as readable empty payloads. "
+            f"Delete the referring rows in {', '.join(table for table, _ in _PAYLOAD_REFERRERS)} first. "
+            "Nothing has been changed by this attempt."
+        )
+
     # The read-model rows this migration deleted are not restored: they never
     # were a source of record, and the next operations tick republishes them on
     # either side of the downgrade.
@@ -304,27 +350,6 @@ def downgrade() -> None:
 
     if _body_is_nullable() is None:
         return
-
-    # The pre-0028 schema cannot express an expired payload, so tombstones
-    # cannot survive the downgrade. Deleting them is the honest option — the
-    # alternative, writing an empty body, would resurrect the row as a
-    # *readable* payload and let a reader validate ``{}`` into a verdict the
-    # evidence never supported.
-    #
-    # Deleting one that something still points at is a different matter, and
-    # this refusal is explicit rather than delegated because the FK only covers
-    # one of the two dialects (see ``_referenced_tombstone_count``). Raising
-    # here aborts the migration transaction, so the downgrade is all-or-nothing
-    # on both. An operator who genuinely wants it removes the referring rows
-    # first.
-    referenced = _referenced_tombstone_count()
-    if referenced:
-        raise RuntimeError(
-            f"0028 downgrade refused: {referenced} tombstoned row(s) in {_PAYLOADS_TABLE} are still referenced. "
-            "The pre-0028 schema cannot express an expired payload, so downgrading would either drop rows that "
-            "are still pointed at (dangling references) or resurrect them as readable empty payloads. "
-            f"Delete the referring rows in {', '.join(table for table, _ in _PAYLOAD_REFERRERS)} first."
-        )
 
     op.execute(sa.text(f"DELETE FROM {_PAYLOADS_TABLE} WHERE body IS NULL"))
 
