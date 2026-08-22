@@ -179,7 +179,7 @@ async def test_sql_heartbeat_projection_returns_latest_evidence_after_rebuild(tm
         await service.flush_task(task_id)
         heartbeat = await service.get_task_heartbeat(task_id)
         usage = await service.get_task_usage(task_id)
-        await service.rebuild_projections()
+        await service.rebuild_until_settled()
         rebuilt = await service.get_task_heartbeat(task_id)
         rebuilt_usage = await service.get_task_usage(task_id)
     finally:
@@ -791,7 +791,7 @@ async def test_out_of_order_heartbeats_converge_on_the_wall_time_high_water_mark
         await service.flush_task(task_id)
         grouped = await _wall_time_rows_by_pair(session_factory)
         usage = await service.get_task_usage(task_id)
-        await service.rebuild_projections()
+        await service.rebuild_until_settled()
         rebuilt_grouped = await _wall_time_rows_by_pair(session_factory)
         rebuilt_usage = await service.get_task_usage(task_id)
     finally:
@@ -1207,7 +1207,7 @@ async def test_late_spawn_backfill_carries_the_wall_time_high_water_mark(tmp_pat
         await service.flush_task(child_id)
         grouped = await _wall_time_rows_by_pair(session_factory)
         usage = await service.get_task_usage(root_id)
-        await service.rebuild_projections()
+        await service.rebuild_until_settled()
         rebuilt_usage = await service.get_task_usage(root_id)
     finally:
         await service.stop()
@@ -1451,7 +1451,7 @@ def test_wall_time_watermark_migration_matches_a_replayed_projection(tmp_path) -
             )
             await service.flush_task(child_id)
             # From-scratch replay of the same observation stream.
-            await service.rebuild_projections()
+            await service.rebuild_until_settled()
         finally:
             await service.stop()
             await engine.dispose()

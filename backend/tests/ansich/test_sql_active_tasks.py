@@ -212,7 +212,7 @@ async def test_active_task_read_model_materializes_current_action_and_operations
         await service.flush_task(task_id)
         await service.assess_operations(now=started_at + timedelta(seconds=10))
         active = await service.list_active_tasks(owner_id="owner-active")
-        await service.rebuild_projections()
+        await service.rebuild_until_settled()
         rebuilt_active = await service.list_active_tasks(owner_id="owner-active")
 
         service.record(

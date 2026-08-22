@@ -952,7 +952,7 @@ async def test_both_budget_health_writers_store_the_same_value_shape(tmp_path):
         await service.flush_task(task_id)
         # Writer two: the assessor, replayed over the same evidence. Its
         # assertion coexists with the first — losing assertions are retained.
-        await service.rebuild_projections()
+        await service.rebuild_until_settled()
         async with session_factory() as session:
             assertions = list(
                 (

@@ -58,7 +58,7 @@ async def test_sql_budget_projection_preserves_effective_policy_across_rebuild(t
         probe.created()
         await service.flush_task(probe.task_id)
         budgets = await service.get_task_budgets(probe.task_id)
-        await service.rebuild_projections()
+        await service.rebuild_until_settled()
         rebuilt = await service.get_task_budgets(probe.task_id)
     finally:
         await service.stop()
@@ -164,7 +164,7 @@ async def test_sql_budget_health_retains_terminal_overshoot_and_evidence(tmp_pat
         terminal_health = await service.get_task_budget_health(task_id)
         periodic_changes = await service.assess_operations(now=observed_at + timedelta(seconds=3))
         health_after_periodic_assessment = await service.get_task_budget_health(task_id)
-        await service.rebuild_projections()
+        await service.rebuild_until_settled()
         rebuilt_terminal_health = await service.get_task_budget_health(task_id)
     finally:
         await service.stop()

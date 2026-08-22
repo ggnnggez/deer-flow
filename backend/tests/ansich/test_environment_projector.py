@@ -664,7 +664,7 @@ async def test_rebuild_projections_reconstructs_identical_environment_rows(tmp_p
         await service.flush_task(task_id)
         before = await _projection_snapshot(session_factory)
 
-        await service.rebuild_projections()
+        await service.rebuild_until_settled()
         after = await _projection_snapshot(session_factory)
 
         async with session_factory() as session:

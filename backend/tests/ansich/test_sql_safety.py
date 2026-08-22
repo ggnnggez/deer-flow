@@ -1745,7 +1745,7 @@ async def test_first_scope_safety_assessment_and_replay_assess_every_tool_call(t
         async with session_factory() as session:
             cold_start_counts = await _conclusion_counts(session)
 
-        await service.rebuild_projections()
+        await service.rebuild_until_settled()
         async with session_factory() as session:
             replayed_counts = await _conclusion_counts(session)
     finally:

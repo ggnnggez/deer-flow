@@ -189,7 +189,7 @@ async def test_start_mints_a_task_free_host_scope(tmp_path) -> None:
             assert service.host_scope_id == expected_scope_id
             # Settled by replay rather than by waiting on the projector loop:
             # the loop would get there, but only this makes *when* deterministic.
-            await service.rebuild_projections()
+            await service.rebuild_until_settled()
 
             async with session_factory() as session:
                 mint = await session.scalar(select(AnsichObservationRow).where(AnsichObservationRow.kind == "scope.snapshotted"))
@@ -237,7 +237,7 @@ async def test_a_bootstrap_row_enqueues_no_task_scoped_assessor(tmp_path) -> Non
 
     try:
         async with _sql_service(engine) as service:
-            await service.rebuild_projections()
+            await service.rebuild_until_settled()
             health = service.get_health()
 
             async with session_factory() as session:
@@ -320,7 +320,7 @@ async def test_the_mint_converges_with_the_environment_probe_host_scope(tmp_path
                 )
             )
             await service.flush_task(task_id)
-            await service.rebuild_projections()
+            await service.rebuild_until_settled()
 
             async with session_factory() as session:
                 scopes = await session.scalars(select(AnsichScopeRow))
@@ -354,7 +354,7 @@ async def test_rebuild_recreates_the_host_scope_from_the_durable_mint(tmp_path) 
 
     try:
         async with _sql_service(engine) as service:
-            await service.rebuild_projections()
+            await service.rebuild_until_settled()
             async with session_factory() as session:
                 assert await session.get(AnsichScopeRow, scope_id) is not None
 

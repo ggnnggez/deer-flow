@@ -443,7 +443,7 @@ async def test_usage_rolls_up_two_levels_and_backfills_a_late_spawn_without_doub
         )
         root_tasks = await service.list_tasks(root_only=True)
         active_tasks = await service.list_active_tasks()
-        await service.rebuild_projections()
+        await service.rebuild_until_settled()
         rebuilt = await service.get_task_usage(root_id)
     finally:
         await service.stop()

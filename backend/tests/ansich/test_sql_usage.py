@@ -69,7 +69,7 @@ async def test_sql_usage_is_idempotent_and_preserves_unknown_token_dimensions(tm
         await service.flush_task(task_id)
 
         usage = await service.get_task_usage(task_id)
-        await service.rebuild_projections()
+        await service.rebuild_until_settled()
         rebuilt = await service.get_task_usage(task_id)
     finally:
         await service.stop()
@@ -386,7 +386,7 @@ async def test_sql_usage_counts_one_tool_execution_across_started_and_terminal_e
         )
         await service.flush_task(task_id)
         usage = await service.get_task_usage(task_id)
-        await service.rebuild_projections()
+        await service.rebuild_until_settled()
         rebuilt = await service.get_task_usage(task_id)
     finally:
         await service.stop()
