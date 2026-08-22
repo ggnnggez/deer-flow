@@ -475,16 +475,20 @@ async def test_the_0028_downgrade_refuses_a_referenced_tombstone_on_postgres() -
                 )
             )
 
-        # A second referrer on the SAME payload: the refusal counts blocked
-        # payloads, not references, so this must not change the number.
+        # A second referrer on the same payload, from a DIFFERENT referrer table.
+        # That distinction is the whole pin: the refusal counts blocked payloads,
+        # not references, and the per-table sum it replaced already collapsed two
+        # rows in ONE table to 1 -- so a second `ansich_observations` row would
+        # have discriminated nothing. Across two tables the old form counts 2 and
+        # the current one counts 1. `ansich_content_blobs` satisfies its own
+        # inline_body/payload_ref_id XOR check by leaving `inline_body` NULL.
         async with engine.begin() as conn:
             await conn.execute(
                 sa.text(
-                    "INSERT INTO ansich_observations (obs_id, schema_version, kind, occurred_at, recorded_at, task_id, subject_type, subject_id, "
-                    "fidelity_class, producer_name, producer_version, producer_instance_id, producer_seq, source_event_id, correlation_id, payload_ref_id) "
-                    "VALUES ('obs-pg-ref-2', 1, 'operator.action_succeeded', now(), now(), 'task-pg-ref', 'scope', 'scope-pg-ref', 'hard', "
-                    "'test-retention', '1', 'test-instance', 2, 'source:obs-pg-ref-2', 'corr:obs-pg-ref-2', 'payload-pg-referenced')"
-                )
+                    "INSERT INTO ansich_content_blobs (blob_key, content_hash, byte_size, content_type, canonicalization_version, inline_body, payload_ref_id, created_at) "
+                    "VALUES ('blob-pg-ref', :content_hash, 4, 'application/json', '1', NULL, 'payload-pg-referenced', now())"
+                ),
+                {"content_hash": "d" * 64},
             )
             # State a retention pass would have earned, so the survival
             # assertions below have something real to be about.

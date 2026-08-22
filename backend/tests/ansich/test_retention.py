@@ -800,6 +800,21 @@ async def test_the_downgrade_refuses_a_referenced_tombstone_on_sqlite(tmp_path: 
                     "'test-instance', 1, 'source:obs-ref', 'corr:obs-ref', 'payload-referenced')"
                 )
             )
+            # A second referrer on the same payload, from a DIFFERENT referrer
+            # table. The refusal counts blocked *payloads*, not references, and
+            # only two tables can show that: the per-table sum this replaced
+            # already collapsed two rows in one table to 1, so a second
+            # Observation would discriminate nothing. Across two tables the old
+            # form counts 2 and the current one counts 1.
+            # `ansich_content_blobs` satisfies its own inline_body/payload_ref_id
+            # XOR check by leaving `inline_body` NULL.
+            await conn.execute(
+                sa.text(
+                    "INSERT INTO ansich_content_blobs (blob_key, content_hash, byte_size, content_type, canonicalization_version, inline_body, payload_ref_id, created_at) "
+                    "VALUES ('blob-ref', :content_hash, 4, 'application/json', '1', NULL, 'payload-referenced', '2026-08-22 12:00:00+00:00')"
+                ),
+                {"content_hash": "d" * 64},
+            )
             # State a retention pass would have earned: a horizon that is not 0,
             # and an operator's version selection with its audit latch.
             await conn.execute(sa.text("INSERT INTO ansich_retention_state (id, observation_horizon_ingest_seq, payload_cursor) VALUES (1, 4242, 'payload-cursor-1')"))
@@ -810,7 +825,7 @@ async def test_the_downgrade_refuses_a_referenced_tombstone_on_sqlite(tmp_path: 
                 )
             )
 
-        with pytest.raises(RuntimeError, match="still referenced"):
+        with pytest.raises(RuntimeError, match=r"1 tombstoned payload row\(s\).*still referenced"):
             await asyncio.to_thread(alembic_command.downgrade, cfg, PRE_RETENTION_REVISION)
 
         # Nothing was destroyed on the way to the refusal.
