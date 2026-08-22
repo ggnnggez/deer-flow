@@ -61,12 +61,21 @@ class StorageUnavailableError(Exception):
 
 #: Why a replay target was refused. Three refusals, three different remedies,
 #: which is the whole reason the caller gets a code rather than a sentence:
-#: ``unknown_projector`` means the name is not registered in this build (a
-#: typo, or a projector that does not exist yet), ``unknown_version`` means the
-#: projector is real but this build cannot execute the version asked for
-#: (deploy the build that can), and ``not_executable`` means this build
-#: *declares* the version replayable and has no code to run it — a partial
-#: change, and a bug in the build rather than in the request.
+#:
+#: * ``unknown_projector`` — the name is not registered in this build (a typo,
+#:   or a projector that does not exist yet). Fix the request.
+#: * ``unknown_version`` — the projector is real but this build cannot execute
+#:   the version asked for. Deploy the build that can.
+#: * ``not_executable`` — this build *declares* the version replayable and
+#:   cannot run it. Fix the deploy, not the command line.
+#:
+#: ``not_executable`` covers **two** conditions, deliberately, because they
+#: share that one remedy and a caller never needs to tell them apart: the
+#: projector has no execution branch at all, or it claims an Observation kind
+#: the contract no longer admits (which would replay it over an empty target
+#: set and report a clean pass over nothing). Both are half-finished code
+#: changes rather than bad requests, and both should be unreachable in a
+#: coherent build. The discriminating detail is in the message.
 ReplayTargetRefusal = Literal[
     "unknown_projector",
     "unknown_version",

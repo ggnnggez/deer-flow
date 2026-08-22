@@ -189,15 +189,26 @@ class TestValidateReplayTarget:
         assert "task.imagined" in str(caught.value)
 
     def test_error_is_a_value_error_carrying_a_readable_message(self) -> None:
+        """The message is pinned whole, not by substring.
+
+        ``"2" in message`` would pass on any text containing a digit — and the
+        message is the only part of the refusal a human ever reads, so it is
+        worth an exact assertion rather than a probe that a rewrite could gut
+        without going red.
+        """
+
         with pytest.raises(ReplayTargetError) as caught:
             _validate_replay_target("task-structural", "2")
         error = caught.value
         assert isinstance(error, ValueError)
         assert error.projector_name == "task-structural"
         assert error.projector_version == "2"
-        message = str(error)
-        assert "task-structural" in message
-        assert "2" in message
+        assert str(error) == "Ansich projector 'task-structural' cannot replay version '2'; this build executes: 1"
+
+    def test_unknown_projector_message_names_the_projector_and_the_build(self) -> None:
+        with pytest.raises(ReplayTargetError) as caught:
+            _validate_replay_target("task-imaginary", "1")
+        assert str(caught.value) == "unknown Ansich projector 'task-imaginary': not registered in this build"
 
 
 class TestClaimedKindsAreKnown:
@@ -217,3 +228,22 @@ class TestClaimedKindsAreKnown:
     def test_every_kind_claiming_projector_is_registered_live(self) -> None:
         live_names = {name for name, _ in _PROJECTORS}
         assert set(_PROJECTOR_KINDS) <= live_names
+
+    def test_exactly_one_live_projector_claims_no_kinds(self) -> None:
+        """The complement, which the two pins above do not cover.
+
+        ``_validate_replay_target`` reads "every kind it *does* claim is
+        known", so a projector with **no** ``_PROJECTOR_KINDS`` entry validates
+        green — correct for ``task-spawn-reconcile``, which is enqueued by
+        ``_project_task_spawn`` rather than fanned out by kind and therefore
+        claims nothing by design, and silently wrong for anything else. A
+        projector that *lost* its entry would be replayed over an empty target
+        set and report a clean pass over nothing.
+
+        Absence cannot be distinguished from deliberate kind-lessness at call
+        time, so it is pinned here instead: exactly one live registration is
+        allowed to be missing, and it is named.
+        """
+
+        live_names = {name for name, _ in _PROJECTORS}
+        assert live_names - set(_PROJECTOR_KINDS) == {"task-spawn-reconcile"}

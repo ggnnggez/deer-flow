@@ -627,6 +627,15 @@ def _validate_replay_target(projector_name: str, version: str) -> None:
     about whether jobs for it already exist: a version that has never been in
     the live set has no jobs for any Observation already ingested, and minting
     them is exactly what the replay that follows is for.
+
+    **And it says nothing about the code discriminating versions.** The
+    projection dispatch in ``project_pending`` branches on ``projector_name``
+    alone and never reads the version, so the moment ``_REPLAYABLE_VERSIONS``
+    names a second version, replaying it executes the *same* code as the first
+    unless that branch is taught the difference. This function accepts such a
+    target because the registry *declares* it executable; nothing here can
+    verify the declaration. A caller must not read an accepted target as
+    evidence that two versions would produce two different results.
     """
 
     versions = _REPLAYABLE_VERSIONS.get(projector_name)
