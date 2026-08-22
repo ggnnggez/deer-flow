@@ -14,6 +14,8 @@ from typing import Literal
 __all__ = [
     "ActiveVersionError",
     "ActiveVersionRefusal",
+    "HardDeleteError",
+    "HardDeleteRefusal",
     "PayloadExpiredError",
     "RawReadAuditUnavailableError",
     "ReplayTargetError",
@@ -300,3 +302,75 @@ class ActiveVersionError(ValueError):
         self.component_kind = component_kind
         self.component_name = component_name
         self.version = version
+
+
+#: Why an owner/thread hard delete was refused (spec §6 D6-2). A sibling of
+#: :data:`ReplayTargetRefusal` and :data:`ActiveVersionRefusal`, written for the
+#: same reason: each refusal has a different remedy and a caller must be able to
+#: branch on it without matching prose.
+#:
+#: * ``unknown_scope`` — no ``Scope`` carries this id. The request names
+#:   something that is not there; nothing was deleted.
+#: * ``bootstrap_sentinel`` — the id is ``ANSICH_BOOTSTRAP_TASK_ID``, which is
+#:   not an entity at all but the value that says *"this Observation has no
+#:   Task"*. Rows subjected to it belong to no deletable Scope, so "erase this
+#:   owner" is not a question about it.
+#: * ``host_scope`` — the process's own anchor Scope. It is this build's
+#:   identity rather than one owner's data, and every worker's audit trail
+#:   hangs off it, so it is not erasable by an owner-scoped action.
+#: * ``parent_scope`` — the Scope is another Scope's parent. Erasing it would
+#:   orphan the child's ancestry (``ansich_scopes.parent_scope_id`` is
+#:   ``RESTRICT``, so the database would refuse it anyway); the remedy is to
+#:   delete the children first. Answered as a refusal rather than as an
+#:   ``IntegrityError`` because a caller cannot branch on a driver error.
+#: * ``blocked`` — a row **outside** this Scope's reach still points at a row
+#:   inside it, so completing the erasure would either orphan that row or
+#:   delete data belonging to somebody else. :attr:`HardDeleteError.blocker`
+#:   names the table and column. This is the only refusal that can be raised
+#:   *after* work has committed; see :class:`HardDeleteError`.
+HardDeleteRefusal = Literal[
+    "unknown_scope",
+    "bootstrap_sentinel",
+    "host_scope",
+    "parent_scope",
+    "blocked",
+]
+
+
+class HardDeleteError(ValueError):
+    """An owner/thread hard delete cannot be completed (spec §6 D6-2).
+
+    A ``ValueError`` for the same reason :class:`ReplayTargetError` is one: with
+    the first four reasons the store is fine and the *request* names something
+    this operation must not touch. Those four are answered **before anything is
+    deleted**, from cheap indexed reads, so a refused request costs the caller
+    nothing but the answer.
+
+    ``blocked`` is the exception and the docstring must not hide it. A hard
+    delete commits in batches — that is what keeps a large thread's erasure off
+    one unbounded transaction — so a blocking referrer discovered part-way
+    through is raised *after* the batches that already committed. This is not a
+    partial failure to apologise for: the operation is **resumable from the
+    store itself** rather than from a cursor (the remaining Tasks are re-derived
+    from the Scope's surviving ``within_scope`` relations), so an operator who
+    removes the blocker and re-runs the same call finishes the erasure. What a
+    caller must not do is treat ``blocked`` as "nothing happened".
+
+    :attr:`blocker` is ``"table.column"`` for ``blocked`` and ``None``
+    otherwise, because "what is still pointing at this" is the whole of the
+    remedy and prose in a message is not something an operator can act on
+    mechanically.
+    """
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        reason: HardDeleteRefusal,
+        scope_id: str,
+        blocker: str | None = None,
+    ) -> None:
+        super().__init__(message)
+        self.reason: HardDeleteRefusal = reason
+        self.scope_id = scope_id
+        self.blocker = blocker

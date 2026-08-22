@@ -1133,6 +1133,62 @@ class RetentionReport(BaseModel):
     observation_horizon_ingest_seq: int = Field(ge=0)
 
 
+class HardDeleteReport(BaseModel):
+    """What one owner/thread hard delete erased (spec §6 D6-2).
+
+    Every count is **rows this call actually deleted**, never rows it found: a
+    resumed run reports only its own half, and adding two runs' reports gives
+    the whole erasure. The families are the ones D6-2 names, so an operator can
+    read the answer to "what went" without knowing the schema.
+
+    ``tasks`` counts ``ansich_tasks`` rows — the subtree the Scope resolved to,
+    the number a person recognises. ``observations`` counts Observation rows,
+    which is the volume figure. ``payloads`` counts ``ansich_payloads`` rows
+    **deleted outright** — not tombstoned: this path owns the rows it orphans
+    (the last-referrer-deleter obligation) and a tombstone here would leave
+    lineage nothing can ever query. ``relations`` and ``read_models`` are called
+    out of the general projection total because they are the two families a
+    reader most often wants to confirm went: the graph edges that made the
+    Scope's membership queryable, and the active-Task read model rows whose
+    survival would be the PB7 failure.
+
+    ``projections`` is **every other deleted row**, summed across every table
+    the cascade reached — Entities, Steps, ToolCalls, content blocks and blobs,
+    heartbeats, budgets, usage contributions, jobs, alerts. One number rather
+    than a per-table map on purpose: the per-table breakdown is a fact about the
+    schema at one revision, and an operator acting on this report is asking "did
+    the derived world go too", which one total answers.
+
+    ``audit_refs`` counts the §7 raw-read audit Observations
+    (``operator.action_*``) that went with the deleted Tasks, and it is
+    deliberately a **subset of** ``observations`` rather than a disjoint family.
+    It is reported separately because *whether* those rows go is a ruling rather
+    than a mechanism: an audit of reading this owner's payloads is itself a
+    record about this owner, so privacy deletion takes it, while audit rows
+    about other subjects — the ones subjected to the host ``Scope`` — are
+    untouched. Double counting is the honest shape here: the rows really are
+    Observations, and a reader who wants the non-audit total subtracts.
+
+    ``batches`` counts committed transactions that deleted something, which is
+    also the number of points at which an interrupted run could have stopped.
+    A hard delete has no batch bound and no ``finished`` field: it runs to
+    completion or raises :class:`~ansich.errors.HardDeleteError`, because a
+    half-finished erasure that reported success would be the one failure mode
+    this operation cannot have.
+    """
+
+    model_config = ConfigDict(frozen=True)
+
+    tasks: int = Field(ge=0)
+    observations: int = Field(ge=0)
+    payloads: int = Field(ge=0)
+    projections: int = Field(ge=0)
+    relations: int = Field(ge=0)
+    read_models: int = Field(ge=0)
+    audit_refs: int = Field(ge=0)
+    batches: int = Field(ge=0)
+
+
 class ReplaySelector(BaseModel):
     """Which Observations a replay aims at — the three filters, and nothing else.
 

@@ -93,6 +93,7 @@ from ansich import AnsichService, AuthorizationSnapshot, ObservationEnvelope, Pr
 from ansich.assessment.scope_safety import SCOPE_SAFETY_ASSESSOR
 from ansich.belief.resolver import DEFAULT_RESOLVER
 from ansich.errors import ActiveVersionError
+from ansich.safety import scope_entity_id, scope_reference_hash
 from sqlalchemy.dialects import postgresql
 from sqlalchemy.engine import URL, make_url
 from sqlalchemy.exc import DBAPIError
@@ -116,7 +117,9 @@ from deerflow.ansich.persistence.models import (
     AnsichObservationRow,
     AnsichPayloadRow,
     AnsichProjectionJobRow,
+    AnsichRelationRow,
     AnsichScopeConclusionRow,
+    AnsichScopeRow,
     AnsichTaskHeartbeatRow,
     AnsichTaskUsageRow,
     AnsichUsageContributionRow,
@@ -2477,3 +2480,98 @@ async def test_observation_retention_deletes_a_claimed_job_beside_its_owner_on_p
         third = await asyncio.wait_for(worker_a.backend.run_retention(policy, now=aged), timeout=60)
         assert third.observations_deleted == 0
         assert third.structural_deleted == 0
+
+
+@pytest.mark.integration
+@pytest.mark.anyio
+async def test_hard_delete_erases_a_scope_beside_a_live_claimer_on_postgres() -> None:
+    """The owner erasure against a live claimer, on the dialect that enforces the keys.
+
+    This is the one thing SQLite cannot say about ``hard_delete_scope``. The
+    suite's SQLite engines run with ``PRAGMA foreign_keys`` off, so *every*
+    delete order "works" there and the referential proof has to be a query
+    sweep. Here the ``RESTRICT`` wall is real: a phase order that deleted an
+    Observation while a ToolCall, a content occurrence or the Scope still
+    pointed at it would fail the statement instead of leaving a dangling row,
+    and the erasure would not complete at all.
+
+    The concurrency half is the peer the erasure actually has. A projection job
+    is re-pended and **claimed by worker B**, which commits ``processing`` in
+    its own transaction before worker A erases the Scope — so A is deleting rows
+    a live worker holds a lease on. Two things must hold and both are asserted:
+    the erasure completes (the job goes with its Observation through
+    ``ON DELETE CASCADE``, which is what keeps the ``RESTRICT`` on
+    ``ansich_projection_errors`` satisfied), and B's settle **drops** rather
+    than raising — ``_complete_projection_job`` guards on
+    ``job_id AND lease_generation`` and a rowcount of zero already means "this
+    worker no longer owns the outcome".
+
+    A hard delete holds the maintenance *and* retention advisory keys, so the
+    peer it cannot have is another sweep; the peer it can have is exactly this
+    one, a worker inside a job it claimed before the erasure started.
+    """
+
+    scope_kind = "thread"
+    external_ref = "thread-erasure-pg"
+    scope_id = scope_entity_id(scope_kind, scope_reference_hash(scope_kind, external_ref))
+    async with _two_workers(inline_payload_max_bytes=1) as (_url, worker_a, worker_b):
+        task_id = new_id()
+        envelopes = [
+            _task_created(task_id, source_id="run-erasure"),
+            _task_started(task_id, source_id="run-erasure"),
+            ObservationEnvelope.scope_snapshotted(
+                task_id=task_id,
+                run_id="run-erasure",
+                occurred_at=_OCCURRED_AT,
+                scope_kind=scope_kind,
+                external_ref=external_ref,
+                relation_role="sandbox_boundary",
+                source_event_id=f"run:run-erasure:scope:{external_ref}",
+            ),
+            _heartbeat(task_id, run_id="run-erasure", ordinal=1, offset_seconds=0),
+            _heartbeat(task_id, run_id="run-erasure", ordinal=2, offset_seconds=1),
+            _heartbeat(task_id, run_id="run-erasure", ordinal=3, offset_seconds=2),
+        ]
+        assert await worker_a.backend.persist_and_project(envelopes) == len(envelopes)
+        await _settle_everything(worker_a, worker_b)
+        async with worker_a.sessions() as session:
+            observed = list((await session.execute(sa.select(AnsichObservationRow.obs_id).order_by(AnsichObservationRow.ingest_seq))).scalars())
+            assert await session.get(AnsichScopeRow, scope_id) is not None
+            assert await session.scalar(sa.select(sa.func.count()).select_from(AnsichRelationRow).where(AnsichRelationRow.object_id == scope_id)) >= 1
+
+        async with worker_a.sessions() as session, session.begin():
+            doomed_job_id = await session.scalar(sa.select(AnsichProjectionJobRow.job_id).order_by(AnsichProjectionJobRow.job_id).limit(1))
+            assert doomed_job_id is not None
+            await session.execute(
+                sa.update(AnsichProjectionJobRow).where(AnsichProjectionJobRow.job_id == doomed_job_id).values(status="pending", attempts=0, lease_owner=None, lease_expires_at=None, available_at=datetime.now(UTC)),
+            )
+        claim = await worker_b.backend._claim_projection_job()
+        assert claim is not None and claim[0] == doomed_job_id
+        async with worker_a.sessions() as session:
+            assert await session.scalar(sa.select(AnsichProjectionJobRow.status).where(AnsichProjectionJobRow.job_id == doomed_job_id)) == "processing", "the claim must be committed before the erasure runs, or this proves nothing"
+
+        report = await asyncio.wait_for(worker_a.backend.hard_delete_scope(scope_id, batch_size=2), timeout=120)
+
+        assert report.tasks == 1
+        assert report.observations == len(observed)
+        assert report.relations >= 1
+        assert report.batches > 1
+
+        async with worker_b.sessions() as session, session.begin():
+            assert await worker_b.backend._complete_projection_job(session, job_id=claim[0], lease_generation=claim[-1]) is False
+
+        async with worker_b.sessions() as session:
+            assert await session.get(AnsichScopeRow, scope_id) is None
+            assert await session.get(AnsichEntityRow, task_id) is None
+            assert list((await session.execute(sa.select(AnsichObservationRow.obs_id))).scalars()) == []
+            assert list((await session.execute(sa.select(AnsichProjectionJobRow.job_id))).scalars()) == []
+            assert list((await session.execute(sa.select(AnsichTaskHeartbeatRow.heartbeat_obs_id))).scalars()) == []
+            # The last-referrer-deleter obligation, on the dialect where a
+            # dangling payload would have had to survive a RESTRICT.
+            assert list((await session.execute(sa.select(AnsichPayloadRow.payload_id))).scalars()) == []
+
+        # Precedence over time retention, read from the other worker: the
+        # erased range is above the horizon it left, so a receipt for it says
+        # `expired` rather than `failed` without any sweep having run.
+        assert await worker_b.backend.observation_retention_horizon() >= len(observed)
+        assert await worker_b.backend.get_observation_projection_status(observed[-1]) == "expired"

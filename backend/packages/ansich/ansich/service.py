@@ -26,6 +26,7 @@ from ansich.contracts import (
     ControlValue,
     DatabaseHealth,
     FlushResult,
+    HardDeleteReport,
     LostRange,
     NamedVersion,
     ObservationEnvelope,
@@ -1958,6 +1959,54 @@ class AnsichService:
         if not callable(run):
             raise RuntimeError("Ansich backend does not support retention")
         return await run(policy, now=now if now is not None else datetime.now(UTC), max_batches=max_batches)
+
+    async def hard_delete_scope(
+        self,
+        scope_id: str,
+        *,
+        batch_size: int | None = None,
+    ) -> HardDeleteReport:
+        """Erase one owner/thread ``Scope`` and everything inside it (spec §6 D6-2).
+
+        A thin passthrough for the same reason ``run_retention`` is one -- the
+        whole operation is storage: it resolves the Scope through the relation
+        index, holds its own cross-worker locks, batches with the store as its
+        own cursor, and reports what it deleted. There is nothing here to
+        coordinate and nothing this layer could add but a second opinion.
+
+        It **does** take ``self._projection_lock``, which retention deliberately
+        does not, and the difference is the hazard rather than the duration.
+        Retention re-arms nothing, so this process's projector loop cannot
+        undo its work. A hard delete erases rows a *claimed* projection job is
+        about to write back: the job was claimed before the erasure started, it
+        projects from an Observation this call is deleting, and on a
+        foreign-key-enforcing dialect it fails loudly while on SQLite it would
+        quietly resurrect a Task's row. Serialising against this worker's own
+        projector is the local half of what the maintenance advisory lock does
+        across workers, and it is the same posture ``rebuild_projections`` and
+        ``retry_failed_projections`` already take.
+
+        Raises rather than degrading if the backend cannot erase: like
+        retention this is an explicit operator action whose whole product is the
+        report, and unlike collection it is not fail-open (Global Constraint 1
+        does not reach it). A silent no-op would tell an owner their data was
+        erased when it was not.
+
+        ``batch_size`` is a passthrough of the rows-per-transaction bound. It is
+        **not** the retention policy: a hard delete takes precedence over time
+        retention and consults no cutoff, so a caller holding the configured
+        policy may pass ``policy.cleanup_batch_size`` to get one operational
+        knob, and a caller that does not gets the backend's default.
+        """
+
+        hard_delete = getattr(self._backend, "hard_delete_scope", None)
+        if not callable(hard_delete):
+            raise RuntimeError("Ansich backend does not support hard delete")
+        projection_lock = self._projection_lock
+        if projection_lock is None:
+            return await hard_delete(scope_id, batch_size=batch_size)
+        async with projection_lock:
+            return await hard_delete(scope_id, batch_size=batch_size)
 
     async def get_retention_last_run(self) -> RetentionLastRun | None:
         """When retention last ran, or ``None`` if it never has.

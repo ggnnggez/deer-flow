@@ -23,43 +23,53 @@ from __future__ import annotations
 
 import ast
 import asyncio
+import hashlib
 import importlib
 import inspect
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Sequence
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import get_args
+from uuid import uuid4
 
 import pytest
 import sqlalchemy as sa
 import yaml
+from _router_auth_helpers import make_authed_test_app
 from alembic import command as alembic_command
-from ansich import AnsichService, ObservationEnvelope, RetentionPolicy, new_id
+from ansich import AnsichService, ObservationEnvelope, Producer, RetentionPolicy, new_id
 from ansich.contracts import ANSICH_BOOTSTRAP_TASK_ID
-from ansich.errors import PayloadExpiredError
+from ansich.errors import HardDeleteError, PayloadExpiredError
 from ansich.evaluation import EvaluationProjectionStatus
-from ansich.safety import host_scope_id
+from ansich.safety import host_scope_id, scope_entity_id, scope_reference_hash
+from httpx import ASGITransport, AsyncClient
 from pydantic import ValidationError
 from sqlalchemy import create_engine, event, func, select, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 from sqlalchemy.orm import Session
+from support.ansich_settle import only_test_driven_assessments
 
 # Pre-import models so ``Base.metadata`` carries the DeerFlow tables too.
 import deerflow.persistence.models  # noqa: F401
-from deerflow.ansich import retention_policy_from_config
+from app.gateway.auth.models import User
+from app.gateway.routers import ansich as ansich_router
+from deerflow.ansich import create_sql_ansich_service, retention_policy_from_config
 from deerflow.ansich.persistence import sql as sql_module
 from deerflow.ansich.persistence.models import (
+    AnsichActiveTaskReadModelRow,
     AnsichActiveVersionRow,
     AnsichAgentReleaseRow,
     AnsichBeliefAssertionRow,
     AnsichBeliefEvidenceRow,
     AnsichContentBlobRow,
+    AnsichContentBlockRow,
     AnsichEntityRow,
     AnsichObservationRow,
     AnsichPayloadRow,
     AnsichProjectionJobRow,
     AnsichRetentionStateRow,
+    AnsichScopeRow,
     AnsichTaskHeartbeatRow,
 )
 from deerflow.ansich.persistence.sql import (
@@ -2811,3 +2821,789 @@ def test_every_blocking_observation_referrer_is_reachable_by_deleting_an_entity(
 
     assert blocking, "the schema must still have blocking Observation referrers, or this pins nothing"
     assert blocking <= entity_cascade, f"blocking referrers outside the Entity cascade would stall the horizon: {sorted(blocking - entity_cascade)}"
+
+
+# ---------------------------------------------------------------------------
+# 9. Task 10 — the owner/thread hard delete (spec §6 D6-2)
+# ---------------------------------------------------------------------------
+#
+# Everything here drives the real ingest path, for the same reason section 5
+# does: what the erasure has to survive is what live ingest produces — Steps and
+# ToolCalls that pin their Observations through RESTRICT evidence pointers,
+# content blocks sharing a deduplicated blob, a spawned subtree, and the §7
+# audit rows T12 writes beside all of it.
+#
+# The orphan proof is an **explicit query sweep** over `Base.metadata`, never a
+# `PRAGMA foreign_keys` hope: the suite's SQLite engines run with foreign keys
+# off (`tests/ansich/conftest.py` says why), so a dangling reference here is
+# silent and only a sweep that asks every edge would see it. The PostgreSQL tier
+# runs the same erasure against real enforcement.
+
+_HARD_DELETE_SCOPE_KIND = "thread"
+
+
+@pytest.fixture
+async def hard_delete_backend(tmp_path: Path) -> AsyncIterator[tuple[SqlAnsichBackend, async_sessionmaker]]:
+    """One worker over one SQLite file, externalizing every payload.
+
+    Same shape as ``retention_backend`` and for the same reason —
+    ``inline_payload_max_bytes=1`` puts every body in ``ansich_payloads``, which
+    is what makes "did the erasure take the payload rows it orphaned" a question
+    with rows behind it.
+    """
+
+    engine = create_async_engine(f"sqlite+aiosqlite:///{(tmp_path / 'ansich-hard-delete.db').as_posix()}")
+    async with engine.begin() as connection:
+        await connection.run_sync(Base.metadata.create_all)
+    sessions = async_sessionmaker(engine, expire_on_commit=False)
+    try:
+        yield SqlAnsichBackend(sessions, inline_payload_max_bytes=1), sessions
+    finally:
+        await engine.dispose()
+
+
+def _hd_scope_id(external_ref: str) -> str:
+    return scope_entity_id(_HARD_DELETE_SCOPE_KIND, scope_reference_hash(_HARD_DELETE_SCOPE_KIND, external_ref))
+
+
+def _hd_scope_snapshotted(task_id: str, *, external_ref: str, run_id: str, occurred_at: datetime) -> ObservationEnvelope:
+    return ObservationEnvelope.scope_snapshotted(
+        task_id=task_id,
+        run_id=run_id,
+        occurred_at=occurred_at,
+        scope_kind=_HARD_DELETE_SCOPE_KIND,
+        external_ref=external_ref,
+        relation_role="sandbox_boundary",
+        source_event_id=f"run:{run_id}:scope:{external_ref}:{task_id}",
+    )
+
+
+def _hd_task_started(task_id: str, *, source_id: str) -> ObservationEnvelope:
+    return ObservationEnvelope.task_lifecycle(
+        kind="task.started",
+        task_id=task_id,
+        source_kind="deerflow_run",
+        source_id=source_id,
+        occurred_at=_RETENTION_OCCURRED_AT,
+        source_event_id=f"run:{source_id}:task:started",
+    )
+
+
+def _hd_step(task_id: str, step_id: str, *, occurred_at: datetime) -> ObservationEnvelope:
+    return ObservationEnvelope(
+        kind="step.started",
+        occurred_at=occurred_at,
+        task_id=task_id,
+        step_id=step_id,
+        subject_type="step",
+        subject_id=step_id,
+        producer=Producer(name="hard-delete-fixture", version="1", instance_id="local"),
+        source_event_id=f"step:{step_id}:started",
+        correlation_id=task_id,
+        payload={"step_seq": 1, "actor_kind": "lead_agent"},
+    )
+
+
+def _hd_tool_issued(task_id: str, step_id: str, tool_call_id: str, *, occurred_at: datetime) -> ObservationEnvelope:
+    return ObservationEnvelope(
+        kind="tool.issued",
+        occurred_at=occurred_at,
+        task_id=task_id,
+        step_id=step_id,
+        subject_type="tool_call",
+        subject_id=tool_call_id,
+        producer=Producer(name="hard-delete-fixture", version="1", instance_id="local"),
+        source_event_id=f"tool:{tool_call_id}:issued",
+        correlation_id=task_id,
+        payload={
+            "call_seq": 1,
+            "provider_call_id": f"provider-{tool_call_id}",
+            "tool_name": "task",
+            "args_hash": "a" * 64,
+            "args_preview": {},
+            "tool_schema_block_id": None,
+        },
+    )
+
+
+def _hd_content(task_id: str, step_id: str, block_id: str, *, body: str, occurred_at: datetime) -> ObservationEnvelope:
+    canonical = body.encode("utf-8")
+    return ObservationEnvelope(
+        kind="content.produced",
+        occurred_at=occurred_at,
+        task_id=task_id,
+        step_id=step_id,
+        subject_type="content_block",
+        subject_id=block_id,
+        producer=Producer(name="hard-delete-fixture", version="1", instance_id="local"),
+        source_event_id=f"content:{block_id}",
+        correlation_id=task_id,
+        payload={
+            "block_id": block_id,
+            "kind": "tool_result",
+            "content_hash": hashlib.sha256(canonical).hexdigest(),
+            "visible_bytes": len(canonical),
+            "estimated_tokens": 1,
+            "source_identity": f"source:{block_id}",
+            "body": body,
+        },
+    )
+
+
+def _hd_spawn(parent_task_id: str, child_task_id: str, step_id: str, tool_call_id: str, *, occurred_at: datetime) -> ObservationEnvelope:
+    return ObservationEnvelope.task_lifecycle(
+        kind="task.created",
+        task_id=child_task_id,
+        source_kind="deerflow_subagent",
+        source_id=f"provider-{tool_call_id}",
+        occurred_at=occurred_at,
+        source_event_id=f"deerflow_subagent:{child_task_id}:task:created",
+        attributes={
+            "parent_task_id": parent_task_id,
+            "spawning_step_id": step_id,
+            "spawning_tool_call_id": tool_call_id,
+            "subagent_name": "researcher",
+        },
+    )
+
+
+class _HardDeleteStore:
+    """One thread Scope with a root Task, a spawned child, and a neighbour."""
+
+    def __init__(self) -> None:
+        self.scope_ref = "thread-doomed"
+        self.scope_id = _hd_scope_id(self.scope_ref)
+        self.neighbour_scope_ref = "thread-neighbour"
+        self.neighbour_scope_id = _hd_scope_id(self.neighbour_scope_ref)
+        self.root_id = new_id()
+        self.child_id = new_id()
+        self.neighbour_id = new_id()
+        self.root_step = new_id()
+        self.root_tool = new_id()
+        self.child_step = new_id()
+        self.neighbour_step = new_id()
+        self.root_block = new_id()
+        self.child_block = new_id()
+        self.neighbour_block = new_id()
+        self.doomed_tasks = (self.root_id, self.child_id)
+
+
+async def _build_hard_delete_store(backend: SqlAnsichBackend) -> _HardDeleteStore:
+    """A doomed thread with a subtree, and a neighbour thread that must survive.
+
+    The neighbour is not decoration. Half of what "erase this owner" means is
+    what it does *not* touch, and a fixture with one thread in it cannot fail
+    that way. Its content block carries the **same body** as the doomed child's,
+    so the two share one deduplicated ``ansich_content_blobs`` row and its
+    payload — which is the exact shape that catches a deleter reclaiming a
+    shared blob because it removed one of its two referrers.
+    """
+
+    store = _HardDeleteStore()
+    at = _RETENTION_OCCURRED_AT
+    envelopes = [
+        _retention_task_created(store.root_id, source_id="run-doomed"),
+        _hd_task_started(store.root_id, source_id="run-doomed"),
+        _hd_scope_snapshotted(store.root_id, external_ref=store.scope_ref, run_id="run-doomed", occurred_at=at),
+        _hd_step(store.root_id, store.root_step, occurred_at=at),
+        _hd_tool_issued(store.root_id, store.root_step, store.root_tool, occurred_at=at),
+        _hd_content(store.root_id, store.root_step, store.root_block, body="doomed-root-body", occurred_at=at),
+        _retention_heartbeat(store.root_id, ordinal=1, source_id="run-doomed"),
+    ]
+    assert await backend.persist_and_project(envelopes) == len(envelopes)
+    await _settle_retention(backend)
+
+    spawned = [
+        _hd_spawn(store.root_id, store.child_id, store.root_step, store.root_tool, occurred_at=at + timedelta(seconds=1)),
+        _hd_scope_snapshotted(store.child_id, external_ref=store.scope_ref, run_id="run-doomed-child", occurred_at=at + timedelta(seconds=1)),
+        _hd_step(store.child_id, store.child_step, occurred_at=at + timedelta(seconds=1)),
+        _hd_content(store.child_id, store.child_step, store.child_block, body="shared-body", occurred_at=at + timedelta(seconds=1)),
+        _retention_heartbeat(store.child_id, ordinal=1, source_id="run-doomed-child"),
+    ]
+    assert await backend.persist_and_project(spawned) == len(spawned)
+    await _settle_retention(backend)
+
+    neighbour = [
+        _retention_task_created(store.neighbour_id, source_id="run-neighbour"),
+        _hd_scope_snapshotted(store.neighbour_id, external_ref=store.neighbour_scope_ref, run_id="run-neighbour", occurred_at=at),
+        _hd_step(store.neighbour_id, store.neighbour_step, occurred_at=at),
+        _hd_content(store.neighbour_id, store.neighbour_step, store.neighbour_block, body="shared-body", occurred_at=at),
+        _retention_heartbeat(store.neighbour_id, ordinal=1, source_id="run-neighbour"),
+    ]
+    assert await backend.persist_and_project(neighbour) == len(neighbour)
+    await _settle_retention(backend)
+    return store
+
+
+async def _record_hard_delete_audits(backend: SqlAnsichBackend, store: _HardDeleteStore) -> None:
+    """Two §7 audit rows: one about the doomed Task, one about neither."""
+
+    await backend.record_raw_read_audit(
+        status="requested",
+        read_id=new_id(),
+        actor="admin-erasure",
+        target_kind="tool_call",
+        target_id=store.root_tool,
+        purpose="support",
+    )
+    await backend.record_raw_read_audit(
+        status="succeeded",
+        read_id=new_id(),
+        actor="admin-erasure",
+        target_kind="agent_release",
+        target_id=new_id(),
+        purpose="support",
+        outcome="served",
+        http_status=200,
+        served_byte_size=12,
+    )
+
+
+async def _referential_orphans(sessions: async_sessionmaker) -> list[str]:
+    """Every Ansich row pointing at a row that is not there, from ``Base.metadata``.
+
+    A query sweep rather than a foreign-key pragma, because the engines under
+    this suite do not enforce foreign keys and a dangling reference would
+    therefore be *silent* on exactly the dialect the fast tests run on. Derived
+    from the metadata so a schema change that adds an edge is covered without
+    anyone remembering to extend a list.
+    """
+
+    problems: list[str] = []
+    async with sessions() as session:
+        for table in Base.metadata.sorted_tables:
+            if not table.name.startswith("ansich_"):
+                continue
+            for foreign_key in sorted(table.foreign_keys, key=lambda key: (key.parent.name, key.column.table.name, key.column.name)):
+                child = foreign_key.parent
+                parent = foreign_key.column
+                dangling = await session.scalar(
+                    sa.select(sa.func.count()).select_from(table).where(child.is_not(None), ~sa.exists(sa.select(sa.literal(1)).select_from(parent.table).where(parent == child))),
+                )
+                if dangling:
+                    problems.append(f"{table.name}.{child.name} -> {parent.table.name}.{parent.name}: {dangling}")
+    return problems
+
+
+async def _observation_task_ids(sessions: async_sessionmaker, task_ids: Sequence[str]) -> int:
+    async with sessions() as session:
+        return int(await session.scalar(select(func.count()).select_from(AnsichObservationRow).where(AnsichObservationRow.task_id.in_(sorted(task_ids)))) or 0)
+
+
+async def _entity_count(sessions: async_sessionmaker, entity_ids: Sequence[str]) -> int:
+    async with sessions() as session:
+        return int(await session.scalar(select(func.count()).select_from(AnsichEntityRow).where(AnsichEntityRow.entity_id.in_(sorted(entity_ids)))) or 0)
+
+
+@pytest.mark.anyio
+async def test_a_full_subtree_hard_delete_leaves_zero_orphans(hard_delete_backend):
+    """The spine: Scope → Tasks → everything, and the referential walk is clean."""
+
+    backend, sessions = hard_delete_backend
+    store = await _build_hard_delete_store(backend)
+    await _record_hard_delete_audits(backend, store)
+    assert await _referential_orphans(sessions) == []
+
+    report = await backend.hard_delete_scope(store.scope_id, batch_size=2)
+
+    assert await _referential_orphans(sessions) == []
+    assert report.tasks == 2
+    assert report.observations > 0
+    assert report.relations >= 2
+    assert report.batches > 1
+    # The Scope itself goes: an owner erasure that left the thread's anchor
+    # standing would leave the thing being erased addressable.
+    assert await _entity_count(sessions, [store.scope_id, store.root_id, store.child_id]) == 0
+    async with sessions() as session:
+        assert await session.get(AnsichScopeRow, store.scope_id) is None
+        assert await session.get(AnsichScopeRow, store.neighbour_scope_id) is not None
+    # And the neighbour thread is untouched, entity for entity.
+    assert await _entity_count(sessions, [store.neighbour_id, store.neighbour_step, store.neighbour_block]) == 3
+    assert await _observation_task_ids(sessions, [store.neighbour_id]) > 0
+
+
+@pytest.mark.anyio
+async def test_the_observations_of_a_deleted_task_go_with_it(hard_delete_backend):
+    """The no-foreign-key path: nothing cascades them, so they are deleted by index."""
+
+    backend, sessions = hard_delete_backend
+    store = await _build_hard_delete_store(backend)
+    before = await _observation_task_ids(sessions, store.doomed_tasks)
+    assert before > 0
+
+    report = await backend.hard_delete_scope(store.scope_id, batch_size=2)
+
+    assert await _observation_task_ids(sessions, store.doomed_tasks) == 0
+    assert report.observations == before
+
+
+@pytest.mark.anyio
+async def test_the_erasure_owns_the_payload_rows_it_orphans(hard_delete_backend):
+    """The last-referrer-deleter obligation, discharged — and not over-discharged.
+
+    Two assertions in one, and the second is the one a careless implementation
+    fails: every payload of the erased Tasks is *gone* (tier 1 refuses to sweep
+    an orphan, so a body left behind here is unreachable forever), while the
+    deduplicated blob the neighbour Task shares with the erased child survives
+    with its body, because the neighbour's content block still points at it.
+    """
+
+    backend, sessions = hard_delete_backend
+    store = await _build_hard_delete_store(backend)
+    async with sessions() as session:
+        doomed_payloads = sorted((await session.execute(select(AnsichObservationRow.payload_ref_id).where(AnsichObservationRow.task_id.in_(sorted(store.doomed_tasks)), AnsichObservationRow.payload_ref_id.is_not(None)))).scalars())
+        # The blob the *neighbour* still points at — the one the erased child
+        # shared with it. Picking any blob would prove nothing.
+        neighbour_blob_key = await session.scalar(select(AnsichContentBlockRow.blob_key).where(AnsichContentBlockRow.entity_id == store.neighbour_block))
+        shared_blob = await session.scalar(select(AnsichContentBlobRow.payload_ref_id).where(AnsichContentBlobRow.blob_key == neighbour_blob_key))
+    assert doomed_payloads
+
+    report = await backend.hard_delete_scope(store.scope_id, batch_size=2)
+
+    rows = await _payload_rows(sessions)
+    assert [payload_id for payload_id in doomed_payloads if payload_id in rows] == []
+    assert report.payloads >= len(doomed_payloads)
+    # Deleted outright, never tombstoned: there is no reader left to tell
+    # "expired by policy" from "missing", because the only route to the row went
+    # with the referrer in the same statement list.
+    assert all(not row.deleted_at for row in rows.values())
+    assert shared_blob in rows and rows[shared_blob].body is not None
+
+
+@pytest.mark.anyio
+async def test_no_content_blob_is_left_orphaned_holding_a_body(hard_delete_backend):
+    """A blob whose last block went is the erasure's own last-referrer case."""
+
+    backend, sessions = hard_delete_backend
+    store = await _build_hard_delete_store(backend)
+    async with sessions() as session:
+        before = int(await session.scalar(select(func.count()).select_from(AnsichContentBlobRow)) or 0)
+    assert before >= 2
+
+    await backend.hard_delete_scope(store.scope_id, batch_size=2)
+
+    async with sessions() as session:
+        blobs = list((await session.execute(select(AnsichContentBlobRow.blob_key))).scalars())
+        referenced = set((await session.execute(select(AnsichContentBlockRow.blob_key))).scalars())
+    assert len(blobs) < before
+    assert {blob for blob in blobs if blob not in referenced} == set()
+
+
+@pytest.mark.anyio
+async def test_a_task_subjected_audit_row_goes_and_a_process_subjected_one_stays(hard_delete_backend):
+    """The eighth family's ruling, enforced in **both** directions (D6-2).
+
+    Privacy deletion wins for an audit row *about the erased owner's data*: it
+    names which of their payloads was read, by whom and why, so keeping it would
+    keep a derivative of the thing being erased. An audit row about a different
+    subject — the process family, carrying the bootstrap sentinel — is untouched,
+    and structurally so: no Task's erasure can reach a row whose ``task_id`` is
+    the sentinel.
+    """
+
+    backend, sessions = hard_delete_backend
+    store = await _build_hard_delete_store(backend)
+    await _record_hard_delete_audits(backend, store)
+    async with sessions() as session:
+        task_subjected = sorted((await session.execute(select(AnsichObservationRow.obs_id).where(AnsichObservationRow.kind.startswith("operator.action_"), AnsichObservationRow.task_id == store.root_id))).scalars())
+        process_subjected = sorted((await session.execute(select(AnsichObservationRow.obs_id).where(AnsichObservationRow.kind.startswith("operator.action_"), AnsichObservationRow.task_id == ANSICH_BOOTSTRAP_TASK_ID))).scalars())
+    assert task_subjected and process_subjected
+
+    report = await backend.hard_delete_scope(store.scope_id, batch_size=2)
+
+    async with sessions() as session:
+        survivors = sorted((await session.execute(select(AnsichObservationRow.obs_id).where(AnsichObservationRow.kind.startswith("operator.action_")))).scalars())
+    assert survivors == process_subjected
+    assert report.audit_refs == len(task_subjected)
+    # `audit_refs` is a subset of `observations`, deliberately, and the contract
+    # says so — a reader who wants the non-audit total subtracts.
+    assert report.audit_refs <= report.observations
+
+
+@pytest.mark.anyio
+async def test_the_bootstrap_sentinel_subject_rows_belong_to_no_deletable_task(hard_delete_backend):
+    """Structural, not incidental: the sentinel is never in any Scope's Task set."""
+
+    backend, sessions = hard_delete_backend
+    store = await _build_hard_delete_store(backend)
+    async with sessions() as session:
+        order = await SqlAnsichBackend._hard_delete_task_order(session, store.scope_id)
+    assert set(order) == set(store.doomed_tasks)
+    assert ANSICH_BOOTSTRAP_TASK_ID not in order
+    # And it is not an entity at all, so no Entity sweep can reach it either.
+    async with sessions() as session:
+        assert await session.get(AnsichEntityRow, ANSICH_BOOTSTRAP_TASK_ID) is None
+
+
+@pytest.mark.anyio
+async def test_the_active_task_read_model_row_goes_with_its_task(hard_delete_backend):
+    """PB7: the read-model row is deleted in the plan's own transaction."""
+
+    backend, sessions = hard_delete_backend
+    store = await _build_hard_delete_store(backend)
+    await backend.assess_operations(now=_RETENTION_OCCURRED_AT + timedelta(seconds=30))
+    async with sessions() as session:
+        live = sorted((await session.execute(select(AnsichActiveTaskReadModelRow.task_id))).scalars())
+    assert store.root_id in live
+
+    report = await backend.hard_delete_scope(store.scope_id, batch_size=2)
+
+    async with sessions() as session:
+        remaining = sorted((await session.execute(select(AnsichActiveTaskReadModelRow.task_id))).scalars())
+    assert store.root_id not in remaining
+    assert store.child_id not in remaining
+    assert report.read_models >= 1
+
+
+@pytest.mark.anyio
+async def test_a_hard_deleted_range_never_resurfaces_through_the_horizon(hard_delete_backend):
+    """Precedence over time retention, and the FC-3 flip it would otherwise cause.
+
+    A deliberate erasure read back as ``failed`` — *presumed lost* — is the same
+    lie the retention horizon exists to prevent, in the one direction retention
+    itself cannot cause. So the erasure moves the horizon over what it removed,
+    in the transaction that removed it, and the receipt reads ``expired``
+    immediately rather than after some later sweep happens to walk past.
+    """
+
+    backend, sessions = hard_delete_backend
+    store = await _build_hard_delete_store(backend)
+    async with sessions() as session:
+        doomed = list(await session.execute(select(AnsichObservationRow.ingest_seq, AnsichObservationRow.obs_id).where(AnsichObservationRow.task_id.in_(sorted(store.doomed_tasks))).order_by(AnsichObservationRow.ingest_seq)))
+    assert await backend.observation_retention_horizon() == 0
+    lowest_doomed = int(doomed[0][0])
+    sample_obs = str(doomed[0][1])
+
+    await backend.hard_delete_scope(store.scope_id, batch_size=2)
+
+    horizon = await backend.observation_retention_horizon()
+    assert horizon >= lowest_doomed
+    async with sessions() as session:
+        lowest_survivor = await session.scalar(select(func.min(AnsichObservationRow.ingest_seq)))
+    # Exactly one below the lowest survivor: the largest value of "everything at
+    # or below this is gone" that is still true. Never a survivor's own seq.
+    assert horizon == int(lowest_survivor) - 1
+    assert await backend.get_observation_projection_status(sample_obs) == "expired"
+
+
+@pytest.mark.anyio
+async def test_a_hard_delete_above_the_horizon_does_not_stall_the_observation_tier(hard_delete_backend):
+    """The interplay, converged over two passes rather than argued about.
+
+    Tier 2 walks *existing rows* ordered by ``ingest_seq``, so the hole an
+    erasure punches above its horizon is not a candidate and the walk steps over
+    it. The proof is that the horizon keeps moving afterwards — a tier that
+    stalled on the gap would leave it where the erasure put it, forever.
+    """
+
+    backend, sessions = hard_delete_backend
+    store = await _build_hard_delete_store(backend)
+    now = _RETENTION_OCCURRED_AT + timedelta(days=400)
+    policy = RetentionPolicy(raw_payload_days=7, observation_days=30, structural_days=90, cleanup_batch_size=2)
+
+    await backend.hard_delete_scope(store.scope_id, batch_size=2)
+    after_erasure = await backend.observation_retention_horizon()
+
+    first = await backend.run_retention(policy, now=now)
+    second = await backend.run_retention(policy, now=now)
+
+    assert second.observation_horizon_ingest_seq > after_erasure
+    assert (first.observations_deleted or 0) + (second.observations_deleted or 0) > 0
+    assert await _referential_orphans(sessions) == []
+
+
+@pytest.mark.anyio
+async def test_the_sentinel_and_the_host_scope_are_refused_with_a_typed_error(hard_delete_backend):
+    """Two refusals, before anything is deleted, branchable without matching prose."""
+
+    backend, sessions = hard_delete_backend
+    store = await _build_hard_delete_store(backend)
+    before = await _observation_task_ids(sessions, store.doomed_tasks)
+
+    with pytest.raises(HardDeleteError) as sentinel:
+        await backend.hard_delete_scope(ANSICH_BOOTSTRAP_TASK_ID)
+    assert sentinel.value.reason == "bootstrap_sentinel"
+
+    with pytest.raises(HardDeleteError) as host:
+        await backend.hard_delete_scope(host_scope_id(backend._hostname))
+    assert host.value.reason == "host_scope"
+
+    with pytest.raises(HardDeleteError) as unknown:
+        await backend.hard_delete_scope(new_id())
+    assert unknown.value.reason == "unknown_scope"
+
+    assert await _observation_task_ids(sessions, store.doomed_tasks) == before
+
+
+@pytest.mark.anyio
+async def test_a_parent_scope_is_refused_before_anything_is_deleted(hard_delete_backend):
+    """``RESTRICT`` would refuse it anyway — mid-erasure, as a driver error."""
+
+    backend, sessions = hard_delete_backend
+    store = await _build_hard_delete_store(backend)
+    async with sessions() as session, session.begin():
+        neighbour = await session.get(AnsichScopeRow, store.neighbour_scope_id)
+        neighbour.parent_scope_id = store.scope_id
+    before = await _observation_task_ids(sessions, store.doomed_tasks)
+
+    with pytest.raises(HardDeleteError) as refusal:
+        await backend.hard_delete_scope(store.scope_id)
+
+    assert refusal.value.reason == "parent_scope"
+    assert refusal.value.blocker == "ansich_scopes.parent_scope_id"
+    assert refusal.value.scope_id == store.scope_id
+    assert await _observation_task_ids(sessions, store.doomed_tasks) == before
+
+
+@pytest.mark.anyio
+async def test_an_interrupted_erasure_resumes_from_the_store_without_double_counting(hard_delete_backend):
+    """No cursor row: the ``within_scope`` edge is the resume handle.
+
+    A Task's membership edge is deleted in the same transaction as the Task, so
+    a run killed between batches leaves the store saying exactly what is still
+    owed. Re-running the same call finishes it, and the two reports add up to
+    one erasure rather than overlapping.
+    """
+
+    backend, sessions = hard_delete_backend
+    store = await _build_hard_delete_store(backend)
+    total_observations = await _observation_task_ids(sessions, store.doomed_tasks)
+    real_plan = sql_module._plan_cascade
+    budget = {"left": 24}
+
+    async def _dying_plan(*args, **kwargs):
+        if budget["left"] <= 0:
+            raise RuntimeError("hard delete killed mid-batch")
+        budget["left"] -= 1
+        return await real_plan(*args, **kwargs)
+
+    sql_module._plan_cascade = _dying_plan
+    try:
+        with pytest.raises(RuntimeError, match="killed mid-batch"):
+            await backend.hard_delete_scope(store.scope_id, batch_size=1)
+    finally:
+        sql_module._plan_cascade = real_plan
+
+    partial = await _observation_task_ids(sessions, store.doomed_tasks)
+    assert 0 < partial < total_observations
+
+    resumed = await backend.hard_delete_scope(store.scope_id, batch_size=1)
+
+    assert await _observation_task_ids(sessions, store.doomed_tasks) == 0
+    assert resumed.observations == partial
+    assert await _referential_orphans(sessions) == []
+
+
+@pytest.mark.anyio
+async def test_a_resume_after_the_last_task_still_erases_what_the_scope_was_pinning(hard_delete_backend):
+    """The resume window the Task loop cannot cover, closed by a derived arm.
+
+    The Scope pins the Observation that created it (``created_obs_id``,
+    ``RESTRICT``), so that row is the one deferral every erasure produces and it
+    can only go once the Scope does. A run killed *after* its last Task and
+    before the Scope phase therefore leaves a store where the Scope stands, no
+    Task of it does, and one Observation is reachable through neither. The
+    re-run has no Task order to match it against, so matching on "this run
+    condemned it" alone would strand it forever — which is why the second arm
+    asks whether the owning Task still exists as an Entity at all.
+    """
+
+    backend, sessions = hard_delete_backend
+    store = await _build_hard_delete_store(backend)
+    real_scope_phase = SqlAnsichBackend._hard_delete_scope_row
+
+    async def _dying_scope_phase(self, *args, **kwargs):
+        raise RuntimeError("hard delete killed before the scope phase")
+
+    SqlAnsichBackend._hard_delete_scope_row = _dying_scope_phase  # type: ignore[method-assign]
+    try:
+        with pytest.raises(RuntimeError, match="before the scope phase"):
+            await backend.hard_delete_scope(store.scope_id, batch_size=2)
+    finally:
+        SqlAnsichBackend._hard_delete_scope_row = real_scope_phase  # type: ignore[method-assign]
+
+    stranded = await _observation_task_ids(sessions, store.doomed_tasks)
+    assert stranded > 0, "the Scope must still be pinning something, or this proves nothing"
+    async with sessions() as session:
+        order = await SqlAnsichBackend._hard_delete_task_order(session, store.scope_id)
+    assert order == (), "the re-run must have no Task order left, which is the whole difficulty"
+
+    resumed = await backend.hard_delete_scope(store.scope_id, batch_size=2)
+
+    assert resumed.observations == stranded
+    assert await _observation_task_ids(sessions, store.doomed_tasks) == 0
+    assert await _referential_orphans(sessions) == []
+    async with sessions() as session:
+        assert await session.get(AnsichScopeRow, store.scope_id) is None
+    # The neighbour's Observations were never candidates: their Task is still an
+    # Entity, so the second arm does not reach them.
+    assert await _observation_task_ids(sessions, [store.neighbour_id]) > 0
+
+
+@pytest.mark.anyio
+async def test_the_erasure_takes_the_maintenance_and_retention_keys_in_that_order(hard_delete_backend, monkeypatch):
+    """Both locks, fixed order — the resurrection peer and the horizon peer.
+
+    Retention's key alone would leave a ``rebuild`` free to re-derive rows from
+    Observations this erasure has not reached yet; the maintenance key alone
+    would leave two deleters writing one horizon row. Nothing else in the module
+    takes both, which is what makes the fixed order deadlock-free.
+    """
+
+    backend, _sessions = hard_delete_backend
+    taken: list[int] = []
+    real_lock = SqlAnsichBackend._advisory_lock
+
+    def _recording(self, key: int, *, purpose: str, refusal: str):
+        taken.append(key)
+        return real_lock(self, key, purpose=purpose, refusal=refusal)
+
+    monkeypatch.setattr(SqlAnsichBackend, "_advisory_lock", _recording)
+    with pytest.raises(HardDeleteError):
+        await backend.hard_delete_scope(_hd_scope_id("never-created"))
+    assert taken == []
+
+    store = await _build_hard_delete_store(backend)
+    await backend.hard_delete_scope(store.scope_id, batch_size=2)
+    assert taken == [_PG_MAINTENANCE_LOCK_KEY, _PG_RETENTION_LOCK_KEY]
+
+
+@pytest.mark.anyio
+async def test_the_task_order_is_deepest_first_and_deterministic(hard_delete_backend):
+    """Constraint 8 at the traversal that takes the locks.
+
+    Deepest-first is what stops an interrupted run stranding a descendant whose
+    only route from the Scope ran through its ancestor, and the tie-break on id
+    is what makes two workers planning the same erasure issue the same
+    statements in the same order.
+    """
+
+    backend, sessions = hard_delete_backend
+    store = await _build_hard_delete_store(backend)
+    async with sessions() as session:
+        order = await SqlAnsichBackend._hard_delete_task_order(session, store.scope_id)
+        again = await SqlAnsichBackend._hard_delete_task_order(session, store.scope_id)
+    assert order == (store.child_id, store.root_id)
+    assert order == again
+
+
+def test_both_spawn_producers_sort_their_descendant_tuple():
+    """Constraint 8's named residual, paid at the producers (not at the consumer).
+
+    ``backend/AGENTS.md`` said the first change that walks ``descendant_task_ids``
+    taking locks must sort it at **both** producers first; the owner hard delete
+    is that change. Read off the AST rather than trusted to a comment, so a later
+    edit that drops one of the two sorts turns this red.
+    """
+
+    functions = _named_functions(_sql_module_ast())
+    for name in ("_project_task_spawn", "_reconcile_spawn_usage"):
+        assignments = [node for node in ast.walk(functions[name]) if isinstance(node, ast.Assign) and any(isinstance(target, ast.Name) and target.id in {"descendant_depths", "descendant_task_ids"} for target in node.targets)]
+        assert assignments, f"{name} no longer produces a descendant tuple"
+        for node in assignments:
+            assert any(isinstance(call.func, ast.Name) and call.func.id == "sorted" for call in ast.walk(node) if isinstance(call, ast.Call)), f"{name} produces an unsorted descendant tuple"
+
+
+@pytest.mark.anyio
+async def test_the_service_seam_passes_the_erasure_through_under_the_projection_lock(hard_delete_backend):
+    """The passthrough, and the one thing it adds that retention deliberately does not."""
+
+    backend, sessions = hard_delete_backend
+    store = await _build_hard_delete_store(backend)
+    service = AnsichService(backend)
+    service._projection_lock = asyncio.Lock()
+    held: list[bool] = []
+    real = backend.hard_delete_scope
+
+    async def _observing(scope_id, *, batch_size=None):
+        held.append(service._projection_lock.locked())
+        return await real(scope_id, batch_size=batch_size)
+
+    backend.hard_delete_scope = _observing  # type: ignore[method-assign]
+    try:
+        report = await service.hard_delete_scope(store.scope_id, batch_size=2)
+    finally:
+        backend.hard_delete_scope = real  # type: ignore[method-assign]
+    assert held == [True]
+    assert report.tasks == 2
+    assert await _observation_task_ids(sessions, store.doomed_tasks) == 0
+
+
+def test_the_task_row_phase_is_what_unpins_a_content_block():
+    """The schema fact phase 2 of the erasure exists for, read off ``Base.metadata``.
+
+    A content block cannot be deleted while a ``ansich_content_occurrences`` row
+    points at it (``RESTRICT``), and the occurrence cascades from
+    ``ansich_tasks`` rather than from anything the satellite sweep touches. That
+    is the whole reason the Task row is deleted in its own phase *between* two
+    satellite sweeps instead of last. Derived rather than commented, so a schema
+    change that moves either edge turns this red instead of turning the erasure
+    into a ``blocked`` refusal nobody can explain.
+    """
+
+    occurrences = Base.metadata.tables["ansich_content_occurrences"]
+    edges = {key.parent.name: (key.ondelete or "").upper() for key in occurrences.foreign_keys}
+
+    assert edges["block_id"] not in {"CASCADE", "SET NULL"}, "the occurrence no longer blocks its content block"
+    assert edges["task_id"] == "CASCADE", "the Task row no longer takes the occurrence with it"
+    assert "ansich_content_occurrences" in _cascade_delete_closure(frozenset({"ansich_tasks"}))
+    # And the block itself is only reachable through its Entity, which is what
+    # makes the second sweep — rather than the Task row phase — the thing that
+    # deletes it.
+    assert "ansich_content_blocks" not in _cascade_delete_closure(frozenset({"ansich_tasks"}))
+    assert "ansich_content_blocks" in _cascade_delete_closure(frozenset({"ansich_entities"}))
+
+
+def _hd_admin_user() -> User:
+    return User(
+        id=uuid4(),
+        email="ansich-erasure-admin@example.com",
+        password_hash="x",
+        system_role="admin",
+    )
+
+
+@pytest.mark.anyio
+async def test_the_hard_delete_route_erases_and_answers_a_refusal_by_reason(tmp_path: Path):
+    """The route, both answers.
+
+    **This one is a route and the §5 rule does not reach it.** That rule forbids
+    an endpoint that runs an arbitrary projector on demand; an owner erasure is
+    an owner-initiated data action with one fixed effect, and there is no way to
+    answer "delete my thread" from a CLI-only seam.
+
+    A refusal is **409 with the reason**, not a 500 and not a bare 400: the
+    request is well-formed and the *state* refuses, and a caller that cannot
+    branch on which state would have to parse prose.
+    """
+
+    engine = create_async_engine(f"sqlite+aiosqlite:///{(tmp_path / 'ansich-hard-delete-route.db').as_posix()}")
+    async with engine.begin() as connection:
+        await connection.run_sync(Base.metadata.create_all)
+    sessions = async_sessionmaker(engine, expire_on_commit=False)
+    service = create_sql_ansich_service(sessions, operations_assessment_interval_ms=60_000)
+    only_test_driven_assessments(service)
+    await service.start()
+    app = make_authed_test_app(user_factory=_hd_admin_user)
+    app.state.ansich_service = service
+    app.include_router(ansich_router.router)
+    try:
+        store = await _build_hard_delete_store(service._backend)
+        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+            missing = await client.post("/api/ansich/retention/hard-delete", json={"scope_id": new_id()})
+            sentinel = await client.post("/api/ansich/retention/hard-delete", json={"scope_id": ANSICH_BOOTSTRAP_TASK_ID})
+            erased = await client.post("/api/ansich/retention/hard-delete", json={"scope_id": store.scope_id})
+    finally:
+        await service.stop()
+        await engine.dispose()
+
+    assert missing.status_code == 404
+    assert missing.json()["detail"]["reason"] == "unknown_scope"
+    assert sentinel.status_code == 409
+    assert sentinel.json()["detail"]["reason"] == "bootstrap_sentinel"
+    assert erased.status_code == 200
+    report = erased.json()["report"]
+    assert report["tasks"] == 2
+    assert report["observations"] > 0
+    assert await _observation_task_ids(sessions, store.doomed_tasks) == 0
+    assert await _referential_orphans(sessions) == []

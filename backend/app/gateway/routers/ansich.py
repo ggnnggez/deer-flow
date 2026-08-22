@@ -13,7 +13,7 @@ from urllib.parse import quote
 from ansich.alerts import AlertWorkflowConflict
 from ansich.contracts import ControlValue, NamedVersion, Producer, TaskLifecycleScope
 from ansich.credentials import contains_credential_like_material
-from ansich.errors import PayloadExpiredError, RawReadAuditUnavailableError, StorageUnavailableError
+from ansich.errors import HardDeleteError, PayloadExpiredError, RawReadAuditUnavailableError, StorageUnavailableError
 from ansich.evaluation import (
     EvaluationDimension,
     EvaluationKind,
@@ -2303,6 +2303,81 @@ async def retry_failed_jobs(
     return {
         "retried": retried.re_armed,
         "unsettled": retried.unsettled,
+        "projection_status": _projection_status(service),
+    }
+
+
+class HardDeleteRequest(BaseModel):
+    """The one thing an owner erasure needs: which Scope."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    scope_id: str = Field(min_length=1, max_length=36, description="The owner or thread Scope entity id to erase")
+
+
+@router.post("/retention/hard-delete")
+async def hard_delete_scope(body: HardDeleteRequest, request: Request) -> dict:
+    """Erase one owner/thread Scope and everything inside it (spec §6 D6-2).
+
+    **This one is a route, and the §5 rule it looks like it breaks does not
+    apply.** That rule forbids an endpoint that runs an arbitrary projector on
+    demand; this is an owner-initiated data action with a fixed, named effect,
+    which is the shape §6 asks for -- there is no way to answer "delete my
+    thread" from a CLI-only seam.
+
+    Refusals are typed at the store and answered as **409** rather than 400: the
+    request is well-formed and the *state* is what refuses (this Scope is a
+    parent, or is the host anchor), except ``unknown_scope`` which is a plain
+    404. ``blocked`` is 409 too and carries ``blocker``, because a caller that
+    resolves the named referrer and re-runs the same call finishes the erasure
+    -- the operation resumes from the store rather than from a cursor.
+
+    Logged at WARNING with the actor and the counts. An owner erasure is
+    irreversible and is the one operation whose *absence* from the record cannot
+    be reconstructed afterwards from the rows it removed.
+    """
+
+    user = await require_admin_user(request, detail=_ADMIN_REQUIRED)
+    service = _service_or_503(request)
+    _ensure_queryable(service)
+    try:
+        report = await service.hard_delete_scope(body.scope_id)
+    except HardDeleteError as exc:
+        logger.warning(
+            "Ansich hard delete refused",
+            extra={
+                "ansich_scope_id": exc.scope_id,
+                "ansich_hard_delete_refusal": exc.reason,
+                "ansich_hard_delete_blocker": exc.blocker,
+                "ansich_actor": str(getattr(user, "id", "unknown")),
+            },
+        )
+        raise HTTPException(
+            status_code=404 if exc.reason == "unknown_scope" else 409,
+            detail={
+                "message": str(exc),
+                "reason": exc.reason,
+                "blocker": exc.blocker,
+            },
+        ) from exc
+    except Exception as exc:
+        raise HTTPException(
+            status_code=503,
+            detail={
+                "message": "Ansich hard delete failed",
+                "projection_status": _projection_status(service),
+            },
+        ) from exc
+    logger.warning(
+        "Ansich hard delete completed",
+        extra={
+            "ansich_scope_id": body.scope_id,
+            "ansich_actor": str(getattr(user, "id", "unknown")),
+            "ansich_hard_delete_report": report.model_dump(mode="json"),
+        },
+    )
+    return {
+        "report": report.model_dump(mode="json"),
         "projection_status": _projection_status(service),
     }
 

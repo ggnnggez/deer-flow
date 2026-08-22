@@ -479,7 +479,7 @@ Localhost persistence deliberately reads the direct request `Host` and ignores `
 | **Models** (`/api/models`) | `GET /` - list models; `GET /{name}` - model details |
 | **Features** (`/api/features`) | `GET /` - report config-gated feature availability (`agents_api.enabled`, `browser_control.enabled`) for frontend UI gating |
 | **Console** (`/api/console`) | Read-only cross-thread observability for the current user (the data layer for an operations dashboard or external monitoring): `GET /stats` - headline counters (runs/threads/agents/tokens/cost); `GET /runs` - paginated run history joined with thread titles (per-run cost); `GET /usage` - zero-filled daily token series + per-model breakdown with spend. Queries `runs`/`threads_meta` directly as a reporting layer (no new `RunStore` methods); requires a SQL database backend — returns 503 on `database.backend: memory`. Real-cost estimation reads optional `models[*].pricing` (`currency`, `input_per_million`, `output_per_million`, `input_cache_hit_per_million`; `ModelConfig` is `extra="allow"`, so no schema change) and prices each run from its `token_usage_by_model` input/output split. Pricing is **cache-aware**: `RunJournal` accumulates prompt-cache hits from `usage_metadata.input_token_details.cache_read` into a sparse `cache_read_tokens` bucket key (also threaded through `SubagentTokenCollector` → `record_external_llm_usage_records`), and cache-hit input tokens are billed at `input_cache_hit_per_million` (omitted → billed at the miss price, a conservative upper bound). Legacy rows fall back to run-level totals at `model_name`; unpriced models yield `cost: null` and cost fields are null when no pricing is configured |
-| **Ansich** (`/api/ansich`) | Admin-only developer/operator Agent observability, gated by startup-only `ansich.enabled`. Task reads include evidence-backed Control/behavior Beliefs, lifecycle/Step/system-operation history, physical LLM attempts, ordered ContextSnapshot/ToolCall accountability, Task-scoped context-compression inventory, bounded ContentBlock lineage, active-task/local-or-inclusive Usage/Budget reads with source breakdown, typed parent/child Task tree navigation, Alert list/detail/workflow plus interrupt/rollback proxy actions, and immutable AgentRelease bindings/comparison/provider drift. Tool/raw/visible payloads and complete sanitized release manifests stay on separate `no-store` endpoints whose every read is audited fail-closed (§7: the access row is committed before the body is read, and a 503 with nothing read if it cannot be); lineage/snapshot/compression, release detail, and alert-list reads are metadata/preview-only. `GET /health` remains process-local and readable when SQL storage is unavailable; projection reads return 503 with the same health summary when storage is unavailable. Failed-job diagnostics (`GET/POST /operations/failed-jobs*`) list and detail currently-failing projection/assessor jobs with their full attempt-error history and support Task-batch retry (first HTTP exposure of the existing non-destructive `retry_failed_projections`). Phase 10 adds the evaluation surface: `POST /evaluations` records one external evaluation (requires `Idempotency-Key`, validates that the subject exists and is the declared Entity type — 404/422 otherwise — and rejects a canonical payload over `ansich.evaluation_max_payload_bytes` with 413), returning the observation id plus `projection_status=pending|applied|failed` without waiting for projection; `GET /tasks/{task_id}/evaluations` returns the Task's five-dimension quality Beliefs (unassessed dimensions included) alongside its recorded evaluations, `GET /steps/{step_id}/evaluations` the Step-scoped rows, and `GET /agent-releases/{release_id}/quality?cohort=` the aggregated `(cohort, dimension)` cells. `GET /agent-releases/compare` gains the same `cohort` parameter and an additive `quality` block whose per-dimension `comparison_status`/`reason` is machine-readable, and `POST /operations/alerts/{alert_id}/dismiss` accepts an optional `semantic_override` that records one human quality assertion beside the workflow write. Evaluation `expected`/`actual`/`rationale` bodies never appear in those lists and load only through the audited `no-store` `GET /evaluations/{obs_id}/payload` route. |
+| **Ansich** (`/api/ansich`) | Admin-only developer/operator Agent observability, gated by startup-only `ansich.enabled`. Task reads include evidence-backed Control/behavior Beliefs, lifecycle/Step/system-operation history, physical LLM attempts, ordered ContextSnapshot/ToolCall accountability, Task-scoped context-compression inventory, bounded ContentBlock lineage, active-task/local-or-inclusive Usage/Budget reads with source breakdown, typed parent/child Task tree navigation, Alert list/detail/workflow plus interrupt/rollback proxy actions, and immutable AgentRelease bindings/comparison/provider drift. Tool/raw/visible payloads and complete sanitized release manifests stay on separate `no-store` endpoints whose every read is audited fail-closed (§7: the access row is committed before the body is read, and a 503 with nothing read if it cannot be); lineage/snapshot/compression, release detail, and alert-list reads are metadata/preview-only. `GET /health` remains process-local and readable when SQL storage is unavailable; projection reads return 503 with the same health summary when storage is unavailable. Failed-job diagnostics (`GET/POST /operations/failed-jobs*`) list and detail currently-failing projection/assessor jobs with their full attempt-error history and support Task-batch retry (first HTTP exposure of the existing non-destructive `retry_failed_projections`). Phase 10 adds the evaluation surface: `POST /evaluations` records one external evaluation (requires `Idempotency-Key`, validates that the subject exists and is the declared Entity type — 404/422 otherwise — and rejects a canonical payload over `ansich.evaluation_max_payload_bytes` with 413), returning the observation id plus `projection_status=pending|applied|failed` without waiting for projection; `GET /tasks/{task_id}/evaluations` returns the Task's five-dimension quality Beliefs (unassessed dimensions included) alongside its recorded evaluations, `GET /steps/{step_id}/evaluations` the Step-scoped rows, and `GET /agent-releases/{release_id}/quality?cohort=` the aggregated `(cohort, dimension)` cells. `GET /agent-releases/compare` gains the same `cohort` parameter and an additive `quality` block whose per-dimension `comparison_status`/`reason` is machine-readable, and `POST /operations/alerts/{alert_id}/dismiss` accepts an optional `semantic_override` that records one human quality assertion beside the workflow write. Evaluation `expected`/`actual`/`rationale` bodies never appear in those lists and load only through the audited `no-store` `GET /evaluations/{obs_id}/payload` route. P11-C adds one destructive route beside the read surface: `POST /retention/hard-delete` erases one owner/thread `Scope` and everything inside it (spec §6 D6-2) — irreversible, logged at WARNING with the actor and the report, typed refusals as 409 (404 for an unknown Scope), and no frontend surface in this batch by design. |
 | **MCP** (`/api/mcp`) | `GET /config` - get config; `PUT /config` - update config (saves to extensions_config.json) |
 | **Skills** (`/api/skills`) | `GET /` - list skills; `GET /{name}` - details; `PUT /{name}` - update enabled; `POST /install` - install from .skill archive (accepts standard optional frontmatter like `version`, `author`, `compatibility`); `POST /reload` - admin-only process-local prompt-cache invalidation after trusted external filesystem changes |
 | **Memory** (`/api/memory`) | `GET /` - memory data; `POST /reload` - force reload; `GET /config` - config; `GET /status` - config + data |
@@ -1549,14 +1549,17 @@ either producer: the assessment list is two concatenated halves (failing groups,
 then recovered ones) whose *partition* differs between workers, so sorting each
 half separately would leave the inversion open.
 
-One ordering residual is deliberate and must not be misread as handled:
-`descendant_task_ids` (`_project_task_spawn` / `_reconcile_spawn_usage`) is
-deterministic but **not sorted** — the child id is prepended ahead of the ordered
-scalars. That is free today because the tuple is only an `IN` predicate and a
-filter over an already-ordered read; the first change that walks it taking locks
-(a per-descendant row lock is the obvious one — PB8 names it as the anchor that
-would close F10-19's residual) must sort it at both producers first. Both sites
-say so in code.
+One ordering residual was carried deliberately and is **now paid** (P11-C, T10):
+`descendant_task_ids` (`_project_task_spawn` / `_reconcile_spawn_usage`) used to
+be deterministic but **not sorted** — the child id prepended ahead of the ordered
+scalars — which was free while the tuple was only an `IN` predicate and a filter
+over an already-ordered read. `hard_delete_scope` is the change that walks a Task
+subtree issuing DELETEs, which take row locks, so the sort landed at **both
+producers** rather than at the consumer that noticed, and
+`test_retention.py::test_both_spawn_producers_sort_their_descendant_tuple` reads
+it off the AST so a later edit that drops one of the two turns red. The rule the
+residual illustrated outlives it: a tuple nothing walks under locks may stay
+unsorted, and the change that first walks it owns sorting it at the source.
 
 What a row lock structurally cannot do is stop a peer from INSERTing a *new
 input*: row locks bound an existing row's writers, not the membership of a set.
@@ -2615,6 +2618,20 @@ survives the first one's deletion, and a manifest survives its Observation and
 goes with its release — row and all — in tier 3, which is the other half of the
 sentence tier 1's exclusion starts.
 
+**The obligation reaches one table further than the payload row, and P11-C's
+T10 is where that was found.** `ansich_content_blobs` is itself a payload
+referrer, so while a blob stands its body is correctly *not* an orphan and the
+reclaim above correctly leaves it alone — which means a deleter that removed the
+last `ansich_content_blocks` row pointing at a blob and stopped there left the
+blob **and** its body behind with nothing able to reach either, and tier 1
+refuses orphans by design. All three deleters now go through one
+`_apply_plan_and_reclaim`: it reads the plan's blob keys *before* the plan is
+applied (afterwards the rows that named them are gone), deletes the blobs
+nothing points at any more, and folds their payload ids into the same single
+residual-referrer check, so a blob two Tasks share survives the first one's
+erasure. One path rather than three, because an obligation discharged in three
+places is an obligation discharged in two.
+
 **`RetentionReport.finished` answers "did the bound stop this pass", not "is the
 store fully expired".** Under cross-pass convergence a caller re-runs regardless:
 a tier that stopped at a pin has finished what *it* can do and reports `True`,
@@ -2624,6 +2641,134 @@ health block, and its `None` means **never run** on a reachable store — which 
 ordinary, since retention is driven by a caller rather than by the store — while
 an unreachable block answers `None` too, so `status` is what tells the two
 apart.
+
+**P11-C: the owner/thread hard delete** (spec §6's D6-2).
+`SqlAnsichBackend.hard_delete_scope(scope_id, *, batch_size)` erases one owner or
+thread Scope and everything inside it, and it **takes precedence over time
+retention**: it consults no cutoff, no age and no tier, because "this owner asked
+to be forgotten" is not a statement about how old the evidence is.
+`AnsichService.hard_delete_scope` is a thin passthrough that adds one thing
+retention deliberately does not — `_projection_lock` — and `POST
+/api/ansich/retention/hard-delete` is the admin route. That route is not the §5
+prohibition it resembles: §5 forbids an endpoint that runs an *arbitrary
+projector* on demand, while this is an owner-initiated data action with one fixed
+effect, and there is no way to answer "delete my thread" from a CLI-only seam.
+There is no frontend for it in this batch, deliberately: an irreversible erasure
+gets an operator-console surface after the API has been exercised, not with it.
+
+**The Scope resolves to its Tasks through the relation reverse index**
+(`ix_ansich_relations_object_predicate`, read as
+`object_id = scope AND predicate = within_scope`), closed over
+`ansich_task_ancestry` and walked **deepest-first, ties by id**. The order is
+load-bearing twice: it is what stops an interrupted run stranding a descendant
+whose only route from the Scope ran through its ancestor, and it is what keeps
+`ansich_relations.inherited_from_task_id` (`RESTRICT`) from blocking an
+ancestor's own erasure. Membership is filtered on the **Entity** (`entity_type
+== "task"`) rather than on `ansich_tasks`, because a Task erasure deletes the
+subtype row several transactions before the Entity, and a resumed run must still
+recognise a half-erased Task as one it owes.
+
+**Five phases per Task, and the order is forced by the schema rather than
+chosen.** `ansich_observations` carries no foreign key to `ansich_tasks`, so
+nothing cascades a Task's Observations away and they are deleted explicitly
+through `ix_ansich_observations_task_ingest`; but nearly every Task-scoped row
+*pins* an Observation through a `RESTRICT` evidence pointer, and those rows hang
+off `ansich_entities` rows only their own deletion removes. So: (1) the satellite
+Entities discovered by this Task's Observations, batched — Steps, ToolCalls,
+content blocks, which is where the volume is; (2) the `ansich_tasks` row in one
+transaction with everything cascading from it, including the **active-Task read
+model** (PB7 held by construction rather than by care) and
+`ansich_content_occurrences`, whose `RESTRICT` on `block_id` is the specific
+thing that stops phase 1 taking a content block; (3) the satellite sweep again,
+picking up exactly what phase 2 unpinned; (4) the Observations, batched by
+`ingest_seq`; (5) the Entity, its `within_scope` edge and whatever Observations
+are left, in **one transaction**. The target Scope goes last of all, after every
+Task, because its authorization scopes, permissions and tool effects
+(`RESTRICT` into `ansich_scopes`) hold it until they do.
+
+**It resumes from the store, not from a cursor, and that is why phase 5 is one
+transaction.** The `within_scope` edge is deleted with the Task it belongs to, so
+the set of Tasks still owed is always exactly what the Scope's surviving edges
+say; re-running the same call after a crash finishes the job and no cursor row
+was added (0028 stays P11-C's only migration). One window the Task loop cannot
+cover is closed by a derived arm rather than by memory: the Scope pins the
+Observation that created it, so a run killed after its last Task and before the
+Scope phase leaves that row reachable through neither, and the re-run has no
+Task order to match it against. The final phase therefore deletes a candidate
+whose `task_id` names a Task **this run condemned** *or* one that **no longer
+exists as an Entity** — with the bootstrap sentinel excluded from the second arm
+by name, since it has no Entity by construction and would otherwise read as
+"erased" forever. A `blocked` refusal — a row
+outside the Scope's reach still pointing into it — can therefore be raised *after*
+batches have committed without that being a partial failure: the operator removes
+the named referrer and re-runs. Three entity types are never taken by the
+satellite sweep and each can produce that refusal rather than silent
+cross-owner damage: another `Scope` (the parent owner Scope of a thread, a
+sibling), an `agent_release` (immutable release identity, excluded from time
+retention for the same reason), and `task` (owned by the Task loop).
+
+**The eighth family — `raw-read audit 中受保护引用` — was adjudicated as privacy
+deletion, and the split is by subject.** A §7 audit row whose target belonged to
+a Task carries that Task's `task_id`, so it is a record *about this owner's
+data* — which payload was read, by whom, when, for what stated purpose — and it
+goes with the Task by the same `task_id` predicate that takes every other
+Observation of it. Nothing special-cases it, which is why it cannot be
+forgotten. Rows subjected to the **host Scope** or the bootstrap sentinel are
+about a different subject and stay, structurally: their `task_id` is
+`ANSICH_BOOTSTRAP_TASK_ID`, which no Scope's Task set can contain. Say the
+consequence plainly: **erasing an owner erases the audit trail of reads of that
+owner's data**; the alternative keeps a derivative of the erased data under the
+name of accountability. The erasure itself is recorded at the route (WARNING,
+actor plus report) rather than as an Observation — an audit row of an erasure
+would have to survive it, which means subjecting it to the host Scope and
+widening `OperatorAuditActionType`, a coherent next step and registered as one.
+
+**Precedence over the retention horizon is structural, not a promise.** Tier 2
+walks *existing rows* ordered by `ingest_seq`, so the hole an erasure punches
+above its horizon is simply not a candidate and the walk steps over it — a hard
+delete can never stall the tier. What would be wrong is the receipt in between:
+RC7's ladder reads an absent Observation above the horizon as `failed`,
+*presumed lost*, and a deliberate erasure reported as loss is the FC-3 flip in
+the one direction retention itself cannot cause. So every transaction here that
+deletes Observations advances the horizon **in the same transaction**, to
+`min(surviving ingest_seq) - 1` — the largest value of *"everything at or below
+this is gone"* that is still true. Derived rather than accumulated, so it cannot
+disagree with tier 2's own incremental advance; `max`ed with the stored value, so
+it stays monotone. The horizon's meaning widens by one word as a result:
+deletion under **policy or owner erasure**, which is the same distinction the
+receipt already makes, since both are configured deletions and neither is loss.
+
+**Both advisory locks, in a fixed order (maintenance, then retention), and
+nothing else takes both.** Maintenance because the hazard a hard delete has and
+retention does not is **resurrection**: `rebuild_projections` re-derives rows
+from Observations, and a worker running one while an erasure is between a Task's
+projection rows and its Observations writes the erased rows back. Retention
+because both operations delete Observations and both write the one
+`ansich_retention_state` row, whose horizon advance is a read-modify-write with
+no second serialising point. The service adds `_projection_lock` for the local
+half of the same hazard — a job *claimed before* the erasure started. The cost is
+accepted and stated: while an owner erasure runs, a rebuild, a failed-job retry
+and a retention sweep all wait.
+
+`HardDeleteReport(tasks, observations, payloads, projections, relations,
+read_models, audit_refs, batches)` counts rows *this call* deleted, so a resumed
+run reports only its own half and two reports add up to one erasure. `audit_refs`
+is deliberately a **subset of** `observations` — the rows really are
+Observations, and reporting the ruling separately is what makes it auditable.
+`payloads` counts rows deleted outright, never tombstoned: there is no reader
+left to tell "expired by policy" from "missing". Refusals are typed
+(`ansich.errors.HardDeleteError` with a `HardDeleteRefusal` reason and a
+`blocker` naming `table.column`), four of them answered before anything is
+deleted; the route maps `unknown_scope` to 404 and the rest to 409.
+
+Proved on both dialects, and the SQLite half cannot lean on the database: the
+suite's engines run with `PRAGMA foreign_keys` off, so
+`test_retention.py::test_a_full_subtree_hard_delete_leaves_zero_orphans` runs an
+**explicit query sweep** over every foreign key in `Base.metadata` rather than
+trusting a pragma. The PostgreSQL tier
+(`test_hard_delete_erases_a_scope_beside_a_live_claimer_on_postgres`) is where
+the `RESTRICT` wall is real and where the peer is real: a projection job claimed
+by the *other* worker, committed `processing`, while the erasure runs.
 
 **P11-C: the remaining first-writer races take the lock-then-read posture**
 (F10-31, F10-33, and a third one the strictness itself found — see the end of
