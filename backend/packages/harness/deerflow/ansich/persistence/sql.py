@@ -8,6 +8,7 @@ import time
 from collections.abc import AsyncIterator, Iterable, Mapping, Sequence
 from contextlib import asynccontextmanager
 from datetime import UTC, datetime, timedelta
+from functools import cache
 from typing import Literal, NamedTuple, cast, get_args, get_origin
 from uuid import uuid4
 
@@ -1277,6 +1278,189 @@ def _payload_retention_condition(cutoff: datetime) -> ColumnElement[bool]:
         .exists()
     )
     return and_(*clauses)
+
+
+#: Job tables the retention path may **delete** from but must never write to.
+#:
+#: Global Constraint 4 (PB7) is pinned over the AST for every statically visible
+#: statement, but the cascade planner below builds its statements from
+#: ``Base.metadata`` at runtime -- ``update(table)`` where ``table`` is a local
+#: variable is invisible to that walk. This set is the guard that replaces the
+#: pin there: :func:`_apply_cascade_plan` refuses to emit a ``SET NULL`` update
+#: against either table rather than trusting that no such foreign key is ever
+#: added. Today neither has one (both job tables reach an Observation through a
+#: ``CASCADE``), so the guard is unreachable and is meant to stay that way; what
+#: it buys is that the day somebody adds a nullable job column pointing at an
+#: Observation, retention refuses the pass instead of quietly re-arming work
+#: below a continuity mark.
+_JOB_TABLE_NAMES = frozenset({AnsichProjectionJobRow.__tablename__, AnsichAssessorJobRow.__tablename__})
+
+
+class _CascadePlan(NamedTuple):
+    """Every row that must go when a set of parent rows goes, in delete order.
+
+    ``rows`` maps a table name to the rows of it that are doomed, expressed as
+    ``{column: values}`` with **union** semantics: a row is doomed if any listed
+    column holds a listed value. The columns are the **edges that condemned the
+    row** -- the child's own foreign key and the parent values it pointed at --
+    never the child's exported keys, and that distinction is load-bearing rather
+    than stylistic. ``ansich_tool_calls.task_id`` is a foreign key somebody else
+    points at, so an identity built out of it would read "every ToolCall of this
+    Task" from the deletion of *one* ToolCall entity and quietly take its
+    siblings. Condemning by the inbound edge cannot over-reach, because it is
+    the same predicate the database's own ``ON DELETE CASCADE`` would apply.
+    A table legitimately appears under several columns at once, which
+    ``ansich_llm_attempts`` and its three Observation pointers do routinely.
+
+    ``order`` is the table names in the order the deletes must be issued:
+    reverse topological over the foreign keys, so a child is always gone before
+    its parent. ``set_null`` carries the ``ON DELETE SET NULL`` edges, which are
+    updates on rows that **survive** and therefore run before any delete.
+
+    ``payload_ids`` is every ``ansich_payloads`` row the plan is about to
+    orphan, collected before the deletes because afterwards there is nothing
+    left to read them from. See :meth:`SqlAnsichBackend._reclaim_orphaned_payloads`
+    for why the plan owns them.
+    """
+
+    rows: dict[str, dict[str, set]]
+    order: tuple[str, ...]
+    set_null: tuple[tuple[str, str, tuple], ...]
+    payload_ids: set[str]
+
+
+def _doomed_predicate(table: Table, doomed: Mapping[str, set]) -> ColumnElement[bool]:
+    """ "This row is in the plan", as SQL over one table's condemning edges."""
+
+    clauses = [table.c[column].in_(sorted(values)) for column, values in sorted(doomed.items()) if values]
+    # `false()` rather than an empty `or_()`, which SQLAlchemy renders as an
+    # always-true empty conjunction -- the opposite answer, and the expensive
+    # direction: it would mark every row of the table as already planned.
+    return or_(*clauses) if clauses else sql_false()
+
+
+@cache
+def _exported_columns(table: Table) -> tuple[str, ...]:
+    """The columns of *table* some other table's foreign key points at.
+
+    The walk continues through these and only these: a value nobody references
+    cannot condemn anything downstream, and selecting it would be a wider read
+    for no answer.
+
+    Cached because it is a pure function of ``Base.metadata``, which is fixed
+    once the models import, and because the Observation tier plans **one row at
+    a time** — an uncached form would re-scan every table's foreign keys for
+    every table in every plan, which is the whole schema squared per deleted
+    Observation.
+    """
+
+    return tuple(sorted({key.column.name for other in Base.metadata.sorted_tables for key in other.foreign_keys if key.column.table.name == table.name}))
+
+
+async def _plan_cascade(
+    session: AsyncSession,
+    *,
+    root: Table,
+    root_column: str,
+    root_values: Sequence,
+) -> _CascadePlan | None:
+    """Walk the foreign keys out from *root_values* and collect the blast radius.
+
+    Returns ``None`` when a **blocking** referrer (``RESTRICT`` or the schema's
+    default ``NO ACTION``) still has a row outside the plan. That is not an
+    error and not a partial answer: it is the whole of how both time tiers say
+    "not yet". Tier 2 stops its contiguous prefix there; tier 3 skips that
+    entity and tries it again on a later pass, once whatever pinned it has
+    itself expired.
+
+    **Why this is derived from ``Base.metadata`` rather than a declared delete
+    order.** ``_REBUILD_DELETE_ORDER`` exists and is correct for what it does --
+    empty a fixed set of tables wholesale -- but retention deletes a *sliver*:
+    the rows reachable from twelve Observations, not every row in forty tables.
+    The reachability is what has to be computed, and the schema already states
+    it. A hand-written list would also have to restate every ``ondelete``, and
+    the direction it would drift is the expensive one: a missed ``CASCADE`` edge
+    leaves rows referencing a deleted parent on any dialect that is not
+    enforcing foreign keys, and a missed blocking edge turns a refusal into an
+    ``IntegrityError`` mid-batch on one that is.
+
+    **The plan is applied in full by this module even where the database would
+    do it.** Every ``CASCADE`` here is one PostgreSQL would perform on its own,
+    and the explicit delete is deliberately redundant there. It buys two things.
+    The suite's SQLite engines run with ``PRAGMA foreign_keys`` off
+    (``tests/ansich/conftest.py`` says why), so a pass that leaned on the
+    database would leave a different store behind on each dialect and the
+    cheaper one could not prove the invariant at all. And a plan that names its
+    own rows can *count* them, which is what ``RetentionReport`` reports.
+    """
+
+    doomed: dict[str, dict[str, set]] = {root.name: {root_column: set(root_values)}}
+    set_null: list[tuple[str, str, tuple]] = []
+    payload_ids: set[str] = set()
+    payload_columns = {(table.name, column.name) for table, column in _payload_referrer_columns()}
+    visited: dict[tuple[str, str], set] = {}
+
+    async def _harvest(table: Table, condition: ColumnElement[bool]) -> list[tuple[str, str, set]]:
+        """Read the doomed rows' exported keys and their payload pointers."""
+
+        wanted = tuple(sorted({*_exported_columns(table), *(name for other, name in payload_columns if other == table.name)}))
+        if not wanted:
+            return []
+        rows = list(await session.execute(select(*[table.c[name] for name in wanted]).where(condition)))
+        onward: list[tuple[str, str, set]] = []
+        for position, name in enumerate(wanted):
+            values = {row[position] for row in rows if row[position] is not None}
+            if not values:
+                continue
+            if (table.name, name) in payload_columns:
+                payload_ids.update(values)
+            if name not in _exported_columns(table):
+                continue
+            seen = visited.setdefault((table.name, name), set())
+            fresh = values - seen
+            seen |= fresh
+            if fresh:
+                onward.append((table.name, name, fresh))
+        return onward
+
+    if not root_values:
+        return _CascadePlan(rows={}, order=(), set_null=(), payload_ids=set())
+    # Sorted at every level so two processes planning the same deletion issue the
+    # same statements in the same order (Constraint 8). The frontier is a list
+    # used as a FIFO rather than a set, because the traversal order is part of
+    # that determinism.
+    visited[(root.name, root_column)] = set(root_values)
+    frontier: list[tuple[str, str, set]] = [(root.name, root_column, set(root_values))]
+    frontier.extend(await _harvest(root, root.c[root_column].in_(sorted(root_values))))
+    while frontier:
+        parent_name, parent_column, values = frontier.pop(0)
+        for child in Base.metadata.sorted_tables:
+            for foreign_key in sorted(child.foreign_keys, key=lambda key: key.parent.name):
+                if foreign_key.column.table.name != parent_name or foreign_key.column.name != parent_column:
+                    continue
+                child_column = foreign_key.parent
+                ondelete = (foreign_key.ondelete or "").upper()
+                condition = child_column.in_(sorted(values))
+                if ondelete == "SET NULL":
+                    # A pointer on a surviving row. Nulling it degrades the
+                    # evidence link rather than the row -- which is exactly what
+                    # `ansich_active_versions.audit_obs_id` was given this
+                    # ondelete for, with `audit_recorded` left standing so the
+                    # NULL stays legible as "expired" and not as "never was".
+                    if child.name in _JOB_TABLE_NAMES:
+                        raise RuntimeError(f"Ansich retention: refusing to null {child.name}.{child_column.name}; retention must not write to a job table (Global Constraint 4)")
+                    set_null.append((child.name, child_column.name, tuple(sorted(values))))
+                    continue
+                already = doomed.get(child.name)
+                unplanned = condition if already is None else and_(condition, ~_doomed_predicate(child, already))
+                if ondelete != "CASCADE":
+                    if await session.scalar(select(1).select_from(child).where(unplanned).limit(1)) is not None:
+                        return None
+                    continue
+                frontier.extend(await _harvest(child, unplanned))
+                doomed.setdefault(child.name, {}).setdefault(child_column.name, set()).update(values)
+    order = tuple(table.name for table in reversed(Base.metadata.sorted_tables) if table.name in doomed)
+    return _CascadePlan(rows=doomed, order=order, set_null=tuple(sorted(set_null)), payload_ids=payload_ids)
 
 
 logger = logging.getLogger(__name__)
@@ -2704,10 +2888,29 @@ class SqlAnsichBackend:
         permanently. A test asserts it over the AST rather than trusting this
         paragraph.
 
-        The report's ``observations_deleted`` and ``structural_deleted`` are
-        ``None`` here and that is deliberate: tiers 2 and 3 are not part of this
-        change, and reporting a tier that did not run as ``0`` would tell an
-        operator the store is smaller than it is.
+        **Three tiers, in containment order, and they converge across passes
+        rather than within one.** Tier 1 tombstones expired payload bodies;
+        tier 2 deletes Observations over a contiguous prefix and moves the
+        horizon; tier 3 deletes structural Entity rows last. The brief's
+        original gate for tier 3 -- "only for Tasks whose entire observation
+        range is *below the horizon*" -- cannot be satisfied on this schema and
+        was replaced by a **controller-ratified deviation**, recorded at
+        :meth:`_run_structural_retention_tier` with the deadlock mechanism.
+        The short form: every Entity pins its own discovery Observation through
+        a NOT NULL, non-cascading foreign key, so the horizon can never reach
+        past the first Task-creating Observation in the store, and tier 3's
+        gate never opens. Tier 3 therefore gates on **age eligibility** rather
+        than on completed deletion, and tier 2's horizon walks past what it
+        unpinned on the *next* pass. Nothing younger than policy is ever
+        touched by either half of that; what it costs is that a store needs as
+        many passes as its dependency graph is deep, which is why a scheduled
+        caller runs this repeatedly rather than once.
+
+        The report's ``observations_deleted`` and ``structural_deleted`` stay
+        ``None`` when their tier **did not run** -- which now means only one
+        thing, that ``max_batches`` was spent before the pass reached it.
+        Reporting an unreached tier as ``0`` would tell an operator the store
+        is smaller than it is.
 
         ``max_batches`` bounds the **whole pass**, not one tier, and it is what
         makes ``RetentionReport.finished`` a real answer rather than a constant.
@@ -2720,6 +2923,15 @@ class SqlAnsichBackend:
         deliberately in *batches* rather than seconds: a batch is the unit that
         commits, so bounding it can never leave a half-written one, whereas a
         wall-clock budget would have to either cut a batch short or overrun.
+
+        **``finished`` answers the bound, not the store.** With three tiers
+        converging across passes it can no longer mean "nothing remains": tier
+        2 stopping at a structural pin is the end of what *it* can do this pass
+        and reports ``True``, while tier 3 — running after it — may have just
+        unpinned that very row for the next one. A scheduler that stopped on
+        ``finished`` would stop one pass early every time. What it does mean is
+        "this pass was not cut short by the batch bound", which is the question
+        a caller with a deadline is actually asking.
         """
 
         started_at = _as_utc(now)
@@ -2731,12 +2943,38 @@ class SqlAnsichBackend:
             # never happened, and the cursor it left behind unexplainable.
             async with self._session_factory() as session, session.begin():
                 state = await self._retention_state(session)
-                resumed_from_cursor = state.payload_cursor is not None
+                # Any tier's cursor, not tier 1's: the pass is one unit of work
+                # and "did this pass pick up where another stopped" is a
+                # question about the pass. A bound spent inside tier 3 leaves
+                # only `structural_cursor` set, and reading that as a fresh
+                # start would make the resume invisible on exactly the passes
+                # that resumed.
+                resumed_from_cursor = state.payload_cursor is not None or state.structural_cursor is not None
                 state.last_run_started_at = started_at
                 state.last_run_finished_at = None
                 state.last_run_policy = policy.snapshot()
 
+            def _remaining(spent: int) -> int | None:
+                return None if max_batches is None else max(max_batches - spent, 0)
+
             payload_tombstoned, batches, finished = await self._run_payload_retention_tier(policy, now=started_at, max_batches=max_batches)
+
+            observations_deleted: int | None = None
+            structural_deleted: int | None = None
+            # A tier the bound has already exhausted is not run at all, and its
+            # count stays `None`. Running it with a budget of zero would spin a
+            # loop that commits nothing and report `0`, which is the
+            # None-never-0 mistake dressed as work.
+            if _remaining(batches) != 0:
+                observations_deleted, tier_batches, tier_finished = await self._run_observation_retention_tier(policy, now=started_at, max_batches=_remaining(batches))
+                batches += tier_batches
+                finished = finished and tier_finished
+            if _remaining(batches) != 0:
+                structural_deleted, tier_batches, tier_finished = await self._run_structural_retention_tier(policy, now=started_at, max_batches=_remaining(batches))
+                batches += tier_batches
+                finished = finished and tier_finished
+            else:
+                finished = False
 
             finished_at = datetime.now(UTC)
             async with self._session_factory() as session, session.begin():
@@ -2746,8 +2984,8 @@ class SqlAnsichBackend:
 
         return RetentionReport(
             payload_tombstoned=payload_tombstoned,
-            observations_deleted=None,
-            structural_deleted=None,
+            observations_deleted=observations_deleted,
+            structural_deleted=structural_deleted,
             batches=batches,
             resumed_from_cursor=resumed_from_cursor,
             finished=finished,
@@ -2837,6 +3075,325 @@ class SqlAnsichBackend:
             label,
         )
         return tombstoned, batches, finished
+
+    @staticmethod
+    async def _apply_cascade_plan(session: AsyncSession, plan: _CascadePlan) -> None:
+        """Issue one plan's updates and deletes, children before parents.
+
+        ``SET NULL`` first, because those rows **survive** and their pointer has
+        to stop referencing the parent before the parent goes; then the deletes
+        in the plan's reverse-topological order. The planner has already refused
+        any ``SET NULL`` against a job table, which is the runtime half of
+        Global Constraint 4 that the AST pin cannot see through a table built at
+        runtime.
+        """
+
+        for table_name, column_name, values in plan.set_null:
+            table = Base.metadata.tables[table_name]
+            await session.execute(update(table).where(table.c[column_name].in_(values)).values({column_name: None}))
+        for table_name in plan.order:
+            table = Base.metadata.tables[table_name]
+            await session.execute(delete(table).where(_doomed_predicate(table, plan.rows[table_name])))
+
+    @staticmethod
+    async def _reclaim_orphaned_payloads(session: AsyncSession, payload_ids: set[str]) -> int:
+        """Delete the ``ansich_payloads`` rows this plan just orphaned.
+
+        **This is the last-referrer-deleter obligation, discharged.** Tier 1
+        deliberately expires no orphan -- being an orphan is a property of the
+        rest of the database at the instant a predicate runs, not of the
+        payload, and a rebuild manufactures orphans for the length of its drain
+        (see :func:`_payload_retention_condition`). What replaces that branch is
+        a rule rather than a mechanism: *whoever removes a payload's last
+        referrer owns the payload row.* Tiers 2 and 3 remove referrers, so they
+        own the rows, and they discharge it **in the same transaction as the
+        delete that orphaned them** -- an orphan that outlived its transaction
+        would be reclaimed by nothing at all, because tier 1 will not touch it.
+
+        The row is **deleted, not tombstoned**, and the choice is not close. A
+        tombstone exists so a reader can tell *expired by policy* from
+        *missing*; here there is no reader left, because the referrer that was
+        the only way to reach this row is gone in the same statement list.
+        Keeping one would leave bytes of lineage nothing can ever query and
+        nothing will ever sweep.
+
+        The residual-referrer check is over ``_payload_referrer_columns()`` --
+        the same derived set tier 1 uses -- so a payload two Observations shared
+        survives the first one's deletion, and a manifest survives its
+        Observation because ``ansich_agent_releases`` still points at it. The
+        ``RESTRICT`` foreign keys force this order anyway: the referrers are
+        already deleted by :meth:`_apply_cascade_plan` when this runs.
+        """
+
+        if not payload_ids:
+            return 0
+        survivors: set[str] = set()
+        for table, column in _payload_referrer_columns():
+            if table.name == AnsichPayloadRow.__tablename__:
+                continue
+            survivors |= {value for (value,) in await session.execute(select(column).where(column.in_(sorted(payload_ids)))) if value is not None}
+        orphaned = sorted(payload_ids - survivors)
+        if not orphaned:
+            return 0
+        await session.execute(delete(AnsichPayloadRow).where(AnsichPayloadRow.payload_id.in_(orphaned)))
+        return len(orphaned)
+
+    async def _run_observation_retention_tier(self, policy: RetentionPolicy, *, now: datetime, max_batches: int | None = None) -> tuple[int, int, bool]:
+        """Tier 2: delete expired Observations over a **contiguous** prefix.
+
+        Returns ``(observations deleted, batches committed, nothing more to
+        do)``.
+
+        Two conditions, and the second is the one that makes RC7 answerable.
+        The Observation must be older than ``observation_days`` by its
+        ``occurred_at`` -- when the thing happened, not when it was ingested --
+        **and** it must be the next one after the horizon. The walk stops dead
+        at the first Observation that fails either test, because a horizon that
+        skipped a survivor would be a claim of completed deletion over a range
+        that still has rows in it, and every receipt at or below it would then
+        read ``expired`` for evidence that is merely *missing its job*. The
+        prefix is the whole of what makes "at or below the horizon" a statement
+        rather than a guess.
+
+        **The delete batch and the horizon advance commit in one transaction.**
+        Not "horizon first" and not "horizon after": either order leaves a
+        window where a kill produces a lie in one direction or the other -- a
+        horizon claiming a deletion that never happened, or rows deleted below a
+        horizon that still reports them as owed and therefore ``failed``. One
+        transaction has no window, and a kill between batches leaves a store
+        where both halves are equally true.
+
+        **What dies with an Observation is decided by the schema, not here**
+        (D6-3). :func:`_plan_cascade` walks the foreign keys: everything with
+        ``ON DELETE CASCADE`` is deleted, everything with ``ON DELETE SET NULL``
+        is nulled, and a single surviving row on a blocking edge stops the
+        prefix instead of raising. The per-family consequences are stated in
+        ``backend/AGENTS.md``; the two worth naming here are that a **Belief
+        assertion is kept** while its evidence rows go (an assertion whose
+        evidence list has emptied under a moved horizon is *explicable* --
+        deleting it would take an Alert's ``source_assertion_id`` with it and
+        destroy the operator record of why something fired), and that the
+        **usage rollup outlives its contributions**, which is what a rollup is
+        for.
+
+        ``ansich_retention_state.observation_cursor`` is deliberately left
+        ``None`` by this tier. The horizon is already a durable, monotone
+        position over the same keyspace and it is the one receipts read; a
+        second position over the same rows could disagree with it, and the
+        disagreement would be silent. A future non-contiguous Observation tier
+        would need that column, and this one does not.
+        """
+
+        cutoff = now - timedelta(days=policy.observation_days)
+        observations = AnsichObservationRow.__table__
+        deleted = 0
+        batches = 0
+        finished = False
+        while True:
+            async with self._session_factory() as session, session.begin():
+                state = await self._retention_state(session)
+                horizon = int(state.observation_horizon_ingest_seq or 0)
+                candidates = list(
+                    await session.execute(
+                        select(observations.c.ingest_seq, observations.c.obs_id, observations.c.occurred_at).where(observations.c.ingest_seq > horizon).order_by(observations.c.ingest_seq).limit(policy.cleanup_batch_size),
+                    )
+                )
+                if not candidates:
+                    finished = True
+                    break
+                # Ascending from the ORDER BY already; re-sorted rather than
+                # assumed, because contiguity is the property this tier exists
+                # to hold and a later edit to the query must not be able to take
+                # it away silently (Constraint 8).
+                candidates.sort(key=lambda row: row[0])
+                advanced: int | None = None
+                for ingest_seq, obs_id, occurred_at in candidates:
+                    if _as_utc(occurred_at) > cutoff:
+                        finished = True
+                        break
+                    plan = await _plan_cascade(session, root=observations, root_column="obs_id", root_values=[obs_id])
+                    if plan is None:
+                        # A structural row still pins it. Tier 3 unpins on this
+                        # pass or a later one and the prefix resumes here.
+                        finished = True
+                        break
+                    await self._apply_cascade_plan(session, plan)
+                    await self._reclaim_orphaned_payloads(session, plan.payload_ids)
+                    advanced = int(ingest_seq)
+                    deleted += 1
+                if advanced is not None:
+                    state.observation_horizon_ingest_seq = advanced
+                    batches += 1
+            if finished:
+                break
+            if max_batches is not None and batches >= max_batches:
+                break
+        logger.info(
+            "ansich retention: tier 2 deleted %d observation(s) in %d batch(es) under observation_days=%d",
+            deleted,
+            batches,
+            policy.observation_days,
+        )
+        return deleted, batches, finished
+
+    async def _run_structural_retention_tier(self, policy: RetentionPolicy, *, now: datetime, max_batches: int | None = None) -> tuple[int, int, bool]:
+        """Tier 3: delete expired structural Entity rows, and unpin what they held.
+
+        Returns ``(entities deleted, batches committed, walked to the end)``.
+        The count is **Entity rows**, not rows removed: one Entity takes its
+        whole cascade with it (a Task's Steps, ToolCalls, context states,
+        heartbeat rows, Relations at both ends) and adding those up would be a
+        number nobody can act on.
+
+        ------------------------------------------------------------------
+        **RECORDED DEVIATION: cross-pass convergence replaces the horizon gate.**
+        ------------------------------------------------------------------
+
+        The brief specifies "tier 3 deletes structural rows only for Tasks whose
+        entire observation range is **below the horizon**". That gate cannot
+        open on this schema, and the deadlock is unconditional rather than a
+        tuning artefact:
+
+        * ``ansich_entities.discovered_obs_id`` is ``NOT NULL`` with **no**
+          ``ON DELETE`` action, so every Entity in the store pins the
+          Observation it was discovered by;
+        * ``ansich_tasks.trigger_obs_id`` (also non-cascading) and
+          ``ansich_scopes.created_obs_id`` (``RESTRICT``) pin a Task's own
+          creation Observation the same way;
+        * so tier 2's contiguous prefix stops at the first Task-creating
+          Observation in the store, and the horizon stays where it was;
+        * and tier 3, gating on that horizon, never fires. Each tier waits for
+          the other.
+
+        Note what is *not* load-bearing in that argument: the configuration's
+        containment rule (``observation_days <= structural_days``) explains why
+        an operator cannot tune their way out, but the deadlock holds whatever
+        order the thresholds are in, because the horizon is ``0`` and tier 3
+        reads the horizon.
+
+        **What runs instead.** Tier 3 gates on *age eligibility* rather than on
+        completed deletion: an Entity is unpinned when its Task's **entire**
+        Observation range is old enough for tier 2 to take -- eligible by
+        ``occurred_at``, not necessarily already deleted. Tier 2's horizon then
+        walks past the unpinned prefix on the **next** pass. Retention converges
+        across passes, bounded by how deep the dependency graph goes, and the
+        safety property the original gate was reaching for is kept exactly:
+        **nothing younger than policy is ever deleted**, because the range test
+        is over ``occurred_at`` and refuses on a single young Observation.
+
+        The predicate, in order of how much it costs to answer:
+
+        1. the Entity's discovery Observation is older than ``structural_days``;
+        2. it is not the host ``Scope`` and its Task is not the bootstrap
+           sentinel -- the process's own anchor and the Task id that means
+           "this Observation has no Task", neither of which is per-run evidence
+           that ages;
+        3. **no Observation of its Task is younger than the Observation
+           cutoff.** This is the ruling's predicate and the reason a Task that
+           started ninety days ago and is *still running* is untouched: its
+           heartbeats are minutes old, so its range is not eligible, so its
+           structure stays;
+        4. nothing outside the plan still points at anything inside it
+           (:func:`_plan_cascade` answers ``None``), which is what lets a
+           shared Entity -- a content block several Tasks referenced -- wait
+           until the last of them has gone.
+
+        Failing 2, 3 or 4 **skips** the Entity and leaves the cursor moving, so
+        one immortal row can never stall the walk behind it. That is the same
+        trade tier 1 makes with a young referrer, and the reason the tier is
+        allowed to be non-contiguous while tier 2 is not: nothing reads a
+        structural "horizon".
+
+        The cursor is ``structural_cursor``, an ``entity_id`` and nothing else
+        (T8's documented contract). Relations are never walked: they reference
+        ``ansich_entities`` with ``ON DELETE CASCADE`` at both ends, so they go
+        with the Entity.
+        """
+
+        structural_cutoff = now - timedelta(days=policy.structural_days)
+        observation_cutoff = now - timedelta(days=policy.observation_days)
+        entities = AnsichEntityRow.__table__
+        observations = AnsichObservationRow.__table__
+        host_scope = host_scope_id(self._hostname)
+        deleted = 0
+        batches = 0
+        finished = False
+        while True:
+            async with self._session_factory() as session, session.begin():
+                state = await self._retention_state(session)
+                statement = select(entities.c.entity_id).select_from(entities.join(observations, observations.c.obs_id == entities.c.discovered_obs_id)).where(observations.c.occurred_at <= structural_cutoff)
+                if state.structural_cursor is not None:
+                    statement = statement.where(entities.c.entity_id > state.structural_cursor)
+                candidates = sorted((await session.execute(statement.order_by(entities.c.entity_id).limit(policy.cleanup_batch_size))).scalars())
+                if not candidates:
+                    state.structural_cursor = None
+                    finished = True
+                    break
+                for entity_id in candidates:
+                    if entity_id == host_scope:
+                        continue
+                    if not await self._structural_range_is_eligible(session, entity_id, observation_cutoff):
+                        continue
+                    # One Entity per plan rather than the whole batch. A batch
+                    # plan would let one Entity's blocking referrer be satisfied
+                    # by another Entity's presence in the same plan depending on
+                    # the order the edges happen to be walked in, which is a
+                    # correctness answer that varies with `sorted_tables`.
+                    plan = await _plan_cascade(session, root=entities, root_column="entity_id", root_values=[entity_id])
+                    if plan is None:
+                        continue
+                    await self._apply_cascade_plan(session, plan)
+                    await self._reclaim_orphaned_payloads(session, plan.payload_ids)
+                    deleted += 1
+                state.structural_cursor = candidates[-1]
+                batches += 1
+            if max_batches is not None and batches >= max_batches:
+                break
+        logger.info(
+            "ansich retention: tier 3 deleted %d entit(y/ies) in %d batch(es) under structural_days=%d",
+            deleted,
+            batches,
+            policy.structural_days,
+        )
+        return deleted, batches, finished
+
+    @staticmethod
+    async def _structural_range_is_eligible(session: AsyncSession, entity_id: str, observation_cutoff: datetime) -> bool:
+        """Is this Entity's Task entirely past the Observation cutoff?
+
+        The Task is read off the Entity's **discovery Observation** rather than
+        from a per-family column, because every Entity has exactly one discovery
+        Observation and ``ansich_observations.task_id`` is on it -- while the
+        subtype tables that carry a ``task_id`` are only some of the families,
+        and the ones that do not (a content block, a Scope) would need a rule
+        each. An Entity that *is* a Task counts itself as well, since its own
+        rows are addressed by ``entity_id``.
+
+        The **bootstrap sentinel refuses outright.** ``ANSICH_BOOTSTRAP_TASK_ID``
+        is not a Task, it is the value that says "this Observation has no Task"
+        (``ansich_observations.task_id`` carries no foreign key precisely so it
+        can be written), so "the Task's whole range" is not a question about it.
+        Aging it as if it were one would let a range test over an unrelated pile
+        of process-level rows decide whether the collector's own bootstrap
+        Scope survives.
+
+        ``None`` from the aggregate means the Task has no Observations at all,
+        which is eligible: there is no evidence to be too young.
+        """
+
+        observations = AnsichObservationRow.__table__
+        tasks = AnsichTaskRow.__table__
+        entities = AnsichEntityRow.__table__
+        owner = await session.scalar(
+            select(observations.c.task_id).select_from(entities.join(observations, observations.c.obs_id == entities.c.discovered_obs_id)).where(entities.c.entity_id == entity_id),
+        )
+        task_ids = {value for value in (owner,) if value is not None}
+        if await session.scalar(select(tasks.c.entity_id).where(tasks.c.entity_id == entity_id)) is not None:
+            task_ids.add(entity_id)
+        if not task_ids or ANSICH_BOOTSTRAP_TASK_ID in task_ids:
+            return False
+        newest = await session.scalar(select(func.max(observations.c.occurred_at)).where(observations.c.task_id.in_(sorted(task_ids))))
+        return newest is None or _as_utc(newest) <= observation_cutoff
 
     async def initialize_metrics(self) -> None:
         await self._refresh_failed_job_count()
@@ -3240,6 +3797,12 @@ class SqlAnsichBackend:
         # `unreachable` with every field `None`, `active_versions` included —
         # which is the honest answer and the one Constraint 2 requires.
         active_versions = await self.get_active_versions()
+        # A third read, and unlike the active-version one it is uncached: the
+        # row is single and tiny, the read is one primary-key `get`, and the
+        # question ("when did retention last run") is only ever asked by an
+        # operator opening a panel. A cache would buy nothing and would make a
+        # sweep that just finished still read as the previous one.
+        retention_last_run = await self.get_retention_last_run()
         return DatabaseHealth(
             status="reachable",
             projectors=snapshot.projectors,
@@ -3247,6 +3810,7 @@ class SqlAnsichBackend:
             failed_jobs=snapshot.failed_jobs,
             stale_completion_count=self._stale_completion_count,
             active_versions=active_versions,
+            retention_last_run=retention_last_run,
         )
 
     # ------------------------------------------------------------------

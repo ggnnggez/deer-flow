@@ -976,7 +976,10 @@ class RetentionReport(BaseModel):
     deleted nothing". Reporting an unexecuted tier as ``0`` would be the
     None-never-0 mistake in its most expensive form — an operator reading a
     clean zero for a tier that never executed has been told the store is
-    smaller than it is.
+    smaller than it is. There is now exactly one way to reach that state:
+    ``max_batches`` was spent before the pass got to that tier. Running a tier
+    with a budget of zero would spin a loop that commits nothing and report
+    ``0``, which is the same mistake wearing a day's work.
 
     ``batches`` counts committed batches across every tier that ran, which is
     also the number of times the durable cursor advanced. ``resumed_from_cursor``
@@ -987,6 +990,15 @@ class RetentionReport(BaseModel):
     true only when every tier that ran walked its whole candidate set to the
     end. A pass cut short by an error, or one that stopped on a batch boundary
     it could not pass, reports ``False`` and the cursor says where to resume.
+
+    **``finished`` is not "the store is fully expired", and under cross-pass
+    convergence a caller re-runs regardless.** The Observation tier stops at the
+    first row a structural row still pins, which is the end of what *it* can do
+    this pass, so it reports ``True`` — while the structural tier, running after
+    it, may have just unpinned exactly that row for the next pass. A scheduler
+    that stopped on ``finished`` would therefore stop one pass early, every
+    time. The field answers "did the batch bound cut this pass short"; whether
+    more remains is answered by running again and reading the counts.
 
     ``observation_horizon_ingest_seq`` is the horizon as it stood when the pass
     returned. ``0`` is honest here and not a missing value: ``ingest_seq``
@@ -1362,6 +1374,17 @@ class DatabaseHealth(BaseModel):
     truth: it is the reporting worker's own count of writes dropped because the
     job had been taken over.
 
+    ``retention_last_run`` is the one field here whose ``None`` means something
+    **other** than "unknown". A reachable store with no retention pass in its
+    history answers ``None`` because there is nothing to report -- retention is
+    driven by a caller, not by the store, and a store nobody has ever swept is
+    a normal store rather than an unreadable one (Global Constraint 2: never
+    epoch-zero, never a fabricated "0 deleted"). An ``unreachable`` block also
+    answers ``None``, so the two states are not distinguishable from this field
+    alone; ``status`` is what tells them apart, exactly as it does for the
+    numbers. Rendering it as "retention has never run" without checking
+    ``status`` first would report an outage as a configuration.
+
     ``active_versions`` follows the same ``None``-means-unknown rule as the
     numbers, and it is the field where the distinction is easiest to get wrong:
     an **empty tuple is impossible**, because a reachable store always reports
@@ -1380,6 +1403,7 @@ class DatabaseHealth(BaseModel):
     failed_jobs: int | None = None
     stale_completion_count: int | None = None
     active_versions: tuple[ActiveVersion, ...] | None = None
+    retention_last_run: RetentionLastRun | None = None
 
 
 class AnsichHealth(BaseModel):

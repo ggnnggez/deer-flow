@@ -2302,3 +2302,103 @@ async def test_retention_tombstones_payloads_beside_a_live_claimer_on_postgres()
         assert rebuild_window.payload_tombstoned == 1
         assert pinned is not None and pinned.body is None
         assert pinned.policy == "raw_payload_days=7"
+
+
+async def test_observation_retention_deletes_a_claimed_job_beside_its_owner_on_postgres() -> None:
+    """Tier 2 against a live claimer, on the dialect that enforces the keys.
+
+    The new surface tiers 2/3 open is not the one tier 1 had. Tier 1 protects a
+    payload whose Observation still has an in-flight job, so a claimer never
+    finds an empty body. **Tier 2 has no such guard, deliberately**, and this is
+    where that decision is proved rather than argued: an Observation past
+    ``observation_days`` whose job is *still* unsettled has been owed for a
+    month, and pinning the evidence on it would let one stuck job hold its
+    Observation out of retention forever — the same reason ``failed`` is not in
+    ``_IN_FLIGHT_JOB_STATUSES``. So the Observation goes and the job goes with
+    it through ``ON DELETE CASCADE``, under the claimer's feet.
+
+    What must then hold is that the claimer's settle **drops** rather than
+    raises: ``_complete_projection_job`` guards on
+    ``job_id AND lease_generation`` and a rowcount of zero already means "this
+    worker no longer owns the outcome". A deleted row is the same answer through
+    the same channel, which is why no new state was needed for it. Asserted here
+    rather than reasoned about, because on PostgreSQL — with foreign keys
+    actually enforced, two workers, two pools — a cascade that did not reach the
+    job would leave a row pointing at a deleted Observation and the settle would
+    fail on a constraint instead.
+
+    Three further things this can only say on the real dialect: that the
+    referrer-first ordering the plan computes satisfies the ``RESTRICT`` wall
+    (SQLite with ``PRAGMA foreign_keys`` off cannot refuse anything), that the
+    payload rows the deletion orphans are gone rather than dangling, and that
+    the receipt for a deleted Observation answers ``expired`` from a horizon a
+    real pass earned.
+    """
+
+    policy = RetentionPolicy(raw_payload_days=7, observation_days=30, structural_days=90, cleanup_batch_size=2)
+    aged = _OCCURRED_AT + timedelta(days=365)
+    async with _two_workers(inline_payload_max_bytes=1) as (_url, worker_a, worker_b):
+        task_id = new_id()
+        envelopes = [
+            _task_created(task_id, source_id="run-obs-retention"),
+            _heartbeat(task_id, run_id="run-obs-retention", ordinal=1, offset_seconds=0),
+            _heartbeat(task_id, run_id="run-obs-retention", ordinal=2, offset_seconds=1),
+            _heartbeat(task_id, run_id="run-obs-retention", ordinal=3, offset_seconds=2),
+        ]
+        assert await worker_a.backend.persist_and_project(envelopes) == len(envelopes)
+        await _settle_everything(worker_a, worker_b)
+        async with worker_a.sessions() as session:
+            observed = list((await session.execute(sa.select(AnsichObservationRow.obs_id).order_by(AnsichObservationRow.ingest_seq))).scalars())
+        assert len(observed) == len(envelopes)
+
+        # Pass 1 unpins. Tier 2 cannot move at all yet — the first Observation
+        # creates the Task Entity — so this pass is tier 3's, and the horizon
+        # staying `0` is what makes the second pass necessary rather than tidy.
+        first = await asyncio.wait_for(worker_a.backend.run_retention(policy, now=aged), timeout=60)
+        assert first.observations_deleted == 0
+        assert first.observation_horizon_ingest_seq == 0
+        assert first.structural_deleted >= 1
+        async with worker_b.sessions() as session:
+            assert await session.get(AnsichEntityRow, task_id) is None
+
+        # Re-pend exactly one job and let worker B claim it, committing
+        # `processing` in its own transaction — the claim protocol's invariant,
+        # and the thing that makes A's sweep race a real claimer rather than a
+        # status this test wrote.
+        async with worker_a.sessions() as session, session.begin():
+            doomed_job_id = await session.scalar(sa.select(AnsichProjectionJobRow.job_id).order_by(AnsichProjectionJobRow.job_id).limit(1))
+            assert doomed_job_id is not None, "the unpinning pass must leave the jobs behind"
+            await session.execute(
+                sa.update(AnsichProjectionJobRow).where(AnsichProjectionJobRow.job_id == doomed_job_id).values(status="pending", attempts=0, lease_owner=None, lease_expires_at=None, available_at=datetime.now(UTC)),
+            )
+        claim = await worker_b.backend._claim_projection_job()
+        assert claim is not None and claim[0] == doomed_job_id
+        async with worker_a.sessions() as session:
+            assert await session.scalar(sa.select(AnsichProjectionJobRow.status).where(AnsichProjectionJobRow.job_id == doomed_job_id)) == "processing", "the claim must be committed before the sweep runs, or this proves nothing"
+
+        second = await asyncio.wait_for(worker_a.backend.run_retention(policy, now=aged), timeout=60)
+
+        assert second.observations_deleted == len(observed)
+        assert second.observation_horizon_ingest_seq == len(observed)
+
+        # The claimed job went with its Observation, and B's settle says so by
+        # returning False rather than raising or writing a row nobody owns.
+        async with worker_b.sessions() as session, session.begin():
+            assert await worker_b.backend._complete_projection_job(session, job_id=claim[0], lease_generation=claim[-1]) is False
+
+        async with worker_b.sessions() as session:
+            assert list((await session.execute(sa.select(AnsichObservationRow.obs_id))).scalars()) == []
+            assert list((await session.execute(sa.select(AnsichProjectionJobRow.job_id))).scalars()) == []
+            assert list((await session.execute(sa.select(AnsichTaskHeartbeatRow.heartbeat_obs_id))).scalars()) == []
+            # The last-referrer-deleter obligation, on the dialect where a
+            # dangling payload would have had to survive a RESTRICT.
+            assert list((await session.execute(sa.select(AnsichPayloadRow.payload_id))).scalars()) == []
+
+        # FC-3 from the other worker, over a horizon this pass really earned.
+        assert await worker_b.backend.get_observation_projection_status(observed[-1]) == "expired"
+
+        # And a third pass has nothing left to find, which is what makes the
+        # convergence terminating rather than merely progressing.
+        third = await asyncio.wait_for(worker_a.backend.run_retention(policy, now=aged), timeout=60)
+        assert third.observations_deleted == 0
+        assert third.structural_deleted == 0

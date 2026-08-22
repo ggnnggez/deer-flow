@@ -41,6 +41,7 @@
 | F10-31 | LLM attempt 双观测的首写者 pkey 竞态:两 worker 各投影同一 attempt 的 request/response 观测,`ansich_llm_attempts_pkey` 碰撞——非破坏(输家整事务回滚→retry→收敛,和数正确),但需要第五处 lock-then-read 转换 | ⬜ 未修复 | — | — |
 | F10-32 | 活动 Task 读模型的「旧盖章」楔子:`c7ce07a8` 之前写下的行带旧语义水位,遇 durably failed 作业时被单调发布守卫永久跳过(已停 Task 那半边**静默**)。接受它的前提是「没有已部署群体」,而该前提**在此分支首次部署时失效** | ⬜ 未修复(带前提,须在首次部署前重判) | — | — |
 | F10-33 | 多 worker 下同一 host-Scope episode 并发碰撞 `uq_ansich_alert_episode`,一次碰撞丢掉**整轮** `assess_operations`(heartbeat/dwell/budget/environment 与两个生产者一起)——不腐蚀、下一轮自愈、已限速可见 | ⬜ 未修复 | — | — |
+| F10-34 | PG tier 的 `_drain_projections` 在**退避中的 `retry` 作业**面前停手,调用方把它当成「投影已完结」——同文件的 `_settle_projections` 正是为这半件事存在的,只是那个调用点没用它。**不是 F10-30**(不是 settle 预算输给负载),也**不是 F10-26**(不是重建单轮被当成完成) | ⬜ 未修复(测试侧;一行改法已知) | — | — |
 
 留观标记:F10-10 的第 4 条证据(`test_step_attempt_and_context_are_queryable_after_projection`)**未证实**——只做了排除法,没拿到原始失败文本。若它再轮换红,**先抓失败文本再修**,不要按已有的三条诊断类推。另:F10-10 的门禁只被 Task 8 的验收负载证明过(`e53cefbc` 记录了这条边界),Task 9 的更重负载下仍有 2 条已上门禁的测试翻红,详见该条的「后续观察」。
 
@@ -550,3 +551,27 @@
 - 现状:一台主机上的每个 Gateway worker 都以**同一个** host `Scope` 为主体、各自跑自己的 1 Hz 评估,于是两个 worker 同时开同一条 episode 会在 `uq_ansich_alert_episode` 上碰撞。**不腐蚀**,而且是任何 `host` 作用域环境告警早就有的既存暴露;但代价不小:炸的是**整个** `assess_operations` 事务,那一轮的 heartbeat、dwell、budget、environment 与两个 process-subject 生产者一起被丢掉。P11-B 至少让它不再无声——`AnsichService._report_assessment_failure` 每次都带 traceback 打 DEBUG、并按 `_ASSESSMENT_WARNING_INTERVAL_SECONDS` 限速打一条 WARNING(带被压制计数),两者都 fail-open。下一轮(一秒后)重做。
 - 方向:要么给 Scope 主体的对账串行化(一把按 `scope_id` 的咨询锁,或把 episode 的开启改成 `ON CONFLICT DO NOTHING` + 重读赢家行——即 T5 的 lock-then-read 姿势用在 episode 上),要么把这两个生产者从共享的 `assess_operations` 事务里拆出来,让一次碰撞只丢掉它们自己那一段而不是整轮。前者更根治,后者更便宜;两条都需要各自的死锁面/语义评估,不是一行改动。
 - 归属:P11-C(与 F10-31 同一族:剩下的首写者/唯一约束竞态)。
+
+## F10-34. PG tier 的 `_drain_projections` 在退避作业前停手,被当成「投影已完结」
+
+- 状态:⬜ 未修复(测试侧;生产行为无关,一行改法已知)。来源:P11-C 批 Task 9b 的 PostgreSQL tier 全量一次翻红。
+- 位置:`backend/tests/integration/test_postgres_multiworker.py::_drain_projections`(:497)与出事的那个调用点 `test_reversing_the_lock_traversal_order_deadlocks_on_postgres`(:1204)。
+- 失败全文:
+
+  ```
+  tests/integration/test_postgres_multiworker.py:1208: in test_reversing_the_lock_traversal_order_deadlocks_on_postgres
+      assert len(dimensions) >= 2, f"need two lockable summary rows, got {dimensions}"
+  E   AssertionError: need two lockable summary rows, got ['llm_attempts']
+  E   assert 1 >= 2
+  ```
+
+- **分诊:这条红既不属于 F10-30,也不属于 F10-26,所以它必须自己立条。** 按 F10-30 窄口 (1) 的分诊规则先看失败形状:
+  - **不是 F10-30**。本族的签名是「settle 预算(flush 超时 / 硬编码 sleep)输给负载」。这里的 settle 不是一个预算:`_drain_projections` 是一个**有界循环**,循环到 `project_pending()` 返回 0 才退出,**不看墙钟**。负载再重也只是让它多转几圈。
+  - **不是 F10-26**。本族的签名是「`rebuild_projections()` 单轮被当成完成 / `unsettled == 0` 被当成完整性」。这里根本没有 `rebuild_projections()`,断言也不是 `unsettled == 0`。
+  - **真机理,而且这个文件自己已经写下来了。**`project_pending()` 返回 0 的含义是「**当下没有可认领的作业**」,不是「没有欠着的作业」:一条被重新武装成 `retry` 的作业带着未来的 `available_at`,在退避窗口里就是不可认领的。所以一次首写者竞态(争用下的回滚 → `retry` → 退避)会让 `_drain_projections` 干净地返回,而 usage 汇总只写出了一个 dimension。`_settle_projections`(:509)的 docstring 一字不差地描述了这半件事——「A job re-armed to `retry` carries an `available_at` in the future, so a plain drain stops with it still outstanding」——它就是为此存在的,只是这个调用点用的是弱的那个 helper。
+- 讨伐(走 F10-30 窄口的两条路径,两条都走通了,尽管本条不归 F10-30):
+  - (a)**单独重跑 3/3 绿**:`cd backend && DEER_FLOW_TEST_POSTGRES_URL=… PYTHONPATH=. timeout 300 uv run pytest "tests/integration/test_postgres_multiworker.py::test_reversing_the_lock_traversal_order_deadlocks_on_postgres" -m integration -q -p no:randomly --no-header` 连跑 3 次,**3/3 `1 passed`**(7.09s / 7.09s / 7.42s);随后同机把整个 tier 再跑一次,**25 passed** 全绿。
+  - (b)**结构性排除**:该用例的函数体与批 BASE `26e70907` 逐字相同(Task 9b 只在这个文件末尾**追加**了一条新用例,一行都没改既有内容);Task 9b 的生产改动全部在 `run_retention` 的三个 tier 与一个新的级联规划器里,认领、投影、usage 扇出四条路上一行都没动。
+  - **唯一可想象的间接关联如实写下**:红的那一轮 PG tier 是与 `tests/ansich` 的 1000+ 条 SQLite 全量**并发**跑的,机器被我自己压住——争用正是首写者竞态(`F10-31` / `F10-6` 残留)赖以发生的那个变量,而这条 helper 的弱点是把那次竞态的后果从「慢」变成了「红」。
+- 方向:那个调用点改用 `_settle_projections`(它做的正是「drain → 把退避的 `available_at` 拉到当下 → 再 drain」,严格更强,不会削弱该用例证明的任何东西)。更彻底的一步是让 `_drain_projections` 自己在返回前确认没有 `retry` 作业在退避——但那会改变它对**所有**调用点的语义,应当单独评估;本条只主张改这一个调用点。**不要**靠调大 `rounds`:那个界不是问题所在。
+- 归属:下一次测试卫生波(与 F10-30 / F10-26 的 settle helper 工作同一批),或任何下一次触达该文件的改动顺带处理。

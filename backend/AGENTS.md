@@ -2511,9 +2511,116 @@ deliberate and one-directional: the deleted row took its `ingest_seq` with it, s
 "in the deleted prefix" is an inference — but the ladder's earlier rungs have
 already answered for everything this process charged as lost, loss has three
 louder channels of its own, and a flipped receipt has none.
-`DatabaseHealth.retention_last_run` and tiers 2/3 are **not** in this change:
-`RetentionReport.observations_deleted`/`.structural_deleted` are `None`, which
-means *that tier did not run*, not that it ran and deleted nothing.
+
+**P11-C retention, tiers 2 and 3: Observation deletion, structural unpinning,
+and cross-pass convergence.** The tiers run in containment order within a pass
+(payload → Observation → structural) and the pass is bounded as a whole by
+`max_batches`; a tier the bound has already exhausted is not run at all and its
+count stays `None`, which is now the *only* thing `None` means on
+`RetentionReport.observations_deleted`/`.structural_deleted`.
+
+**The brief's tier-3 gate was replaced by a controller-ratified deviation,
+because it deadlocks on this schema.** As specified, tier 3 deletes structural
+rows "only for Tasks whose entire observation range is *below the horizon*".
+`ansich_entities.discovered_obs_id` is NOT NULL with **no** `ON DELETE` action,
+`ansich_tasks.trigger_obs_id` is the same and `ansich_scopes.created_obs_id` is
+`RESTRICT`, so every Entity pins its own discovery Observation and a Task pins
+its own creation Observation. Tier 2's contiguous prefix therefore stops at the
+first Task-creating Observation in the store, the horizon stays `0`, and tier
+3 — gating on that horizon — never fires. Each tier waits for the other, and the
+deadlock is unconditional: the configuration's containment rule explains why an
+operator cannot tune out of it, but the argument does not depend on the
+thresholds' order. What runs instead gates tier 3 on **age eligibility** rather
+than on completed deletion — an Entity is unpinned when its Task's *entire*
+Observation range is old enough for tier 2 to take, eligible by `occurred_at`
+and not necessarily already deleted — and tier 2's horizon then walks past the
+unpinned prefix on the **next** pass. Retention converges *across* passes,
+bounded by how deep the dependency graph is, and gives nothing away on safety:
+one Observation younger than the Observation cutoff refuses the whole Entity, so
+a Task that started ninety days ago and is still emitting heartbeats keeps its
+structure. `test_two_passes_converge_where_one_cannot` is the statement in
+executable form — one pass cannot finish that store and two can — and
+`test_every_blocking_observation_referrer_is_reachable_by_deleting_an_entity`
+pins the structural fact the pairing depends on off `Base.metadata`: every table
+that can *block* an Observation deletion is inside the `ansich_entities`
+cascade, so a schema change that adds one outside it turns a test red instead of
+stalling a production horizon at a sequence nobody can explain.
+
+**One derived planner serves both tiers.** `_plan_cascade` walks the foreign
+keys out from a root row set and returns the blast radius, or `None` when a
+blocking referrer still has a row outside the plan — which is not an error but
+the whole of how both tiers say "not yet". Rows are condemned **by the inbound
+edge that reached them**, never by their own exported keys: `ansich_tool_calls.task_id`
+is a key somebody else points at, and an identity built out of it would read
+"every ToolCall of this Task" from the deletion of one ToolCall Entity. The plan
+is applied in full by this module even where PostgreSQL would cascade on its
+own, because the suite's SQLite engines run with `PRAGMA foreign_keys` off and a
+pass that leaned on the database would leave a different store behind on each
+dialect — and because a plan that names its own rows can count them.
+`ON DELETE SET NULL` edges are applied as updates *before* the deletes, since
+those rows survive; the planner refuses one against a job table outright, which
+is the runtime half of Global Constraint 4 that the AST pin cannot see through a
+table built at runtime.
+
+**Tier 2 commits the delete batch and the horizon advance in one transaction.**
+Either order as two transactions produces a lie in one direction: horizon-first
+claims a deletion that never happened, horizon-after leaves rows deleted below a
+horizon that still reports them as owed — the FC-3 flip. One transaction has no
+window, and `test_the_delete_batch_and_the_horizon_advance_are_one_transaction`
+kills the process inside it and finds both halves untouched. The horizon is also
+tier 2's **cursor**: `ansich_retention_state.observation_cursor` is deliberately
+left `None`, because the horizon is already a durable monotone position over the
+same keyspace and it is the one receipts read, so a second position over the
+same rows could disagree with it silently. A future non-contiguous Observation
+tier would need that column; this one does not.
+
+**What dies with an Observation is the schema's decision, not the module's**
+(D6-3), and the three answers are worth naming. Projection jobs and their errors
+go (`CASCADE`), which is what makes the receipt ladder reach its horizon rung at
+all; per-Observation projections go with them (heartbeats, task budgets, usage
+contributions, evaluation index rows, alert and relation evidence) while the
+**usage rollup outlives its contributions**, which is what a rollup is for. The
+**Belief assertion is kept** while its evidence rows go: an assertion whose
+evidence list has emptied under a moved horizon is *explicable* — the horizon
+beside it says deletion completed over that range, the same inference the
+receipt ladder makes — whereas deleting it would take
+`ansich_alerts.source_assertion_id` (NOT NULL, non-cascading) with it and
+destroy the operator's record of why something fired. Every Belief read already
+tolerates an empty evidence tuple, and that is asserted rather than assumed. And
+an expiring audit anchor is **nulled**, not deleted: `ansich_active_versions.audit_obs_id`
+degrades the evidence pointer while `audit_recorded` keeps the NULL legible as
+"expired" rather than "never was".
+
+**Tier 3 walks `ansich_entities` by `entity_id`** (T8's `structural_cursor`
+contract; relations are never walked, because they cascade from the Entity at
+both ends) and **refuses two things by name**: the host `Scope`, which is this
+process's own anchor rather than per-run evidence, and any Entity whose Task is
+`ANSICH_BOOTSTRAP_TASK_ID` — not a Task at all but the value that says "this
+Observation has no Task", so "is its Task's whole range old" is not a question
+about it. A refusal *skips* and leaves the cursor moving, unlike tier 2's
+contiguous stop, because nothing reads a structural horizon.
+
+**Both tiers discharge the last-referrer-deleter obligation in the same
+transaction as the delete that created it.** Tier 1 expires no orphan in either
+direction, so a payload whose last referrer these tiers remove is reclaimed by
+nothing unless they reclaim it. The row is **deleted, not tombstoned**: a
+tombstone exists so a reader can tell *expired by policy* from *missing*, and
+here the only way to reach the row went with the referrer in the same statement
+list. The residual check runs over the same derived referrer set
+(`_payload_referrer_columns`) tier 1 uses, so a payload two Observations share
+survives the first one's deletion, and a manifest survives its Observation and
+goes with its release — row and all — in tier 3, which is the other half of the
+sentence tier 1's exclusion starts.
+
+**`RetentionReport.finished` answers "did the bound stop this pass", not "is the
+store fully expired".** Under cross-pass convergence a caller re-runs regardless:
+a tier that stopped at a pin has finished what *it* can do and reports `True`,
+and the next pass may still have work because the pass before it unpinned
+something. `DatabaseHealth.retention_last_run` carries the last pass to the
+health block, and its `None` means **never run** on a reachable store — which is
+ordinary, since retention is driven by a caller rather than by the store — while
+an unreachable block answers `None` too, so `status` is what tells the two
+apart.
 
 **Workspace change review**: `packages/harness/deerflow/workspace_changes/`
 captures a pre-run and post-run snapshot of the thread-owned `workspace` and
