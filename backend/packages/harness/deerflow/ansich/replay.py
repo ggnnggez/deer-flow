@@ -23,6 +23,17 @@ Observations and payloads are never written, never deleted, and never replayed
 (Global Constraint 3). What it changes is jobs and read models, both of which
 are rebuildable by definition.
 
+**``replace`` adds a step 0 and two refusals** (plan ruling RC4). It deletes
+the target projector's exclusively-owned read-model tables whole, in the mint's
+own transaction, before the re-pend -- which is what turns a replay from "write
+the rows again" into "these rows are exactly what this history produces".
+Because the delete cannot be narrowed the way the re-derive can, a replace
+combined with any filter is refused; and because owning a table does not by
+itself mean the projector can put its rows back from the Observation stream
+alone, a replace of a projector that has not been shown to do so is refused
+too. Both live in ``_validate_replace_request``, with the reasoning at
+``_REPLACE_PROVEN_PROJECTORS``.
+
 **What an accepted target does and does not assert.** ``_validate_replay_target``
 answers three questions -- registered name, declared version, executable in
 this build -- and the third one is checked with a proxy: the dispatch chain's
@@ -61,6 +72,7 @@ from ansich import ReplayReport, ReplaySelector
 from deerflow.ansich.persistence.sql import (
     _PROJECTOR_OWNED_TABLES,
     SqlAnsichBackend,
+    _validate_replace_request,
     _validate_replay_target,
 )
 
@@ -87,12 +99,31 @@ DEFAULT_MAX_DRAIN_BATCHES = 500
 __all__ = ["DEFAULT_BATCH_LIMIT", "DEFAULT_MAX_DRAIN_BATCHES", "DEFAULT_MAX_ROUNDS", "execute_replay", "plan_replay"]
 
 
+def _replace_notes(projector_name: str, *, replace: bool) -> list[str]:
+    """Say in words that a whole table was (or would be) cleared.
+
+    A replace that succeeded looks exactly like a replay that did not in every
+    number ``ReplayReport`` carries -- same targets, same counts, and, when it
+    works, the same digest. The one thing an operator cannot recover from the
+    report is *which tables were emptied and re-derived*, and that is the part
+    they would want to read back after the fact. So it is said here, in the
+    free-text channel, rather than by adding a count nobody would compare.
+    """
+
+    if not replace:
+        return []
+    tables = _PROJECTOR_OWNED_TABLES.get(projector_name, ())
+    names = ", ".join(sorted(model.__table__.name for model in tables))
+    return [f"replace: {len(tables)} read-model table(s) owned by {projector_name} cleared and re-derived ({names})"]
+
+
 async def plan_replay(
     backend: SqlAnsichBackend,
     *,
     projector_name: str,
     projector_version: str,
     selector: ReplaySelector | None = None,
+    replace: bool = False,
 ) -> ReplayReport:
     """Answer "what would this replay do" without doing any of it.
 
@@ -103,7 +134,9 @@ async def plan_replay(
 
     The target is validated first, so a dry run of an impossible target refuses
     exactly as the real one would -- the point of ``--dry-run`` is to find that
-    out cheaply.
+    out cheaply. That includes ``replace``: a filtered replace and a projector
+    whose restore is unproven are refused here on exactly the terms the real
+    pass would refuse them.
 
     ``digest`` is always ``None`` here, and that is not a limitation to be
     lifted later. A digest computed now would describe the store *before* the
@@ -113,6 +146,7 @@ async def plan_replay(
 
     selector = ReplaySelector() if selector is None else selector
     _validate_replay_target(projector_name, projector_version)
+    _validate_replace_request(projector_name, projector_version, selector, replace=replace)
     minted, re_pended = await backend.count_replay_targets(
         projector_name=projector_name,
         projector_version=projector_version,
@@ -121,6 +155,7 @@ async def plan_replay(
     unsettled = await backend.unsettled_job_count()
     failed = await backend.failed_projection_job_count(projector_name=projector_name, projector_version=projector_version)
     errors = ["dry run: nothing was written, so no digest was computed"]
+    errors.extend(_replace_notes(projector_name, replace=replace))
     if unsettled:
         errors.append(f"{unsettled} job(s) unsettled in the store before this replay")
     if failed:
@@ -147,6 +182,7 @@ async def execute_replay(
     projector_name: str,
     projector_version: str,
     selector: ReplaySelector | None = None,
+    replace: bool = False,
     max_rounds: int = DEFAULT_MAX_ROUNDS,
     batch_limit: int = DEFAULT_BATCH_LIMIT,
     max_drain_batches: int = DEFAULT_MAX_DRAIN_BATCHES,
@@ -181,10 +217,12 @@ async def execute_replay(
 
     selector = ReplaySelector() if selector is None else selector
     _validate_replay_target(projector_name, projector_version)
+    _validate_replace_request(projector_name, projector_version, selector, replace=replace)
     minted, re_pended = await backend.mint_replay_jobs(
         projector_name=projector_name,
         projector_version=projector_version,
         selector=selector,
+        replace=replace,
     )
 
     replayed = 0
@@ -212,7 +250,7 @@ async def execute_replay(
         if unsettled == 0:
             break
 
-    errors: list[str] = []
+    errors: list[str] = _replace_notes(projector_name, replace=replace)
     if unsettled:
         errors.append(f"{unsettled} job(s) still unsettled after {max(max_rounds, 1)} round(s); the store still owes work, run the replay again or raise --max-rounds")
     # Durably failed jobs are *settled*, badly, so they never appear in

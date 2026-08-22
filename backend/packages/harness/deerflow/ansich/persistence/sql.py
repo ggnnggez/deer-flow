@@ -638,10 +638,9 @@ _SHARED_REBUILT_TABLES: tuple[type[Base], ...] = (
 #: explicitly, so their default is never taken and dropping them costs a little
 #: sensitivity for a rule that needs no exceptions.
 #:
-#: What this does **not** cover, and T5 must check before ``--replace`` ships:
-#: whether every owned table's primary key is derived from Observation content
-#: rather than minted fresh. A randomly-keyed read-model row would break
-#: replace-and-compare the same way, and this exclusion would not save it.
+#: The other half of that hazard -- whether every owned table's primary key is
+#: derived from Observation content rather than minted fresh -- was audited for
+#: T5 and is answered by ``_DIGEST_RANDOM_KEY_COLUMNS`` below.
 _DIGEST_EXCLUDED_COLUMNS: set[tuple[str, str]] = {
     (model.__table__.name, column.name)
     for models in _PROJECTOR_OWNED_TABLES.values()
@@ -655,6 +654,83 @@ _DIGEST_EXCLUDED_COLUMNS: set[tuple[str, str]] = {
     # ``DateTime``, so nothing deterministic is caught by it.
     if isinstance(column.type, DateTime) and column.default is not None and column.default.is_callable
 }
+#: Owned-table primary-key columns the projector **mints** (``new_id()``)
+#: instead of deriving from the Observation. The T5 audit of every owned
+#: table's key, written down rather than remembered.
+#:
+#: A minted key breaks replace-and-compare twice over, and the second way is
+#: the one an exclusion alone does not reach: the value itself is fresh on
+#: every re-derivation, *and* it is what ``read_model_digest`` orders by -- so
+#: two replaces of one history would disagree about both the contents and the
+#: order of the rows. Both halves are closed here: the column is dropped from
+#: the hashed payload, and ``_DIGEST_SURROGATE_ORDER`` gives its table a
+#: deterministic order to use instead.
+#:
+#: Only two exist, and neither is referenced by a foreign key from any other
+#: owned table, which is what keeps the fix local: excluding the column cannot
+#: leave the same random value hiding in a sibling's row.
+#:
+#: * ``ansich_transitions.transition_id`` -- ``_project_control``.
+#: * ``ansich_context_windows.entity_id`` -- ``_project_context_snapshot``
+#:   mints one window per Task when it finds none.
+#:
+#: Pinned against an AST audit of ``sql.py`` by
+#: ``TestOwnedPrimaryKeysAreDerived``, so a projector that starts minting a key
+#: cannot slip past on nobody re-reading this file.
+_DIGEST_RANDOM_KEY_COLUMNS: set[tuple[str, str]] = {
+    ("ansich_transitions", "transition_id"),
+    ("ansich_context_windows", "entity_id"),
+}
+#: What ``read_model_digest`` orders a minted-key table by instead of its
+#: primary key. Each entry must be **unique** on its table -- an order that is
+#: not total is not an order, and the digest would report a difference that is
+#: only the storage engine's choice of row order.
+#:
+#: Both are derived from the Observation stream: a transition's evidence
+#: Observation, and a context window's Task.
+_DIGEST_SURROGATE_ORDER: dict[str, tuple[str, ...]] = {
+    "ansich_transitions": ("evidence_obs_id",),
+    "ansich_context_windows": ("task_id",),
+}
+#: Projectors ``--replace`` will act on, and the list is a **proof obligation**
+#: rather than a preference.
+#:
+#: ``--replace`` deletes the target projector's exclusively-owned read-model
+#: tables and re-derives them from that projector's Observations (plan ruling
+#: RC4). Exclusive ownership -- ``_PROJECTOR_OWNED_TABLES``' conservative rule,
+#: which review finding F1 sharpened -- is necessary for that to be safe and
+#: **not sufficient**. The missing property is that the projector can rebuild
+#: those rows from the Observation stream *alone*: a projector that consults
+#: state a projector-scoped replace does not clear reads, after the delete, a
+#: world that already contains the answer, and writes something else.
+#:
+#: ``task-control`` is the worked counterexample and the reason this set
+#: exists. It owns ``ansich_transitions`` outright, and ``_project_control``
+#: computes each transition's ``from_value`` from the current control Belief --
+#: which lives in the shared Belief triple, which a projector-scoped replace
+#: neither owns nor clears. Replacing it therefore deletes
+#: ``unknown -> created`` and ``created -> running`` and re-derives
+#: ``running -> running``: not a hole, a different history, with the same row
+#: count. (Its plain, non-replace replay is separately broken -- re-projecting
+#: an already-projected control Observation collides on
+#: ``ansich_transitions.evidence_obs_id`` -- which is a projector-idempotence
+#: defect this batch found rather than introduced, and did not fix.)
+#:
+#: Membership is decided by
+#: ``tests/ansich/test_replay.py::TestReplaceIsDeterministic``, which
+#: parametrizes over this set: for each member it replays, digests, replaces,
+#: replays and digests again over a non-empty row set, and asserts the two
+#: digests agree. Adding a projector here without that property turns that test
+#: red rather than shipping a silent rewrite. Everything else is refused with
+#: ``replace_restore_unproven`` -- unproven, not impossible, and the way in is
+#: to extend the fixture and let the check answer.
+_REPLACE_PROVEN_PROJECTORS: frozenset[str] = frozenset(
+    {
+        "task-heartbeat",
+        "task-budget",
+        "environment-projector",
+    }
+)
 _NON_PROJECTOR_REBUILT_TABLES: tuple[type[Base], ...] = (
     AnsichAlertReadModelRow,
     AnsichAlertWorkflowEventRow,
@@ -915,6 +991,50 @@ def _validate_replay_target(projector_name: str, version: str) -> None:
         raise ReplayTargetError(
             f"Ansich projector {projector_name!r} declares version {version!r} replayable but this build {detail}",
             reason="not_executable",
+            projector_name=projector_name,
+            projector_version=version,
+        )
+    return None
+
+
+def _validate_replace_request(projector_name: str, version: str, selector: ReplaySelector, *, replace: bool) -> None:
+    """Refuse a ``--replace`` this build will not honour, before it deletes anything.
+
+    Two refusals, both taken before any read and long before any write, because
+    what is at stake here is rows rather than time.
+
+    **A filter plus a replace is refused** (plan ruling RC4). ``--replace`` is
+    whole-table by construction: read-model rows carry no version and no
+    provenance column pointing back at the Observation that produced them, so
+    the delete simply cannot be narrowed the way the re-derive can. Honouring
+    the request literally would clear the table and re-derive only the window,
+    losing every row outside it -- a data loss whose only symptom is a smaller
+    table. Refusing costs one message.
+
+    **A projector whose restore is unproven is refused.** Owning a table
+    exclusively means no *other* projector's branch writes it; it does not mean
+    this projector can put the rows back from the Observation stream alone. See
+    ``_REPLACE_PROVEN_PROJECTORS`` for the property, the counterexample that
+    made it necessary (``task-control``), and how membership is decided.
+
+    ``selector``'s own validators have already rejected half-given and reversed
+    ranges by the time this runs, so ``is_unfiltered`` is the whole test.
+    """
+
+    if not replace:
+        return None
+    if not selector.is_unfiltered:
+        raise ReplayTargetError(
+            f"Ansich replay of {projector_name!r} cannot combine --replace with a task, time or ingest filter: replace is whole-table, so it would clear rows this pass never re-derives",
+            reason="filtered_replace_unsupported",
+            projector_name=projector_name,
+            projector_version=version,
+        )
+    if projector_name not in _REPLACE_PROVEN_PROJECTORS:
+        proven = ", ".join(sorted(_REPLACE_PROVEN_PROJECTORS))
+        raise ReplayTargetError(
+            f"Ansich projector {projector_name!r} is not proven to re-derive its own read models after a --replace; replace is available for: {proven}. Use rebuild_projections() to re-derive the whole projection zone instead",
+            reason="replace_restore_unproven",
             projector_name=projector_name,
             projector_version=version,
         )
@@ -2406,12 +2526,39 @@ class SqlAnsichBackend:
         projector_version: str,
         selector: ReplaySelector,
         batch_size: int = 1000,
+        replace: bool = False,
     ) -> tuple[int, int]:
         """Put a target set back in the queue, and clear what its return breaks.
 
-        Three writes, **one transaction**, under the same ``_maintenance_lock``
-        ``rebuild_projections`` holds -- so a replay and a rebuild (or two
-        replays) queue rather than interleaving their re-pends.
+        Three writes -- four with ``replace`` -- in **one transaction**, under
+        the same ``_maintenance_lock`` ``rebuild_projections`` holds, so a
+        replay and a rebuild (or two replays) queue rather than interleaving
+        their re-pends.
+
+        0. **With ``replace``, delete the target projector's exclusively-owned
+           read-model tables**, whole, in ``_REBUILD_DELETE_ORDER``'s order so
+           the foreign keys between them are respected (children first). It
+           runs *before* the re-pend, inside the same transaction, so no worker
+           can ever observe a claimable job for a table this call is midway
+           through emptying -- the delete and the queue state it justifies
+           commit together or not at all.
+
+           What it deletes is decided entirely by
+           ``_PROJECTOR_OWNED_TABLES[projector_name]``, and the conservative
+           reading of that map is what makes the delete safe: a table another
+           projector's branch also writes would take that projector's rows with
+           it and only get them back if it were replayed too (review finding
+           F1). The caller is expected to have validated the request with
+           ``_validate_replace_request`` -- a filtered replace and an unproven
+           projector are both refused there, before anything is read.
+
+           Shared and non-projector tables are never touched, which has a
+           consequence worth stating: a replace is *not* a scoped rebuild. It
+           re-derives one projector's own rows against a shared zone that keeps
+           standing, and for the two tables whose primary key is minted rather
+           than derived (``_DIGEST_RANDOM_KEY_COLUMNS``) the old key's
+           ``ansich_entities`` row is left behind as an orphan -- harmless, and
+           it accumulates one row per replaced Task per replace.
 
         1. **Mint** a ``pending`` job for every targeted Observation the target
            ``(projector, version)`` has none for. This is how a version that
@@ -2496,6 +2643,15 @@ class SqlAnsichBackend:
         minted = 0
         async with self._maintenance_lock():
             async with self._session_factory() as session, session.begin():
+                if replace:
+                    owned = frozenset(_PROJECTOR_OWNED_TABLES.get(projector_name, ()))
+                    # Iterated in the rebuild's own order rather than the map's,
+                    # so the foreign keys between the owned tables are respected
+                    # without this call restating a dependency order that already
+                    # exists (and could drift from it).
+                    for model in _REBUILD_DELETE_ORDER:
+                        if model in owned:
+                            await session.execute(delete(model))
                 targeted_obs = select(AnsichObservationRow.obs_id).where(condition)
                 # Re-pend BEFORE minting, so "already has a job" means "had one
                 # before this call" and the rows this call creates cannot be
@@ -2619,6 +2775,14 @@ class SqlAnsichBackend:
         would answer "were these written in the same order" instead of "do
         these hold the same facts".
 
+        **Unless the primary key is minted rather than derived**, in which case
+        ordering by it would answer a third question, "did the same uuids come
+        out twice", whose answer is always no. Those two tables are ordered by
+        ``_DIGEST_SURROGATE_ORDER``'s content-derived unique key instead, and
+        the minted column is dropped from the payload alongside the wall-clock
+        ones. This is what makes the §11 check survive ``--replace``, which
+        re-derives the rows and therefore re-mints the keys.
+
         Returns ``None`` when the projector owns no table exclusively rather
         than hashing the empty set: an empty hash compares equal to every other
         empty hash, so it would report determinism nobody established.
@@ -2641,9 +2805,12 @@ class SqlAnsichBackend:
         async with self._session_factory() as session:
             for model in tables:
                 table = model.__table__
-                columns = [column for column in table.columns if (table.name, column.name) not in _DIGEST_EXCLUDED_COLUMNS]
+                dropped = _DIGEST_EXCLUDED_COLUMNS | _DIGEST_RANDOM_KEY_COLUMNS
+                columns = [column for column in table.columns if (table.name, column.name) not in dropped]
                 column_names = [column.name for column in columns]
-                rows = (await session.execute(select(*columns).order_by(*table.primary_key.columns))).all()
+                surrogate = _DIGEST_SURROGATE_ORDER.get(table.name)
+                order_by = [table.columns[name] for name in surrogate] if surrogate else list(table.primary_key.columns)
+                rows = (await session.execute(select(*columns).order_by(*order_by))).all()
                 payload.append(
                     [
                         table.name,

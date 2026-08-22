@@ -125,8 +125,13 @@ lock-then-read under the same interleaving**, the traversal ordering shown to be
 the difference between two workers completing and PostgreSQL aborting one as a
 deadlock, PB4's stale-assessor rollback, the spawn-usage reconcile gate against a
 live vs. expired lease, per-projector status counts agreeing from either worker,
-and `0027`'s two `lease_generation` columns plus its `(projector_name, status)`
-index on a real server. It is **not** a Postgres run of the whole suite:
+`0027`'s two `lease_generation` columns plus its `(projector_name, status)`
+index on a real server, and — added by P11-C — the whole versioned-replay path
+in one script: the read-model digest computed on the asyncpg dialect and equal
+across two replays, a peer worker's `assess_operations` driven from inside the
+mint's open transaction, the re-pend's bulk `UPDATE … IN (subquery)` against a
+live claimer, and `--replace` followed by a re-replace with an unchanged digest.
+It is **not** a Postgres run of the whole suite:
 everything outside `tests/integration/` still runs on SQLite only.
 
 **Where that tier actually runs, stated plainly:** on a developer's own
@@ -2046,14 +2051,69 @@ declaration, and comparing two versions' digests is meaningless until the
 dispatch really discriminates. `_EXECUTABLE_PROJECTOR_NAMES` likewise proxies
 "has a dispatch branch" with "is live-registered".
 
+**`--replace` is projector-scoped and whole-table** (plan ruling RC4). It
+deletes `_PROJECTOR_OWNED_TABLES[projector]` outright — in
+`_REBUILD_DELETE_ORDER`'s order, so the foreign keys between those tables are
+respected — inside `mint_replay_jobs`' own transaction, under the same
+maintenance lock, **before** the re-pend, so no worker ever sees a claimable job
+for a table the call is midway through emptying. The plan's letter ("the
+projection rows this version manages") describes rows that do not exist: not one
+read model carries a version column or a provenance column pointing back at the
+Observation that produced it, so the delete cannot be narrowed the way the
+re-derive can. Hence the first refusal: `--replace` combined with a task, time or
+ingest filter is rejected with `filtered_replace_unsupported`, because honouring
+it literally would clear the whole table and re-derive only the window, and the
+only symptom would be a smaller table. Shared and non-projector tables are never
+touched, so a replace is **not** a scoped rebuild — it re-derives one
+projector's rows against a shared zone that keeps standing.
+
+**Exclusive ownership is necessary for a replace and not sufficient**, which is
+the second refusal and a T5 narrowing on top of RC4. The missing property is
+that the projector can rebuild those rows from the Observation stream *alone*.
+`task-control` is the counterexample that forced it: it owns `ansich_transitions`
+outright (no second dispatch branch writes it — F1's conservative rule is
+satisfied), and `_project_control` still computes each transition's `from_value`
+from the **current control Belief**, which lives in the shared Belief triple a
+projector-scoped replace neither owns nor clears. Deleting and re-deriving
+therefore reads a Belief that already carries the destination value and rewrites
+`unknown -> created` plus `created -> running` into a single `running -> running`:
+same row count, different history. So `--replace` is opt-in per projector via
+`_REPLACE_PROVEN_PROJECTORS` (today `task-heartbeat`, `task-budget`,
+`environment-projector`); everything else is refused with
+`replace_restore_unproven` and pointed at `rebuild_projections()`. That set is a
+**proof obligation**, not a preference:
+`tests/ansich/test_replay.py::TestReplaceIsDeterministic` parametrizes over it and,
+for each member, replays → digests → replaces → replays → digests again over a
+non-empty row set and asserts the two agree, so adding a projector without the
+property turns that test red instead of shipping a silent rewrite. One
+pre-existing defect this found and did **not** fix: `_project_control` is not
+idempotent — re-projecting an already-projected control Observation collides on
+`ansich_transitions.evidence_obs_id` — so `task-control`'s *plain* replay is
+broken today too (a rebuild is unaffected, because it deletes the Beliefs as
+well).
+
+**The digest's primary-key audit** closes the other half of F5. Dropping
+wall-clock columns only helps if the same row can be *found* twice, and a
+primary key minted with `new_id()` fails that twice over: the value is fresh on
+every re-derivation, and it is also what `read_model_digest` orders by. An AST
+audit of every owned table found exactly two — `ansich_transitions.transition_id`
+and `ansich_context_windows.entity_id` — and neither is referenced by a foreign
+key from another owned table, so the fix stays local:
+`_DIGEST_RANDOM_KEY_COLUMNS` drops them from the hashed payload beside the
+wall-clock ones, and `_DIGEST_SURROGATE_ORDER` orders those two tables by a
+content-derived **unique** column instead (`evidence_obs_id`, `task_id`).
+`TestOwnedPrimaryKeysAreDerived` pins the declared set against the AST's answer
+and requires every surrogate order to be backed by a real uniqueness constraint.
+One accepted cost: after a replace the old minted key leaves an orphan
+`ansich_entities` row (a shared table, correctly not deleted) — harmless, and it
+accumulates one row per replaced Task per replace.
+
 The CLI carries `--projector/--version/--task-id/--occurred-from/--occurred-to/
---ingest-from/--ingest-to/--dry-run/--max-rounds/--format`. `--replace` is
-**not** wired here — it is T5's, and shipping a flag that silently did nothing
-would be worse than not having it. Exit codes are the machine-readable half of
+--ingest-from/--ingest-to/--dry-run/--replace/--max-rounds/--format`. Exit codes are the machine-readable half of
 the report and are decided by two counts, `unsettled` **and** `failed`: `0`
 clean, `1` the pass ran and work is owed, `2` the request was refused (bad
-target, malformed filter, or `database.backend: memory`, which stores no
-Observations to replay). Both counts are needed because neither implies the
+target, malformed filter, either replace refusal, or `database.backend: memory`,
+which stores no Observations to replay). Both counts are needed because neither implies the
 other — `unsettled` excludes `failed`, so keying on it alone let a pass exit `0`
 having left N projections permanently unlanded. A **missing digest is
 deliberately not** part of that test: three projectors honestly have none, and
@@ -2063,7 +2123,17 @@ describe the pre-replay store while reading as this pass's result. Tests:
 `tests/ansich/test_replay.py`, including the §11 double-replay determinism
 check, the late-Observation case (an Observation ingested mid-pass is outside
 `targeted` and visible in the store-wide `replayed`), and the PB7 freeze proved
-both ways — fixed, and reproduced with the in-transaction delete disarmed.
+both ways — fixed, and reproduced with the in-transaction delete disarmed. The
+whole replay path is also proved once on a real server:
+`tests/integration/test_postgres_multiworker.py::test_replay_and_replace_hold_on_postgres_with_a_second_worker_live`
+runs one script covering the digest on the asyncpg dialect (computed, and equal
+across two replays), a second worker's `assess_operations` driven from *inside*
+the mint's open transaction, the re-pend's bulk `UPDATE … WHERE obs_id IN
+(subquery)` against a live claimer (whose claim must come back empty **and
+promptly** — a lock-order cycle fails the test rather than hanging the tier),
+and `--replace` followed by a re-replace with an unchanged digest. It also pins
+the invariant those rest on: a job claimed *before* the replay cannot settle it
+afterwards, because the re-pend raised its `lease_generation`.
 
 **Workspace change review**: `packages/harness/deerflow/workspace_changes/`
 captures a pre-run and post-run snapshot of the thread-owned `workspace` and

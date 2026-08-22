@@ -89,7 +89,7 @@ from datetime import UTC, datetime, timedelta
 import pytest
 import sqlalchemy as sa
 from alembic import command as alembic_command
-from ansich import AnsichService, AuthorizationSnapshot, ObservationEnvelope, Producer, new_id
+from ansich import AnsichService, AuthorizationSnapshot, ObservationEnvelope, Producer, ReplayReport, ReplaySelector, new_id
 from ansich.assessment.scope_safety import SCOPE_SAFETY_ASSESSOR
 from sqlalchemy.dialects import postgresql
 from sqlalchemy.engine import URL, make_url
@@ -107,12 +107,15 @@ from deerflow.ansich.persistence.models import (
     AnsichAssessorErrorRow,
     AnsichAssessorJobRow,
     AnsichAssessorWatermarkRow,
+    AnsichObservationRow,
     AnsichProjectionJobRow,
     AnsichScopeConclusionRow,
+    AnsichTaskHeartbeatRow,
     AnsichTaskUsageRow,
     AnsichUsageContributionRow,
 )
 from deerflow.ansich.persistence.sql import _PG_MAINTENANCE_LOCK_KEY, SqlAnsichBackend
+from deerflow.ansich.replay import execute_replay
 from deerflow.persistence.base import Base
 from deerflow.persistence.bootstrap import _get_alembic_config, _get_head_revision
 
@@ -1692,3 +1695,242 @@ async def test_two_workers_assessing_the_same_task_never_duplicate_an_episode() 
                     await service.stop()
             for engine in engines:
                 await engine.dispose()
+
+
+# ===========================================================================
+# 11. Versioned replay and `--replace` on a real server
+# ===========================================================================
+
+
+def _heartbeat(task_id: str, *, run_id: str, ordinal: int, offset_seconds: int) -> ObservationEnvelope:
+    return ObservationEnvelope.task_heartbeat(
+        task_id=task_id,
+        run_id=run_id,
+        occurred_at=_OCCURRED_AT + timedelta(seconds=offset_seconds),
+        elapsed_ms=1000 * (offset_seconds + 1),
+        worker_id=f"{run_id}-worker",
+        ownership_epoch=f"{run_id}-epoch",
+        source_event_id=f"run:{run_id}:heartbeat:{ordinal}",
+        producer_seq=ordinal,
+    )
+
+
+async def _settle_everything(*workers: _Worker) -> None:
+    """Drain projections, run one assessment, drain again -- until nothing is owed.
+
+    An assessment pass is not optional here: a re-projected Observation enqueues
+    assessor jobs and only ``assess_operations`` settles them, so a drain-only
+    settle would leave the store permanently unsettled and the digest below
+    permanently ``None``. Same shape the replay's own drive loop uses.
+    """
+
+    for _ in range(10):
+        await _settle_projections(*workers)
+        await workers[0].backend.assess_operations()
+        if await workers[0].backend.unsettled_job_count() == 0:
+            return
+    raise AssertionError("the store did not settle within the bounded loop")
+
+
+async def test_replay_and_replace_hold_on_postgres_with_a_second_worker_live() -> None:
+    """The replay path's real-server half: the digest, the mint's window, the re-pend.
+
+    Four claims this file is the only place that can answer, in one script
+    because they are one pass -- splitting them would run the same expensive
+    setup four times and still not show them interacting.
+
+    **(a) The digest computes, and computes the same thing twice.**
+    ``_canonical_digest_value`` exists *because* dialects disagree: SQLite hands
+    back naive datetimes and PostgreSQL aware ones, and some columns are
+    ``bytes``. Until this test it had never run against the dialect it was
+    written for, so "it does not raise on asyncpg" was an assumption. Two
+    replays of one Observation set must agree, on this dialect, over a non-empty
+    row set -- and ``task-safety``'s owned tables are digested too, unreplayed,
+    purely to widen the column types that reach the canonicaliser here (JSON,
+    aware timestamps) beyond the heartbeat table's three.
+
+    **(b) A second worker assesses across the mint's commit window.** The mint
+    is one transaction under ``_maintenance_lock`` that re-pends jobs and then
+    deletes active-Task read-model rows (ruling RC3). The configuration in which
+    that delete, the PB7 publish guard and the guarded sweep genuinely contend
+    is a *peer's* 1 Hz ``assess_operations`` running while the mint is open --
+    which needs two pools, so SQLite cannot express it. Worker B's tick is
+    driven from inside worker A's paused mint transaction.
+
+    **(c) The bulk ``UPDATE ... WHERE obs_id IN (subquery)`` re-pend against a
+    live claimer.** The re-pend takes row locks over its whole target set in one
+    statement, in an order the planner picks; a claimer takes them one at a time
+    with ``FOR UPDATE SKIP LOCKED``. The claim is therefore expected to come
+    back **empty and promptly** rather than to block or to abort as a deadlock,
+    and "promptly" is asserted with a budget so a lock-order cycle would fail
+    the test rather than hang the tier.
+
+    **(d) ``--replace`` on PostgreSQL, and the §11 acceptance taken through it.**
+    The replace deletes ``task-heartbeat``'s owned table whole inside that same
+    transaction and re-derives it; the digest afterwards must equal the digest
+    before, which is what makes "these rows are what this history produces" a
+    claim rather than a hope. A row nothing in the Observation stream produces
+    is planted first, so the delete is told apart from an overwrite.
+
+    Plus the invariant those four rest on: a job claimed **before** the replay
+    cannot settle it afterwards. Worker B's claim is taken first and completed
+    last, and its compare-and-set has to fail against the generation the
+    re-pend raised -- the property ``mint_replay_jobs``' docstring asserts and
+    that no single-worker test can reach.
+    """
+
+    async with _two_workers() as (_url, worker_a, worker_b):
+        task_id = new_id()
+        step_id = new_id()
+        run_id = "run-pg-replay"
+        await worker_a.backend.persist_and_project(
+            [
+                _task_created(task_id, source_id=run_id),
+                _task_started(task_id, source_id=run_id),
+                *(_heartbeat(task_id, run_id=run_id, ordinal=index, offset_seconds=index) for index in range(1, 4)),
+                *_authorized_tool_call(task_id, step_id, new_id(), new_id()),
+            ]
+        )
+        await _settle_everything(worker_a, worker_b)
+
+        # (a) The digest, on this dialect, over rows that exist.
+        heartbeats_before = await _row_count(worker_a, AnsichTaskHeartbeatRow)
+        assert heartbeats_before == 3
+        safety_digest = await worker_a.backend.read_model_digest("task-safety")
+        assert safety_digest is not None
+        assert await worker_b.backend.read_model_digest("task-safety") == safety_digest
+
+        first = await execute_replay(worker_a.backend, projector_name="task-heartbeat", projector_version="1", selector=ReplaySelector())
+        second = await execute_replay(worker_a.backend, projector_name="task-heartbeat", projector_version="1", selector=ReplaySelector())
+        assert (first.unsettled, first.failed) == (0, 0)
+        assert (second.unsettled, second.failed) == (0, 0)
+        assert first.digest is not None
+        assert first.digest == second.digest
+
+        # The live claimer, taken before the replace so the re-pend has a real
+        # in-flight claim to invalidate. Its job has to be the *heartbeat* one
+        # -- that is the projector the replace re-pends -- so the sibling jobs
+        # this Observation also mints are settled out of the claim's way first,
+        # the same narrowing the takeover test above uses. Their read models are
+        # not what this test reads.
+        late = _heartbeat(task_id, run_id=run_id, ordinal=9, offset_seconds=9)
+        await worker_a.backend.persist_and_project([late])
+        async with worker_a.sessions() as session, session.begin():
+            await session.execute(
+                sa.update(AnsichProjectionJobRow)
+                .where(
+                    AnsichProjectionJobRow.status.in_(("pending", "retry")),
+                    AnsichProjectionJobRow.projector_name != "task-heartbeat",
+                )
+                .values(status="completed", lease_owner=None, lease_expires_at=None)
+            )
+        stale_claim = await worker_b.backend._claim_projection_job()
+        assert stale_claim is not None
+        assert stale_claim[1] == "task-heartbeat"
+        stale_job_id = stale_claim[0]
+        stale_generation = stale_claim[-1]
+
+        # A row no Observation produces: it must not survive the replace, which
+        # is how a whole-table delete is distinguished from an overwrite. Its
+        # key is a real Observation of the *wrong kind* -- the foreign key here
+        # is enforced for real, and `task-heartbeat` would never build a
+        # heartbeat row from a `task.created`.
+        async with worker_a.sessions() as session, session.begin():
+            wrong_kind_obs_id = await session.scalar(sa.select(AnsichObservationRow.obs_id).where(AnsichObservationRow.kind == "task.created").limit(1))
+            assert wrong_kind_obs_id is not None
+            session.add(
+                AnsichTaskHeartbeatRow(
+                    heartbeat_obs_id=wrong_kind_obs_id,
+                    task_id=task_id,
+                    occurred_at=_OCCURRED_AT,
+                    producer_instance_id="planted-by-nothing",
+                    ownership_epoch="planted",
+                    elapsed_ms=999_999,
+                )
+            )
+
+        mint_open = asyncio.Event()
+        peer_done = asyncio.Event()
+        state: dict[str, object] = {"paused": False, "peer_claim": "not-run", "claim_seconds": None}
+
+        async def pause_inside_the_open_mint(statement: object) -> None:
+            text = _statement_text(statement)
+            if state["paused"] or "update ansich_projection_jobs" not in text or "in (select" not in text:
+                return
+            state["paused"] = True
+            mint_open.set()
+            # The peer is expected to finish inside this budget -- its claim
+            # skips the locked rows rather than waiting on them. A budget that
+            # elapsed here would mean the two lock orders had cycled, which is
+            # asserted on below rather than suppressed.
+            with contextlib.suppress(TimeoutError, asyncio.TimeoutError):
+                await asyncio.wait_for(peer_done.wait(), timeout=_INTERLEAVE_TIMEOUT_SECONDS)
+
+        worker_a.session_class.after_execute = staticmethod(pause_inside_the_open_mint)  # type: ignore[assignment]
+        try:
+
+            async def run_replace() -> ReplayReport:
+                return await execute_replay(
+                    worker_a.backend,
+                    projector_name="task-heartbeat",
+                    projector_version="1",
+                    selector=ReplaySelector(),
+                    replace=True,
+                )
+
+            async def run_peer() -> None:
+                await mint_open.wait()
+                try:
+                    # (b) the peer's operations tick, inside the open mint.
+                    await worker_b.backend.assess_operations()
+                    # (c) the peer's claim against the re-pend's locked set.
+                    started = asyncio.get_running_loop().time()
+                    claimed = await asyncio.wait_for(worker_b.backend._claim_projection_job(), timeout=_INTERLEAVE_TIMEOUT_SECONDS)
+                    state["claim_seconds"] = asyncio.get_running_loop().time() - started
+                    state["peer_claim"] = "empty" if claimed is None else "claimed"
+                finally:
+                    peer_done.set()
+
+            replace_report, _ = await asyncio.wait_for(asyncio.gather(run_replace(), run_peer()), timeout=_SCRIPT_TIMEOUT_SECONDS)
+        finally:
+            worker_a.session_class.after_execute = None  # type: ignore[assignment]
+
+        assert state["paused"], "the script never reached the open mint transaction"
+        # (b)/(c): the peer neither raised nor cycled. `assess_operations`
+        # returning at all is the assertion for (b) -- it commits or it raises.
+        assert state["peer_claim"] == "empty", f"the peer's claim came back {state['peer_claim']!r} against the re-pend's locked set"
+        assert float(state["claim_seconds"]) < _INTERLEAVE_TIMEOUT_SECONDS
+
+        # (d) the replace landed, and the planted row is gone -- the table was
+        # emptied, not written over.
+        assert (replace_report.unsettled, replace_report.failed) == (0, 0), _unsettled(await _projection_jobs(worker_a))
+        assert await _row_count(worker_a, AnsichTaskHeartbeatRow) == heartbeats_before + 1
+        async with worker_a.sessions() as session:
+            planted = await session.scalar(sa.select(sa.func.count()).select_from(AnsichTaskHeartbeatRow).where(AnsichTaskHeartbeatRow.ownership_epoch == "planted"))
+        assert int(planted or 0) == 0
+
+        # §11 taken through the replace, on this dialect: delete the table
+        # whole a second time, re-derive it, and the digest must not move. It
+        # must also *differ* from the three-heartbeat digest above, or the
+        # comparison would be insensitive to the row set it is about.
+        replayed_again = await execute_replay(
+            worker_a.backend,
+            projector_name="task-heartbeat",
+            projector_version="1",
+            selector=ReplaySelector(),
+            replace=True,
+        )
+        assert (replayed_again.unsettled, replayed_again.failed) == (0, 0), _unsettled(await _projection_jobs(worker_a))
+        assert replace_report.digest is not None
+        assert replayed_again.digest == replace_report.digest
+        assert replace_report.digest != first.digest
+
+        # The invariant underneath all four: the pre-replay claim cannot settle
+        # the job the re-pend took back.
+        async with worker_b.sessions() as session, session.begin():
+            settled = await worker_b.backend._complete_projection_job(session, job_id=stale_job_id, lease_generation=stale_generation)
+        assert settled is False
+        assert worker_b.backend.stale_completion_count == 1
+        after = await _projection_job(worker_a, stale_job_id)
+        assert after.status == "completed"
+        assert after.lease_generation > stale_generation

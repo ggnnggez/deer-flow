@@ -35,7 +35,7 @@ from ansich import ObservationEnvelope, ReplayReport, ReplaySelector, new_id
 from ansich.contracts import ObservationKind
 from ansich.errors import ReplayTargetError
 from pydantic import ValidationError
-from sqlalchemy import func, select, update
+from sqlalchemy import UniqueConstraint, func, select, update
 from sqlalchemy.dialects import sqlite
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
@@ -48,15 +48,20 @@ from deerflow.ansich.persistence.models import (
     AnsichProjectionJobRow,
     AnsichProjectorVersionRow,
     AnsichStepRow,
+    AnsichTaskBudgetRow,
     AnsichTaskHeartbeatRow,
+    AnsichTransitionRow,
 )
 from deerflow.ansich.persistence.sql import (
     _DIGEST_EXCLUDED_COLUMNS,
+    _DIGEST_RANDOM_KEY_COLUMNS,
+    _DIGEST_SURROGATE_ORDER,
     _NON_PROJECTOR_REBUILT_TABLES,
     _PROJECTOR_KINDS,
     _PROJECTOR_OWNED_TABLES,
     _PROJECTORS,
     _REBUILD_DELETE_ORDER,
+    _REPLACE_PROVEN_PROJECTORS,
     _REPLAYABLE_VERSIONS,
     _SHARED_REBUILT_TABLES,
     SqlAnsichBackend,
@@ -1446,3 +1451,493 @@ class TestExitCodesAreHonest:
         assert replay_cli.exit_code(self._report(unsettled=2, digest=None)) == 1
         assert replay_cli.exit_code(self._report()) == 0
         assert replay_cli.exit_code(self._report(dry_run=True, digest=None)) == 0
+
+
+# ---------------------------------------------------------------------------
+# T5: `--replace`
+# ---------------------------------------------------------------------------
+
+
+def _new_id_bound_names(function: ast.AST) -> set[str]:
+    """Names this function binds to a ``new_id()`` call.
+
+    One level, deliberately: ``window_id = new_id()`` is the shape the audit
+    below has to see through, and chasing further would trade a fact for an
+    inference.
+    """
+
+    bound: set[str] = set()
+    for node in ast.walk(function):
+        if isinstance(node, ast.Assign) and len(node.targets) == 1 and isinstance(node.targets[0], ast.Name) and isinstance(node.value, ast.Call) and isinstance(node.value.func, ast.Name) and node.value.func.id == "new_id":
+            bound.add(node.targets[0].id)
+    return bound
+
+
+def _minted_primary_key_columns() -> set[tuple[str, str]]:
+    """``(table, column)`` for every owned-table primary key set from ``new_id()``.
+
+    Walks ``sql.py`` for the two forms a projector writes a row in: the ORM
+    constructor (``AnsichXRow(pk=...)``) and the dict handed to
+    ``_insert_ignoring_conflict``. A primary-key value that is ``new_id()`` --
+    directly, or through a local the same function bound to it -- is a key that
+    is *minted*, not derived from the Observation, which is the property
+    ``--replace`` cannot survive.
+    """
+
+    owned = {model.__name__: model for models in _PROJECTOR_OWNED_TABLES.values() for model in models}
+    source = Path(sql_module.__file__).read_text(encoding="utf-8")
+    minted: set[tuple[str, str]] = set()
+
+    def _is_minted(value: ast.AST, bound: set[str]) -> bool:
+        if isinstance(value, ast.Call) and isinstance(value.func, ast.Name) and value.func.id == "new_id":
+            return True
+        return isinstance(value, ast.Name) and value.id in bound
+
+    for function in ast.walk(ast.parse(source)):
+        if not isinstance(function, ast.FunctionDef | ast.AsyncFunctionDef):
+            continue
+        bound = _new_id_bound_names(function)
+        for node in ast.walk(function):
+            if not isinstance(node, ast.Call):
+                continue
+            # Form 1: the ORM constructor.
+            if isinstance(node.func, ast.Name) and node.func.id in owned:
+                table = owned[node.func.id].__table__
+                keys = {column.name for column in table.primary_key.columns}
+                minted |= {(table.name, keyword.arg) for keyword in node.keywords if keyword.arg in keys and _is_minted(keyword.value, bound)}
+            # Form 2: `_insert_ignoring_conflict(session, Model, {...})`.
+            model_arguments = [argument for argument in node.args if isinstance(argument, ast.Name) and argument.id in owned]
+            dict_arguments = [argument for argument in node.args if isinstance(argument, ast.Dict)]
+            for model_argument in model_arguments:
+                table = owned[model_argument.id].__table__
+                keys = {column.name for column in table.primary_key.columns}
+                for mapping in dict_arguments:
+                    for key, value in zip(mapping.keys, mapping.values, strict=True):
+                        if isinstance(key, ast.Constant) and key.value in keys and _is_minted(value, bound):
+                            minted.add((table.name, str(key.value)))
+    return minted
+
+
+@pytest.fixture
+async def enriched(
+    backend: tuple[SqlAnsichBackend, async_sessionmaker],
+    populated: dict[str, object],
+) -> dict[str, object]:
+    """``populated`` plus rows for every projector ``--replace`` is proven for.
+
+    The determinism-through-replace check below is parametrized over
+    ``_REPLACE_PROVEN_PROJECTORS`` and asserts a **non-empty** owned row set
+    before it compares anything, so this fixture is what stops that check from
+    passing vacuously: an empty table hashes equal to an empty table, which is
+    the F10-26 mistake in the digest's clothes.
+    """
+
+    sql_backend, sessions = backend
+    task_a = str(populated["task_a"])
+    scope = ObservationEnvelope.scope_snapshotted(
+        task_id=task_a,
+        run_id="run-a",
+        occurred_at=_OCCURRED_AT,
+        scope_kind="sandbox",
+        external_ref="replace-sandbox",
+        relation_role="sandbox_boundary",
+        source_event_id="run-a:scope:sandbox",
+        producer_seq=1,
+    )
+    scope_id = scope.subject_id
+    envelopes = [
+        scope,
+        ObservationEnvelope.budget_configured(
+            task_id=task_a,
+            run_id="run-a",
+            occurred_at=_OCCURRED_AT,
+            dimension="total_tokens",
+            aggregation_scope="local",
+            warning_limit=800,
+            hard_limit=1000,
+            enforcement=True,
+            source_kind="release_default",
+            requested_value=None,
+            effective_value=1000,
+            source_event_id="run-a:budget:total_tokens",
+        ),
+    ]
+    for tick in range(1, 4):
+        envelopes.append(
+            ObservationEnvelope.environment_sampled(
+                task_id=task_a,
+                run_id="run-a",
+                occurred_at=_OCCURRED_AT + timedelta(seconds=tick),
+                scope_id=scope_id,
+                payload={
+                    "environment_scope": "container",
+                    "coverage": "continuous",
+                    "provider": "local",
+                    "metrics": {"fd_open": {"value": 10 + tick, "limit": 1024}},
+                    "window": {
+                        "started_at": _OCCURRED_AT.isoformat(),
+                        "ended_at": (_OCCURRED_AT + timedelta(seconds=tick)).isoformat(),
+                        "sample_count": 1,
+                    },
+                },
+                source_event_id=f"run-a:env:{scope_id}:{tick}",
+                producer_seq=tick,
+            )
+        )
+    assert await sql_backend.persist_and_project(envelopes) == len(envelopes)
+    await _settle(sql_backend)
+    await sql_backend.assess_operations()
+    await _settle(sql_backend)
+    return {**populated, "scope_id": scope_id}
+
+
+async def _owned_row_count(sessions: async_sessionmaker, projector_name: str) -> int:
+    total = 0
+    async with sessions() as session:
+        for model in _PROJECTOR_OWNED_TABLES[projector_name]:
+            total += int(await session.scalar(select(func.count()).select_from(model)) or 0)
+    return total
+
+
+class TestOwnedPrimaryKeysAreDerived:
+    """The other half of review finding F5, and the reason it had to be checked.
+
+    Dropping wall-clock columns makes a re-derived row hash the same only if the
+    row can be *found* in the same place twice. A primary key minted with
+    ``new_id()`` breaks that twice over: the key itself is a fresh value in the
+    hashed payload, and it is what the digest orders by -- so two replaces of
+    one history would disagree on both the contents and the order, with nothing
+    going red, because ``task-heartbeat`` (the §11 driver) has neither.
+    """
+
+    def test_the_minted_key_set_is_exactly_what_the_projectors_actually_mint(self) -> None:
+        """Audited from the source, not from memory.
+
+        The declared set has to be the AST's answer: an entry that stops being
+        minted should stop being excluded, and a table that starts minting one
+        must not be able to slip past by nobody re-reading ``sql.py``.
+        """
+
+        assert _minted_primary_key_columns() == _DIGEST_RANDOM_KEY_COLUMNS
+
+    def test_the_two_known_minted_keys_are_named(self) -> None:
+        """The audit's finding, written down so the reason outlives the fix."""
+
+        assert _DIGEST_RANDOM_KEY_COLUMNS == {
+            ("ansich_transitions", "transition_id"),
+            ("ansich_context_windows", "entity_id"),
+        }
+
+    def test_every_minted_key_table_orders_by_a_unique_derived_key(self) -> None:
+        """Excluding the column is not enough -- the *order* has to survive too.
+
+        A surrogate order that is not unique is not an order at all: two rows
+        sharing its value would come back in whatever order the storage engine
+        felt like, and the digest would report a difference that is not one. So
+        each surrogate is checked against a real uniqueness constraint on the
+        table, and against not being minted itself.
+        """
+
+        assert set(_DIGEST_SURROGATE_ORDER) == {table for table, _ in _DIGEST_RANDOM_KEY_COLUMNS}
+        for table_name, order in _DIGEST_SURROGATE_ORDER.items():
+            table = Base.metadata.tables[table_name]
+            assert order, f"{table_name} declares an empty surrogate order"
+            unique_columns = {(column.name,) for column in table.columns if column.unique} | {tuple(constraint.columns.keys()) for constraint in table.constraints if isinstance(constraint, UniqueConstraint)}
+            assert tuple(order) in unique_columns, f"{table_name} orders by {order}, which nothing makes unique"
+            assert all((table_name, column) not in _DIGEST_RANDOM_KEY_COLUMNS for column in order)
+
+    @pytest.mark.anyio
+    async def test_a_minted_key_cannot_move_the_digest(
+        self,
+        backend: tuple[SqlAnsichBackend, async_sessionmaker],
+        populated: dict[str, object],
+    ) -> None:
+        """The mechanism, driven: rewrite the key, keep the facts, same digest.
+
+        ``ansich_transitions`` is the table the audit found, and this rewrites
+        every ``transition_id`` in place. Nothing an Observation said has
+        changed, so the digest must not move -- which is exactly what a replace
+        that re-derives these rows would do to them.
+        """
+
+        sql_backend, sessions = backend
+        before = await sql_backend.read_model_digest("task-control")
+        assert before is not None
+        async with sessions() as session, session.begin():
+            rows = list((await session.execute(select(AnsichTransitionRow))).scalars().all())
+            assert rows, "the fixture must produce transitions for this to mean anything"
+            for row in rows:
+                await session.delete(row)
+            await session.flush()
+            for row in rows:
+                session.add(
+                    AnsichTransitionRow(
+                        **{
+                            **{column.name: getattr(row, column.name) for column in AnsichTransitionRow.__table__.columns},
+                            "transition_id": new_id(),
+                        }
+                    )
+                )
+        assert await sql_backend.read_model_digest("task-control") == before
+
+
+class TestReplaceIsRefusedWhereItCannotBeHonoured:
+    """RC4's narrowing, and the one this task had to add on top of it."""
+
+    @pytest.mark.anyio
+    @pytest.mark.parametrize(
+        "selector",
+        [
+            ReplaySelector(task_id="task-7"),
+            ReplaySelector(ingest_from=1, ingest_to=2),
+            ReplaySelector(occurred_from=_OCCURRED_AT, occurred_to=_OCCURRED_AT + timedelta(hours=1)),
+        ],
+        ids=["task", "ingest", "time"],
+    )
+    async def test_a_filtered_replace_is_refused(
+        self,
+        backend: tuple[SqlAnsichBackend, async_sessionmaker],
+        populated: dict[str, object],
+        selector: ReplaySelector,
+    ) -> None:
+        """Ruling RC4: replace is whole-table, so a filter is a contradiction.
+
+        The delete cannot honour the filter -- read models carry no row-level
+        provenance back to the Observation that produced them -- so a filtered
+        replace would delete far more than it re-derives and silently lose every
+        row outside the window. Refusing costs the operator one message; the
+        alternative costs them the table.
+        """
+
+        sql_backend, sessions = backend
+        before = await _row_counts(sessions)
+        with pytest.raises(ReplayTargetError) as caught:
+            await execute_replay(
+                sql_backend,
+                projector_name="task-heartbeat",
+                projector_version="1",
+                selector=selector,
+                replace=True,
+            )
+        assert caught.value.reason == "filtered_replace_unsupported"
+        assert caught.value.projector_version == "1"
+        assert await _row_counts(sessions) == before
+
+    @pytest.mark.anyio
+    async def test_a_projector_whose_restore_is_unproven_is_refused(
+        self,
+        backend: tuple[SqlAnsichBackend, async_sessionmaker],
+        populated: dict[str, object],
+    ) -> None:
+        """Exclusive ownership is necessary for replace and **not sufficient**.
+
+        ``task-control`` owns ``ansich_transitions`` outright -- no other
+        dispatch branch writes it -- and a replace of it still cannot restore
+        what it deletes: ``_project_control`` computes ``from_value`` from the
+        *current control Belief*, which lives in the shared Belief triple that a
+        projector-scoped replace neither owns nor clears. Re-deriving after the
+        delete therefore reads a Belief that already carries the destination
+        value and writes ``running -> running`` where history had
+        ``unknown -> created`` and ``created -> running``.
+        """
+
+        sql_backend, sessions = backend
+        before = await _row_counts(sessions)
+        with pytest.raises(ReplayTargetError) as caught:
+            await execute_replay(
+                sql_backend,
+                projector_name="task-control",
+                projector_version="1",
+                selector=ReplaySelector(),
+                replace=True,
+            )
+        assert caught.value.reason == "replace_restore_unproven"
+        assert "task-control" in str(caught.value)
+        assert await _row_counts(sessions) == before
+
+    @pytest.mark.anyio
+    async def test_a_dry_run_refuses_the_same_requests(
+        self,
+        backend: tuple[SqlAnsichBackend, async_sessionmaker],
+        populated: dict[str, object],
+    ) -> None:
+        """``--dry-run`` exists to find this out cheaply, so it must find it out."""
+
+        sql_backend, _ = backend
+        with pytest.raises(ReplayTargetError):
+            await plan_replay(
+                sql_backend,
+                projector_name="task-heartbeat",
+                projector_version="1",
+                selector=ReplaySelector(task_id="task-7"),
+                replace=True,
+            )
+        with pytest.raises(ReplayTargetError):
+            await plan_replay(
+                sql_backend,
+                projector_name="task-control",
+                projector_version="1",
+                selector=ReplaySelector(),
+                replace=True,
+            )
+
+    def test_every_proven_projector_owns_something_to_replace(self) -> None:
+        """A proven projector that owns nothing would be a no-op wearing a flag."""
+
+        assert _REPLACE_PROVEN_PROJECTORS
+        for projector_name in _REPLACE_PROVEN_PROJECTORS:
+            assert _PROJECTOR_OWNED_TABLES[projector_name], f"{projector_name} is declared replaceable but owns no table"
+
+
+class TestReplaceIsProjectorScoped:
+    @pytest.mark.anyio
+    async def test_replace_deletes_the_owned_tables_and_nothing_else(
+        self,
+        backend: tuple[SqlAnsichBackend, async_sessionmaker],
+        enriched: dict[str, object],
+    ) -> None:
+        """The F1 lesson, driven on rows rather than on the map.
+
+        Three assertions, and the first is the one that gives the other two
+        teeth: a row nothing in the Observation stream produces is planted in
+        the target's own table and must be **gone** afterwards, which is how a
+        genuine whole-table delete is told apart from a replay that merely
+        overwrote what it found. The sibling projectors' rows -- ``task-control``'s
+        transitions and ``task-budget``'s budget row -- must be untouched, and
+        the target's real rows must be back.
+        """
+
+        sql_backend, sessions = backend
+        async with sessions() as session, session.begin():
+            session.add(
+                AnsichTaskHeartbeatRow(
+                    heartbeat_obs_id=new_id(),
+                    task_id=str(enriched["task_a"]),
+                    occurred_at=_OCCURRED_AT,
+                    producer_instance_id="planted-by-nothing",
+                    ownership_epoch="planted",
+                    elapsed_ms=999_999,
+                )
+            )
+        planted = await _owned_row_count(sessions, "task-heartbeat")
+        async with sessions() as session:
+            transitions_before = sorted((await session.execute(select(AnsichTransitionRow.transition_id))).scalars().all())
+            budgets_before = sorted((await session.execute(select(AnsichTaskBudgetRow.entity_id))).scalars().all())
+        assert transitions_before
+        assert budgets_before
+
+        report = await execute_replay(
+            sql_backend,
+            projector_name="task-heartbeat",
+            projector_version="1",
+            selector=ReplaySelector(),
+            replace=True,
+        )
+
+        assert report.unsettled == 0
+        assert report.failed == 0
+        assert await _owned_row_count(sessions, "task-heartbeat") == planted - 1
+        async with sessions() as session:
+            assert sorted((await session.execute(select(AnsichTransitionRow.transition_id))).scalars().all()) == transitions_before
+            assert sorted((await session.execute(select(AnsichTaskBudgetRow.entity_id))).scalars().all()) == budgets_before
+
+    @pytest.mark.anyio
+    async def test_the_frozen_read_model_delete_still_fires_on_the_replace_path(
+        self,
+        backend: tuple[SqlAnsichBackend, async_sessionmaker],
+        populated: dict[str, object],
+    ) -> None:
+        """PB7 is not suspended because the operator asked for a replace.
+
+        The replace-delete joins ``mint_replay_jobs``' transaction; the
+        active-Task read-model clear is the *last* step of that same
+        transaction, and it has nothing to do with ownership -- it exists
+        because the re-pend lowers ``min(unsettled ingest_seq)`` and would
+        otherwise freeze the publish guard shut (ruling RC3).
+        """
+
+        sql_backend, sessions = backend
+        await sql_backend.assess_operations()
+        async with sessions() as session:
+            before = int(await session.scalar(select(func.count()).select_from(AnsichActiveTaskReadModelRow)) or 0)
+        assert before > 0
+
+        cleared: list[int] = []
+        original = sql_backend._clear_frozen_active_task_rows
+
+        async def instrumented(session, **kwargs):
+            deleted = await original(session, **kwargs)
+            cleared.append(deleted)
+            return deleted
+
+        with pytest.MonkeyPatch.context() as patch:
+            patch.setattr(sql_backend, "_clear_frozen_active_task_rows", instrumented)
+            await execute_replay(
+                sql_backend,
+                projector_name="task-heartbeat",
+                projector_version="1",
+                selector=ReplaySelector(),
+                replace=True,
+            )
+        assert cleared == [before]
+
+    @pytest.mark.anyio
+    async def test_a_dry_run_replace_writes_nothing(
+        self,
+        backend: tuple[SqlAnsichBackend, async_sessionmaker],
+        populated: dict[str, object],
+    ) -> None:
+        """Asking what a replace would delete must not delete it."""
+
+        sql_backend, sessions = backend
+        before = await _row_counts(sessions)
+        report = await plan_replay(
+            sql_backend,
+            projector_name="task-heartbeat",
+            projector_version="1",
+            selector=ReplaySelector(),
+            replace=True,
+        )
+        assert await _row_counts(sessions) == before
+        assert report.dry_run is True
+        assert any("replace" in note for note in report.errors)
+
+
+class TestReplaceIsDeterministic:
+    """Spec §11's determinism acceptance, taken **through** ``--replace``.
+
+    This is what ``_REPLACE_PROVEN_PROJECTORS`` means. A projector is listed
+    there because this test passes for it, not because someone read its code
+    and believed it: the parametrization is over the set itself, so adding a
+    member whose owned tables cannot be re-derived from the Observation stream
+    alone turns this red rather than shipping a silent data loss.
+    """
+
+    @pytest.mark.anyio
+    @pytest.mark.parametrize("projector_name", sorted(_REPLACE_PROVEN_PROJECTORS))
+    async def test_replace_reproduces_the_pre_replace_digest(
+        self,
+        backend: tuple[SqlAnsichBackend, async_sessionmaker],
+        enriched: dict[str, object],
+        projector_name: str,
+    ) -> None:
+        sql_backend, sessions = backend
+        assert await _owned_row_count(sessions, projector_name) > 0, f"{projector_name} owns no rows here, so the comparison below would be vacuous"
+
+        first = await execute_replay(sql_backend, projector_name=projector_name, projector_version="1", selector=ReplaySelector())
+        assert first.unsettled == 0
+        assert first.failed == 0
+        assert first.digest is not None
+
+        second = await execute_replay(sql_backend, projector_name=projector_name, projector_version="1", selector=ReplaySelector(), replace=True)
+        assert second.unsettled == 0
+        assert second.failed == 0
+        assert second.digest == first.digest
+        assert await _owned_row_count(sessions, projector_name) > 0
+
+
+class TestReplaceCli:
+    def test_the_replace_flag_reaches_the_module(self) -> None:
+        args = replay_cli.build_parser().parse_args(["--projector", "task-heartbeat", "--version", "1", "--replace"])
+        assert args.replace is True
+        assert replay_cli.build_parser().parse_args(["--projector", "task-heartbeat", "--version", "1"]).replace is False

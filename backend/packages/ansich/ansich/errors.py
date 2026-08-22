@@ -77,6 +77,24 @@ class StorageUnavailableError(Exception):
 #:   ingest filter instead — both of which have an index of their own. This is
 #:   a refusal rather than a silent full scan because the scan is over a table
 #:   with no retention: it gets slower every day and never gets faster.
+#: * ``filtered_replace_unsupported`` — the request pairs ``--replace`` with a
+#:   task, time or ingest filter. ``--replace`` is **whole-table** (plan ruling
+#:   RC4): read-model rows carry no provenance back to the Observation that
+#:   produced them, so a delete cannot honour a filter the way the re-derive
+#:   can. Running it anyway would clear the whole table and re-derive only the
+#:   window, silently losing every row outside it. Drop the filter to replace
+#:   the table, or drop ``--replace`` to re-derive the window in place.
+#: * ``replace_restore_unproven`` — ``--replace`` was asked for a projector
+#:   whose owned tables are not known to survive being deleted and re-derived.
+#:   Exclusive ownership is necessary for a replace and **not sufficient**: the
+#:   projector must also be able to rebuild those rows from the Observation
+#:   stream *alone*, and one that consults state a projector-scoped replace
+#:   does not clear cannot. ``task-control`` is the worked counterexample — it
+#:   owns ``ansich_transitions`` outright, and computes each transition's
+#:   ``from_value`` from the current control Belief, which lives in the shared
+#:   Belief triple a replace neither owns nor clears — so replacing it rewrites
+#:   history into ``running -> running``. The remedy for such a projector is
+#:   ``rebuild_projections()``, which clears the shared zone too.
 #:
 #: ``not_executable`` covers **two** conditions, deliberately, because they
 #: share that one remedy and a caller never needs to tell them apart: the
@@ -90,6 +108,8 @@ ReplayTargetRefusal = Literal[
     "unknown_version",
     "not_executable",
     "time_filter_unsupported",
+    "filtered_replace_unsupported",
+    "replace_restore_unproven",
 ]
 
 

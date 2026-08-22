@@ -23,7 +23,17 @@ that has to parse prose to decide whether to page someone will get it wrong:
   conditions on its own -- three projectors own no read-model table
   exclusively and honestly have none.
 * ``2`` -- the request itself was refused (a target this build cannot honour, a
-  malformed filter, or no SQL store configured). Re-running changes nothing.
+  malformed filter, a ``--replace`` this build will not honour, or no SQL store
+  configured). Re-running changes nothing.
+
+``--replace`` is the destructive flag and reads as one: it empties the target
+projector's own read-model tables and re-derives them, so the report's digest
+describes rows this history actually produces rather than rows that merely
+survived. It is whole-table (plan ruling RC4) -- combining it with a filter is
+refused rather than approximated -- and it is available only for projectors
+whose ability to restore what it deletes is proven by a test
+(``_REPLACE_PROVEN_PROJECTORS``); everything else is refused with
+``replace_restore_unproven`` and the remedy named in the message.
 """
 
 from __future__ import annotations
@@ -59,6 +69,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--ingest-from", type=int, help="Lowest ingest_seq to target")
     parser.add_argument("--ingest-to", type=int, help="Highest ingest_seq to target")
     parser.add_argument("--dry-run", action="store_true", help="Report what the replay would do and write nothing")
+    parser.add_argument(
+        "--replace",
+        action="store_true",
+        help="Delete the projector's own read-model tables whole before re-deriving them. Whole-table only: refused with any filter, and refused for a projector whose restore is not proven.",
+    )
     parser.add_argument("--max-rounds", type=int, default=DEFAULT_MAX_ROUNDS, help="Bounded drain-then-recount rounds before reporting what is still owed")
     parser.add_argument("--format", choices=["json", "text"], default="json")
     return parser
@@ -162,6 +177,7 @@ async def run(args: argparse.Namespace, selector: ReplaySelector) -> ReplayRepor
             projector_name=args.projector,
             projector_version=args.version,
             selector=selector,
+            replace=args.replace,
             **kwargs,
         )
     finally:
