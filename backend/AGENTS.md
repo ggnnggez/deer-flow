@@ -1010,8 +1010,16 @@ blanket handler. The receipt vocabulary is deliberately
 unchanged: it is **not** answered `failed` — that would report ignorance ("I
 cannot tell whether this is a replay") as knowledge ("it is lost") — the error
 is **not** swallowed so the write can proceed, which would skip the dedupe and
-mint a phantom receipt id, and no fourth `EvaluationProjectionStatus` value
-exists for it (F10-25). `GET /evaluations/{obs_id}/payload` is the only
+mint a phantom receipt id, and no `EvaluationProjectionStatus` value is minted
+for it (F10-25). **Corrected 2026-08-22 (P11-C, ruling RC7)**, because that
+last clause used to read "no *fourth* value exists for it": a fourth value,
+`expired`, does now exist — for retention, not for this — and the sentence
+above is the reason the two are kept apart rather than an argument weakened by
+it. `expired` is a positive claim the store makes from its own durable record
+(the retention horizon); this condition has no record to appeal to, because the
+read that would have told us anything is the read that failed, so a value
+minted here would have to mean "unknown". `errors.py::StorageUnavailableError`
+carries the same retraction in place. `GET /evaluations/{obs_id}/payload` is the only
 read that returns `expected`/`actual`/`rationale`: admin-only, actor-logged,
 `Cache-Control: no-store`, and guarded on the Observation kind so it cannot
 become a generic payload reader.

@@ -201,6 +201,7 @@ from ansich.usage import (
     usage_contributions_for_observation,
 )
 from sqlalchemy import Column, DateTime, Table, and_, case, delete, func, or_, select, text, update
+from sqlalchemy import false as sql_false
 from sqlalchemy.dialects.postgresql import insert as postgresql_insert
 from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 from sqlalchemy.exc import DisconnectionError, InterfaceError, OperationalError
@@ -1076,6 +1077,14 @@ class _PayloadReferrer(NamedTuple):
     eligible for tier 1 only when **every** referrer row pointing at it is older
     than the cutoff. ``None`` means this referrer's payloads are excluded from
     time retention altogether: any row at all blocks the tombstone.
+
+    Note what the ``None`` form can and cannot promise on its own. It is a
+    predicate over a *referrer table*, so it protects a payload exactly while
+    that table still points at it — and a table can be emptied transiently by
+    something else (``_rebuild_projections_locked`` deletes and re-derives two
+    of these). The guarantee is completed by ``_payload_retention_condition``'s
+    refusal to expire an orphan at all; without that half, "excluded from time
+    retention" would hold only between rebuilds.
     """
 
     age_column: str | None
@@ -1176,14 +1185,48 @@ def _payload_retention_condition(cutoff: datetime) -> ColumnElement[bool]:
       share is only expired when both are, and a partial answer here is the
       difference between "old evidence" and "evidence somebody is still using";
     * no referrer at all, for the families declared non-expirable;
-    * an **orphan** — a payload nothing references — is aged by its own
-      ``created_at`` instead. That fallback is deliberately *not* applied to a
-      referenced payload, and the distinction matters: ``created_at`` is an
-      ingest time, while the spec ages evidence by when it *happened*
-      (``occurred_at`` and its siblings). A backfilled Observation from a month
-      ago is expired evidence written today, and an ingest-time floor would keep
-      it for another week for no reason anybody could state. An orphan has no
-      event time to appeal to, so its own row is the only honest clock it has.
+    * **at least one referrer from an aged family points at it.** An orphan —
+      a payload nothing references — is never expired by the time tiers.
+
+    That last clause is the one that needs an argument, because it looks like a
+    leak and is the fix for a data-loss bug.
+
+    **Why an orphan is not tier 1's to expire.** An earlier form of this
+    predicate aged an orphan by its own ``created_at``, which is honest as far
+    as it goes — an orphan has no event time to appeal to. What it misses is
+    that *being an orphan is not a durable property of a payload*. It is a
+    property of the rest of the database at the instant this query runs, and
+    another operation can create it transiently. ``_rebuild_projections_locked``
+    commits ``DELETE FROM ansich_agent_releases`` in its own transaction and
+    only then re-projects, so for the whole of a rebuild's drain — minutes on a
+    real store — every release manifest payload is an orphan. Retention holds a
+    *different* advisory key by design and takes no ``_projection_lock``, so a
+    concurrent pass sees exactly that state and tombstones a body this module
+    declares non-expirable. The re-projection then recreates the release row
+    against the retained digest and succeeds, so the store looks healthy while
+    ``_load_agent_release_manifest`` raises for that release forever — and its
+    message says "manifests are excluded from time retention", which is what it
+    *was*. ``ansich_authorization_snapshots`` sits in the same delete list and
+    has the same window; only its consequence is milder, because those payloads
+    are time-expirable anyway.
+
+    **Why this shape rather than the narrower fixes.** Two-pass confirmation
+    (tombstone only a payload orphaned across two consecutive passes) narrows
+    the window instead of closing it: a rebuild that spans two retention passes
+    still loses the manifest, and a scheduled sweep against a large store makes
+    that ordinary rather than exotic. It also needs durable per-payload state
+    this schema does not have. Taking the maintenance lock as well would close
+    *this* window and serialise every sweep behind every rebuild, which is the
+    exact cost the separate key exists to avoid — and it would still say nothing
+    about a future operation that empties a referrer table without that lock.
+    Refusing orphans closes the class outright, for any transient window of any
+    length, and costs nothing today: **whoever removes a payload's last referrer
+    owns the payload row.** Nothing in this build orphans a payload durably —
+    ``_ensure_content_blob``'s losing-race branch deletes the payload it minted
+    — and the tiers that will (the Observation and structural tiers, and the
+    owner hard delete) delete rows outright rather than leaving them behind. An
+    orphan row that outlives its deleter is a leak to fix at that deleter, not
+    something a sweep should guess at from the outside.
 
     The referrer set comes from the ORM (``_payload_referrer_columns``); the
     timestamp that means "old" for each comes from ``_PAYLOAD_REFERRER_TIERS``.
@@ -1207,7 +1250,14 @@ def _payload_retention_condition(cutoff: datetime) -> ColumnElement[bool]:
         age = table.c[referrer.age_column]
         clauses.append(~select(1).select_from(table).where(column == payloads.c.payload_id, age > cutoff).exists())
         referenced.append(select(1).select_from(table).where(column == payloads.c.payload_id).exists())
-    clauses.append(or_(payloads.c.created_at <= cutoff, *referenced))
+    # At least one aged-family referrer must still point at this payload. See
+    # the docstring: an orphan is a statement about the rest of the database at
+    # this instant, not a property of the payload, and another operation can
+    # manufacture one. `false()` rather than `or_()` for the empty case, which
+    # SQLAlchemy would otherwise render as an always-true empty conjunction --
+    # a build where every referrer family is declared non-expirable must expire
+    # nothing, not everything.
+    clauses.append(or_(*referenced) if referenced else sql_false())
     observations = AnsichObservationRow.__table__
     jobs = AnsichProjectionJobRow.__table__
     # A body a projector may still be about to read is not expirable, whatever
@@ -2629,7 +2679,7 @@ class SqlAnsichBackend:
                 observation_horizon_ingest_seq=int(state.observation_horizon_ingest_seq or 0),
             )
 
-    async def run_retention(self, policy: RetentionPolicy, *, now: datetime) -> RetentionReport:
+    async def run_retention(self, policy: RetentionPolicy, *, now: datetime, max_batches: int | None = None) -> RetentionReport:
         """One time-tiered retention pass (spec §6, D6-3/D6-4).
 
         Held under ``_retention_lock`` — its **own** advisory key, so an
@@ -2658,6 +2708,18 @@ class SqlAnsichBackend:
         ``None`` here and that is deliberate: tiers 2 and 3 are not part of this
         change, and reporting a tier that did not run as ``0`` would tell an
         operator the store is smaller than it is.
+
+        ``max_batches`` bounds the **whole pass**, not one tier, and it is what
+        makes ``RetentionReport.finished`` a real answer rather than a constant.
+        A pass that spends the bound stops on a batch boundary with its cursor
+        persisted and reports ``finished=False``; the next pass resumes from
+        there. ``None`` means unbounded, which is the right default for an
+        operator running one sweep to completion, while a scheduled caller that
+        must return the store to normal service on a deadline gives a bound and
+        reads ``finished`` to decide whether to come back. The bound is
+        deliberately in *batches* rather than seconds: a batch is the unit that
+        commits, so bounding it can never leave a half-written one, whereas a
+        wall-clock budget would have to either cut a batch short or overrun.
         """
 
         started_at = _as_utc(now)
@@ -2674,7 +2736,7 @@ class SqlAnsichBackend:
                 state.last_run_finished_at = None
                 state.last_run_policy = policy.snapshot()
 
-            payload_tombstoned, batches = await self._run_payload_retention_tier(policy, now=started_at)
+            payload_tombstoned, batches, finished = await self._run_payload_retention_tier(policy, now=started_at, max_batches=max_batches)
 
             finished_at = datetime.now(UTC)
             async with self._session_factory() as session, session.begin():
@@ -2688,16 +2750,16 @@ class SqlAnsichBackend:
             structural_deleted=None,
             batches=batches,
             resumed_from_cursor=resumed_from_cursor,
-            finished=True,
+            finished=finished,
             started_at=started_at,
             finished_at=finished_at,
             observation_horizon_ingest_seq=horizon,
         )
 
-    async def _run_payload_retention_tier(self, policy: RetentionPolicy, *, now: datetime) -> tuple[int, int]:
+    async def _run_payload_retention_tier(self, policy: RetentionPolicy, *, now: datetime, max_batches: int | None = None) -> tuple[int, int, bool]:
         """Tier 1: replace expired payload **bodies** with tombstones.
 
-        Returns ``(bodies tombstoned, batches committed)``.
+        Returns ``(bodies tombstoned, batches committed, walked to the end)``.
 
         The row is never deleted. ``body`` goes ``NULL``, ``deleted_at`` records
         when and ``policy`` records under which rule, all three in one UPDATE so
@@ -2719,6 +2781,15 @@ class SqlAnsichBackend:
         aged past the cutoff while the pass was running — is therefore picked up
         by the next pass rather than by this one, which is the honest trade: a
         cursor that jumped backwards to catch it could not terminate.
+
+        ``max_batches`` stops the walk on a batch boundary with the cursor left
+        where it stopped, and the returned ``finished`` is ``False``. It is a
+        deliberate slight **under**-claim: a walk that spends its last batch on
+        the final candidates reports ``False`` even though nothing remains,
+        because the only way to know otherwise is one more query and "run me
+        again" is the cheap side of that trade. ``finished=False`` therefore
+        means "do not assume this tier is done", never "there is definitely
+        more".
         """
 
         cutoff = now - timedelta(days=policy.raw_payload_days)
@@ -2726,6 +2797,7 @@ class SqlAnsichBackend:
         payloads = AnsichPayloadRow.__table__
         tombstoned = 0
         batches = 0
+        finished = False
         while True:
             async with self._session_factory() as session, session.begin():
                 state = await self._retention_state(session)
@@ -2741,6 +2813,7 @@ class SqlAnsichBackend:
                 )
                 if not candidates:
                     state.payload_cursor = None
+                    finished = True
                     break
                 # Already ascending from the ORDER BY; sorted again rather than
                 # assumed, because the traversal order is the property
@@ -2753,13 +2826,17 @@ class SqlAnsichBackend:
                 state.payload_cursor = candidates[-1]
                 tombstoned += len(candidates)
                 batches += 1
+            if max_batches is not None and batches >= max_batches:
+                # Outside the transaction, so the batch just committed stands
+                # with its cursor. The next pass resumes from it.
+                break
         logger.info(
             "ansich retention: tier 1 tombstoned %d payload bod(y/ies) in %d batch(es) under %s",
             tombstoned,
             batches,
             label,
         )
-        return tombstoned, batches
+        return tombstoned, batches, finished
 
     async def initialize_metrics(self) -> None:
         await self._refresh_failed_job_count()

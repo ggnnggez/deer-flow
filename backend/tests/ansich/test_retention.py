@@ -1246,6 +1246,151 @@ async def test_an_agent_release_manifest_is_never_expired_by_time_retention(rete
 
 
 @pytest.mark.anyio
+async def test_a_manifest_survives_a_rebuild_that_transiently_orphans_it(retention_backend):
+    """The reviewer's reproduction, committed as the regression it earned.
+
+    The "manifests are excluded from time retention" guarantee used to be a
+    predicate over ``ansich_agent_releases`` — protected exactly while a row
+    pointed at the payload — while an orphan fell back to its own
+    ``created_at``. ``_rebuild_projections_locked`` commits
+    ``DELETE FROM ansich_agent_releases`` **before** its drain re-projects, so
+    for the whole of a rebuild every manifest payload in the store is an
+    orphan; a concurrent retention pass (different advisory key, no
+    ``_projection_lock``) then tombstoned it. The re-projection recreated the
+    release row against the retained digest and succeeded, so nothing failed
+    and nothing alerted — while ``_load_agent_release_manifest`` raised for
+    that release forever, with a message saying manifests are excluded from
+    time retention, which is what it had just not been.
+
+    The fixture *is* the rebuild window: the delete is the exact statement the
+    rebuild commits. What the fix makes true is that the window is no longer a
+    window at all.
+    """
+
+    backend, sessions = retention_backend
+    async with sessions() as session, session.begin():
+        session.add(
+            AnsichPayloadRow(
+                payload_id="manifest-rebuild",
+                content_type="application/vnd.ansich.agent-release+json",
+                encoding="utf-8",
+                compression="none",
+                byte_size=2,
+                sha256="c" * 64,
+                body=b"{}",
+                created_at=_RETENTION_OCCURRED_AT,
+            )
+        )
+        discovered = _observation("obs-release-rebuild")
+        discovered.occurred_at = _RETENTION_OCCURRED_AT
+        discovered.recorded_at = _RETENTION_OCCURRED_AT
+        session.add(discovered)
+        await session.flush()
+        session.add(AnsichEntityRow(entity_id="release-rebuild", entity_type="agent_release", discovered_obs_id="obs-release-rebuild"))
+        await session.flush()
+        session.add(
+            AnsichAgentReleaseRow(
+                entity_id="release-rebuild",
+                namespace="test",
+                agent_name="lead-agent",
+                release_hash="d" * 64,
+                schema_version=1,
+                model_hash="e" * 64,
+                prompt_hash="f" * 64,
+                tool_catalog_hash="0" * 64,
+                policy_hash="1" * 64,
+                runtime_build_id="build-1",
+                manifest_payload_id="manifest-rebuild",
+                discovered_obs_id="obs-release-rebuild",
+                created_at=_RETENTION_OCCURRED_AT,
+            )
+        )
+
+    # The rebuild's own first statement, committed in its own transaction
+    # exactly as `_rebuild_projections_locked` commits it, before the drain that
+    # would recreate the row.
+    async with sessions() as session, session.begin():
+        await session.execute(sa.delete(AnsichAgentReleaseRow))
+
+    report = await backend.run_retention(_POLICY, now=_RETENTION_OCCURRED_AT + timedelta(days=365))
+
+    payloads = await _payload_rows(sessions)
+    assert payloads["manifest-rebuild"].body == b"{}", "a rebuild's delete must not widen retention's eligibility set"
+    assert payloads["manifest-rebuild"].deleted_at is None
+    assert report.payload_tombstoned == 0
+
+
+@pytest.mark.anyio
+async def test_an_orphaned_payload_is_never_expired_by_the_time_tiers(retention_backend):
+    """The class, not the instance: no orphan is tier 1's to expire.
+
+    Being an orphan is a statement about the rest of the database at the instant
+    the query runs, not a property of the payload, and any operation that
+    empties a referrer table manufactures one. Rather than narrowing the window
+    (two-pass confirmation still loses a manifest to a rebuild that spans two
+    passes) or serialising retention behind every rebuild (which is the cost the
+    separate advisory key exists to avoid), the orphan branch is gone: whoever
+    removes a payload's last referrer owns the payload row.
+
+    The cost is stated rather than hidden — a payload nothing references is
+    never reclaimed here — and it is zero today because nothing in this build
+    orphans one durably.
+    """
+
+    backend, sessions = retention_backend
+    async with sessions() as session, session.begin():
+        session.add(
+            AnsichPayloadRow(
+                payload_id="orphan-payload",
+                content_type="application/json",
+                encoding="utf-8",
+                compression="none",
+                byte_size=2,
+                sha256="2" * 64,
+                body=b"{}",
+                created_at=_RETENTION_OCCURRED_AT,
+            )
+        )
+
+    report = await backend.run_retention(_POLICY, now=_RETENTION_OCCURRED_AT + timedelta(days=365))
+
+    assert report.payload_tombstoned == 0
+    assert (await _payload_rows(sessions))["orphan-payload"].body == b"{}"
+
+
+@pytest.mark.anyio
+async def test_a_pass_that_spends_its_batch_bound_reports_unfinished(retention_backend):
+    """``finished`` is an answer, not a constant.
+
+    A bounded pass is what a scheduled caller needs: return the store to normal
+    service on a deadline, say honestly that the tier was not walked to the end,
+    and resume next time from the cursor this one left. The bound is in batches
+    rather than seconds because a batch is the unit that commits — bounding it
+    can never leave a half-written one.
+    """
+
+    backend, sessions = retention_backend
+    await _settled_store(backend, heartbeats=4)
+    total = len(await _payload_rows(sessions))
+    assert total > _POLICY.cleanup_batch_size
+
+    bounded = await backend.run_retention(_POLICY, now=_RETENTION_NOW, max_batches=1)
+
+    assert bounded.finished is False
+    assert bounded.batches == 1
+    assert bounded.payload_tombstoned == _POLICY.cleanup_batch_size
+    async with sessions() as session:
+        assert await session.scalar(select(AnsichRetentionStateRow.payload_cursor)) is not None
+
+    rest = await backend.run_retention(_POLICY, now=_RETENTION_NOW)
+
+    assert rest.finished is True
+    assert rest.resumed_from_cursor is True
+    assert bounded.payload_tombstoned + rest.payload_tombstoned == total
+    assert all(row.body is None for row in (await _payload_rows(sessions)).values())
+
+
+@pytest.mark.anyio
 async def test_a_payload_whose_observation_still_owes_a_projection_is_skipped(retention_backend):
     """An in-flight job pins its evidence, whatever the evidence's age.
 
@@ -1829,6 +1974,14 @@ async def test_a_surviving_observation_is_never_read_as_expired(retention_backen
 
 _JOB_ROW_CLASSES = frozenset({"AnsichProjectionJobRow", "AnsichAssessorJobRow"})
 _INSERT_CALLS = frozenset({"insert", "postgresql_insert", "sqlite_insert"})
+#: ``update`` is refused beside the insert forms because the shape PB7 actually
+#: names is a **re-pend** — ``update(AnsichProjectionJobRow).values(status=...)``
+#: is exactly what ``_rebuild_projections_locked`` issues, and it is what lowers
+#: ``min(unsettled ingest_seq)``. Nothing narrower than "retention issues no
+#: UPDATE against a job table at all" is worth pinning: a predicate that looked
+#: only for ``status=`` in the ``.values()`` would be satisfied by an edit that
+#: re-armed a job through ``available_at`` or ``attempts`` instead.
+_MUTATE_CALLS = _INSERT_CALLS | {"update"}
 
 
 def _sql_module_ast() -> ast.Module:
@@ -1884,11 +2037,16 @@ def test_retention_never_creates_or_re_pends_a_job():
     an AST pin is that "trivially" stays true through the next edit rather than
     through the next reader's memory.
 
-    Three write shapes are refused: constructing a job row, passing one to an
-    ``insert``, and adding one to a session. Reads are untouched — the payload
-    tier's in-flight guard genuinely has to look at ``ansich_projection_jobs``,
-    and a pin that forbade mentioning the table would forbid the guard that
-    keeps a projector from finding an empty body.
+    Four write shapes are refused: constructing a job row, passing one to an
+    ``insert``, passing one to an ``update``, and adding one to a session. The
+    ``update`` arm is the one the name of this test actually promises — a
+    **re-pend** is `update(JobRow).values(status="pending", ...)`, the shape
+    ``_rebuild_projections_locked`` itself uses and the one that lowers
+    ``min(unsettled ingest_seq)`` — and it was missing while the docstring
+    claimed it. Reads are untouched deliberately: the payload tier's in-flight
+    guard genuinely has to look at ``ansich_projection_jobs``, and a pin that
+    forbade mentioning the table would forbid the guard that keeps a projector
+    from finding an empty body.
     """
 
     functions = _named_functions(_sql_module_ast())
@@ -1907,8 +2065,8 @@ def test_retention_never_creates_or_re_pends_a_job():
             if isinstance(target, ast.Name) and target.id in _JOB_ROW_CLASSES:
                 offenders.append(f"{name}: constructs {target.id}")
             mentions = {inner.id for inner in ast.walk(child) if isinstance(inner, ast.Name)} & _JOB_ROW_CLASSES
-            if isinstance(target, ast.Name) and target.id in _INSERT_CALLS and mentions:
-                offenders.append(f"{name}: inserts into {sorted(mentions)}")
+            if isinstance(target, ast.Name) and target.id in _MUTATE_CALLS and mentions:
+                offenders.append(f"{name}: {target.id} against {sorted(mentions)}")
             if isinstance(target, ast.Attribute) and target.attr == "add" and mentions:
                 offenders.append(f"{name}: session.add of {sorted(mentions)}")
     assert offenders == []

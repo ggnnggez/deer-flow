@@ -1448,9 +1448,94 @@ async def test_a_raw_payload_expired_under_retention_answers_410_not_404():
         response = await client.get(f"/api/ansich/content-blocks/{new_id()}/payload")
 
     assert response.status_code == 410
+    # `no-store` rides on the exception, not on the injected `Response`: those
+    # routes set the header as their last statement before returning, which
+    # never runs on a raise. 410 is one of the heuristically cacheable statuses
+    # (RFC 7231 §6.1), so this is the one status in this family where its
+    # absence has teeth.
+    assert response.headers["cache-control"] == "no-store"
     detail = response.json()["detail"]
     assert detail["payload_id"] == "payload-expired"
     assert detail["policy"] == "raw_payload_days=7"
     assert detail["deleted_at"] == "2026-08-22T12:00:00+00:00"
     assert detail["sha256"] == "a" * 64
     assert detail["byte_size"] == 4096
+
+
+def _expired_payload_error() -> PayloadExpiredError:
+    return PayloadExpiredError(
+        "Ansich payload expired",
+        payload_id="payload-expired",
+        policy="raw_payload_days=7",
+        deleted_at=datetime(2026, 8, 22, 12, 0, tzinfo=UTC),
+        sha256="b" * 64,
+        byte_size=17,
+    )
+
+
+@pytest.mark.anyio
+async def test_an_expired_evaluation_payload_answers_410_with_no_store():
+    """The second of the three raw-body routes, which had no 410 test at all.
+
+    Same contract as the ContentBlock route and asserted separately rather than
+    parametrized, because each route reaches the refusal through its own
+    ``except`` clause — a shared assertion would pass while one of them was
+    still mapping the error to a 503 through the blanket handler below it.
+    """
+
+    app = make_authed_test_app(user_factory=admin_user)
+    service = AnsichService.in_memory()
+
+    async def _expired(_obs_id: str):
+        raise _expired_payload_error()
+
+    service.get_evaluation_observation_payload = _expired  # type: ignore[method-assign]
+    app.state.ansich_service = service
+    app.include_router(ansich_router.router)
+
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        response = await client.get(f"/api/ansich/evaluations/{new_id()}/payload")
+
+    assert response.status_code == 410
+    assert response.headers["cache-control"] == "no-store"
+    detail = response.json()["detail"]
+    assert detail["payload_id"] == "payload-expired"
+    assert detail["policy"] == "raw_payload_days=7"
+    assert detail["byte_size"] == 17
+
+
+@pytest.mark.anyio
+async def test_an_expired_tool_result_payload_answers_410_with_no_store():
+    """The third route, reached through the shared tool-result helper.
+
+    It resolves the ToolCall first, so the fixture has to give it one before the
+    payload read can be the thing that fails — otherwise this would pass on a
+    404 from the lookup and prove nothing about the 410 clause.
+    """
+
+    app = make_authed_test_app(user_factory=admin_user)
+    service = AnsichService.in_memory()
+    tool_call_id = new_id()
+    block_id = new_id()
+
+    async def _tool_call(_tool_call_id: str):
+        return SimpleNamespace(
+            tool_call_id=tool_call_id,
+            raw_results=(SimpleNamespace(content_block_id=block_id),),
+            visible_results=(),
+        )
+
+    async def _expired(_block_id: str):
+        raise _expired_payload_error()
+
+    service.get_tool_call = _tool_call  # type: ignore[method-assign]
+    service.get_content_block_payload = _expired  # type: ignore[method-assign]
+    app.state.ansich_service = service
+    app.include_router(ansich_router.router)
+
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        response = await client.get(f"/api/ansich/tool-calls/{tool_call_id}/raw-result")
+
+    assert response.status_code == 410
+    assert response.headers["cache-control"] == "no-store"
+    assert response.json()["detail"]["payload_id"] == "payload-expired"

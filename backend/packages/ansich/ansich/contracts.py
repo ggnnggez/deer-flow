@@ -1085,6 +1085,26 @@ class ReplayReport(BaseModel):
     the alternative, silently counting only the targeted subset, would let a
     concurrently ingested Observation be absorbed with nothing said.
 
+    **``settled`` is doing exact work in that sentence: it counts jobs that were
+    settled, not projections that were written.** A job whose Observation's
+    payload expired under the retention policy is settled without projecting
+    anything (the tombstone's lineage is recorded on the job; see
+    ``sql.py::_settle_expired_evidence_job``), and it is counted here like any
+    other. So on a store old enough to have run retention, ``replayed`` is a
+    count of work the loop *finished*, and some of that work honestly produced
+    no rows. A caller reading it as "rows re-derived" will over-read a replay
+    over expired evidence.
+
+    Counting them is the right choice and the reason is mechanical rather than
+    semantic: the drive loop — like ``_rebuild_projections_locked``'s — exits
+    the round when ``project_pending`` returns **zero**. A round consisting only
+    of expired settles would therefore end the drain early with claimable work
+    still queued behind it, and a store holding many such jobs could spend the
+    whole round budget without converging. (What it would *not* do is leave
+    ``unsettled`` non-zero forever: that is a live query over the job tables and
+    the rows really are ``completed`` either way — worth stating because it is
+    the plausible-sounding wrong reason for the same decision.)
+
     ``unsettled`` carries the same meaning and the same lower-bound caveat as
     :class:`RebuildOutcome`'s: every projection or assessor job still
     ``pending``/``retry``/``processing`` at the end of the last round, counted

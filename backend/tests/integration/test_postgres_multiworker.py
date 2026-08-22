@@ -106,10 +106,12 @@ from deerflow.ansich import create_sql_ansich_service
 from deerflow.ansich.persistence import sql as ansich_sql
 from deerflow.ansich.persistence.models import (
     AnsichActiveVersionRow,
+    AnsichAgentReleaseRow,
     AnsichAlertRow,
     AnsichAssessorErrorRow,
     AnsichAssessorJobRow,
     AnsichAssessorWatermarkRow,
+    AnsichEntityRow,
     AnsichObservationRow,
     AnsichPayloadRow,
     AnsichProjectionJobRow,
@@ -2227,3 +2229,76 @@ async def test_retention_tombstones_payloads_beside_a_live_claimer_on_postgres()
         await _settle_everything(worker_a, worker_b)
         async with worker_a.sessions() as session:
             assert await session.scalar(sa.select(AnsichProjectionJobRow.status).where(AnsichProjectionJobRow.job_id == pinned_job_id)) == "completed"
+
+        # ------------------------------------------------------------------
+        # The rebuild window, on the dialect that actually enforces the keys.
+        # ------------------------------------------------------------------
+        # `_rebuild_projections_locked` commits `DELETE FROM ansich_agent_releases`
+        # in its own transaction and only then re-projects, so for the whole of
+        # a rebuild every manifest payload is an orphan. Retention holds a
+        # different advisory key and takes no `_projection_lock`, so nothing
+        # excludes a pass from running in that gap -- and here the two really
+        # are separate workers with separate pools rather than two coroutines,
+        # which is the half SQLite cannot supply. The delete is issued from
+        # worker B and the sweep from worker A, both committed, and the
+        # manifest must survive.
+        release_id = new_id()
+        async with worker_a.sessions() as session, session.begin():
+            session.add(
+                AnsichPayloadRow(
+                    payload_id="manifest-pg",
+                    content_type="application/vnd.ansich.agent-release+json",
+                    encoding="utf-8",
+                    compression="none",
+                    byte_size=2,
+                    sha256="c" * 64,
+                    body=b"{}",
+                    created_at=_OCCURRED_AT,
+                )
+            )
+            manifest_obs_id = await session.scalar(sa.select(AnsichObservationRow.obs_id).order_by(AnsichObservationRow.ingest_seq).limit(1))
+            session.add(AnsichEntityRow(entity_id=release_id, entity_type="agent_release", discovered_obs_id=manifest_obs_id))
+            await session.flush()
+            session.add(
+                AnsichAgentReleaseRow(
+                    entity_id=release_id,
+                    namespace="test",
+                    agent_name="lead-agent",
+                    release_hash="d" * 64,
+                    schema_version=1,
+                    model_hash="e" * 64,
+                    prompt_hash="f" * 64,
+                    tool_catalog_hash="0" * 64,
+                    policy_hash="1" * 64,
+                    runtime_build_id="build-pg",
+                    manifest_payload_id="manifest-pg",
+                    discovered_obs_id=manifest_obs_id,
+                    created_at=_OCCURRED_AT,
+                )
+            )
+        async with worker_b.sessions() as session, session.begin():
+            await session.execute(sa.delete(AnsichAgentReleaseRow).where(AnsichAgentReleaseRow.entity_id == release_id))
+
+        rebuild_window = await asyncio.wait_for(
+            worker_a.backend.run_retention(
+                RetentionPolicy(raw_payload_days=7, observation_days=30, structural_days=90, cleanup_batch_size=2),
+                now=_OCCURRED_AT + timedelta(days=365),
+            ),
+            timeout=30,
+        )
+
+        async with worker_b.sessions() as session:
+            manifest = await session.get(AnsichPayloadRow, "manifest-pg")
+            pinned = await session.get(AnsichPayloadRow, pinned_payload_id)
+        assert manifest is not None and manifest.body == b"{}", "a peer's committed delete must not widen retention's eligibility set"
+        assert manifest.deleted_at is None
+        # The count is asserted per-row rather than as a total, because this
+        # sweep legitimately has something else to do: B's claim settled above,
+        # so the payload the in-flight guard was protecting is now expirable and
+        # this pass takes it. That is the guard releasing on schedule, and it is
+        # worth pinning beside the manifest -- one assertion says the exclusion
+        # held, the other says the guard is a pause rather than a permanent
+        # reprieve.
+        assert rebuild_window.payload_tombstoned == 1
+        assert pinned is not None and pinned.body is None
+        assert pinned.policy == "raw_payload_days=7"

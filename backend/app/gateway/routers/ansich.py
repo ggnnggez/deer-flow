@@ -63,7 +63,7 @@ def _service_or_503(request: Request):
     return service
 
 
-def _expired_payload_410(exc: PayloadExpiredError, *, what: str) -> HTTPException:
+def _expired_payload_410(exc: PayloadExpiredError, *, what: str, request: Request) -> HTTPException:
     """Answer a raw-body read whose evidence expired under retention with 410.
 
     **410 Gone, not 404** (plan ruling RC6). The two are different answers and
@@ -77,8 +77,30 @@ def _expired_payload_410(exc: PayloadExpiredError, *, what: str) -> HTTPExceptio
     the size, when it went and under which rule. That is the whole of what can
     still be said truthfully about the bytes, and it is what lets an operator
     tell a retention outcome from a deletion nobody configured.
+
+    **``no-store`` rides on the exception, not on the injected ``Response``.**
+    Those routes set the header as their last statement before returning, which
+    never executes on a raise — FastAPI builds a fresh response from the
+    exception and the injected object's headers are only merged on the success
+    path. That gap matters more here than beside the 404 and 503 next to it,
+    because **410 is one of the heuristically cacheable statuses** (RFC 7231
+    §6.1), so the one new status this family gained is the one where an absent
+    ``no-store`` has teeth. The cached body would be lineage rather than
+    evidence, so the exposure is small — but "never polled, never cached,
+    always logged" is this family's stated discipline and it should be true.
+    The actor line is the "always logged" half, for the same reason: a read
+    that was refused is still a read that was attempted.
     """
 
+    user = getattr(request.state, "user", None)
+    logger.info(
+        "Ansich raw payload read refused: evidence expired under retention",
+        extra={
+            "ansich_payload_id": exc.payload_id,
+            "ansich_retention_policy": exc.policy,
+            "ansich_actor_id": str(getattr(user, "id", "unknown")),
+        },
+    )
     return HTTPException(
         status_code=410,
         detail={
@@ -89,6 +111,7 @@ def _expired_payload_410(exc: PayloadExpiredError, *, what: str) -> HTTPExceptio
             "sha256": exc.sha256,
             "byte_size": exc.byte_size,
         },
+        headers={"Cache-Control": "no-store"},
     )
 
 
@@ -1690,7 +1713,7 @@ async def get_evaluation_payload(obs_id: str, request: Request, response: Respon
     try:
         payload = await service.get_evaluation_observation_payload(obs_id)
     except PayloadExpiredError as expired:
-        raise _expired_payload_410(expired, what="evaluation payload") from expired
+        raise _expired_payload_410(expired, what="evaluation payload", request=request) from expired
     except Exception as exc:
         raise HTTPException(
             status_code=503,
@@ -1999,7 +2022,7 @@ async def _get_tool_result_payload(
     try:
         payload = await service.get_content_block_payload(result.content_block_id)
     except PayloadExpiredError as expired:
-        raise _expired_payload_410(expired, what=f"ToolCall {role} payload") from expired
+        raise _expired_payload_410(expired, what=f"ToolCall {role} payload", request=request) from expired
     except Exception as exc:
         raise HTTPException(
             status_code=503,
@@ -2067,7 +2090,7 @@ async def get_content_block_payload(block_id: str, request: Request, response: R
     try:
         payload = await service.get_content_block_payload(block_id)
     except PayloadExpiredError as expired:
-        raise _expired_payload_410(expired, what="ContentBlock payload") from expired
+        raise _expired_payload_410(expired, what="ContentBlock payload", request=request) from expired
     except Exception as exc:
         raise HTTPException(
             status_code=503,
