@@ -1779,6 +1779,17 @@ class AnsichRetentionStateRow(Base):
     least once, which is not the same statement as "starts at the beginning"
     and must not be written as ``0`` or an empty string.
 
+    ``observation_cursor`` is the exception to the "how far a tier walked"
+    reading above, and it acquired its meaning in P11-C's T10. Tier 2 never
+    writes it (its horizon is already a monotone position over the same
+    keyspace), and the **owner hard delete** claims it as the mark of a
+    *non-contiguous* deliberate deletion: the highest ``ingest_seq`` an erasure
+    has removed. It is not a cursor -- nothing resumes a walk from it -- and it
+    makes no prefix claim, which is precisely why it can hold what the horizon
+    structurally cannot. Receipt resolution reads it beside the horizon, so a
+    hard-deleted Observation reads ``expired`` even when a survivor below the
+    erased range pins the horizon in place.
+
     ``structural_cursor`` holds an ``ansich_entities.entity_id`` and nothing
     else. Naming the keyspace matters because the structural tier covers two
     tables and both keys are ``String(36)`` uuid4 with no discriminator, so a

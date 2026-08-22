@@ -1109,6 +1109,23 @@ _HARD_DELETE_BATCH_SIZE = 500
 #: Each exclusion can leave the Observation that discovered the entity pinned;
 #: that surfaces as a named ``blocked`` refusal rather than as a silent skip.
 _HARD_DELETE_PROTECTED_ENTITY_TYPES = frozenset({"task", "scope", "agent_release"})
+#: The ``ScopeKind`` values an owner/thread hard delete may erase. The other
+#: four -- ``workspace``, ``sandbox``, ``authorization``, ``external_origin`` --
+#: are shared across owners by construction (a repository path, a pooled
+#: runtime, a policy, a provenance), so erasing one would take every Task that
+#: ever reported it from every owner. ``host`` is refused earlier and by id, as
+#: this process's own anchor. Declared rather than derived because "does this
+#: kind name one owner's data" is a product decision the schema does not carry.
+_HARD_DELETE_OWNER_SCOPE_KINDS = frozenset({"owner", "thread"})
+#: The removable edge to name when a protected Entity of each type is what pins
+#: an Observation an erasure cannot take. ``ansich_entities.discovered_obs_id``
+#: is the edge the planner refuses on, but it is a column on the *surviving*
+#: row and names nothing an operator can act on; what they can act on is the
+#: Scope or the AgentRelease itself, so its own pin is the edge reported.
+_HARD_DELETE_PROTECTED_PIN_EDGES: dict[str, str] = {
+    "scope": "ansich_scopes.created_obs_id",
+    "agent_release": "ansich_agent_releases.discovered_obs_id",
+}
 #: The read-model tables ``HardDeleteReport.read_models`` counts. Named rather
 #: than derived because "read model" is a statement about what a table *means*
 #: -- a rebuildable projection of other rows -- which no schema metadata carries.
@@ -1364,9 +1381,18 @@ class _HardDeleteCounts:
     Everything the four named tables do not claim lands in ``projections``: that
     is the definition, not a leftover bucket, and it is why a schema change that
     adds a table needs no edit here.
+
+    **It knows nothing about transactions, so the two boundary calls do.**
+    ``commit_batch`` counts a transaction only when it deleted something (a
+    batch counter that ticked on an empty commit would make a refusal look like
+    progress), and ``rollback_batch`` rewinds every family to the last committed
+    snapshot, so a phase that absorbed a plan and then raised does not report
+    rows the database is about to restore.
     """
 
-    __slots__ = ("audit_refs", "batches", "highest_ingest_seq", "observations", "payloads", "projections", "read_models", "relations", "tasks")
+    _FAMILIES = ("tasks", "observations", "payloads", "projections", "relations", "read_models", "audit_refs")
+
+    __slots__ = ("_committed", "audit_refs", "batches", "highest_ingest_seq", "observations", "payloads", "projections", "read_models", "relations", "tasks")
 
     def __init__(self) -> None:
         self.tasks = 0
@@ -1383,6 +1409,7 @@ class _HardDeleteCounts:
         self.read_models = 0
         self.audit_refs = 0
         self.batches = 0
+        self._committed = dict.fromkeys(self._FAMILIES, 0)
 
     def absorb(self, deleted: Mapping[str, int], payloads_reclaimed: int) -> None:
         for table_name, count in sorted(deleted.items()):
@@ -1399,6 +1426,26 @@ class _HardDeleteCounts:
             else:
                 self.projections += count
         self.payloads += payloads_reclaimed
+
+    def deleted_total(self) -> int:
+        """Rows deleted so far. ``audit_refs`` is excluded because it is a
+        **subset** of ``observations`` and adding it would double-count."""
+
+        return self.tasks + self.observations + self.payloads + self.projections + self.relations + self.read_models
+
+    def commit_batch(self) -> None:
+        """Count one committed transaction, but only if it deleted something."""
+
+        snapshot = {name: getattr(self, name) for name in self._FAMILIES}
+        if snapshot != self._committed:
+            self.batches += 1
+            self._committed = snapshot
+
+    def rollback_batch(self) -> None:
+        """Rewind every family to the last committed snapshot."""
+
+        for name, value in self._committed.items():
+            setattr(self, name, value)
 
     def report(self) -> HardDeleteReport:
         return HardDeleteReport(
@@ -3547,8 +3594,11 @@ class SqlAnsichBackend:
         ``None`` by this tier. The horizon is already a durable, monotone
         position over the same keyspace and it is the one receipts read; a
         second position over the same rows could disagree with it, and the
-        disagreement would be silent. A future non-contiguous Observation tier
-        would need that column, and this one does not.
+        disagreement would be silent. **The non-contiguous deleter that sentence
+        anticipated now exists** -- ``hard_delete_scope`` writes that column as
+        its deliberate-deletion mark (see ``_advance_deletion_horizon``) -- and
+        the two still cannot disagree, because the column is not a cursor:
+        nothing walks from it, and this tier neither reads nor writes it.
         """
 
         cutoff = now - timedelta(days=policy.observation_days)
@@ -3877,23 +3927,39 @@ class SqlAnsichBackend:
         stranding a descendant whose only route from the Scope ran through an
         ancestor.
 
-        Raises :class:`~ansich.errors.HardDeleteError` for the four
+        Raises :class:`~ansich.errors.HardDeleteError` for the five
         request-shaped refusals *before touching anything*, and for ``blocked``
         -- a row outside the Scope's reach still pointing into it -- possibly
-        after batches have committed. See that class for why that is a resumable
-        state and not a partial failure.
+        after batches have committed. **A ``blocked`` erasure always leaves the
+        Scope row standing**, because that row is the resume handle: the final
+        phase raises from inside its own transaction, so its Scope delete rolls
+        back with it (review finding F1). An earlier shape raised after that
+        transaction committed and left a re-run answering ``unknown_scope`` --
+        a half-erased owner with no API able to finish the job.
+
+        The two **pure** refusals (the sentinel, the host Scope) are answered
+        before the locks, since they read nothing. The three that read the store
+        are answered *inside* the locks (F8): a child Scope minted between an
+        outside-the-lock check and the Scope phase would otherwise surface as
+        the ``IntegrityError`` the pre-flight exists to replace, mid-erasure,
+        after batches had committed.
         """
 
         size = max(int(batch_size if batch_size is not None else _HARD_DELETE_BATCH_SIZE), 1)
-        await self._refuse_undeletable_scope(scope_id)
+        self._refuse_undeletable_scope_id(scope_id)
         counts = _HardDeleteCounts()
         async with self._maintenance_lock(), self._retention_lock():
             async with self._session_factory() as session:
+                await self._refuse_undeletable_scope_row(scope_id, session)
+            async with self._session_factory() as session:
                 task_order = await self._hard_delete_task_order(session, scope_id)
             deferred: set[str] = set()
+            blocked: list[str] = []
             for task_id in task_order:
-                deferred |= await self._hard_delete_task(scope_id, task_id, size=size, counts=counts)
-            await self._hard_delete_scope_row(scope_id, task_order, deferred, size=size, counts=counts)
+                task_deferred, task_blocked = await self._hard_delete_task(scope_id, task_id, size=size, counts=counts)
+                deferred |= task_deferred
+                blocked.extend(task_blocked)
+            await self._hard_delete_scope_row(scope_id, task_order, deferred, blocked, size=size, counts=counts)
         logger.info(
             "ansich hard delete: scope %s erased %d task(s), %d observation(s) (%d audit), %d payload(s) in %d batch(es)",
             scope_id,
@@ -3905,15 +3971,14 @@ class SqlAnsichBackend:
         )
         return counts.report()
 
-    async def _refuse_undeletable_scope(self, scope_id: str) -> None:
-        """The four request-shaped refusals, answered before anything is deleted.
+    def _refuse_undeletable_scope_id(self, scope_id: str) -> None:
+        """The two refusals that read nothing, answered before the locks.
 
-        All four are cheap indexed reads and all four are typed rather than left
-        to the database, because ``parent_scope`` in particular *would* surface
-        on its own -- ``ansich_scopes.parent_scope_id`` is ``RESTRICT`` -- but as
-        an ``IntegrityError`` raised half-way through an erasure that had already
-        committed batches. A refusal a caller can branch on, raised before the
-        first delete, is a different product.
+        Both are properties of the *id*: the bootstrap sentinel is not an entity
+        at all, and the host Scope is this process's own anchor. Neither can
+        change under a lock, so taking two advisory locks to answer them would
+        queue a rebuild and a retention sweep behind a request that was never
+        going to touch the store.
         """
 
         if scope_id == ANSICH_BOOTSTRAP_TASK_ID:
@@ -3928,14 +3993,59 @@ class SqlAnsichBackend:
                 reason="host_scope",
                 scope_id=scope_id,
             )
-        async with self._session_factory() as session:
-            if await session.get(AnsichScopeRow, scope_id) is None:
-                raise HardDeleteError(
-                    f"Ansich hard delete refused: no Scope {scope_id}",
-                    reason="unknown_scope",
-                    scope_id=scope_id,
-                )
-            child = await session.scalar(select(AnsichScopeRow.entity_id).where(AnsichScopeRow.parent_scope_id == scope_id).order_by(AnsichScopeRow.entity_id).limit(1))
+
+    @staticmethod
+    async def _refuse_undeletable_scope_row(scope_id: str, session: AsyncSession | None = None) -> None:
+        """The three refusals that read the store, answered **under the locks**.
+
+        All three are cheap indexed reads and all three are typed rather than
+        left to the database, because ``parent_scope`` in particular *would*
+        surface on its own -- ``ansich_scopes.parent_scope_id`` is ``RESTRICT``
+        -- but as an ``IntegrityError`` raised half-way through an erasure that
+        had already committed batches. A refusal a caller can branch on, raised
+        before the first delete, is a different product.
+
+        **Under the locks, not before them** (review finding F8). A pre-flight
+        outside the advisory locks is a time-of-check/time-of-use gap: a child
+        Scope minted between the check and the Scope phase reaches the database
+        as exactly the ``IntegrityError`` this refusal exists to replace, and by
+        then batches have committed. The window is not closed absolutely --
+        another *worker* can still project a child Scope while this erasure
+        runs, since projection is not excluded by either key -- but it is
+        narrowed from "the whole request" to "the erasure itself", and the
+        residual is the ordinary blocked-referrer path rather than a driver
+        error.
+
+        **The kind guard is the one refusal that is about meaning rather than
+        shape** (F2). ``ScopeKind`` spans seven values and only ``owner`` and
+        ``thread`` name one owner's data; ``workspace`` names a repository path,
+        ``sandbox`` a pooled runtime, ``authorization`` and ``external_origin``
+        a policy and a provenance, and every one of those is shared *across*
+        owners by construction. Erasing one would take every Task that ever
+        reported it, from every owner, with no signal that it had. That is the
+        same argument ``host_scope`` already rests on -- "not one owner's
+        data" -- and D6-2 calls this the *owner/thread* hard delete, so the
+        constraint the brief, the contract and the route all state is enforced
+        here rather than assumed of the caller.
+        """
+
+        if session is None:
+            raise RuntimeError("Ansich hard delete: the scope-row refusals need a session")
+        scope = await session.get(AnsichScopeRow, scope_id)
+        if scope is None:
+            raise HardDeleteError(
+                f"Ansich hard delete refused: no Scope {scope_id}",
+                reason="unknown_scope",
+                scope_id=scope_id,
+            )
+        if scope.scope_kind not in _HARD_DELETE_OWNER_SCOPE_KINDS:
+            raise HardDeleteError(
+                f"Ansich hard delete refused: Scope {scope_id} is a {scope.scope_kind!r} Scope, which is shared across owners; only {sorted(_HARD_DELETE_OWNER_SCOPE_KINDS)} name one owner's data",
+                reason="shared_scope_kind",
+                scope_id=scope_id,
+                blocker=f"{AnsichScopeRow.__tablename__}.scope_kind",
+            )
+        child = await session.scalar(select(AnsichScopeRow.entity_id).where(AnsichScopeRow.parent_scope_id == scope_id).order_by(AnsichScopeRow.entity_id).limit(1))
         if child is not None:
             raise HardDeleteError(
                 f"Ansich hard delete refused: Scope {scope_id} is the parent of Scope {child}; delete the children first",
@@ -4007,7 +4117,7 @@ class SqlAnsichBackend:
             depths[str(descendant_id)] = int(depth or 0)
         return tuple(sorted(ordered, key=lambda task_id: (-depths[task_id], task_id)))
 
-    async def _hard_delete_task(self, scope_id: str, task_id: str, *, size: int, counts: _HardDeleteCounts) -> set[str]:
+    async def _hard_delete_task(self, scope_id: str, task_id: str, *, size: int, counts: _HardDeleteCounts) -> tuple[set[str], list[str]]:
         """Erase one Task, in the five phases the schema forces.
 
         ``ansich_observations`` carries **no** foreign key to ``ansich_tasks``
@@ -4046,10 +4156,21 @@ class SqlAnsichBackend:
            resumability -- until it commits, the ``within_scope`` edge still
            names this Task and re-running the call picks it up again.
 
-        Returns the Observation ids still deferred, for the final phase.
+        Returns the Observation ids still deferred **and the blocking edges the
+        second satellite sweep hit**, both for the final phase. The blocked list
+        used to be collected here and thrown away, which is why an operator was
+        told the proximate ``ansich_entities.discovered_obs_id`` instead of the
+        removable Scope or AgentRelease that actually holds the row (F4).
         """
 
         observations = AnsichObservationRow.__table__
+        # Two lists, and conflating them is what made the first shape refuse a
+        # clean erasure. `hints` collects the *proximate* edge every deferred
+        # Observation refused on -- almost always the target Scope, which the
+        # final phase is about to delete -- so it is a diagnostic and never a
+        # refusal condition. `blocked` collects the second satellite sweep's
+        # edges, which are final: nothing later frees them.
+        hints: list[str] = []
         blocked: list[str] = []
         await self._hard_delete_satellites(task_id, size=size, counts=counts)
         async with self._session_factory() as session, session.begin():
@@ -4061,9 +4182,10 @@ class SqlAnsichBackend:
                     reason="blocked",
                     scope_id=scope_id,
                     blocker=blocked_by[0],
+                    report=counts.report(),
                 )
             counts.absorb(*await self._apply_plan_and_reclaim(session, plan))
-            counts.batches += 1
+            counts.commit_batch()
         blocked.extend(await self._hard_delete_satellites(task_id, size=size, counts=counts))
 
         deferred: set[str] = set()
@@ -4078,10 +4200,10 @@ class SqlAnsichBackend:
                 if not batch:
                     break
                 batch.sort(key=lambda row: row[0])
-                deferred |= await self._hard_delete_observations(session, [(str(row[1]), str(row[2])) for row in batch], counts=counts, blocked=blocked)
+                deferred |= await self._hard_delete_observations(session, [(str(row[1]), str(row[2])) for row in batch], counts=counts, blocked=hints)
                 watermark = int(batch[-1][0])
                 await self._advance_deletion_horizon(session, counts, watermark)
-                counts.batches += 1
+                counts.commit_batch()
 
         async with self._session_factory() as session, session.begin():
             blocked_by = []
@@ -4092,6 +4214,7 @@ class SqlAnsichBackend:
                     reason="blocked",
                     scope_id=scope_id,
                     blocker=blocked_by[0],
+                    report=counts.report(),
                 )
             counts.absorb(*await self._apply_plan_and_reclaim(session, plan))
             remaining = list(
@@ -4100,10 +4223,58 @@ class SqlAnsichBackend:
                 )
             )
             highest = max((int(row[0]) for row in remaining), default=watermark)
-            deferred |= await self._hard_delete_observations(session, [(str(row[1]), str(row[2])) for row in remaining], counts=counts, blocked=blocked)
+            still = await self._hard_delete_observations(session, [(str(row[1]), str(row[2])) for row in remaining], counts=counts, blocked=hints)
+            # **A deferral is only legitimate when the target Scope is what
+            # pins it**, because the final phase deletes that Scope and takes
+            # the row with it. A *protected foreign* Entity — another owner's
+            # Scope, a shared AgentRelease — is never removed by this erasure,
+            # so deferring it would report success on a later run while an
+            # Observation of the erased owner stood in the store forever: the
+            # resumed run has no deferred set to carry, so nothing would even
+            # attempt it. Refusing here instead rolls this Task's Entity delete
+            # back with the raise, so the Task, its membership edge and the
+            # Scope all survive and the whole erasure stays re-runnable.
+            pin = await self._hard_delete_protected_pin(session, scope_id, sorted(still))
+            if pin is not None:
+                counts.rollback_batch()
+                raise HardDeleteError(
+                    f"Ansich hard delete blocked: Task {task_id} of Scope {scope_id} has an Observation pinned by a protected entity ({pin}); remove it and re-run the same call",
+                    reason="blocked",
+                    scope_id=scope_id,
+                    blocker=pin,
+                    report=counts.report(),
+                )
+            deferred |= still
             await self._advance_deletion_horizon(session, counts, highest)
-            counts.batches += 1
-        return deferred
+            counts.commit_batch()
+        return deferred, blocked
+
+    @staticmethod
+    async def _hard_delete_protected_pin(session: AsyncSession, scope_id: str, obs_ids: Sequence[str]) -> str | None:
+        """The removable edge, when a **protected** Entity is what pins these rows.
+
+        Only two Entity types can pin an Observation that this erasure will
+        never free: a ``Scope`` other than the target, and an ``agent_release``.
+        (The third protected type, ``task``, is one of this run's own and goes
+        with the loop.) Anything else the Task loop defers is pinned by the
+        target Scope, which the final phase deletes.
+
+        Returns the pin's own edge rather than
+        ``ansich_entities.discovered_obs_id``, because the latter is a column on
+        the row that is *surviving* and names nothing an operator can remove.
+        """
+
+        if not obs_ids:
+            return None
+        entities = AnsichEntityRow.__table__
+        rows = sorted(await session.execute(select(entities.c.entity_id, entities.c.entity_type).where(entities.c.discovered_obs_id.in_(list(obs_ids)))))
+        for entity_id, entity_type in rows:
+            if str(entity_id) == scope_id:
+                continue
+            edge = _HARD_DELETE_PROTECTED_PIN_EDGES.get(str(entity_type))
+            if edge is not None:
+                return edge
+        return None
 
     async def _hard_delete_satellites(self, task_id: str, *, size: int, counts: _HardDeleteCounts) -> list[str]:
         """Delete the Entities this Task's Observations discovered, in batches.
@@ -4153,7 +4324,7 @@ class SqlAnsichBackend:
                             continue
                         counts.absorb(*await self._apply_plan_and_reclaim(session, one))
                 cursor = batch[-1]
-                counts.batches += 1
+                counts.commit_batch()
 
     async def _hard_delete_observations(
         self,
@@ -4209,6 +4380,7 @@ class SqlAnsichBackend:
         scope_id: str,
         task_order: Sequence[str],
         deferred: set[str],
+        blocked: list[str],
         *,
         size: int,
         counts: _HardDeleteCounts,
@@ -4221,6 +4393,23 @@ class SqlAnsichBackend:
         still hold it. Once it goes, the Observation that created it -- pinned
         until this moment by ``ansich_scopes.created_obs_id`` -- can go too,
         which is the one deferral the Task loop routinely produces.
+
+        ------------------------------------------------------------------
+        **The whole phase is one transaction, and the refusal raises inside
+        it** (review finding F1).
+        ------------------------------------------------------------------
+
+        The Scope row is the erasure's **resume handle**: a re-run finds the
+        remaining Tasks through its ``within_scope`` edges, and
+        ``_refuse_undeletable_scope_row`` resolves the request through the row
+        itself. So a ``blocked`` refusal raised *after* this transaction
+        committed would delete the handle and leave the re-run answering
+        ``unknown_scope`` -- an owner half-erased, with one of their
+        Observations standing and no API able to finish the job. That is the one
+        failure mode a privacy-deletion path cannot have, so the raise happens
+        **before the commit** and the Scope delete rolls back with it. What the
+        operator is left with is exactly what a resumable state looks like: every
+        Task gone, the Scope standing, and a named edge to remove.
 
         The deferred set is re-derived from the store rather than only trusted
         from memory: the Scope row still names its ``created_obs_id`` and the
@@ -4237,17 +4426,11 @@ class SqlAnsichBackend:
         stays: a pointer that reaches out of the Scope to a Task that is still
         there names somebody else's evidence, and this operation does not delete
         somebody else's evidence.
-
-        Anything still pinned at the end is the genuine ``blocked`` refusal, and
-        it is raised **after** the erasure has gone as far as it can rather than
-        before, so an operator gets the maximum erasure plus a named remedy
-        instead of a smaller erasure and the same remedy.
         """
 
         entities = AnsichEntityRow.__table__
         observations = AnsichObservationRow.__table__
         condemned = set(task_order)
-        blocked: list[str] = []
         async with self._session_factory() as session, session.begin():
             scope = await session.get(AnsichScopeRow, scope_id)
             entity = await session.get(AnsichEntityRow, scope_id)
@@ -4260,6 +4443,7 @@ class SqlAnsichBackend:
                     reason="blocked",
                     scope_id=scope_id,
                     blocker=blocked_by[0],
+                    report=counts.report(),
                 )
             counts.absorb(*await self._apply_plan_and_reclaim(session, plan))
             candidates = sorted(deferred | pinned)
@@ -4277,15 +4461,71 @@ class SqlAnsichBackend:
                 if str(row[3]) in condemned or (str(row[3]) != ANSICH_BOOTSTRAP_TASK_ID and str(row[3]) not in alive)
             ]
             still = await self._hard_delete_observations(session, [(str(row[1]), str(row[2])) for row in rows], counts=counts, blocked=blocked)
+            # `still` alone decides. The satellite sweeps' edges are a *name*
+            # for the remedy, not evidence of one: a sweep legitimately skips an
+            # Entity another Task's phase 2 later unpins, and refusing on the
+            # list would fail an erasure that completed.
+            if still:
+                # Inside the transaction, so the Scope delete above rolls back
+                # with this raise. `counts` is a plain object and keeps the
+                # numbers this phase added; they describe work that is being
+                # rolled back, so the report handed to the caller is taken from
+                # the state *before* this transaction (`counts.report()` is read
+                # after `rollback_batch`), and the committed batches are what it
+                # names.
+                counts.rollback_batch()
+                blocker = await self._hard_delete_actionable_blocker(session, sorted(still), blocked)
+                raise HardDeleteError(
+                    f"Ansich hard delete blocked: Scope {scope_id} cannot erase {len(still)} Observation(s) still referenced by {blocker or 'a surviving row'}; remove it and re-run the same call",
+                    reason="blocked",
+                    scope_id=scope_id,
+                    blocker=blocker,
+                    report=counts.report(),
+                )
             await self._advance_deletion_horizon(session, counts, max((int(row[0]) for row in rows), default=0))
-            counts.batches += 1
-        if still or blocked:
-            raise HardDeleteError(
-                f"Ansich hard delete blocked: Scope {scope_id} left {len(still)} Observation(s) referenced by {blocked[0] if blocked else 'a surviving row'}",
-                reason="blocked",
-                scope_id=scope_id,
-                blocker=blocked[0] if blocked else None,
-            )
+            counts.commit_batch()
+
+    @staticmethod
+    async def _hard_delete_actionable_blocker(session: AsyncSession, obs_ids: Sequence[str], proximate: Sequence[str]) -> str | None:
+        """Name the edge an operator can **remove**, not the one that refused first.
+
+        ``_plan_cascade`` answers with the first blocking referrer its walk hits,
+        and for a protected Entity pinning an Observation that is always
+        ``ansich_entities.discovered_obs_id`` -- a column on the *surviving*
+        row, naming nothing anybody can act on. The remedy is the Scope or the
+        AgentRelease that owns that Entity, and its own pin
+        (``ansich_scopes.created_obs_id``,
+        ``ansich_agent_releases.discovered_obs_id``) is an edge in the same
+        derived set, one table further out.
+
+        So this re-asks the question over *every* blocking referrer of
+        ``ansich_observations`` that really holds one of these rows, derived from
+        ``Base.metadata`` like everything else in this path, and prefers the
+        first that is not the entity row itself. It runs on the refusal path
+        only, where one extra pass per blocking table is free, and falls back to
+        the proximate edge rather than to ``None`` so the answer is never worse
+        than it was.
+        """
+
+        if not obs_ids:
+            return proximate[0] if proximate else None
+        observations = AnsichObservationRow.__table__
+        holders: list[str] = []
+        for table in Base.metadata.sorted_tables:
+            for foreign_key in sorted(table.foreign_keys, key=lambda key: key.parent.name):
+                if foreign_key.column.table.name != observations.name or foreign_key.column.name != "obs_id":
+                    continue
+                if (foreign_key.ondelete or "").upper() in {"CASCADE", "SET NULL"}:
+                    continue
+                column = foreign_key.parent
+                if await session.scalar(select(1).select_from(table).where(column.in_(list(obs_ids))).limit(1)) is not None:
+                    holders.append(f"{table.name}.{column.name}")
+        actionable = [edge for edge in holders if edge != f"{AnsichEntityRow.__tablename__}.discovered_obs_id"]
+        if actionable:
+            return actionable[0]
+        if holders:
+            return holders[0]
+        return proximate[0] if proximate else None
 
     async def _advance_deletion_horizon(self, session: AsyncSession, counts: _HardDeleteCounts, highest_deleted: int) -> None:
         """Move the Observation horizon over what this transaction just erased.
@@ -4317,6 +4557,37 @@ class SqlAnsichBackend:
         one, because the advisory lock is a *deployment* property -- it is a
         no-op on SQLite and it is one refactor away from being taken somewhere
         else -- while the row lock is a property of this statement.
+
+        ------------------------------------------------------------------
+        **The horizon alone cannot describe a hole, so this also writes
+        ``observation_cursor``** (review finding F3).
+        ------------------------------------------------------------------
+
+        The horizon is a **contiguous prefix** claim and tier 2 reads it as its
+        own cursor (``ingest_seq > horizon``), so its value may never rise above
+        the lowest surviving row -- inflating it would make tier 2 skip live
+        Observations forever. That is fine when an erasure takes a prefix, and
+        useless when it punches a hole: with any survivor *below* the erased
+        range the minimum does not move, the horizon stays where it was, and
+        ``get_observation_projection_status`` reads the erased rows as
+        ``failed`` -- *presumed lost* -- which is the exact FC-3 flip this whole
+        mechanism exists to prevent.
+
+        ``ansich_retention_state.observation_cursor`` is where that is recorded,
+        and this is not a repurposing: T9 left the column unwritten with the
+        note that *"a future non-contiguous Observation tier would need that
+        column; this one does not"*. The owner hard delete is that deleter. It
+        holds the highest ``ingest_seq`` a **non-contiguous deliberate
+        deletion** has removed, it is monotone, and it makes no prefix claim at
+        all -- nothing reads it as a cursor, so it cannot mislead tier 2 the way
+        an inflated horizon would.
+
+        The receipt rung then reads *either* mark, and the imprecision it adds
+        is the same one the horizon rung already accepts, one notch wider: an
+        absent id on a store where a deliberate deletion has happened reads
+        ``expired``. That trade is unchanged in direction -- loss has three
+        louder channels of its own and a flipped receipt has none -- and it is
+        the direction this batch chose on the record.
         """
 
         observations = AnsichObservationRow.__table__
@@ -4326,6 +4597,8 @@ class SqlAnsichBackend:
         lowest = await session.scalar(select(func.min(observations.c.ingest_seq)))
         candidate = int(lowest) - 1 if lowest is not None else counts.highest_ingest_seq
         state.observation_horizon_ingest_seq = max(int(state.observation_horizon_ingest_seq or 0), candidate)
+        if counts.highest_ingest_seq > 0:
+            state.observation_cursor = max(int(state.observation_cursor or 0), counts.highest_ingest_seq)
 
     async def initialize_metrics(self) -> None:
         await self._refresh_failed_job_count()
@@ -8848,8 +9121,23 @@ class SqlAnsichBackend:
             if not statuses:
                 observation_exists = await session.scalar(select(AnsichObservationRow.ingest_seq).where(AnsichObservationRow.obs_id == obs_id))
                 if observation_exists is None:
-                    horizon = await session.scalar(select(AnsichRetentionStateRow.observation_horizon_ingest_seq).where(AnsichRetentionStateRow.id == _RETENTION_STATE_ID))
-                    if int(horizon or 0) > 0:
+                    marks = (
+                        await session.execute(
+                            select(
+                                AnsichRetentionStateRow.observation_horizon_ingest_seq,
+                                AnsichRetentionStateRow.observation_cursor,
+                            ).where(AnsichRetentionStateRow.id == _RETENTION_STATE_ID)
+                        )
+                    ).first()
+                    horizon, non_contiguous = (0, 0) if marks is None else (int(marks[0] or 0), int(marks[1] or 0))
+                    # Two marks, one question: has a *deliberate* deletion
+                    # happened on this store. The horizon answers it for a
+                    # contiguous prefix (retention's tier 2); the cursor answers
+                    # it for a non-contiguous erasure (the owner hard delete),
+                    # which cannot raise the horizon at all when a survivor sits
+                    # below the range it removed. Reading only the horizon
+                    # reported every hard-deleted Observation as `failed`.
+                    if horizon > 0 or non_contiguous > 0:
                         return "expired"
                 return None
         if any(status == "failed" for status in statuses):

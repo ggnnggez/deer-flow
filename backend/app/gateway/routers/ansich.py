@@ -11,7 +11,7 @@ from typing import Literal
 from urllib.parse import quote
 
 from ansich.alerts import AlertWorkflowConflict
-from ansich.contracts import ControlValue, NamedVersion, Producer, TaskLifecycleScope
+from ansich.contracts import ControlValue, HardDeleteReport, NamedVersion, Producer, TaskLifecycleScope
 from ansich.credentials import contains_credential_like_material
 from ansich.errors import HardDeleteError, PayloadExpiredError, RawReadAuditUnavailableError, StorageUnavailableError
 from ansich.evaluation import (
@@ -2327,10 +2327,13 @@ async def hard_delete_scope(body: HardDeleteRequest, request: Request) -> dict:
 
     Refusals are typed at the store and answered as **409** rather than 400: the
     request is well-formed and the *state* is what refuses (this Scope is a
-    parent, or is the host anchor), except ``unknown_scope`` which is a plain
-    404. ``blocked`` is 409 too and carries ``blocker``, because a caller that
-    resolves the named referrer and re-runs the same call finishes the erasure
-    -- the operation resumes from the store rather than from a cursor.
+    parent, is the host anchor, or is a kind shared across owners), except
+    ``unknown_scope`` which is a plain 404. ``blocked`` is 409 too and carries
+    ``blocker`` **and the committed counts**, because a caller that resolves the
+    named referrer and re-runs the same call finishes the erasure -- the
+    operation resumes from the store rather than from a cursor, and the Scope
+    row it resumes through is still there (the final phase rolls its own delete
+    back when it refuses).
 
     Logged at WARNING with the actor and the counts. An owner erasure is
     irreversible and is the one operation whose *absence* from the record cannot
@@ -2352,12 +2355,18 @@ async def hard_delete_scope(body: HardDeleteRequest, request: Request) -> dict:
                 "ansich_actor": str(getattr(user, "id", "unknown")),
             },
         )
+        # The committed counts ride along on a `blocked` refusal, because that
+        # is the one refusal raised after work has landed: a caller told only
+        # "blocked" has no way to learn that most of the owner's data is
+        # already gone, and would read a resumable state as "nothing happened".
+        partial = exc.report.model_dump(mode="json") if isinstance(exc.report, HardDeleteReport) else None
         raise HTTPException(
             status_code=404 if exc.reason == "unknown_scope" else 409,
             detail={
                 "message": str(exc),
                 "reason": exc.reason,
                 "blocker": exc.blocker,
+                "report": partial,
             },
         ) from exc
     except Exception as exc:

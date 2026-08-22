@@ -2624,8 +2624,14 @@ referrer, so while a blob stands its body is correctly *not* an orphan and the
 reclaim above correctly leaves it alone — which means a deleter that removed the
 last `ansich_content_blocks` row pointing at a blob and stopped there left the
 blob **and** its body behind with nothing able to reach either, and tier 1
-refuses orphans by design. All three deleters now go through one
-`_apply_plan_and_reclaim`: it reads the plan's blob keys *before* the plan is
+refuses orphans by design. **Tier 2 never leaked, and saying otherwise over-claims the fix**: its plan root
+is `ansich_observations` and `ansich_content_blocks` is not in that CASCADE
+closure (its `producer_obs_id`/`payload_obs_id` edges are blocking), so tier 2
+can never delete a block. The leak was tier 3's and the new erasure's, and the
+tier-3 half is pinned by its own regression — `run_retention` alone, no erasure
+anywhere near it — because a later refactor that moved the reclaim into the
+erasure path only would re-open a live retention leak silently. All three
+deleters now go through one `_apply_plan_and_reclaim`: it reads the plan's blob keys *before* the plan is
 applied (afterwards the rows that named them are gone), deletes the blobs
 nothing points at any more, and folds their payload ids into the same single
 residual-referrer check, so a blob two Tasks share survives the first one's
@@ -2686,9 +2692,9 @@ are left, in **one transaction**. The target Scope goes last of all, after every
 Task, because its authorization scopes, permissions and tool effects
 (`RESTRICT` into `ansich_scopes`) hold it until they do.
 
-**It resumes from the store, not from a cursor, and that is why phase 5 is one
-transaction.** The `within_scope` edge is deleted with the Task it belongs to, so
-the set of Tasks still owed is always exactly what the Scope's surviving edges
+**It resumes from the store, not from a cursor, and every refusal is written to
+keep that true.** The `within_scope` edge is deleted with the Task it belongs to,
+so the set of Tasks still owed is always exactly what the Scope's surviving edges
 say; re-running the same call after a crash finishes the job and no cursor row
 was added (0028 stays P11-C's only migration). One window the Task loop cannot
 cover is closed by a derived arm rather than by memory: the Scope pins the
@@ -2698,14 +2704,36 @@ Task order to match it against. The final phase therefore deletes a candidate
 whose `task_id` names a Task **this run condemned** *or* one that **no longer
 exists as an Entity** — with the bootstrap sentinel excluded from the second arm
 by name, since it has no Entity by construction and would otherwise read as
-"erased" forever. A `blocked` refusal — a row
-outside the Scope's reach still pointing into it — can therefore be raised *after*
-batches have committed without that being a partial failure: the operator removes
-the named referrer and re-runs. Three entity types are never taken by the
-satellite sweep and each can produce that refusal rather than silent
-cross-owner damage: another `Scope` (the parent owner Scope of a thread, a
-sibling), an `agent_release` (immutable release identity, excluded from time
-retention for the same reason), and `task` (owned by the Task loop).
+"erased" forever.
+
+**Two refusals raise from inside the transaction they would otherwise have
+committed, and that ordering is the whole of why `blocked` is resumable rather
+than terminal** (review finding F1; the first shape got it wrong and left an
+owner half-erased with the re-run answering `unknown_scope` 404). The **final
+phase** raises before committing its Scope delete, so the Scope row — the resume
+handle both the Task lookup and `_refuse_undeletable_scope_row` go through —
+survives every refusal. And **phase 5 refuses outright** when an Observation it
+could not take is pinned by a *protected foreign* Entity (another owner's Scope,
+a shared AgentRelease): those are never freed by this erasure, so deferring one
+would let a later run report success while an Observation of the erased owner
+stood forever — the resumed run carries no deferred set, so nothing would even
+attempt it. Refusing rolls that Task's Entity delete back with the raise, so the
+Task, its membership edge and the Scope all survive and the erasure stays
+re-runnable. Both refusals name the **removable** edge
+(`ansich_scopes.created_obs_id`, `ansich_agent_releases.discovered_obs_id`)
+rather than the `ansich_entities.discovered_obs_id` the planner refused on,
+which is a column on the surviving row and names nothing an operator can act on
+(F4), and both carry the counts already committed (F7) so a caller cannot read
+`blocked` as "nothing happened".
+
+**The residual that shape leaves is a mutual pin, and it is loud rather than
+silent.** When two Scopes' provenance runs through the *same* Task — each
+holding one of its Observations — neither can be erased, because freeing either
+pin needs the Task gone and the Task needs both pins gone. Every attempt is a
+typed refusal naming the edge; nothing is stranded and nothing is half-reported.
+v1 has no multi-Scope erasure to resolve it with, which is the registered next
+step. Three entity types are never taken by the satellite sweep: another
+`Scope`, an `agent_release`, and `task` (owned by the Task loop).
 
 **The eighth family — `raw-read audit 中受保护引用` — was adjudicated as privacy
 deletion, and the split is by subject.** A §7 audit row whose target belonged to
@@ -2738,6 +2766,24 @@ it stays monotone. The horizon's meaning widens by one word as a result:
 deletion under **policy or owner erasure**, which is the same distinction the
 receipt already makes, since both are configured deletions and neither is loss.
 
+**That mark alone only covers a prefix, so the erasure writes a second one**
+(review finding F3). The horizon is a *contiguous prefix* claim and tier 2 reads
+it as its own cursor, so its value may never rise above the lowest surviving
+row — inflating it would make tier 2 skip live Observations forever. With any
+survivor **below** the erased range the minimum cannot move, and the receipt read
+the erased rows as `failed`: the exact FC-3 flip, in the direction only this path
+can cause. `ansich_retention_state.observation_cursor` is where that is now
+recorded, and it is not a repurposing — T9 left the column unwritten with the
+note that *"a future non-contiguous Observation tier would need that column"*,
+and this is that deleter. It holds the highest `ingest_seq` a non-contiguous
+deliberate deletion has removed, it is monotone, and **nothing walks from it**,
+so it cannot mislead tier 2 the way an inflated horizon would.
+`get_observation_projection_status` reads either mark. The imprecision that adds
+is the horizon rung's own, one notch wider — an absent id on a store where a
+deliberate deletion has happened reads `expired` — and the direction is the one
+this batch chose on the record: loss has three louder channels, a flipped receipt
+has none.
+
 **Both advisory locks, in a fixed order (maintenance, then retention), and
 nothing else takes both.** Maintenance because the hazard a hard delete has and
 retention does not is **resurrection**: `rebuild_projections` re-derives rows
@@ -2758,8 +2804,21 @@ Observations, and reporting the ruling separately is what makes it auditable.
 `payloads` counts rows deleted outright, never tombstoned: there is no reader
 left to tell "expired by policy" from "missing". Refusals are typed
 (`ansich.errors.HardDeleteError` with a `HardDeleteRefusal` reason and a
-`blocker` naming `table.column`), four of them answered before anything is
-deleted; the route maps `unknown_scope` to 404 and the rest to 409.
+`blocker` naming `table.column`), five of them answered before anything is
+deleted; the route maps `unknown_scope` to 404 and the rest to 409, and a
+`blocked` 409 carries the partial report.
+
+**`shared_scope_kind` is the fifth, and it is the one refusal about meaning
+rather than shape** (F2). `ScopeKind` spans seven values and only `owner` and
+`thread` name one owner's data: `workspace` names a repository path, `sandbox` a
+pooled runtime, `authorization` a policy, `external_origin` a provenance — each
+shared *across* owners by construction, so erasing one would take every Task
+that ever reported it, from every owner, with no signal that it had. That is the
+same argument `host_scope` already rests on. **The two refusals that read
+nothing** (the sentinel, the host Scope) are answered before the locks; **the
+three that read the store** are answered under them, because a pre-flight
+outside the locks is a time-of-check/time-of-use gap that resurfaces as the
+`IntegrityError` the typed refusal exists to replace, mid-erasure (F8).
 
 Proved on both dialects, and the SQLite half cannot lean on the database: the
 suite's engines run with `PRAGMA foreign_keys` off, so

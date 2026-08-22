@@ -318,6 +318,15 @@ class ActiveVersionError(ValueError):
 #: * ``host_scope`` — the process's own anchor Scope. It is this build's
 #:   identity rather than one owner's data, and every worker's audit trail
 #:   hangs off it, so it is not erasable by an owner-scoped action.
+#: * ``shared_scope_kind`` — the Scope is real and its kind is not one owner's
+#:   data. ``ScopeKind`` also spans ``workspace``, ``sandbox``, ``authorization``
+#:   and ``external_origin``, which are shared *across* owners by construction: a
+#:   workspace Scope names a repository path and a sandbox Scope a pooled
+#:   runtime, so erasing one would take every Task that ever reported it, from
+#:   every owner, with no signal that it had. Only ``owner`` and ``thread`` name
+#:   one owner's data, and D6-2 calls this the *owner/thread* hard delete. This
+#:   is the same argument ``host_scope`` rests on — "not one owner's data" —
+#:   applied to the kinds it also covers.
 #: * ``parent_scope`` — the Scope is another Scope's parent. Erasing it would
 #:   orphan the child's ancestry (``ansich_scopes.parent_scope_id`` is
 #:   ``RESTRICT``, so the database would refuse it anyway); the remedy is to
@@ -332,6 +341,7 @@ HardDeleteRefusal = Literal[
     "unknown_scope",
     "bootstrap_sentinel",
     "host_scope",
+    "shared_scope_kind",
     "parent_scope",
     "blocked",
 ]
@@ -356,10 +366,31 @@ class HardDeleteError(ValueError):
     removes the blocker and re-runs the same call finishes the erasure. What a
     caller must not do is treat ``blocked`` as "nothing happened".
 
+    **That resumability is a property of the erasure's transaction boundaries,
+    not of this docstring** (review finding F1). The Scope row is the resume
+    handle — a resumed run finds its Tasks through it — so the phase that
+    deletes it raises from *inside* its own transaction, and a ``blocked``
+    erasure therefore leaves the Scope standing. An earlier shape raised after
+    that transaction committed, which deleted the handle and left the re-run
+    answering ``unknown_scope``: a half-erased owner with no API able to finish
+    the job, which is the one failure mode this operation cannot have.
+
     :attr:`blocker` is ``"table.column"`` for ``blocked`` and ``None``
-    otherwise, because "what is still pointing at this" is the whole of the
-    remedy and prose in a message is not something an operator can act on
-    mechanically.
+    otherwise, and it names the **removable** edge rather than the proximate
+    one. A protected Entity pinning an Observation refuses on
+    ``ansich_entities.discovered_obs_id`` first, which is a column on the
+    *surviving* row and names nothing an operator can act on; what they can act
+    on is the Scope or the AgentRelease that owns it, so that is what this
+    carries. Prose in a message is not something an operator can act on
+    mechanically, which is the whole reason this field exists.
+
+    :attr:`report` carries the counts the erasure had already committed when it
+    refused, for ``blocked`` only. Typed ``object`` rather than
+    ``HardDeleteReport`` to keep this module dependency-free — the same reason
+    :class:`PayloadExpiredError` carries an ``object`` timestamp — and ``None``
+    for every refusal raised before anything was deleted, which is all of the
+    others. Without it a caller told "blocked" has no way to learn that most of
+    the owner's data is already gone.
     """
 
     def __init__(
@@ -369,8 +400,10 @@ class HardDeleteError(ValueError):
         reason: HardDeleteRefusal,
         scope_id: str,
         blocker: str | None = None,
+        report: object | None = None,
     ) -> None:
         super().__init__(message)
         self.reason: HardDeleteRefusal = reason
         self.scope_id = scope_id
         self.blocker = blocker
+        self.report = report

@@ -37,11 +37,11 @@ import sqlalchemy as sa
 import yaml
 from _router_auth_helpers import make_authed_test_app
 from alembic import command as alembic_command
-from ansich import AnsichService, ObservationEnvelope, Producer, RetentionPolicy, new_id
+from ansich import AnsichService, HardDeleteReport, ObservationEnvelope, Producer, RetentionPolicy, new_id
 from ansich.contracts import ANSICH_BOOTSTRAP_TASK_ID
 from ansich.errors import HardDeleteError, PayloadExpiredError
 from ansich.evaluation import EvaluationProjectionStatus
-from ansich.safety import host_scope_id, scope_entity_id, scope_reference_hash
+from ansich.safety import ScopeKind, host_scope_id, scope_entity_id, scope_reference_hash
 from httpx import ASGITransport, AsyncClient
 from pydantic import ValidationError
 from sqlalchemy import create_engine, event, func, select, update
@@ -73,11 +73,13 @@ from deerflow.ansich.persistence.models import (
     AnsichTaskHeartbeatRow,
 )
 from deerflow.ansich.persistence.sql import (
+    _HARD_DELETE_OWNER_SCOPE_KINDS,
     _PAYLOAD_REFERRER_TIERS,
     _PG_MAINTENANCE_LOCK_KEY,
     _PG_RETENTION_LOCK_KEY,
     SqlAnsichBackend,
     _cascade_delete_closure,
+    _HardDeleteCounts,
     _payload_referrer_columns,
 )
 from deerflow.config.ansich_config import AnsichConfig, AnsichRetentionConfig
@@ -2988,7 +2990,7 @@ class _HardDeleteStore:
         self.doomed_tasks = (self.root_id, self.child_id)
 
 
-async def _build_hard_delete_store(backend: SqlAnsichBackend) -> _HardDeleteStore:
+async def _build_hard_delete_store(backend: SqlAnsichBackend, *, neighbour_first: bool = False) -> _HardDeleteStore:
     """A doomed thread with a subtree, and a neighbour thread that must survive.
 
     The neighbour is not decoration. Half of what "erase this owner" means is
@@ -3001,6 +3003,24 @@ async def _build_hard_delete_store(backend: SqlAnsichBackend) -> _HardDeleteStor
 
     store = _HardDeleteStore()
     at = _RETENTION_OCCURRED_AT
+
+    async def _ingest(batch: list[ObservationEnvelope]) -> None:
+        assert await backend.persist_and_project(batch) == len(batch)
+        await _settle_retention(backend)
+
+    neighbour = [
+        _retention_task_created(store.neighbour_id, source_id="run-neighbour"),
+        _hd_scope_snapshotted(store.neighbour_id, external_ref=store.neighbour_scope_ref, run_id="run-neighbour", occurred_at=at),
+        _hd_step(store.neighbour_id, store.neighbour_step, occurred_at=at),
+        _hd_content(store.neighbour_id, store.neighbour_step, store.neighbour_block, body="shared-body", occurred_at=at),
+        _retention_heartbeat(store.neighbour_id, ordinal=1, source_id="run-neighbour"),
+    ]
+    # `neighbour_first` is the whole difference between a prefix erasure and a
+    # hole: ingesting the surviving thread first puts survivors *below* the
+    # doomed range, which is the case `min(surviving) - 1` cannot describe.
+    if neighbour_first:
+        await _ingest(neighbour)
+
     envelopes = [
         _retention_task_created(store.root_id, source_id="run-doomed"),
         _hd_task_started(store.root_id, source_id="run-doomed"),
@@ -3010,8 +3030,7 @@ async def _build_hard_delete_store(backend: SqlAnsichBackend) -> _HardDeleteStor
         _hd_content(store.root_id, store.root_step, store.root_block, body="doomed-root-body", occurred_at=at),
         _retention_heartbeat(store.root_id, ordinal=1, source_id="run-doomed"),
     ]
-    assert await backend.persist_and_project(envelopes) == len(envelopes)
-    await _settle_retention(backend)
+    await _ingest(envelopes)
 
     spawned = [
         _hd_spawn(store.root_id, store.child_id, store.root_step, store.root_tool, occurred_at=at + timedelta(seconds=1)),
@@ -3020,18 +3039,10 @@ async def _build_hard_delete_store(backend: SqlAnsichBackend) -> _HardDeleteStor
         _hd_content(store.child_id, store.child_step, store.child_block, body="shared-body", occurred_at=at + timedelta(seconds=1)),
         _retention_heartbeat(store.child_id, ordinal=1, source_id="run-doomed-child"),
     ]
-    assert await backend.persist_and_project(spawned) == len(spawned)
-    await _settle_retention(backend)
+    await _ingest(spawned)
 
-    neighbour = [
-        _retention_task_created(store.neighbour_id, source_id="run-neighbour"),
-        _hd_scope_snapshotted(store.neighbour_id, external_ref=store.neighbour_scope_ref, run_id="run-neighbour", occurred_at=at),
-        _hd_step(store.neighbour_id, store.neighbour_step, occurred_at=at),
-        _hd_content(store.neighbour_id, store.neighbour_step, store.neighbour_block, body="shared-body", occurred_at=at),
-        _retention_heartbeat(store.neighbour_id, ordinal=1, source_id="run-neighbour"),
-    ]
-    assert await backend.persist_and_project(neighbour) == len(neighbour)
-    await _settle_retention(backend)
+    if not neighbour_first:
+        await _ingest(neighbour)
     return store
 
 
@@ -3448,6 +3459,14 @@ async def test_the_erasure_takes_the_maintenance_and_retention_keys_in_that_orde
     Observations this erasure has not reached yet; the maintenance key alone
     would leave two deleters writing one horizon row. Nothing else in the module
     takes both, which is what makes the fixed order deadlock-free.
+
+    It also pins **where each refusal is answered**. The two that read nothing —
+    the sentinel and the host Scope — take no lock at all, because a request
+    that was never going to touch the store must not queue a rebuild and a
+    sweep behind it. The three that read the store are answered *inside* the
+    locks: a check taken before them is a time-of-check/time-of-use gap that
+    surfaces as the ``IntegrityError`` the typed refusal exists to replace,
+    mid-erasure, after batches have committed.
     """
 
     backend, _sessions = hard_delete_backend
@@ -3459,10 +3478,17 @@ async def test_the_erasure_takes_the_maintenance_and_retention_keys_in_that_orde
         return real_lock(self, key, purpose=purpose, refusal=refusal)
 
     monkeypatch.setattr(SqlAnsichBackend, "_advisory_lock", _recording)
-    with pytest.raises(HardDeleteError):
-        await backend.hard_delete_scope(_hd_scope_id("never-created"))
-    assert taken == []
+    for scope_id in (ANSICH_BOOTSTRAP_TASK_ID, host_scope_id(backend._hostname)):
+        with pytest.raises(HardDeleteError):
+            await backend.hard_delete_scope(scope_id)
+    assert taken == [], "a refusal that reads nothing must not take a lock"
 
+    with pytest.raises(HardDeleteError) as unknown:
+        await backend.hard_delete_scope(_hd_scope_id("never-created"))
+    assert unknown.value.reason == "unknown_scope"
+    assert taken == [_PG_MAINTENANCE_LOCK_KEY, _PG_RETENTION_LOCK_KEY], "a refusal that reads the store is answered under the locks"
+
+    taken.clear()
     store = await _build_hard_delete_store(backend)
     await backend.hard_delete_scope(store.scope_id, batch_size=2)
     assert taken == [_PG_MAINTENANCE_LOCK_KEY, _PG_RETENTION_LOCK_KEY]
@@ -3497,11 +3523,36 @@ def test_both_spawn_producers_sort_their_descendant_tuple():
     """
 
     functions = _named_functions(_sql_module_ast())
+
+    def _sorts_the_whole_tuple(value: ast.expr) -> bool:
+        """The sort must wrap the **whole** value, not sit somewhere inside it.
+
+        ``[(child, 0), *sorted(rows)]`` contains a ``sorted`` call and is
+        semantically the exact bug that was paid off — the child prepended ahead
+        of an ordered tail — so "some sorted() appears" is not the property. What
+        is: the outermost expression is ``sorted(...)``, or a one-argument
+        wrapper (``tuple``/``list``) around it.
+        """
+
+        if not isinstance(value, ast.Call) or not isinstance(value.func, ast.Name):
+            return False
+        if value.func.id == "sorted":
+            return True
+        if value.func.id in {"tuple", "list"} and len(value.args) == 1:
+            return _sorts_the_whole_tuple(value.args[0])
+        return False
+
     for name in ("_project_task_spawn", "_reconcile_spawn_usage"):
         assignments = [node for node in ast.walk(functions[name]) if isinstance(node, ast.Assign) and any(isinstance(target, ast.Name) and target.id in {"descendant_depths", "descendant_task_ids"} for target in node.targets)]
         assert assignments, f"{name} no longer produces a descendant tuple"
         for node in assignments:
-            assert any(isinstance(call.func, ast.Name) and call.func.id == "sorted" for call in ast.walk(node) if isinstance(call, ast.Call)), f"{name} produces an unsorted descendant tuple"
+            assert _sorts_the_whole_tuple(node.value), f"{name} produces a descendant tuple whose ordering is not a whole-value sort"
+
+    # And the weaker form really is weaker: the shape below carries a `sorted`
+    # call and is still the bug, so a pin that only looked for one would pass it.
+    prepended = ast.parse("descendant_task_ids = [(child_task_id, 0), *sorted(rows)]").body[0]
+    assert any(isinstance(call, ast.Call) and isinstance(call.func, ast.Name) and call.func.id == "sorted" for call in ast.walk(prepended))
+    assert not _sorts_the_whole_tuple(prepended.value)
 
 
 @pytest.mark.anyio
@@ -3552,6 +3603,281 @@ def test_the_task_row_phase_is_what_unpins_a_content_block():
     # deletes it.
     assert "ansich_content_blocks" not in _cascade_delete_closure(frozenset({"ansich_tasks"}))
     assert "ansich_content_blocks" in _cascade_delete_closure(frozenset({"ansich_entities"}))
+
+
+@pytest.mark.anyio
+async def test_a_blocked_erasure_leaves_the_scope_standing_and_finishes_after_the_obstacle_clears(hard_delete_backend):
+    """Review finding F1, as a committed regression.
+
+    A doomed Task that first-discovered a **protected** Entity — here a second,
+    foreign thread Scope — pins one of its Observations, and the erasure cannot
+    take it. The shape that shipped first deleted the target Scope, committed
+    that transaction, and *then* raised: the resume handle was gone, so the
+    re-run answered ``unknown_scope`` 404 and one Observation of the erased
+    owner stood in the store permanently, with every route back closed.
+
+    Three things are asserted here and all three are the fix: the refusal leaves
+    the Scope row standing, the **re-run still refuses rather than 404ing**
+    (which is what makes "remove the blocker and re-run" a real remedy), and
+    once the obstacle is cleared the same call completes with zero orphans.
+    """
+
+    backend, sessions = hard_delete_backend
+    store = await _build_hard_delete_store(backend)
+    # A second thread Scope reported by the doomed root Task. It is a protected
+    # entity type, so the satellite sweep skips it and its `created_obs_id`
+    # (RESTRICT) pins an Observation of a Task this erasure is condemning.
+    obstacle_ref = "thread-obstacle"
+    obstacle_id = _hd_scope_id(obstacle_ref)
+    extra = [_hd_scope_snapshotted(store.root_id, external_ref=obstacle_ref, run_id="run-doomed-obstacle", occurred_at=_RETENTION_OCCURRED_AT)]
+    assert await backend.persist_and_project(extra) == 1
+    await _settle_retention(backend)
+
+    with pytest.raises(HardDeleteError) as first:
+        await backend.hard_delete_scope(store.scope_id, batch_size=2)
+
+    assert first.value.reason == "blocked"
+    # The remedy names the removable edge, not the surviving entity row it
+    # refused on first (review finding F4).
+    assert first.value.blocker == "ansich_scopes.created_obs_id"
+    assert isinstance(first.value.report, HardDeleteReport)
+    assert first.value.report.tasks >= 1, "the committed counts ride along, or a caller reads `blocked` as `nothing happened`"
+    async with sessions() as session:
+        assert await session.get(AnsichScopeRow, store.scope_id) is not None, "the Scope row is the resume handle and must survive the refusal"
+        assert await session.get(AnsichEntityRow, store.root_id) is not None, "the pinned Task rolls back too, so nothing is stranded"
+
+    # The re-run refuses the same way — never 404 — which is what makes the
+    # documented remedy executable. This is the assertion the shipped shape
+    # could not satisfy: it had deleted the Scope, so the re-run answered
+    # `unknown_scope` and the erasure was unfinishable.
+    with pytest.raises(HardDeleteError) as second:
+        await backend.hard_delete_scope(store.scope_id, batch_size=2)
+    assert second.value.reason == "blocked"
+    assert await _referential_orphans(sessions) == []
+
+    # Erasing the obstacle Scope refuses too, and that is the documented
+    # limitation rather than a defect: both Scopes' provenance runs through the
+    # *same* Task, so neither can free the other's pin. What matters is that it
+    # is **reported** — a typed refusal naming the edge — instead of one of them
+    # succeeding and leaving the other's evidence behind.
+    with pytest.raises(HardDeleteError) as mutual:
+        await backend.hard_delete_scope(obstacle_id, batch_size=2)
+    assert mutual.value.reason == "blocked"
+
+    # Clear the obstacle the way an operator with a mutual pin must: remove the
+    # foreign Scope's rows. (There is no API for it in v1 — that is the
+    # residual, and this is what "after the obstacle clears" means for it.)
+    async with sessions() as session, session.begin():
+        await session.execute(sa.delete(AnsichScopeRow).where(AnsichScopeRow.entity_id == obstacle_id))
+        await session.execute(sa.delete(AnsichEntityRow).where(AnsichEntityRow.entity_id == obstacle_id))
+
+    finished = await backend.hard_delete_scope(store.scope_id, batch_size=2)
+
+    assert await _observation_task_ids(sessions, store.doomed_tasks) == 0
+    assert await _referential_orphans(sessions) == []
+    async with sessions() as session:
+        assert await session.get(AnsichScopeRow, store.scope_id) is None
+    assert finished.observations > 0
+    # The two reports add up to one erasure, which is the contract: the refused
+    # run had already committed both `ansich_tasks` deletes (only the pinned
+    # Task's *Entity* rolled back), so the resumed run legitimately reports
+    # zero there and finishes the rest.
+    assert first.value.report.tasks + finished.tasks == 2
+    assert await _observation_task_ids(sessions, [store.neighbour_id]) > 0
+
+
+@pytest.mark.anyio
+async def test_a_shared_scope_kind_is_refused_before_anything_is_deleted(hard_delete_backend):
+    """Review finding F2: only ``owner`` and ``thread`` name one owner's data.
+
+    ``workspace``/``sandbox``/``authorization``/``external_origin`` Scopes are
+    shared across owners by construction — a repository path, a pooled runtime,
+    a policy, a provenance — so erasing one would take every Task that ever
+    reported it, from every owner, with no signal that it had. That is the same
+    argument the host-Scope refusal already rests on, and D6-2 calls this the
+    *owner/thread* hard delete.
+    """
+
+    backend, sessions = hard_delete_backend
+    store = await _build_hard_delete_store(backend)
+    workspace_ref = "/srv/shared-repo"
+    workspace_id = scope_entity_id("workspace", scope_reference_hash("workspace", workspace_ref))
+    shared = [
+        ObservationEnvelope.scope_snapshotted(
+            task_id=store.neighbour_id,
+            run_id="run-neighbour",
+            occurred_at=_RETENTION_OCCURRED_AT,
+            scope_kind="workspace",
+            external_ref=workspace_ref,
+            relation_role="sandbox_boundary",
+            source_event_id="run:run-neighbour:scope:workspace",
+        )
+    ]
+    assert await backend.persist_and_project(shared) == 1
+    await _settle_retention(backend)
+    before = await _observation_task_ids(sessions, store.doomed_tasks)
+
+    with pytest.raises(HardDeleteError) as refusal:
+        await backend.hard_delete_scope(workspace_id)
+
+    assert refusal.value.reason == "shared_scope_kind"
+    assert set(_HARD_DELETE_OWNER_SCOPE_KINDS) == {"owner", "thread"}
+    assert set(_HARD_DELETE_OWNER_SCOPE_KINDS) < set(get_args(ScopeKind)), "the deletable kinds must stay a strict subset, or the guard means nothing"
+    assert refusal.value.blocker == "ansich_scopes.scope_kind"
+    assert refusal.value.report is None, "a refusal raised before any delete has no partial report to carry"
+    assert await _observation_task_ids(sessions, store.doomed_tasks) == before
+    async with sessions() as session:
+        assert await session.get(AnsichScopeRow, workspace_id) is not None
+    # And the thread Scope beside it is still erasable, so the guard is a kind
+    # test rather than a blanket refusal.
+    assert (await backend.hard_delete_scope(store.scope_id, batch_size=2)).tasks == 2
+
+
+@pytest.mark.anyio
+async def test_an_erased_range_above_a_survivor_still_reads_expired(hard_delete_backend):
+    """Review finding F3: the hole case, which the prefix fixture cannot show.
+
+    ``min(surviving ingest_seq) - 1`` cannot move when a survivor sits **below**
+    the erased range, and the horizon may not be inflated past a survivor
+    (tier 2 reads it as its own cursor and would skip live rows forever). With
+    only that mark, an erased Observation read ``failed`` — *presumed lost* —
+    which is the exact FC-3 flip the mechanism exists to prevent.
+
+    The neighbour is ingested **first** here, so the erased range is a genuine
+    hole and not a prefix. What answers it is the second mark: the
+    non-contiguous deletion cursor T9 reserved for exactly this deleter.
+    """
+
+    backend, sessions = hard_delete_backend
+    store = await _build_hard_delete_store(backend, neighbour_first=True)
+    async with sessions() as session:
+        rows = list(await session.execute(select(AnsichObservationRow.ingest_seq, AnsichObservationRow.obs_id, AnsichObservationRow.task_id).order_by(AnsichObservationRow.ingest_seq)))
+    doomed = [row for row in rows if str(row[2]) in set(store.doomed_tasks)]
+    survivors_below = [row for row in rows if str(row[2]) not in set(store.doomed_tasks) and int(row[0]) < int(doomed[0][0])]
+    assert survivors_below, "the fixture must put a survivor below the erased range, or this is the prefix case again"
+    sample_obs = str(doomed[0][1])
+
+    await backend.hard_delete_scope(store.scope_id, batch_size=2)
+
+    async with sessions() as session:
+        state = await session.get(AnsichRetentionStateRow, 1)
+        horizon = int(state.observation_horizon_ingest_seq or 0)
+        cursor = int(state.observation_cursor or 0)
+        lowest_survivor = int(await session.scalar(select(func.min(AnsichObservationRow.ingest_seq))))
+    # The horizon is honest and unmoved: it may never claim a survivor is gone.
+    assert horizon < lowest_survivor
+    assert horizon == 0
+    # The non-contiguous mark is what carries the erasure.
+    assert cursor >= int(doomed[-1][0])
+    assert await backend.get_observation_projection_status(sample_obs) == "expired"
+
+
+@pytest.mark.anyio
+async def test_the_hole_the_erasure_punched_does_not_stall_the_observation_tier(hard_delete_backend):
+    """The other half of F3's binding requirement, on the hole fixture.
+
+    Tier 2 selects existing rows ordered by ``ingest_seq``, so a hole is simply
+    never a candidate and the walk steps over it. Proved by the horizon moving
+    *past* the erased range on ordinary passes rather than stopping at it.
+    """
+
+    backend, sessions = hard_delete_backend
+    store = await _build_hard_delete_store(backend, neighbour_first=True)
+    now = _RETENTION_OCCURRED_AT + timedelta(days=400)
+    policy = RetentionPolicy(raw_payload_days=7, observation_days=30, structural_days=90, cleanup_batch_size=2)
+    # Survivors on *both* sides of the erased range: without rows above it,
+    # "the walk steps over the hole" has nothing to step onto and the assertion
+    # below would be satisfied by an empty store instead of by a moving walk.
+    later = [_retention_heartbeat(store.neighbour_id, ordinal=ordinal, source_id="run-neighbour") for ordinal in (2, 3, 4)]
+    assert await backend.persist_and_project(later) == len(later)
+    await _settle_retention(backend)
+    async with sessions() as session:
+        doomed_seqs = sorted(int(row[0]) for row in await session.execute(select(AnsichObservationRow.ingest_seq, AnsichObservationRow.task_id)) if str(row[1]) in set(store.doomed_tasks))
+        above = sorted(int(row[0]) for row in await session.execute(select(AnsichObservationRow.ingest_seq, AnsichObservationRow.task_id)) if str(row[1]) not in set(store.doomed_tasks) and int(row[0]) > max(doomed_seqs))
+    assert above, "the fixture must leave survivors above the hole"
+
+    await backend.hard_delete_scope(store.scope_id, batch_size=2)
+    assert await backend.observation_retention_horizon() == 0
+
+    for _ in range(6):
+        await backend.run_retention(policy, now=now)
+
+    assert await backend.observation_retention_horizon() > max(doomed_seqs), "the tier must walk past the hole, not stall at it"
+    assert await _observation_ids(sessions) == []
+    assert await _referential_orphans(sessions) == []
+
+
+@pytest.mark.anyio
+async def test_tier_three_reclaims_a_content_blob_with_no_hard_delete_in_the_picture(retention_backend):
+    """Review finding F5: the live retention leak the shared helper closes.
+
+    The blob obligation was found while writing the hard delete, but the leak it
+    fixes is **tier 3's** and reproduces with no erasure anywhere near it: the
+    structural tier deletes a content-block Entity, and the ``ansich_content_blobs``
+    row it was the last referrer of holds the body. Tier 1 refuses to sweep an
+    orphan by design, so without this those bytes are unreachable forever.
+
+    Pinned separately because the hard-delete test cannot see it — a later
+    refactor that moved the reclaim into the erasure path only would re-open the
+    retention leak silently.
+    """
+
+    backend, sessions = retention_backend
+    task_id = new_id()
+    at = _RETENTION_OCCURRED_AT
+    envelopes = [
+        _retention_task_created(task_id, source_id="run-blob"),
+        _hd_step(task_id, new_id(), occurred_at=at),
+    ]
+    step_id = str(envelopes[-1].step_id)
+    envelopes.append(_hd_content(task_id, step_id, new_id(), body="tier-three-blob-body", occurred_at=at))
+    assert await backend.persist_and_project(envelopes) == len(envelopes)
+    await _settle_retention(backend)
+    async with sessions() as session:
+        assert int(await session.scalar(select(func.count()).select_from(AnsichContentBlobRow)) or 0) == 1
+
+    policy = RetentionPolicy(raw_payload_days=7, observation_days=30, structural_days=90, cleanup_batch_size=5)
+    for _ in range(6):
+        await backend.run_retention(policy, now=at + timedelta(days=400))
+
+    async with sessions() as session:
+        blobs = list((await session.execute(select(AnsichContentBlobRow.blob_key))).scalars())
+        referenced = set((await session.execute(select(AnsichContentBlockRow.blob_key))).scalars())
+    assert [blob for blob in blobs if blob not in referenced] == [], "tier 3 must reclaim the blob it orphaned"
+    assert all(row.body is not None or row.deleted_at is not None for row in (await _payload_rows(sessions)).values())
+
+
+def test_the_batch_counter_ignores_a_transaction_that_deleted_nothing():
+    """``batches`` means what the contract says (review finding F9).
+
+    ``HardDeleteReport.batches`` is documented as "committed transactions that
+    deleted something", and a counter that ticked on an empty commit would let a
+    refusal — a phase in which everything was blocked or deferred — read as
+    progress. The rollback half is pinned in the same place: the counters are a
+    plain object and know nothing about transactions, so a phase that absorbed a
+    plan and then raised would otherwise report rows the database restores.
+    """
+
+    counts = _HardDeleteCounts()
+
+    counts.commit_batch()
+    assert counts.batches == 0, "an empty commit is not a batch"
+
+    counts.absorb({"ansich_tasks": 1, "ansich_steps": 3}, 2)
+    counts.commit_batch()
+    assert (counts.batches, counts.tasks, counts.projections, counts.payloads) == (1, 1, 3, 2)
+
+    counts.commit_batch()
+    assert counts.batches == 1, "a second commit that changed nothing is not a second batch"
+
+    counts.absorb({"ansich_observations": 4}, 1)
+    counts.rollback_batch()
+    counts.commit_batch()
+    assert (counts.batches, counts.observations, counts.payloads) == (1, 0, 2), "a rolled-back transaction leaves neither counts nor a batch"
+    # `audit_refs` is a subset of `observations` and must not be double-counted
+    # into the deleted total the batch check compares.
+    counts.audit_refs += 1
+    assert counts.deleted_total() == counts.tasks + counts.observations + counts.payloads + counts.projections + counts.relations + counts.read_models
 
 
 def _hd_admin_user() -> User:
