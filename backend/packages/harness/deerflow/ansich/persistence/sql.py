@@ -1998,6 +1998,26 @@ def _reconciliation_alert_rows_statement(*, task_id: str):
 
 
 def _periodic_budget_rows_statement():
+    """Running Tasks' budget rows, in a worker-independent order.
+
+    The `ORDER BY` is a lock-ordering requirement, not a presentation choice.
+    `_assess_budget_rows` takes one `FOR UPDATE` on `ansich_current_beliefs` per
+    row it walks, inside the single `assess_operations` transaction and held to
+    commit, so two workers walking this result in different orders can take the
+    same two rows in opposite orders and deadlock — and PostgreSQL resolves that
+    by aborting one tick, which is the whole-tick loss F10-33 and F10-35 exist to
+    remove, arrived at from the other side. PostgreSQL promises no order without
+    `ORDER BY`, and `synchronize_seqscans` (on by default) makes a second backend
+    join an in-progress scan mid-heap and wrap around, so two workers running
+    this identical query legitimately get different orders. The key is the
+    triple this row set is unique on, so the order is total.
+
+    The two Belief traversals in one tick are over disjoint row sets — the
+    heartbeat loop takes `field_name='heartbeat'`, this one takes
+    `budget_health:*` — so ordering each independently is sufficient; neither
+    needs a serializing prefix against the other. See `_lock_rollup_targets`.
+    """
+
     return (
         select(AnsichTaskBudgetRow)
         .join(
@@ -2005,6 +2025,11 @@ def _periodic_budget_rows_statement():
             AnsichTaskSummaryRow.task_id == AnsichTaskBudgetRow.task_id,
         )
         .where(AnsichTaskSummaryRow.control_value == "running")
+        .order_by(
+            AnsichTaskBudgetRow.task_id,
+            AnsichTaskBudgetRow.dimension,
+            AnsichTaskBudgetRow.aggregation_scope,
+        )
     )
 
 
@@ -2573,6 +2598,11 @@ _OBSERVABILITY_LOSS_WINDOW_SECONDS = 900
 #: bound leaves that one episode to the next tick — it is never raised, because
 #: this whole conversion exists to stop an episode collision discarding a tick.
 _ALERT_EPISODE_FIRST_WRITER_PASSES = 3
+#: How many times `_resolve_current_assessment` may re-reduce against a peer
+#: that opened the current-Belief row first (F10-35). Two is provably sufficient
+#: at any worker count — the argument is written at the loop, because a bound
+#: whose justification lives elsewhere is a bound nobody can check.
+_CURRENT_BELIEF_FIRST_WRITER_PASSES = 2
 #: Bound on how many ``observability.lost`` rows one assessment tick reads. The
 #: rows in a fifteen-minute window are unbounded under a sustained outage, and
 #: this pass runs once a second, so the scan has to have a ceiling.
@@ -2709,6 +2739,7 @@ class SqlAnsichBackend:
         # over (its ``lease_generation`` moved). It is process-local and resets
         # on restart; exposing it as durable health is Task 10's call.
         self._stale_completion_count = 0
+        self._episode_first_writer_loss_count = 0
         self._latest_recorded_at: datetime | None = None
         self._latest_projected_at: datetime | None = None
         self._last_loss_scan_warning_at: float | None = None
@@ -2738,6 +2769,22 @@ class SqlAnsichBackend:
         """Writes this worker dropped because the job had been taken over."""
 
         return self._stale_completion_count
+
+    @property
+    def episode_first_writer_loss_count(self) -> int:
+        """Alert episodes this worker lost the first write on (F10-33).
+
+        A process-local debug counter, deliberately **not** a health field, on
+        the same footing as `stale_completion_count`: losing an episode race is
+        a change of writer, not a fault, and it is now absorbed with one row
+        re-read. It exists because absorbing it also made it invisible — the
+        tier test that guards this race can no longer tell "the collision never
+        happened" from "it happened and was handled", and a fixture drift that
+        stopped provoking it would turn that test into a tautology with no
+        signal. This is the signal.
+        """
+
+        return self._episode_first_writer_loss_count
 
     @asynccontextmanager
     async def _maintenance_lock(self) -> AsyncIterator[None]:
@@ -6824,20 +6871,50 @@ class SqlAnsichBackend:
         subject_id: str,
         field_name: str,
     ) -> None:
-        # At most two passes: the second only runs when this worker lost the
-        # first-write race, and by then the row exists, so its lock is real.
-        # Re-resolving rather than reusing the first pass's answer is the point
-        # -- the peer's Assertion was invisible to that read under READ
-        # COMMITTED and has to be ranked against ours before either can be
-        # published. F10-6's entry named this first writer as the half its own
+        # Re-resolving rather than reusing the first pass's answer is the point:
+        # the peer's Assertion was invisible to that read under READ COMMITTED
+        # and has to be ranked against ours before either can be published.
+        # F10-6's entry named this first writer as the half its own
         # lock-then-read conversion did not close.
-        for _pass in range(2):
+        #
+        # **Two passes are provably sufficient, at any worker count**, which is
+        # why this bound is a literal rather than a tunable:
+        #
+        # * `ON CONFLICT DO NOTHING` reports a loss only once the conflicting
+        #   insert has *committed* — it waits out an in-flight one and proceeds
+        #   if that transaction aborts — so by the time pass 1 returns `False`
+        #   the row is committed and pass 2's `FOR UPDATE` finds it. A row that
+        #   exists takes the UPDATE branch, which cannot lose a primary key.
+        # * With W workers, one wins and W−1 reach pass 2.
+        #   `_lock_rollup_targets` is a plain `FOR UPDATE` (no `skip_locked`), so
+        #   they queue on that row and each re-reads under READ COMMITTED after
+        #   the previous one commits. Nothing here deletes a current-Belief row,
+        #   so the row cannot vanish back into the first-writer branch.
+        #
+        # The loop therefore exists to *express* the two states, not to poll.
+        for _pass in range(_CURRENT_BELIEF_FIRST_WRITER_PASSES):
             if await self._resolve_current_assessment_once(
                 session,
                 subject_id=subject_id,
                 field_name=field_name,
             ):
                 return
+        # Unreachable by the argument above, and reported rather than assumed
+        # away -- the sibling loop in `_reconcile_alerts_for_assessments` logs
+        # its equally-unreachable exhaustion the same way. Silence here would
+        # leave the current-Belief row on the peer's answer and this pass's
+        # Assertion unreferenced, with nothing anywhere saying so.
+        logger.debug(
+            "Ansich current Belief did not settle within %d first-writer passes: subject=%s field=%s",
+            _CURRENT_BELIEF_FIRST_WRITER_PASSES,
+            subject_id,
+            field_name,
+            extra={
+                "event": "ansich.current_belief.first_writer_unsettled",
+                "subject_id": subject_id,
+                "field_name": field_name,
+            },
+        )
 
     async def _resolve_current_assessment_once(
         self,
@@ -6943,21 +7020,22 @@ class SqlAnsichBackend:
         # leased workers claim action-repetition and absolute-limit for one
         # Task concurrently, and both then recompute this single row. See
         # `_lock_rollup_targets` for why the lock has to precede the read and
-        # for what it deliberately does not cover; the residual here is the
-        # reference implementation's own: a `behavior` current-Belief row that
-        # does not exist yet cannot be locked, so two concurrent first writers
-        # both reach `_resolve_current_assessment`'s insert and one loses on the
-        # composite primary key. That IntegrityError is an ordinary assessor
-        # error (`_record_assessor_error` re-arms the job to `retry`), so the
-        # race costs one attempt rather than correctness.
+        # for what it deliberately does not cover.
+        #
+        # The first-writer residual this comment used to record -- a `behavior`
+        # current-Belief row that does not exist yet cannot be locked, so two
+        # concurrent first writers both reached `_resolve_current_assessment`'s
+        # bare insert and one lost on the composite primary key, costing one
+        # charged assessor attempt -- is **closed** (P11-C, F10-35). That insert
+        # is now `_open_or_lock_current_belief`, and the loser re-reads the
+        # winner's row under the lock and re-reduces. This lock still earns its
+        # place: it serialises the two writers so the second reduces over the
+        # first's committed signals.
         # Lost-update proof on a real PostgreSQL server: T9's two-worker tier,
         # tests/integration/test_postgres_multiworker.py.
         await _lock_rollup_targets(
             session,
-            select(AnsichCurrentBeliefRow).where(
-                AnsichCurrentBeliefRow.subject_id == task_id,
-                AnsichCurrentBeliefRow.field_name == "behavior",
-            ),
+            _current_belief_statement(task_id, "behavior"),
         )
         signal_rows = list(
             (
@@ -7207,14 +7285,34 @@ class SqlAnsichBackend:
                     candidate,
                 ):
                     break
-                winner = await self._persist_alert_episode(
+                wrote, winner = await self._persist_alert_episode(
                     session,
                     reconciliation=reconciliation,
                     possibly_affected_task_ids=possibly_affected_task_ids,
                 )
-                if winner is None:
+                if wrote:
                     by_id[candidate.alert_id] = candidate
                     changed += 1
+                    break
+                if winner is None:
+                    # Lost the insert AND the winner's row could not be re-read.
+                    # Unreachable (see `_locked_alert_episode`), and the two
+                    # halves are reported separately rather than sharing one
+                    # `None` precisely so this case cannot be counted as a write
+                    # that happened: `changed` would claim an episode nobody
+                    # wrote, and `by_id` would carry one that does not exist.
+                    logger.debug(
+                        "Ansich alert episode lost its first write and its winner vanished: subject=%s alert_key=%s episode=%d",
+                        subject_id,
+                        candidate.alert_key,
+                        candidate.episode,
+                        extra={
+                            "event": "ansich.alert_episode.winner_vanished",
+                            "subject_id": subject_id,
+                            "alert_key": candidate.alert_key,
+                            "episode": candidate.episode,
+                        },
+                    )
                     break
                 # A peer opened this episode first. Re-decide against the row it
                 # committed, through the same state machine, exactly as this
@@ -7291,12 +7389,21 @@ class SqlAnsichBackend:
         *,
         reconciliation: AlertReconciliation,
         possibly_affected_task_ids: list[str] | None = None,
-    ) -> AlertEpisode | None:
+    ) -> tuple[bool, AlertEpisode | None]:
         """Write one reconciled episode; report a lost first-writer race.
 
-        Returns ``None`` when the episode was written, and the *winner's*
-        hydrated episode when this call lost the race to open
-        ``(alert_key, episode)`` — the caller re-decides against it (F10-33).
+        Returns ``(wrote, winner)``, and the pair is deliberately not collapsed
+        into one optional value — three outcomes have to stay distinguishable:
+
+        * ``(True, None)`` — this call wrote the episode.
+        * ``(False, winner)`` — it lost the race to open ``(alert_key, episode)``
+          and hands back the winner's hydrated episode for the caller to
+          re-decide against (F10-33).
+        * ``(False, None)`` — it lost *and* the winner's row could not be
+          re-read. Unreachable, and it must not share an encoding with the
+          first case: the caller counts a successful write, so a single ``None``
+          would make an episode nobody wrote appear in ``changed`` and in the
+          caller's local view.
 
         Every Gateway worker on a host subjects the same host `Scope` and runs
         its own 1 Hz assessment, so two of them opening one episode concurrently
@@ -7310,7 +7417,7 @@ class SqlAnsichBackend:
 
         alert = reconciliation.alert
         if alert is None:
-            return None
+            return True, None
         row = await session.get(AnsichAlertRow, alert.alert_id)
         if row is None:
             if not alert.evidence:
@@ -7360,7 +7467,8 @@ class SqlAnsichBackend:
                 # leaving it behind would accumulate one orphan per collision.
                 await session.delete(entity)
                 await session.flush()
-                return await self._locked_alert_episode(
+                self._episode_first_writer_loss_count += 1
+                return False, await self._locked_alert_episode(
                     session,
                     alert_key=alert.alert_key,
                     episode=alert.episode,
@@ -7443,7 +7551,7 @@ class SqlAnsichBackend:
                 # non-empty observation is honest; unioning across time would
                 # not be, so it is deliberately not done.
                 read_model.possibly_affected_task_ids = possibly_affected_task_ids
-        return None
+        return True, None
 
     async def _locked_alert_episode(
         self,
@@ -9494,7 +9602,16 @@ class SqlAnsichBackend:
         # projection churn.
         changed = 0
         async with self._session_factory() as session, session.begin():
-            task_ids = tuple((await session.execute(select(AnsichTaskSummaryRow.task_id).where(AnsichTaskSummaryRow.control_value == "running"))).scalars())
+            # Sorted before anything is locked. The loop below takes one
+            # `FOR UPDATE` on `ansich_current_beliefs` per Task, inside this one
+            # transaction and held to commit, so two workers walking an
+            # unordered `SELECT` in native order can take two rows in opposite
+            # orders and deadlock — PostgreSQL aborts one tick, which is exactly
+            # the whole-tick loss this batch removes, by another door. See
+            # `_periodic_budget_rows_statement` for the same argument in full
+            # and for why the two Belief traversals in a tick do not need a
+            # serializing prefix against each other.
+            task_ids = tuple((await session.execute(select(AnsichTaskSummaryRow.task_id).where(AnsichTaskSummaryRow.control_value == "running").order_by(AnsichTaskSummaryRow.task_id))).scalars())
             for task_id in task_ids:
                 heartbeat_row = await session.scalar(
                     select(AnsichTaskHeartbeatRow)
@@ -9524,6 +9641,19 @@ class SqlAnsichBackend:
                 # unchanged-comparison below is made against (F10-6's posture,
                 # F10-35's blast radius): every Gateway worker on this host runs
                 # its own 1 Hz tick over the same running Tasks.
+                #
+                # This lock is UNCONDITIONAL, and that is a real change in
+                # contention: before it, a tick that changed nothing took no row
+                # lock on this table at all, so two workers only serialized on
+                # transitions. Now the second worker's tick blocks on the first
+                # row it reaches and waits out the peer's whole tick. Accepted
+                # deliberately — the alternative is the race — and made
+                # deadlock-free by the sorted traversal at the driver above.
+                # Restoring the transition gate would mean checking unlocked
+                # first and re-checking under the lock when a write is actually
+                # needed; that is a second pass on the tick's hottest loop and
+                # is the named next step, not something to smuggle into the
+                # correctness fix.
                 current = next(
                     iter(await _lock_rollup_targets(session, _current_belief_statement(task_id, "heartbeat"))),
                     None,
@@ -9589,9 +9719,14 @@ class SqlAnsichBackend:
                         # evidence. The one cost of the race is that this pass's
                         # Assertion was appended before the loss was known, so a
                         # first-write collision leaves one extra (same-verdict)
-                        # `heartbeat` Assertion for that Task -- bounded at one,
-                        # because from here on the row exists and the ordinary
-                        # unchanged-skip applies.
+                        # `heartbeat` Assertion **per losing writer** -- W−1 of
+                        # them for W concurrent first writers, not one. The real
+                        # bound is that it is one-shot per subject: from here on
+                        # the row exists and the ordinary unchanged-skip applies.
+                        # Those extras are retained non-selected Assertions, so
+                        # each raises `conflicting_assertion_count` by one for
+                        # every later reader of this field -- see that field's
+                        # note in `belief/resolver.py`.
                         current.assertion_id = assertion.assertion_id
                         current.resolver_name = belief.selected_by.name
                         current.resolver_version = belief.selected_by.version

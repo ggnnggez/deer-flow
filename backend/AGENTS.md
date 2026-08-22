@@ -1524,12 +1524,14 @@ is the half a lock cannot do**: `FOR UPDATE` cannot lock a row that does not
 exist, so each site pairs the lock with `_insert_ignoring_conflict`
 (`INSERT … ON CONFLICT DO NOTHING`, returning whether *this* caller won) and
 the loser re-reads the winner's row — now lockable — and converges on it. Two
-residuals are named rather than papered over: `_resolve_current_assessment`'s
-own first write still collides as one retryable assessor attempt (bounded,
-self-healing, F10-6's entry says so), and the LLM-attempt projector's two
-Observations still collide on `ansich_llm_attempts_pkey` (F10-31 — a fifth
-lock-then-read conversion, not a one-liner; **closed by P11-C**, see the
-last-two-races paragraph below). **Multi-row rollups also lock in a
+residuals were named rather than papered over, and **both are now closed by
+P11-C** (see the last-races paragraph below — read that before treating either
+sentence as current): `_resolve_current_assessment`'s own first write collided
+as one retryable assessor attempt (bounded, self-healing, F10-6's entry says
+so — closed as part of F10-35, whose blast radius on the operations tick is what
+made it urgent), and the LLM-attempt projector's two Observations collided on
+`ansich_llm_attempts_pkey` (F10-31 — a fifth lock-then-read conversion, not a
+one-liner). **Multi-row rollups also lock in a
 deterministic order**: the usage fan-out, the spawn backfill (**both** axes —
 ancestors *and* the descendant contribution read, since one ancestor with two
 descendants takes two locked high-water rows), the environment per-metric
@@ -2708,8 +2710,27 @@ The heartbeat and budget losers instead point the peer's row at their own
 Assertion, which is exactly what a tick that read second does. **The one cost is
 stated rather than hidden**: those two append their Assertion before they can
 know they lost, so a first-write collision leaves one extra same-verdict
-Assertion for that subject — bounded at one, since from then on the row exists
-and the ordinary transition-only skip applies. The two *projector*-path writers
+Assertion **per losing writer** — W−1 of them for W concurrent first writers,
+not one. The bound worth stating is that it is *one-shot per subject*: from then
+on the row exists and the ordinary transition-only skip applies. Each extra is a
+retained non-selected Assertion, so it raises that field's
+`conflicting_assertion_count` permanently — a `heartbeat` Belief can report a
+conflict when nothing ever disagreed. That is not a miscount under the field's
+own definition ("retained and set aside", not "disagreed"), which is pinned by
+`test_conflicting_assertion_count_counts_retained_non_selected_assertions` and
+rendered by the frontend's conflict badge; narrowing it to disagreements would
+be a different contract, so the consequence is documented at the field instead.
+**Contention changed too, and it is not free**: pre-fix a tick that changed
+nothing took no row lock on `ansich_current_beliefs` at all, while the
+`FOR UPDATE` is now taken for every running Task on every 1 Hz tick and held to
+commit — so two workers' ticks serialize end to end on those rows rather than
+only on transitions. That is the correct posture and the F1 ordering above is
+what keeps the serialization deadlock-free, but a slow tick under several
+workers is now an expected consequence rather than a mystery. Restoring the
+transition gate means a read-check-then-lock pass (check unlocked, and if a
+write is needed take the lock and *re-check* under it) on the tick's hottest
+loop; it is the named next step, deliberately not taken in the same change as
+the correctness fix. The two *projector*-path writers
 of the same table (`_project_control`, the ToolCall execution Belief) are
 deliberately **not** converted: there a collision costs one job transaction and a
 `retry`, which is the bounded self-healing case F10-6 already records.
@@ -2724,11 +2745,20 @@ current-Belief race including its bounded extra Assertion) and
 on **both** sides of it inside one tick — a stale-heartbeat Task reconciled
 before it, a second losing producer's episode opened after it — proving the tick
 survives and the loser confirms onto the winner's row, plus the pre-fix bare
-insert reproduced as the whole-tick loss). Both races were provoked on the real
-server, so the tier carries the proof:
+insert reproduced as the whole-tick loss). **What the tier carries is a strict
+regression guard, not a live demonstration**, and the difference matters:
 `test_two_workers_assessing_the_same_task_never_duplicate_an_episode` is now
 strict (no round may raise, every round opens exactly one episode per Task)
-where it used to allow a discarded tick to open nothing. One test-side fix rides
+where it used to allow a discarded tick to open nothing — but once the collision
+is absorbed it is invisible from outside, so a run that never entered the
+contended window and a run that entered and handled it are indistinguishable
+from every assertion. The provocation happened, pre-fix, and cannot be re-shown;
+what remains is `SqlAnsichBackend.episode_first_writer_loss_count`, a
+process-local debug counter the tier prints (never asserts — requiring a racy
+provocation would make an honest green flaky) so a fixture edit that stops
+reaching the window leaves evidence instead of quietly producing a tautology.
+The third race's provocation is different and *was* reproducible: it went red
+3/3 the moment F10-31's tolerance came off. One test-side fix rides
 along: that file's traversal-order test drove its setup with `_drain_projections`
 and now uses `_settle_projections`, which is F10-34's known one-line remedy —
 `project_pending` returning 0 means "nothing claimable right now", not "nothing

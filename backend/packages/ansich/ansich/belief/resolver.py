@@ -55,6 +55,23 @@ class ResolvedBelief(BaseModel):
     selected: BeliefAssertion
     resolver: NamedVersion
     evidence: tuple[EvidenceRef, ...]
+    #: Retained Assertions this resolution did **not** select. It counts rows,
+    #: not disagreements, and the distinction is load-bearing: two Assertions
+    #: carrying the *same* value still count as one conflict here, because the
+    #: field's question is "how much was retained and set aside", not "how many
+    #: rivals disagreed". ``test_conflicting_assertion_count_counts_retained_non_selected_assertions``
+    #: pins exactly that, with four same-valued Assertions counting three.
+    #:
+    #: One consequence is worth knowing before reading a number off a panel
+    #: (F10-35): a first-write race on the operations tick leaves an extra
+    #: same-verdict Assertion behind — one per losing writer — and each of those
+    #: raises this count by one. A `heartbeat` Belief can therefore report a
+    #: conflict when nothing ever disagreed about the heartbeat. That is not a
+    #: miscount under the definition above, but it does mean a small non-zero
+    #: count on a periodic Belief is as likely to be a past collision as a real
+    #: dispute. Narrowing the field to "disagreeing Assertions" would be a
+    #: different contract than the one this codebase, its pin, and the frontend's
+    #: conflict badge already carry, so it is deliberately not done here.
     conflicting_assertion_count: int = Field(ge=0)
 
 

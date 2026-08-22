@@ -111,6 +111,7 @@ from deerflow.ansich.persistence.models import (
     AnsichAssessorErrorRow,
     AnsichAssessorJobRow,
     AnsichAssessorWatermarkRow,
+    AnsichCurrentBeliefRow,
     AnsichEntityRow,
     AnsichObservationRow,
     AnsichPayloadRow,
@@ -1243,6 +1244,80 @@ async def test_reversing_the_lock_traversal_order_deadlocks_on_postgres() -> Non
         assert [item for item in agreed if isinstance(item, BaseException)] == [], f"the sorted order still aborted: {agreed}"
 
 
+async def test_reversing_the_current_belief_traversal_deadlocks_on_postgres() -> None:
+    """The same demonstration for the row set F10-35's conversion added locks to.
+
+    `assess_operations` now takes a `FOR UPDATE` on `ansich_current_beliefs` per
+    running Task (heartbeat) and per budget row, unconditionally, inside the one
+    tick transaction and held to commit. Two workers walking those in different
+    orders is therefore a live cycle, and PostgreSQL resolves a cycle by
+    aborting one tick -- which is the whole-tick loss F10-33/F10-35 exist to
+    remove, arrived at from the other side. That is why both drivers carry an
+    `ORDER BY` (`assess_operations`' running-Task select and
+    `_periodic_budget_rows_statement`) rather than relying on native scan order,
+    which PostgreSQL does not promise and `synchronize_seqscans` actively
+    varies between backends.
+
+    Deliberately scripted against the rows rather than by racing two real ticks:
+    a tick's own order is now sorted, so racing them would prove the fix cannot
+    reproduce the bug rather than proving the bug is real.
+    """
+
+    async with _two_workers() as (_url, worker_a, worker_b):
+        task_ids = sorted(new_id() for _ in range(2))
+        for index, task_id in enumerate(task_ids):
+            source_id = f"run-belief-deadlock-{index}"
+            await worker_a.backend.persist_and_project(
+                [
+                    _task_created(task_id, source_id=source_id),
+                    _task_started(task_id, source_id=source_id),
+                    ObservationEnvelope.task_heartbeat(
+                        task_id=task_id,
+                        run_id=source_id,
+                        occurred_at=_OCCURRED_AT,
+                        elapsed_ms=0,
+                        worker_id=f"{source_id}-worker",
+                        ownership_epoch=f"{source_id}-epoch",
+                        source_event_id=f"{source_id}:heartbeat:1",
+                    ),
+                ]
+            )
+        await _settle_projections(worker_a)
+        await worker_a.backend.assess_operations(now=_OCCURRED_AT + timedelta(seconds=10))
+
+        async with worker_a.sessions() as session:
+            present = sorted((await session.execute(sa.select(AnsichCurrentBeliefRow.subject_id).where(AnsichCurrentBeliefRow.subject_id.in_(task_ids), AnsichCurrentBeliefRow.field_name == "heartbeat"))).scalars())
+        assert present == task_ids, f"need a heartbeat Belief row for both Tasks, got {present}"
+        first, second = task_ids[0], task_ids[1]
+
+        async def lock_in_order(worker: _Worker, order: tuple[str, str], mine: asyncio.Event, theirs: asyncio.Event) -> None:
+            async with worker.sessions() as session, session.begin():
+                rows = await ansich_sql._lock_rollup_targets(session, ansich_sql._current_belief_statement(order[0], "heartbeat"))
+                assert rows, f"{order[0]} heartbeat Belief row is missing; the script would prove nothing"
+                mine.set()
+                with contextlib.suppress(TimeoutError, asyncio.TimeoutError):
+                    await asyncio.wait_for(theirs.wait(), timeout=_INTERLEAVE_TIMEOUT_SECONDS)
+                await ansich_sql._lock_rollup_targets(session, ansich_sql._current_belief_statement(order[1], "heartbeat"))
+
+        async def run(order_b: tuple[str, str]) -> list[BaseException | None]:
+            a_ready, b_ready = asyncio.Event(), asyncio.Event()
+            return await asyncio.wait_for(
+                asyncio.gather(
+                    lock_in_order(worker_a, (first, second), a_ready, b_ready),
+                    lock_in_order(worker_b, order_b, b_ready, a_ready),
+                    return_exceptions=True,
+                ),
+                timeout=_SCRIPT_TIMEOUT_SECONDS,
+            )
+
+        crossed = await run((second, first))
+        deadlocks = [item for item in crossed if isinstance(item, DBAPIError) and "deadlock" in str(item).lower()]
+        assert len(deadlocks) == 1, f"crossed Belief lock orders did not produce exactly one deadlock abort: {crossed}"
+
+        agreed = await run((first, second))
+        assert [item for item in agreed if isinstance(item, BaseException)] == [], f"the sorted order still aborted: {agreed}"
+
+
 # ===========================================================================
 # 6. PB4 / PB5: a stale assessor completion rolls its whole evaluation back
 # ===========================================================================
@@ -1678,6 +1753,16 @@ async def test_two_workers_assessing_the_same_task_never_duplicate_an_episode() 
             async with factories[1]() as session:
                 duplicates = list((await session.execute(sa.select(AnsichAlertRow.alert_key, AnsichAlertRow.episode, sa.func.count()).group_by(AnsichAlertRow.alert_key, AnsichAlertRow.episode).having(sa.func.count() > 1))).all())
             assert duplicates == [], f"an episode was written twice: {duplicates}"
+
+            # The collision is absorbed now, so it is invisible from outside --
+            # a clean run and a run that never entered the contended window look
+            # identical from every assertion above. Report the one signal that
+            # still distinguishes them, so a fixture edit that quietly stops
+            # provoking the race leaves evidence instead of turning this test
+            # into a tautology. Not asserted: provocation is genuinely racy, and
+            # requiring it would make an honest green flaky.
+            losses = sum(service._backend.episode_first_writer_loss_count for service in services)
+            print(f"\n[episode-collision] absorbed {losses} first-writer loss(es) across the bounded rounds (0 means the window was not reached this run, not that it is closed)")
         finally:
             for service in services:
                 with contextlib.suppress(Exception):

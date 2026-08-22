@@ -51,6 +51,7 @@ from deerflow.ansich.persistence.models import (
     AnsichAssessorJobRow,
     AnsichBeliefAssertionRow,
     AnsichCurrentBeliefRow,
+    AnsichEntityRow,
     AnsichObservationRow,
     AnsichPayloadRow,
     AnsichProjectionJobRow,
@@ -1487,6 +1488,8 @@ async def test_an_episode_collision_no_longer_discards_the_whole_assessment_tick
         duplicates = await _duplicate_episodes(session_factory)
         async with session_factory() as session:
             collided_evidence = list((await session.execute(select(AnsichAlertEvidenceRow.obs_id).where(AnsichAlertEvidenceRow.alert_id == collided[0].entity_id).order_by(AnsichAlertEvidenceRow.ordinal))).scalars())
+            alert_entities = int(await session.scalar(select(func.count()).select_from(AnsichEntityRow).where(AnsichEntityRow.entity_type == "alert")) or 0)
+            alert_rows = int(await session.scalar(select(func.count()).select_from(AnsichAlertRow)) or 0)
     finally:
         await service.stop()
         await engine.dispose()
@@ -1501,6 +1504,11 @@ async def test_an_episode_collision_no_longer_discards_the_whole_assessment_tick
     assert collided[0].updated_at.replace(tzinfo=UTC) == _T0 + timedelta(seconds=10), "the loser must reconcile onto the winner's row, not walk away from it"
     assert len(collided_evidence) == 2, "the confirm must carry this tick's evidence, which is what makes it a real write"
     assert duplicates == []
+    # The loser minted an `ansich_entities` row for an alert_id that ended up
+    # naming nothing. Nothing else would ever carry it away -- `ansich_alerts`
+    # has no inbound edge to that row -- so a withdrawal that silently stopped
+    # happening would accumulate one orphan per collision with no other symptom.
+    assert alert_entities == alert_rows, "the loser must withdraw the Entity row it minted for an alert that was never written"
 
     # The tick survived on both sides of it.
     assert sorted(row.stable_condition_key for row in degradation) == sorted(
@@ -1510,6 +1518,40 @@ async def test_an_episode_collision_no_longer_discards_the_whole_assessment_tick
         )
     ), "the rule that runs AFTER the collision must still have opened its episode"
     assert [row.episode for row in heartbeat] == [1], "the Task reconciled BEFORE the collision must still have its episode"
+
+
+@pytest.mark.anyio
+async def test_exhausting_the_episode_passes_is_logged_and_left_to_the_next_tick(tmp_path, monkeypatch, caplog):
+    """The bound's give-up branch: reported at DEBUG, and never raised.
+
+    Argued unreachable (a confirm onto the winner's row is an UPDATE and cannot
+    lose the unique key again), so it is driven by shrinking the bound to one
+    pass. What it must not do is raise: this whole conversion exists to stop one
+    episode collision discarding the tick, so an exhausted retry has to cost
+    that one episode and nothing else.
+    """
+
+    engine, session_factory, service, _peer_episode, stale_task_id = await _collision_fixture(tmp_path, "process-health-episode-exhaustion.db")
+    try:
+        _hide_alert_type(monkeypatch, "projection_failure")
+        monkeypatch.setattr(sql_module, "_ALERT_EPISODE_FIRST_WRITER_PASSES", 1)
+        with caplog.at_level(logging.DEBUG):
+            await service.assess_operations(now=_T0 + timedelta(seconds=10))
+
+        degradation = await _alerts(session_factory, "observability_degradation")
+        heartbeat = await _alerts_for_subject(session_factory, stale_task_id, "heartbeat_missing")
+        duplicates = await _duplicate_episodes(session_factory)
+    finally:
+        await service.stop()
+        await engine.dispose()
+
+    unsettled = [record for record in caplog.records if getattr(record, "event", None) == "ansich.alert_episode.first_writer_unsettled"]
+    assert unsettled, "exhausting the bound must say so"
+    assert unsettled[0].subject_id == _SCOPE_ID
+    # The one episode is left to the next tick; nothing else in the tick pays.
+    assert len(degradation) == 2
+    assert [row.episode for row in heartbeat] == [1]
+    assert duplicates == []
 
 
 @pytest.mark.anyio

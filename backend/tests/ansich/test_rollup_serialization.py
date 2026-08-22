@@ -42,6 +42,7 @@ from datetime import UTC, datetime, timedelta
 
 import pytest
 from ansich import AnsichService, ObservationEnvelope, Producer, new_id
+from ansich.alerts.episodes import AlertCondition, AlertEpisode
 from sqlalchemy import delete, event, select
 from sqlalchemy.dialects import postgresql, sqlite
 from sqlalchemy.exc import IntegrityError
@@ -143,7 +144,29 @@ def _index_of_first_touch(recorded: list[_Statement], table: str) -> int:
     raise AssertionError(f"nothing touched {table} in {[item.sql for item in recorded]}")
 
 
-def _lock_missing_once(monkeypatch: pytest.MonkeyPatch, table: str) -> dict[str, int]:
+def _statement_text(statement: object) -> str:
+    """Compiled SQL with its bound values inlined where the dialect allows it.
+
+    Aiming an injected miss at *one* of several locks on the same table needs
+    the predicate's values, not its placeholders -- three sites in one
+    `assess_operations` tick lock `ansich_current_beliefs`, and they are told
+    apart only by `field_name`. Literal binds can fail on an exotic type, so
+    this degrades to the placeholder form rather than taking the test with it.
+    """
+
+    try:
+        return str(statement.compile(dialect=sqlite.dialect(), compile_kwargs={"literal_binds": True})).lower()  # type: ignore[attr-defined]
+    except Exception:  # pragma: no cover - defensive, a value we cannot inline
+        return str(statement.compile(dialect=sqlite.dialect())).lower()  # type: ignore[attr-defined]
+
+
+def _lock_missing_once(
+    monkeypatch: pytest.MonkeyPatch,
+    table: str,
+    *,
+    where: str | None = None,
+    occurrence: int = 1,
+) -> dict[str, int]:
     """Make the target-row lock miss once, as a not-yet-existing row does.
 
     This is the injected half of the first-writer race. SQLite serializes
@@ -152,18 +175,31 @@ def _lock_missing_once(monkeypatch: pytest.MonkeyPatch, table: str) -> dict[str,
     survive is exactly the state this leaves behind -- the lock found nothing,
     and by the time the insert runs a peer's row is committed. Injecting it is
     the same move ``test_lease_cas.py`` makes for lease expiry.
+
+    ``where`` and ``occurrence`` aim it. Without them the miss lands on the
+    first lock of ``table`` in the run, which is fine when a site is alone on
+    its table and useless when it is not: one operations tick locks
+    `ansich_current_beliefs` from the heartbeat block, from
+    `_assess_budget_rows` and from `_resolve_current_assessment`, so a test that
+    wants the second or third has to say which. ``where`` narrows by a
+    substring of the literal-bound SQL (the `field_name` predicate, in
+    practice); ``occurrence`` picks the Nth *matching* call. ``seen`` reports
+    how many matched, so a test whose aim silently stopped matching fails
+    instead of passing vacuously.
     """
 
     original = ansich_sql._lock_rollup_targets
-    state = {"remaining": 1, "calls": 0, "missed": 0}
+    state = {"remaining": 1, "calls": 0, "missed": 0, "seen": 0}
 
     async def _patched(session: object, statement: object) -> list:
         state["calls"] += 1
-        text = str(statement.compile(dialect=sqlite.dialect())).lower()  # type: ignore[attr-defined]
-        if state["remaining"] and table in text:
-            state["remaining"] -= 1
-            state["missed"] += 1
-            return []
+        text = _statement_text(statement)
+        if table in text and (where is None or where in text):
+            state["seen"] += 1
+            if state["seen"] == occurrence and state["remaining"]:
+                state["remaining"] -= 1
+                state["missed"] += 1
+                return []
         return await original(session, statement)  # type: ignore[arg-type]
 
     monkeypatch.setattr(ansich_sql, "_lock_rollup_targets", _patched)
@@ -905,6 +941,71 @@ async def test_heartbeat_belief_first_write_race_converges_instead_of_discarding
 
 
 @pytest.mark.anyio
+async def test_budget_belief_first_write_race_converges_on_the_peers_row(tmp_path, monkeypatch):
+    """The second of the three converted sites, aimed at explicitly.
+
+    One tick locks `ansich_current_beliefs` from three places, so without
+    aiming the injection every test would keep re-proving the heartbeat block.
+    """
+
+    async with _representative_state(tmp_path, "rollup-conflict-budget-belief") as (service, task_id, _budget):
+        backend = service._backend
+        await service.stop()
+        state = _lock_missing_once(monkeypatch, "ansich_current_beliefs", where="budget_health")
+        async with backend._session_factory() as session:
+            before = list((await session.execute(select(AnsichCurrentBeliefRow).where(AnsichCurrentBeliefRow.subject_id == task_id, AnsichCurrentBeliefRow.field_name.like("budget_health:%")))).scalars())
+        await backend.assess_operations(now=_ASSESSED_AT + timedelta(seconds=5))
+        async with backend._session_factory() as session:
+            after = list((await session.execute(select(AnsichCurrentBeliefRow).where(AnsichCurrentBeliefRow.subject_id == task_id, AnsichCurrentBeliefRow.field_name.like("budget_health:%")))).scalars())
+
+    assert state["seen"] >= 1, "the injection stopped matching the budget site"
+    assert state["missed"] == 1
+    assert len(before) == 1
+    assert len(after) == 1, "the losing writer must converge on the peer's row"
+    assert after[0].assertion_id != before[0].assertion_id
+
+
+@pytest.mark.anyio
+async def test_a_lost_current_belief_first_write_re_reduces_over_the_peers_assertion(tmp_path, monkeypatch):
+    """`_resolve_current_assessment`'s second pass, which nothing else covers.
+
+    This is the only one of the three converted sites whose loser cannot simply
+    point the row at its own Assertion: its input is *every* Assertion for the
+    subject/field, and the peer's was invisible to the first pass under READ
+    COMMITTED. Publishing the first pass's answer would be the lost update the
+    lock exists to prevent, so the second pass must read the set again -- which
+    the doubled Assertion scan below is the structural evidence for, exactly as
+    the usage-summary test reads its doubled contribution rescan.
+    """
+
+    async with _representative_state(tmp_path, "rollup-conflict-resolve") as (service, task_id, _budget):
+        backend = service._backend
+        await service.stop()
+        state = _lock_missing_once(monkeypatch, "ansich_current_beliefs", where="'heartbeat'")
+        with _record_statements() as recorded:
+            async with backend._session_factory() as session, session.begin():
+                await backend._resolve_current_assessment(
+                    session,
+                    subject_id=task_id,
+                    field_name="heartbeat",
+                )
+        async with backend._session_factory() as session:
+            rows = list((await session.execute(select(AnsichCurrentBeliefRow).where(AnsichCurrentBeliefRow.subject_id == task_id, AnsichCurrentBeliefRow.field_name == "heartbeat"))).scalars())
+            assertions = list((await session.execute(select(AnsichBeliefAssertionRow).where(AnsichBeliefAssertionRow.subject_id == task_id, AnsichBeliefAssertionRow.field_name == "heartbeat"))).scalars())
+
+    assert state["missed"] == 1
+    # Three locks on that row, in order: pass 1 (missed by injection), the
+    # loser's re-read inside `_open_or_lock_current_belief`, and pass 2's own.
+    assert state["seen"] == 3, "the losing pass must take the lock again rather than publishing its stale answer"
+    reads = [item for item in recorded if item.touches("ansich_belief_assertions") and not item.for_update and "select" in item.sql]
+    assert len(reads) >= 2, "the losing pass must re-reduce, not publish the answer it computed before the peer was visible"
+    assert len(rows) == 1
+    # The published pointer is the resolver's own answer over the full set, not
+    # whichever pass happened to write last.
+    assert rows[0].assertion_id in {item.assertion_id for item in assertions}
+
+
+@pytest.mark.anyio
 async def test_the_pre_fix_bare_current_belief_insert_is_what_discarded_the_tick(tmp_path, monkeypatch):
     """The control: the whole tick used to go with it."""
 
@@ -1122,6 +1223,28 @@ async def test_the_pre_fix_bare_attempt_insert_is_what_the_race_crashes_on(tmp_p
         with pytest.raises(IntegrityError):
             async with backend._session_factory() as session, session.begin():
                 await backend._project_step(session, responded)
+
+
+def test_every_alert_condition_field_survives_onto_the_episode_it_opens():
+    """The premise `_reconcile_opened_episode_against_winner` is built on.
+
+    That helper rebuilds the losing pass's `AlertCondition` from the candidate
+    episode rather than threading the real one down through persistence, which
+    is exact only while every condition field also rides onto the episode.
+    `active` is the one deliberate exception: it is not an episode field, and
+    `True` is sound because only an active condition can produce `opened`, the
+    only change that reaches the insert.
+
+    The failure this pins is asymmetric and both halves are bad. A new
+    *required* `AlertCondition` field makes that constructor raise
+    `ValidationError` on the loser path -- inside the operations tick, i.e. the
+    whole-tick loss returns by the back door, on a path only the injected
+    collision test reaches. A new *optional* one diverges silently instead.
+    """
+
+    missing = set(AlertCondition.model_fields) - {"active"} - set(AlertEpisode.model_fields)
+
+    assert missing == set(), f"AlertCondition fields with nowhere to come back from on the episode: {sorted(missing)}"
 
 
 @pytest.mark.parametrize(
