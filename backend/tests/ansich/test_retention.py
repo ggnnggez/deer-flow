@@ -34,7 +34,7 @@ import pytest
 import sqlalchemy as sa
 import yaml
 from alembic import command as alembic_command
-from ansich import ObservationEnvelope, RetentionPolicy, new_id
+from ansich import AnsichService, ObservationEnvelope, RetentionPolicy, new_id
 from ansich.errors import PayloadExpiredError
 from ansich.evaluation import EvaluationProjectionStatus
 from pydantic import ValidationError
@@ -2147,3 +2147,39 @@ def test_the_policy_model_enforces_the_same_containment_as_the_config():
         RetentionPolicy(raw_payload_days=9, observation_days=8, structural_days=90, cleanup_batch_size=1)
     with pytest.raises(ValidationError, match="observation_days must not exceed structural_days"):
         RetentionPolicy(raw_payload_days=1, observation_days=90, structural_days=30, cleanup_batch_size=1)
+
+
+@pytest.mark.anyio
+async def test_the_service_seam_carries_the_batch_bound_and_the_unfinished_answer(retention_backend):
+    """``finished`` must be reachable as ``False`` through the *public* seam.
+
+    ``AnsichService.run_retention`` is what a scheduler or an operator route
+    will call; the backend method is not. A bound that existed only on the
+    backend would leave ``RetentionReport.finished`` permanently ``True`` for
+    every real caller — a field nobody can make ``False`` is a field nobody will
+    branch on, which is how a documented state becomes decorative.
+
+    The service is constructed around the same backend the other tests use, so
+    this exercises the passthrough rather than a second implementation of it.
+    """
+
+    backend, sessions = retention_backend
+    await _settled_store(backend, heartbeats=4)
+    total = len(await _payload_rows(sessions))
+    assert total > _POLICY.cleanup_batch_size
+
+    service = AnsichService(backend)
+
+    bounded = await service.run_retention(_POLICY, now=_RETENTION_NOW, max_batches=1)
+
+    assert bounded.finished is False
+    assert bounded.batches == 1
+    assert bounded.payload_tombstoned == _POLICY.cleanup_batch_size
+
+    # And the default is unbounded, so an operator running one sweep to
+    # completion gets the whole walk without knowing the keyword exists.
+    rest = await service.run_retention(_POLICY, now=_RETENTION_NOW)
+
+    assert rest.finished is True
+    assert rest.resumed_from_cursor is True
+    assert bounded.payload_tombstoned + rest.payload_tombstoned == total

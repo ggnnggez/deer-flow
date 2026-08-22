@@ -1862,6 +1862,7 @@ class AnsichService:
         policy: RetentionPolicy,
         *,
         now: datetime | None = None,
+        max_batches: int | None = None,
     ) -> RetentionReport:
         """Run one time-tiered retention pass against the store (spec §6).
 
@@ -1883,6 +1884,15 @@ class AnsichService:
         reason the backend takes it: every cutoff in the pass derives from one
         value, and a caller that wants a reproducible pass supplies it.
 
+        ``max_batches`` is a straight passthrough, and it is here rather than
+        only on the backend because ``RetentionReport.finished`` is otherwise
+        unreachable as anything but ``True`` through the public seam — a field
+        no caller can make ``False`` is a field no caller will branch on.
+        ``None`` is unbounded, which is right for an operator running one sweep
+        to completion; a scheduled caller that has to return the store to normal
+        service on a deadline passes a bound and reads ``finished`` to decide
+        whether to come back.
+
         Raises rather than degrading if the backend cannot run one. Retention is
         an explicit operator action with a report as its whole product, so a
         silent no-op would be the one outcome that cannot be acted on — this is
@@ -1893,7 +1903,7 @@ class AnsichService:
         run = getattr(self._backend, "run_retention", None)
         if not callable(run):
             raise RuntimeError("Ansich backend does not support retention")
-        return await run(policy, now=now if now is not None else datetime.now(UTC))
+        return await run(policy, now=now if now is not None else datetime.now(UTC), max_batches=max_batches)
 
     async def get_retention_last_run(self) -> RetentionLastRun | None:
         """When retention last ran, or ``None`` if it never has.

@@ -2408,24 +2408,62 @@ transaction as the UPDATE it describes** — that is the whole of the
 resumability story, and it is why a pass killed mid-tier resumes rather than
 restarting or skipping. On completing the walk the cursor resets to `None`; a
 payload that becomes eligible *behind* the cursor mid-pass is picked up by the
-next pass, because a cursor that jumped backwards could not terminate.
+next pass, because a cursor that jumped backwards could not terminate. The
+optional `max_batches` (on both `run_retention` seams, default unbounded) bounds
+a whole pass: it stops on a batch boundary with the cursor persisted and reports
+`RetentionReport.finished=False`, which is what makes that field an answer
+rather than a constant. The bound is in **batches** rather than seconds because
+a batch is the unit that commits, so bounding it can never leave a half-written
+one; and `finished=False` is a deliberate slight under-claim ("do not assume
+this tier is done"), never a promise that more remains.
 
 Eligibility is derived, not declared: the **set** of `ansich_payloads` referrers
 comes from `Base.metadata` (`_payload_referrer_columns`), so a schema change
 that adds one cannot silently narrow retention, while `_PAYLOAD_REFERRER_TIERS`
 declares the half metadata cannot answer — which timestamp means "old" for each
 table. A payload with **any** referrer younger than the cutoff is skipped
-whole, an orphan is aged by its own `created_at` (referenced payloads
-deliberately are not: `created_at` is an ingest time and the spec ages evidence
-by when it happened), and an undeclared referrer refuses the pass rather than
-defaulting. **AgentRelease manifests are excluded from time retention
-entirely** — a manifest is the immutable identity of a release rather than
-per-run evidence, `release_hash` is derived from it, and its size is bounded by
-the manifest rather than by run volume; it goes with its release, row and all.
-A payload whose Observation still has an *in-flight* projection job is also
-skipped, which keeps the expired-evidence claim path off the ordinary loop;
-`failed` is deliberately not in `_IN_FLIGHT_JOB_STATUSES`, or one poison job
-would pin its evidence past its policy forever.
+whole, and an undeclared referrer refuses the pass rather than defaulting.
+**AgentRelease manifests are excluded from time retention entirely** — a
+manifest is the immutable identity of a release rather than per-run evidence,
+`release_hash` is derived from it, and its size is bounded by the manifest
+rather than by run volume; it goes with its release, row and all. A payload
+whose Observation still has an *in-flight* projection job is also skipped, which
+keeps the expired-evidence claim path off the ordinary loop; `failed` is
+deliberately not in `_IN_FLIGHT_JOB_STATUSES`, or one poison job would pin its
+evidence past its policy forever.
+
+**Tier 1 expires no orphan, and the reason is a fixed bug rather than
+caution.** A payload nothing references is skipped, whatever its age. An
+earlier form aged an orphan by its own `created_at`, which reads as reasonable
+and is not, because **being an orphan is not a property of a payload** — it is
+a property of the rest of the database at the instant the predicate runs, and
+another operation can manufacture one. `_rebuild_projections_locked` commits
+`DELETE FROM ansich_agent_releases` in its own transaction and only then
+re-projects, so for the whole of a rebuild every release manifest is an orphan;
+retention holds a different advisory key by design and takes no
+`_projection_lock`, so a concurrent pass tombstoned exactly the bodies the
+paragraph above declares non-expirable, the re-projection recreated the release
+row against the retained digest and succeeded, and the store then looked healthy
+while every read of that manifest raised forever.
+(`ansich_authorization_snapshots` sits in the same delete list with the same
+window and a milder consequence.) Narrower fixes were rejected on the record:
+two-pass orphan confirmation narrows the window rather than closing it (a
+rebuild spanning two passes still loses the manifest), and taking the
+maintenance lock as well would serialise every sweep behind every rebuild —
+the exact cost the separate key exists to avoid — while still saying nothing
+about the next operation that empties a referrer table.
+
+What replaces the orphan branch is an **obligation, not a mechanism**:
+*whoever removes a payload's last referrer owns the payload row.* Nothing in
+this build orphans a payload durably (`_ensure_content_blob`'s losing-race
+branch deletes the payload it minted), so the rule costs nothing today — but it
+binds the Observation and structural tiers and the owner hard delete, which
+must delete the payload row outright rather than leaving it behind. Say the
+consequence plainly: **an orphaned body is not reclaimed by tier 1 in either
+direction** — never tombstoned, never swept — so if an owning deleter forgets
+its payload rows, those bytes accumulate with nothing to catch them, and the
+remedy is a fix at that deleter or a future reclaim tier that owns orphans
+explicitly, never a widening of this predicate back to what it was.
 
 **Every reader now distinguishes three payload states, and only one of them is
 loud** (RC6). `_hydrated_observation_payload` returns an `_ObservationPayload`
