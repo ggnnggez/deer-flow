@@ -91,6 +91,8 @@ import sqlalchemy as sa
 from alembic import command as alembic_command
 from ansich import AnsichService, AuthorizationSnapshot, ObservationEnvelope, Producer, ReplayReport, ReplaySelector, new_id
 from ansich.assessment.scope_safety import SCOPE_SAFETY_ASSESSOR
+from ansich.belief.resolver import DEFAULT_RESOLVER
+from ansich.errors import ActiveVersionError
 from sqlalchemy.dialects import postgresql
 from sqlalchemy.engine import URL, make_url
 from sqlalchemy.exc import DBAPIError, IntegrityError
@@ -103,6 +105,7 @@ import deerflow.persistence.models  # noqa: F401
 from deerflow.ansich import create_sql_ansich_service
 from deerflow.ansich.persistence import sql as ansich_sql
 from deerflow.ansich.persistence.models import (
+    AnsichActiveVersionRow,
     AnsichAlertRow,
     AnsichAssessorErrorRow,
     AnsichAssessorJobRow,
@@ -1992,3 +1995,119 @@ async def test_replay_and_replace_hold_on_postgres_with_a_second_worker_live() -
         after = await _projection_job(worker_a, stale_job_id)
         assert after.status == "completed"
         assert after.lease_generation > stale_generation
+
+
+# ===========================================================================
+# 12. The active-version writer on a real server
+# ===========================================================================
+
+
+async def test_activate_version_writes_row_and_audit_atomically_on_postgres() -> None:
+    """The one write path P11-C's active-version work adds, on real PostgreSQL.
+
+    Review finding F7: the tier was run for this task and proved nothing about
+    it, because no integration test touched ``activate_version`` — the whole
+    write path (transaction boundary, the flush-before-pointer ordering the
+    ``ON DELETE SET NULL`` FK needs under *enforced* foreign keys, the UPSERT
+    branch, and the ``String(128)`` bound that SQLite silently ignores) had only
+    ever run on SQLite. Three things are asserted here that SQLite cannot
+    answer:
+
+    1. **Enforced foreign keys.** ``tests/ansich/conftest.py`` leaves
+       ``PRAGMA foreign_keys`` off, so the ordering that makes
+       ``audit_obs_id`` insertable — flush the Observation, *then* write the
+       pointer — is unverified there. Here a wrong order is a constraint
+       violation.
+    2. **Rollback of a real transaction.** The failure is injected after the
+       audit INSERT has been flushed to the server, so the roll back is a
+       server-side ``ROLLBACK`` of a statement that really executed, not a
+       session that never issued one. The previous activation must stand
+       untouched.
+    3. **The column bound.** PostgreSQL raises
+       ``StringDataRightTruncationError`` for an over-long ``activated_by``;
+       SQLite stores it. The typed refusal has to fire *before* either,
+       identically on both.
+    """
+
+    async with _two_workers() as (_url, worker_a, worker_b):
+        first = await worker_a.backend.activate_version(
+            component_kind="resolver",
+            component_name="ansich-default",
+            version="1.0.0",
+            actor="first-operator",
+        )
+        assert first.origin == "activated_audited"
+
+        async with worker_b.sessions() as session:
+            row = await session.get(AnsichActiveVersionRow, ("resolver", "ansich-default"))
+            assert row is not None
+            assert row.active_version == "1.0.0"
+            assert row.audit_obs_id == first.audit_obs_id
+            assert bool(row.audit_recorded) is True
+            audit = await session.scalar(sa.select(AnsichObservationRow).where(AnsichObservationRow.obs_id == first.audit_obs_id))
+            assert audit is not None
+            assert audit.kind == "operator.action_succeeded"
+            assert audit.payload_json is not None
+            assert audit.payload_json["action_type"] == "activate_version"
+            assert audit.producer_instance_id == "first-operator"
+
+        # The over-long actor is refused by the rule, not by the column: no
+        # driver error escapes, and nothing is written.
+        with pytest.raises(ActiveVersionError) as caught:
+            await worker_a.backend.activate_version(
+                component_kind="resolver",
+                component_name="ansich-default",
+                version="2.0.0",
+                actor="x" * 200,
+            )
+        assert caught.value.reason == "invalid_actor"
+
+        # A failure after the audit is flushed: both writes roll back together
+        # and the first activation is untouched.
+        original_get = AsyncSession.get
+        seen_inside_transaction: list[int] = []
+
+        async def exploding_get(self: AsyncSession, *args: object, **kwargs: object) -> object:
+            seen_inside_transaction.append(int(await self.scalar(sa.select(sa.func.count()).select_from(AnsichObservationRow)) or 0))
+            raise RuntimeError("killed after the audit flush, before the commit")
+
+        AsyncSession.get = exploding_get  # type: ignore[method-assign]
+        try:
+            with pytest.raises(RuntimeError, match="after the audit flush"):
+                await worker_a.backend.activate_version(
+                    component_kind="resolver",
+                    component_name="ansich-default",
+                    version="2.0.0",
+                    actor="second-operator",
+                )
+        finally:
+            AsyncSession.get = original_get  # type: ignore[method-assign]
+
+        # Two Observations were live in that transaction (the first
+        # activation's, durable, plus this one's) — so the count below is a
+        # rollback, not a write that never ran.
+        assert seen_inside_transaction == [2]
+        worker_a.backend.invalidate_active_version_cache()
+        worker_b.backend.invalidate_active_version_cache()
+        async with worker_b.sessions() as session:
+            assert int(await session.scalar(sa.select(sa.func.count()).select_from(AnsichObservationRow)) or 0) == 1
+            row = await session.get(AnsichActiveVersionRow, ("resolver", "ansich-default"))
+            assert row is not None
+            assert row.active_version == "1.0.0"
+            assert row.activated_by == "first-operator"
+
+        # The UPSERT branch, on the dialect: one row, a second audit beside the
+        # first, and the peer worker reads the switch once its cache is dropped.
+        second = await worker_a.backend.activate_version(
+            component_kind="resolver",
+            component_name="ansich-default",
+            version="2.0.0",
+            actor="second-operator",
+        )
+        assert second.audit_obs_id != first.audit_obs_id
+        worker_b.backend.invalidate_active_version_cache()
+        async with worker_b.sessions() as session:
+            assert int(await session.scalar(sa.select(sa.func.count()).select_from(AnsichActiveVersionRow)) or 0) == 1
+            assert int(await session.scalar(sa.select(sa.func.count()).select_from(AnsichObservationRow)) or 0) == 2
+        assert await worker_b.backend.get_active_resolver() == DEFAULT_RESOLVER
+        assert await worker_b.backend.validate_active_versions() == ()

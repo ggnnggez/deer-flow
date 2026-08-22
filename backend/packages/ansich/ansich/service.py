@@ -13,6 +13,7 @@ from weakref import ReferenceType, WeakMethod, ref
 
 from ansich.alerts.views import AlertDetailView, AlertSummaryView, BeliefAssertionView
 from ansich.backend import AnsichBackend
+from ansich.belief.resolver import DEFAULT_RESOLVER
 from ansich.budget import BudgetHealthBelief, TaskBudgetsView
 from ansich.compression import ContextCompressionSummaryView, ContextCompressionView
 from ansich.context_state import ContextStateView
@@ -25,6 +26,7 @@ from ansich.contracts import (
     DatabaseHealth,
     FlushResult,
     LostRange,
+    NamedVersion,
     ObservationEnvelope,
     Producer,
     ProducerHealth,
@@ -749,6 +751,25 @@ class AnsichService:
         except Exception:
             logger.debug("Ansich active-version read failed", exc_info=True)
             return None
+
+    async def get_active_resolver(self) -> NamedVersion:
+        """The Belief resolver this store selects with, or the code default.
+
+        Fail-open like every other active-version read: a backend that cannot
+        answer (or does not implement it) yields ``DEFAULT_RESOLVER``, which is
+        what an absent row means anyway. Returning ``None`` here would push the
+        same fallback onto every caller, and the fallback is not a judgement
+        call — there is exactly one honest answer when the store cannot say.
+        """
+
+        provider = getattr(self._backend, "get_active_resolver", None)
+        if not callable(provider):
+            return DEFAULT_RESOLVER
+        try:
+            return await provider()
+        except Exception:
+            logger.debug("Ansich active-resolver read failed", exc_info=True)
+            return DEFAULT_RESOLVER
 
     async def validate_active_versions(self) -> tuple[ActiveVersionMismatch, ...] | None:
         """Active-version rows this build can no longer honour. Never raises.

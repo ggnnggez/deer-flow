@@ -32,13 +32,14 @@ from typing import Literal, get_args, get_origin
 
 import pytest
 from ansich import ObservationEnvelope, ReplayReport, ReplaySelector, new_id
-from ansich.belief.resolver import DEFAULT_RESOLVER, RESOLVER_V1
-from ansich.contracts import ObservationKind
+from ansich.belief.resolver import DEFAULT_RESOLVER, RESOLVER_V1, BeliefAssertion, resolve_current_belief
+from ansich.contracts import ActiveVersion, NamedVersion, ObservationKind
 from ansich.errors import ActiveVersionError, ReplayTargetError
+from ansich.operator import OperatorAuditActionType, TaskOperatorActionType
 from pydantic import ValidationError
 from sqlalchemy import UniqueConstraint, func, select, update
 from sqlalchemy.dialects import sqlite
-from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
+from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 
 from deerflow.ansich import replay_cli
 from deerflow.ansich.persistence import models as models_module
@@ -69,6 +70,8 @@ from deerflow.ansich.persistence.sql import (
     _REPLACE_PROVEN_PROJECTORS,
     _REPLAYABLE_VERSIONS,
     _SHARED_REBUILT_TABLES,
+    ACTIVATE_VERSION_ACTION,
+    ACTIVE_VERSION_ACTOR_MAX_LENGTH,
     ACTIVE_VERSION_CACHE_TTL_SECONDS,
     ACTIVE_VERSION_COMPONENT_KINDS,
     RESOLVER_COMPONENT_NAME,
@@ -78,6 +81,7 @@ from deerflow.ansich.persistence.sql import (
     _projectors_for_kind,
     _replay_observation_condition,
     _validate_replay_target,
+    active_version_caveat,
 )
 from deerflow.ansich.replay import execute_replay, plan_replay
 from deerflow.persistence.base import Base
@@ -1911,6 +1915,15 @@ class TestReplaceIsProjectorScoped:
                 )
             )
         planted = await _owned_row_count(sessions, "task-heartbeat")
+        # The fixture's own precondition, asserted rather than assumed (review
+        # note W1). `planted` is the sentinel plus whatever the fixture's
+        # projection pass actually landed, and `_project_heartbeat` defers on a
+        # missing `AnsichTaskRow` with a 250ms backoff — so "the fixture landed
+        # nothing" is a *timing* outcome, not an impossible one. Without this
+        # line that outcome surfaces below as a confusing off-by-N on the
+        # post-replace count, which is a mystery to diagnose; here it fails
+        # where it happened and says what went wrong.
+        assert planted > 1, "the enriched fixture landed no heartbeat rows; this test needs real rows beside the planted one"
         async with sessions() as session:
             transitions_before = sorted((await session.execute(select(AnsichTransitionRow.transition_id))).scalars().all())
             budgets_before = sorted((await session.execute(select(AnsichTaskBudgetRow.entity_id))).scalars().all())
@@ -2243,31 +2256,39 @@ class TestActivationWritesTheRowAndItsAuditTogether:
             assert observation.payload_json["active_version"] == RESOLVER_V1.version
 
     @pytest.mark.anyio
-    async def test_a_failure_between_the_two_writes_leaves_neither(
+    async def test_a_failure_after_the_audit_is_flushed_still_leaves_neither(
         self,
         backend: tuple[SqlAnsichBackend, async_sessionmaker],
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
-        """Injected between the Observation insert and the row insert.
+        """Injected AFTER the audit INSERT is flushed and BEFORE the commit.
 
-        The Observation is added and flushed first (the FK needs it), so this
-        is precisely the window a crash would land in. If the two writes were
-        not one transaction, this store would come back holding an audit of a
-        switch that never took effect.
+        The earlier version of this test raised from inside
+        ``_add_observation_row``, which only calls ``session.add`` — so the
+        failure landed before the flush and a hypothetical *two*-transaction
+        implementation (commit the audit, then open a second session for the
+        row) would have passed it unchanged. It proved "an exception rolls
+        back", which is not the property under audit (review finding F2).
+
+        This injects at the ``session.get`` that follows ``session.flush()``,
+        and first reads the Observation count back **through the same
+        session** — so the assertion below is not "nothing was written" but
+        "the audit row was live inside this transaction and went away with
+        it". A two-transaction implementation cannot satisfy that: its first
+        commit would already be durable when this fires.
         """
 
         sql_backend, sessions = backend
-        original = SqlAnsichBackend._add_observation_row
-        calls: list[str] = []
+        seen_inside_transaction: list[int] = []
+        original_get = AsyncSession.get
 
-        def exploding(session: object, observation: object) -> None:
-            calls.append("added")
-            original(session, observation)  # type: ignore[arg-type]
-            raise RuntimeError("killed between the audit and the row")
+        async def exploding_get(self: AsyncSession, *args: object, **kwargs: object) -> object:
+            seen_inside_transaction.append(int(await self.scalar(select(func.count()).select_from(AnsichObservationRow)) or 0))
+            raise RuntimeError("killed after the audit flush, before the commit")
 
-        monkeypatch.setattr(SqlAnsichBackend, "_add_observation_row", staticmethod(exploding))
+        monkeypatch.setattr(AsyncSession, "get", exploding_get)
 
-        with pytest.raises(RuntimeError, match="killed between"):
+        with pytest.raises(RuntimeError, match="after the audit flush"):
             await sql_backend.activate_version(
                 component_kind="resolver",
                 component_name=RESOLVER_COMPONENT_NAME,
@@ -2275,7 +2296,10 @@ class TestActivationWritesTheRowAndItsAuditTogether:
                 actor="operator",
             )
 
-        assert calls == ["added"]
+        monkeypatch.setattr(AsyncSession, "get", original_get)
+        # The audit really was inserted before the failure — that is what makes
+        # the emptiness below a rollback rather than a write that never ran.
+        assert seen_inside_transaction == [1]
         async with sessions() as session:
             assert (await session.scalar(select(func.count()).select_from(AnsichActiveVersionRow))) == 0
             assert (await session.scalar(select(func.count()).select_from(AnsichObservationRow))) == 0
@@ -2318,6 +2342,38 @@ class TestActivationWritesTheRowAndItsAuditTogether:
             assert {audit.obs_id for audit in audits} == {first.audit_obs_id, second.audit_obs_id}
 
     @pytest.mark.anyio
+    async def test_the_written_action_type_is_a_member_of_the_shared_literal(
+        self,
+        backend: tuple[SqlAnsichBackend, async_sessionmaker],
+    ) -> None:
+        """Review finding F4: the coordination has to do structural work.
+
+        ``OperatorAuditActionType`` was declared, unused and unexported, and the
+        value that reached storage was a bare string — so widening the Literal
+        for T12 would have changed nothing anybody reads, and the two could
+        drift in either direction silently. The write site is now annotated
+        with the Literal, and this asserts the value that actually lands in the
+        payload is one of its members.
+        """
+
+        sql_backend, sessions = backend
+        activated = await sql_backend.activate_version(
+            component_kind="resolver",
+            component_name=RESOLVER_COMPONENT_NAME,
+            version=RESOLVER_V1.version,
+            actor="operator",
+        )
+        async with sessions() as session:
+            observation = await session.scalar(select(AnsichObservationRow).where(AnsichObservationRow.obs_id == activated.audit_obs_id))
+        assert observation is not None
+        assert observation.payload_json is not None
+        assert observation.payload_json["action_type"] in get_args(OperatorAuditActionType)
+        assert ACTIVATE_VERSION_ACTION in get_args(OperatorAuditActionType)
+        # Kept apart from the Task-scoped family on purpose: `OperatorActionView`
+        # requires a `task_id` no process-level action can have.
+        assert ACTIVATE_VERSION_ACTION not in get_args(TaskOperatorActionType)
+
+    @pytest.mark.anyio
     async def test_the_audit_row_mints_no_projection_or_assessor_work(
         self,
         backend: tuple[SqlAnsichBackend, async_sessionmaker],
@@ -2358,14 +2414,30 @@ class TestTheLatchIsNeverSetWithoutItsPointer:
     def test_the_writer_sets_the_two_fields_in_the_same_statement(self) -> None:
         """A source-level pin, because a run cannot prove an absence.
 
-        Every write of ``audit_recorded`` in the whole adapter must live in
+        Every write of ``audit_recorded`` the walk below recognises must live in
         ``activate_version`` and must be accompanied, in the *same* statement
         group, by a write of ``audit_obs_id`` to the audit Observation's id —
         never to ``None`` and never to a bare constant.
+
+        **This is a deliberate lower bound**, declared here the way this file's
+        other AST audits declare theirs (``TestOwnershipIsConservativeInFact``,
+        ``TestOwnedPrimaryKeysAreDerived``). It recognises four shapes: the ORM
+        constructor keyword, attribute assignment on a loaded row, and
+        ``update(...)/insert(...).values(audit_recorded=...)`` — the last two
+        added because they are what a future retention pass or repair tool
+        would most plausibly reach for, and are the shape the sibling tests
+        here already use to simulate expiry. It does **not** see raw
+        ``text(...)`` SQL, a `values()` built from a variable dict, or a write
+        through an aliased table object. What it catches is the class of
+        mistake, which is the point; it does not prove no shape can exist.
         """
 
         source = Path(sql_module.__file__).read_text(encoding="utf-8")
         tree = ast.parse(source)
+        # The walk must have teeth: a shape it cannot see is a shape it cannot
+        # police, so the recognised-shape list is asserted against a synthetic
+        # module before it is trusted against the real one.
+        probe = ast.parse("update(AnsichActiveVersionRow).values(audit_recorded=False)\nsqlite_insert(AnsichActiveVersionRow).values(audit_recorded=True)\n")
         writer: ast.AsyncFunctionDef | None = None
         for node in ast.walk(tree):
             if isinstance(node, ast.AsyncFunctionDef) and node.name == "activate_version":
@@ -2384,11 +2456,17 @@ class TestTheLatchIsNeverSetWithoutItsPointer:
             for node in ast.walk(scope):
                 if isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and node.func.id == "AnsichActiveVersionRow":
                     found += sum(1 for keyword in node.keywords if keyword.arg == "audit_recorded")
+                elif isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute) and node.func.attr == "values":
+                    # `update(...)/insert(...).values(audit_recorded=...)` — the
+                    # bulk shape the constructor/attribute forms do not cover.
+                    found += sum(1 for keyword in node.keywords if keyword.arg == "audit_recorded")
                 elif isinstance(node, ast.Assign):
                     for target in node.targets:
                         if isinstance(target, ast.Attribute) and target.attr == "audit_recorded":
                             found += 1
             return found
+
+        assert latch_writes(probe) == 2, "the walk must recognise the bulk values() shapes it claims to"
 
         # Nothing outside the writer touches the latch at all.
         assert latch_writes(tree) == latch_writes(writer)
@@ -2495,24 +2573,66 @@ class TestUnknownActivationTargetsAreRefusedTyped:
             assert (await session.scalar(select(func.count()).select_from(AnsichObservationRow))) == 0
 
     @pytest.mark.anyio
-    async def test_an_unattributed_switch_is_refused_before_anything_is_written(
+    @pytest.mark.parametrize("actor", ["   ", "x" * 200])
+    async def test_an_actor_the_audit_trail_cannot_carry_is_refused_typed(
         self,
         backend: tuple[SqlAnsichBackend, async_sessionmaker],
+        actor: str,
     ) -> None:
-        """An anonymous switch is not an audited one."""
+        """Review finding F3: blank and over-long, one typed refusal.
+
+        Blank because an unattributed switch is not an audited one. Over-long
+        because the actor is stored twice — the row's ``activated_by`` and the
+        Observation's ``producer.instance_id`` — and only the column width was
+        stopping it: SQLite stored an over-long value happily beside a
+        truncated second copy, so the audit trail disagreed with itself about
+        who acted, while PostgreSQL raised a raw driver error that is neither
+        ``ActiveVersionError`` nor ``RuntimeError`` and escaped the CLI's
+        handlers to exit ``1``. Both stores now refuse identically, before
+        anything is written.
+        """
 
         sql_backend, sessions = backend
 
-        with pytest.raises(ValueError, match="needs an actor"):
+        with pytest.raises(ActiveVersionError) as caught:
             await sql_backend.activate_version(
                 component_kind="resolver",
                 component_name=RESOLVER_COMPONENT_NAME,
                 version=RESOLVER_V1.version,
-                actor="   ",
+                actor=actor,
             )
 
+        assert caught.value.reason == "invalid_actor"
         async with sessions() as session:
             assert (await session.scalar(select(func.count()).select_from(AnsichObservationRow))) == 0
+            assert (await session.scalar(select(func.count()).select_from(AnsichActiveVersionRow))) == 0
+
+    def test_the_actor_bound_is_read_off_the_column_that_stores_it(self) -> None:
+        """Derived, not restated: both copies are ``String(128)``."""
+
+        assert ACTIVE_VERSION_ACTOR_MAX_LENGTH == AnsichActiveVersionRow.__table__.c.activated_by.type.length
+        assert AnsichObservationRow.__table__.c.producer_instance_id.type.length >= ACTIVE_VERSION_ACTOR_MAX_LENGTH
+
+    @pytest.mark.anyio
+    async def test_the_two_records_of_who_acted_agree_exactly(
+        self,
+        backend: tuple[SqlAnsichBackend, async_sessionmaker],
+    ) -> None:
+        """The row and the audit Observation are two records of one fact."""
+
+        sql_backend, sessions = backend
+        actor = "o" * ACTIVE_VERSION_ACTOR_MAX_LENGTH
+        activated = await sql_backend.activate_version(
+            component_kind="resolver",
+            component_name=RESOLVER_COMPONENT_NAME,
+            version=RESOLVER_V1.version,
+            actor=actor,
+        )
+        async with sessions() as session:
+            row = await session.get(AnsichActiveVersionRow, ("resolver", RESOLVER_COMPONENT_NAME))
+            observation = await session.scalar(select(AnsichObservationRow).where(AnsichObservationRow.obs_id == activated.audit_obs_id))
+        assert row is not None and observation is not None
+        assert row.activated_by == observation.producer_instance_id == actor
 
     def test_every_refusal_reason_is_reachable(self) -> None:
         """The literal and the branches that raise it stay in step."""
@@ -2523,6 +2643,7 @@ class TestUnknownActivationTargetsAreRefusedTyped:
             "unknown_component_kind",
             "unknown_component",
             "unknown_version",
+            "invalid_actor",
         }
 
 
@@ -2566,6 +2687,118 @@ class TestTheResolverReadConsultsTheRow:
         )
 
         assert await self._resolve(sql_backend, sessions, subject_id) == RESOLVER_V1.version
+
+    @pytest.mark.anyio
+    async def test_a_known_version_that_cannot_rank_the_evidence_falls_back_too(
+        self,
+        backend: tuple[SqlAnsichBackend, async_sessionmaker],
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """Review finding F1, reproduced then closed.
+
+        ``ansich-default@1.0.0`` is a version this build knows perfectly well,
+        so ``_active_resolver``'s unknown-version fallback never fires for it —
+        and its authority ladder omits ``soft_human``, which production writes
+        every time a run is rated. Before the guard, activating it made
+        ``resolve_current_belief`` raise inside the projector's/assessor's
+        transaction for every ``(subject, field)`` holding such an assertion:
+        an attempt charged, a durable failed job, and a re-collision on every
+        retry, for as long as the row stood.
+
+        The red half is asserted first — v1 genuinely cannot resolve this
+        evidence — so the green half below is not vacuous.
+        """
+
+        sql_backend, sessions = backend
+        subject_id = new_id()
+        soft = _assertion_row(assertion_id=new_id(), subject_id=subject_id, authority_class="soft_human", value="completed", offset_seconds=1)
+        async with sessions() as session:
+            session.add(_assertion_row(assertion_id=new_id(), subject_id=subject_id, authority_class="automated", value="running", offset_seconds=0))
+            session.add(soft)
+            await session.commit()
+
+        # Red: the active version, asked directly, refuses this evidence.
+        with pytest.raises(ValueError, match="soft_human"):
+            resolve_current_belief(
+                [
+                    BeliefAssertion.model_validate(
+                        {
+                            "assertion_id": soft.assertion_id,
+                            "subject_id": subject_id,
+                            "field_name": "control",
+                            "value": {"value": "completed"},
+                            "as_of": _OCCURRED_AT,
+                            "asserted_at": _OCCURRED_AT,
+                            "assessor": NamedVersion(name="test-assessor", version="1"),
+                            "config_hash": "0" * 64,
+                            "authority_class": "soft_human",
+                            "fidelity_class": "hard",
+                            "confidence": None,
+                            "evidence": (),
+                        }
+                    )
+                ],
+                resolver=RESOLVER_V1,
+            )
+
+        await sql_backend.activate_version(
+            component_kind="resolver",
+            component_name=RESOLVER_COMPONENT_NAME,
+            version=RESOLVER_V1.version,
+            actor="operator",
+        )
+
+        # Green: resolution still happens, under the code default, and the
+        # Belief records which resolver actually selected it.
+        with caplog.at_level("WARNING"):
+            async with sessions() as session:
+                await sql_backend._resolve_current_assessment(session, subject_id=subject_id, field_name="control")
+                await session.commit()
+        async with sessions() as session:
+            current = await session.get(AnsichCurrentBeliefRow, (subject_id, "control"))
+            assert current is not None
+            assert current.resolver_version == DEFAULT_RESOLVER.version
+            assert current.assertion_id == soft.assertion_id
+
+        # And the event is reported, naming the active version as the cause —
+        # otherwise the fallback reads as a defect in the evidence rather than
+        # as a consequence of a switch an operator can undo.
+        assert any(RESOLVER_V1.version in record.getMessage() and "falling back" in record.getMessage() for record in caplog.records)
+
+    @pytest.mark.anyio
+    async def test_the_fallback_warning_is_rate_limited_not_one_per_belief(
+        self,
+        backend: tuple[SqlAnsichBackend, async_sessionmaker],
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """Every Belief write in the process hits this condition while the row
+        stands, so an unthrottled line would bury the log in one row."""
+
+        sql_backend, _sessions = backend
+        with caplog.at_level("WARNING"):
+            for _ in range(5):
+                sql_backend._warn_active_resolver_degraded(RESOLVER_V1, ValueError("nope"))
+
+        emitted = [record for record in caplog.records if "falling back" in record.getMessage()]
+        assert len(emitted) == 1
+        assert sql_backend._suppressed_resolver_fallback_warning_count == 4
+
+    @pytest.mark.anyio
+    async def test_an_ordinary_resolver_error_is_not_swallowed_by_the_guard(
+        self,
+        backend: tuple[SqlAnsichBackend, async_sessionmaker],
+    ) -> None:
+        """The guard covers a *non-default* active resolver only.
+
+        With no row there is nothing to fall back to, so a ``ValueError`` means
+        what it always meant — a bug — and re-resolving with the identical
+        argument would only hide it.
+        """
+
+        sql_backend, sessions = backend
+        async with sessions() as session:
+            with pytest.raises(ValueError, match="at least one"):
+                await sql_backend._resolve_under_active_resolver(session, [])
 
     @pytest.mark.anyio
     async def test_a_version_this_build_cannot_run_falls_back_rather_than_raising(
@@ -2833,9 +3066,83 @@ class TestActiveVersionCli:
         assert replay_cli.main(["activate", "--component-kind", "projector", "--component-name", "task-step", "--version", "9", "--actor", "operator"]) == 2
         assert "unknown_version" in capsys.readouterr().err
 
-    def test_the_listing_marks_a_code_default_apart_from_a_switch(self) -> None:
-        from ansich.contracts import ActiveVersion
+    def test_the_no_upside_version_is_named_on_the_listing_and_before_the_switch(self) -> None:
+        """Review finding F1's operational column, surfaced where it is read.
 
+        ``ansich-default@1.0.0`` ranks every class it shares with ``@2.0.0``
+        identically, so it can never select a *different* assertion — its only
+        behavioural difference is that it cannot rank ``soft_human`` at all. An
+        operator deciding what to activate should be told that before, not
+        after.
+        """
+
+        caveat = active_version_caveat("resolver", RESOLVER_COMPONENT_NAME, RESOLVER_V1.version)
+        assert caveat is not None
+        assert "soft_human" in caveat
+        assert active_version_caveat("resolver", RESOLVER_COMPONENT_NAME, DEFAULT_RESOLVER.version) is None
+        assert active_version_caveat("projector", "task-step", "1") is None
+
+        rendered = replay_cli.render_versions(
+            (
+                ActiveVersion(
+                    component_kind="resolver",
+                    component_name=RESOLVER_COMPONENT_NAME,
+                    active_version=DEFAULT_RESOLVER.version,
+                    code_default_version=DEFAULT_RESOLVER.version,
+                    origin="code_default",
+                ),
+            ),
+            output_format="text",
+        )
+        # Carried per *known* version, so it is visible before the switch.
+        assert f"caveat ({RESOLVER_V1.version})" in rendered
+
+    def test_the_caveat_is_printed_before_the_activation_runs(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        order: list[str] = []
+
+        async def fake_activate(args: object) -> ActiveVersion:
+            order.append("ran")
+            return ActiveVersion(
+                component_kind="resolver",
+                component_name=RESOLVER_COMPONENT_NAME,
+                active_version=RESOLVER_V1.version,
+                code_default_version=DEFAULT_RESOLVER.version,
+                origin="activated_audited",
+                activated_at=_OCCURRED_AT,
+                activated_by="operator",
+                audit_obs_id=new_id(),
+            )
+
+        monkeypatch.setattr(replay_cli, "run_activate", fake_activate)
+        assert replay_cli.main(["activate", "--component-kind", "resolver", "--component-name", RESOLVER_COMPONENT_NAME, "--version", RESOLVER_V1.version, "--actor", "operator"]) == 0
+        captured = capsys.readouterr()
+        assert order == ["ran"]
+        assert "soft_human" in captured.err
+
+    def test_a_blank_actor_exits_two_rather_than_tracing_back(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        """Review finding F6: exit ``1`` here means "re-run me", which is wrong.
+
+        A bare ``ValueError`` escaped because ``except ActiveVersionError`` does
+        not catch its parent. The refusal is typed now *and* the parent clause
+        exists, so both paths land on ``2``.
+        """
+
+        async def refusing(args: object) -> object:
+            raise ValueError("an active-version switch needs an actor")
+
+        monkeypatch.setattr(replay_cli, "run_activate", refusing)
+        assert replay_cli.main(["activate", "--component-kind", "resolver", "--component-name", RESOLVER_COMPONENT_NAME, "--version", DEFAULT_RESOLVER.version, "--actor", "   "]) == 2
+        assert "activation refused" in capsys.readouterr().err
+
+    def test_the_listing_marks_a_code_default_apart_from_a_switch(self) -> None:
         rendered = replay_cli.render_versions(
             (
                 ActiveVersion(

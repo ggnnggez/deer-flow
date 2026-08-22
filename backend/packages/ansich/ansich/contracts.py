@@ -1133,6 +1133,23 @@ class ActiveVersionMismatch(BaseModel):
     the two moments is the *build*, not the request — a row that was legal when
     written is a mismatch after a rollback — which is why validating once at
     the write is not enough.
+
+    **What a mismatch is not, and must not be read as.** Every reason here is a
+    statement about whether this build *knows* the version. A version this
+    build knows perfectly well can still be **degraded at runtime** against the
+    evidence a particular store holds — ``ansich-default@1.0.0`` cannot rank a
+    ``soft_human`` assertion at all, so on a store that has any, it resolves
+    nothing and the read falls back to the code default. That row is *not*
+    reported here, and deliberately so: a startup scan for "does the store
+    contain a class this ladder cannot rank" answers a question that goes stale
+    the moment the next such assertion is written, so a clean answer would be a
+    promise nobody can keep, and calling it a "mismatch" would conflate "this
+    build does not know the version" with "this version is lossy on this data".
+    The runtime condition is handled where it can be handled honestly — at the
+    read, which falls back and says so in a rate-limited log naming the active
+    version — and it is visible up front through the CLI's caveat on the
+    versions listing and on the activation itself. An empty tuple here means
+    "every row names something this build can execute", nothing more.
     """
 
     model_config = ConfigDict(frozen=True)

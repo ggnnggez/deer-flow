@@ -306,6 +306,12 @@ async def compare_releases(
         () if right_quality is None else right_quality.cohorts,
         min_samples=settings.min_cohort_samples,
         unexplained_loss=service.get_health().loss_detected,
+        # The store's own active selection, not the build's constant: since the
+        # active-version row exists those are two different facts, and stamping
+        # the constant made this field a claim nobody had checked. The read is
+        # fail-open and served from the same per-process cache the write path
+        # uses, so it cannot fail the comparison or disagree with it.
+        resolver=await service.get_active_resolver(),
     )
     return {
         "comparison": comparison.model_dump(mode="json"),

@@ -80,6 +80,7 @@ from deerflow.ansich.persistence.sql import (
     ACTIVE_VERSION_COMPONENT_KINDS,
     SqlAnsichBackend,
     _active_version_registry,
+    active_version_caveat,
 )
 from deerflow.ansich.replay import DEFAULT_MAX_ROUNDS, execute_replay, plan_replay
 from deerflow.config import get_app_config
@@ -296,6 +297,10 @@ def render_versions(active: tuple[ActiveVersion, ...], *, output_format: str) ->
             "activated_by": entry.activated_by,
             "audit_obs_id": entry.audit_obs_id,
             "known_versions": list(registry[(entry.component_kind, entry.component_name)][0]),
+            # Per *known* version, not only the active one: this listing is what
+            # an operator reads while deciding what to switch to, so a caveat
+            # that only appeared after the switch would be told too late.
+            "version_caveats": {version: caveat for version in registry[(entry.component_kind, entry.component_name)][0] if (caveat := active_version_caveat(entry.component_kind, entry.component_name, version)) is not None},
         }
         for entry in active
     ]
@@ -306,6 +311,8 @@ def render_versions(active: tuple[ActiveVersion, ...], *, output_format: str) ->
         marker = " (code default)" if row["origin"] == "code_default" else f" ({row['origin']}, by {row['activated_by']})"
         lines.append(f"{row['component_kind']}/{row['component_name']}: {row['active_version']}{marker}")
         lines.append(f"    code default: {row['code_default_version']}    known: {', '.join(row['known_versions'])}")
+        for version, caveat in sorted(row["version_caveats"].items()):
+            lines.append(f"    caveat ({version}): {caveat}")
     return "\n".join(lines)
 
 
@@ -344,10 +351,24 @@ async def run_versions(_args: argparse.Namespace) -> tuple[ActiveVersion, ...]:
 
 
 def _main_activate(args: argparse.Namespace) -> int:
+    caveat = active_version_caveat(args.component_kind, args.component_name, args.version)
+    if caveat is not None:
+        # Before the write, because the operator's decision is whether to make
+        # it at all — the same placement, and the same reasoning, as the
+        # known-defect warning on the replay path.
+        print(f"warning: {caveat}", file=sys.stderr)
     try:
         activated = asyncio.run(run_activate(args))
     except ActiveVersionError as error:
         print(f"activation refused ({error.reason}): {error}", file=sys.stderr)
+        return 2
+    except ValueError as error:
+        # `ActiveVersionError` is itself a `ValueError`, and `except` on the
+        # subclass does not catch the parent — so without this clause any other
+        # refusal shaped as a bad argument (a validator on the envelope, say)
+        # escaped as a traceback and exited `1`, the code this CLI publishes as
+        # "the pass ran and work is owed; re-run me". A refusal must exit `2`.
+        print(f"activation refused: {error}", file=sys.stderr)
         return 2
     except RuntimeError as error:
         print(f"activation unavailable: {error}", file=sys.stderr)

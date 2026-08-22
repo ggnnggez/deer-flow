@@ -65,6 +65,17 @@ class QualityComparisonView(BaseModel):
 
     ``observed_delta`` is exactly that — an observed difference, never a
     significance claim. It is populated only when the pair is comparable.
+
+    ``resolver`` names **the Belief resolver this store currently selects
+    with** — the active-version selection, or the code default when nothing was
+    activated — and it is deliberately not a per-cell claim. Each aggregated
+    assertion carries its own resolver on its ``ansich_current_beliefs`` row,
+    and after an active-version switch (or during the bounded window in which
+    two workers have not yet converged on one) those rows can legitimately
+    disagree with each other and with this field. Read it as "the precedence
+    semantics in force for this comparison", never as "the version that
+    selected every assertion underneath it"; the per-row stamp is where that
+    question is answered.
     """
 
     model_config = ConfigDict(extra="forbid", frozen=True, strict=True)
@@ -86,6 +97,7 @@ def compare_release_quality(
     *,
     min_samples: int,
     unexplained_loss: bool,
+    resolver: NamedVersion = DEFAULT_RESOLVER,
 ) -> tuple[QualityComparisonView, ...]:
     """Compare two releases' quality cells under the cohort comparability rules.
 
@@ -105,6 +117,14 @@ def compare_release_quality(
     The delta is ``right - left`` on the mean score when both sides carry one,
     and on the pass rate (``pass_count / assessed_count``) otherwise, which is
     the only comparable summary a verdict-only cohort has.
+
+    ``resolver`` is stamped onto every comparison and defaults to the code
+    default. A caller with a store to consult should pass that store's **active**
+    resolver instead: since the active-version row exists, the build's default
+    and what the store actually selects with are two different facts, and
+    reading a constant here while the store had been switched made the field a
+    claim nobody had checked. This module stays framework-independent — it takes
+    the answer, it does not go looking for it.
     """
 
     left_cells = {(cell.dimension, cell.cohort_key): cell for cell in left}
@@ -135,9 +155,10 @@ def compare_release_quality(
                     min_samples=min_samples,
                     unexplained_loss=unexplained_loss,
                 ),
-                # The Belief resolver that selected the current assertions these
-                # cells aggregate; comparisons inherit its precedence semantics.
-                resolver=DEFAULT_RESOLVER,
+                # The resolver in force for this comparison; see the field's
+                # note on why that is not the same as "what selected every
+                # assertion underneath".
+                resolver=resolver,
             )
         )
     return tuple(comparisons)

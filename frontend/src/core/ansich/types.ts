@@ -234,24 +234,6 @@ export interface AnsichProjectorHealth {
 }
 
 /**
- * Database-side projection truth, merged into `GET /health` beside the process
- * block (P11-B §4).
- *
- * `status` is the field every other one is conditional on: when it is
- * `unreachable` the projector rows are empty and every number is `null`. `null`
- * means unknown here and nowhere means zero — a block that could not be read
- * must never render as "0ms behind, 0 failed jobs". The process block is still
- * served in full either way, because `GET /health` stays the one Ansich route
- * that answers while storage is down; the panel mirrors that by keeping the
- * process-side numbers visible under an explicit unreachable banner.
- *
- * `failed_jobs` here is the **authoritative** count, read live from both job
- * tables across every worker; `AnsichHealth.failed_jobs` keeps its name and its
- * process-local, advisory meaning. `stale_completion_count` is the one field in
- * this block that is not database truth at all: it is the reporting worker's
- * own count of writes dropped because the job had been taken over.
- */
-/**
  * Where one component's running version came from, and how well the switch is
  * evidenced.
  *
@@ -298,6 +280,24 @@ export interface AnsichActiveVersion {
   audit_obs_id: string | null;
 }
 
+/**
+ * Database-side projection truth, merged into `GET /health` beside the process
+ * block (P11-B §4).
+ *
+ * `status` is the field every other one is conditional on: when it is
+ * `unreachable` the projector rows are empty and every number is `null`. `null`
+ * means unknown here and nowhere means zero — a block that could not be read
+ * must never render as "0ms behind, 0 failed jobs". The process block is still
+ * served in full either way, because `GET /health` stays the one Ansich route
+ * that answers while storage is down; the panel mirrors that by keeping the
+ * process-side numbers visible under an explicit unreachable banner.
+ *
+ * `failed_jobs` here is the **authoritative** count, read live from both job
+ * tables across every worker; `AnsichHealth.failed_jobs` keeps its name and its
+ * process-local, advisory meaning. `stale_completion_count` is the one field in
+ * this block that is not database truth at all: it is the reporting worker's
+ * own count of writes dropped because the job had been taken over.
+ */
 export interface AnsichDatabaseHealth {
   status: "reachable" | "unreachable";
   projectors: AnsichProjectorHealth[];

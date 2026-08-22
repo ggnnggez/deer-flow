@@ -169,10 +169,20 @@ class ReplayTargetError(ValueError):
 #:   the version asked for. Deploy the build that does; activating a version
 #:   this process cannot execute would leave a row every reader has to
 #:   fall back from.
+#: * ``invalid_actor`` — the actor is blank or longer than the column that has
+#:   to hold it. It is a *typed* refusal rather than a bare ``ValueError``
+#:   because both halves otherwise fail late and differently: a blank actor
+#:   makes an unattributed switch (which is not an audited one), and an
+#:   over-long one is refused only by accident of the column width — silently
+#:   truncated on SQLite, where the row's ``activated_by`` and the audit
+#:   Observation's producer identity then disagree about who acted, and raised
+#:   as a raw driver error on PostgreSQL, which escapes every handler a CLI has
+#:   and exits on the code that means "re-run me".
 ActiveVersionRefusal = Literal[
     "unknown_component_kind",
     "unknown_component",
     "unknown_version",
+    "invalid_actor",
 ]
 
 

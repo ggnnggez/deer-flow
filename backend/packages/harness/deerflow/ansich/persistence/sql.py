@@ -94,6 +94,7 @@ from ansich.belief.resolver import (
     DEFAULT_RESOLVER,
     RESOLVER_V1,
     BeliefAssertion,
+    ResolvedBelief,
     resolve_current_belief,
 )
 from ansich.budget import (
@@ -160,7 +161,7 @@ from ansich.operations import (
     assess_dwell,
     assess_heartbeat,
 )
-from ansich.operator import OperatorActionView, TaskActionTarget
+from ansich.operator import OperatorActionView, OperatorAuditActionType, TaskActionTarget
 from ansich.process_health import (
     MAX_PROCESS_ALERT_EVIDENCE,
     NON_VERDICT_VALUE_KEYS,
@@ -431,6 +432,53 @@ ACTIVE_VERSION_COMPONENT_KINDS: tuple[str, ...] = ("projector", "resolver")
 #: registry, so the name is taken from the constant rather than restated —
 #: renaming the resolver must not silently orphan its active-version row.
 RESOLVER_COMPONENT_NAME = DEFAULT_RESOLVER.name
+#: How long an actor may be, read off the column that stores it rather than
+#: restated. Both copies of the actor — ``activated_by`` and the audit
+#: Observation's ``producer.instance_id`` — are ``String(128)``, so one bound
+#: covers both and a schema change moves it without a second edit. Deriving it
+#: is the point: the previous code truncated one copy to 128 and wrote the other
+#: untruncated, so an over-long actor left an audit trail whose two records of
+#: who acted did not agree.
+ACTIVE_VERSION_ACTOR_MAX_LENGTH: int = AnsichActiveVersionRow.__table__.c.activated_by.type.length or 128
+#: The value that reaches ``payload["action_type"]`` on an activation's audit
+#: Observation, **typed** rather than written as a bare string at the write
+#: site. The annotation is what makes the shared
+#: :data:`~ansich.operator.OperatorAuditActionType` do structural work: a member
+#: removed or renamed there fails type checking here, and a test asserts the
+#: written payload's value is one of the Literal's members — otherwise widening
+#: that Literal would be a coordination that changes nothing anybody reads.
+ACTIVATE_VERSION_ACTION: OperatorAuditActionType = "activate_version"
+#: Caveats an operator should see *before* activating a version this build can
+#: run but should probably not be asked to. Keyed ``(kind, name, version)``.
+#:
+#: The one member today is not a style note. ``ansich-default@1.0.0`` and
+#: ``@2.0.0`` rank the four authority classes they share in the *same* relative
+#: order (``human_override > deterministic > configured_rule > automated``);
+#: v2's only change is inserting ``soft_human`` between ``configured_rule`` and
+#: ``automated``. So for any assertion set v1 can resolve at all, v1 and v2
+#: select the **identical** assertion — the single behavioural difference
+#: between the two versions is that v1 *raises* on a ``soft_human`` assertion,
+#: which production writes every time a run is rated. There is no outcome an
+#: operator can obtain by activating v1 that v2 does not already give them.
+#: Activating it is still allowed (a build may legitimately want v1's
+#: reproducibility on a store that holds no soft-human evidence), and the read
+#: side no longer breaks when it happens — but the operator is told.
+_ACTIVE_VERSION_CAVEATS: dict[tuple[str, str, str], str] = {
+    ("resolver", RESOLVER_COMPONENT_NAME, RESOLVER_V1.version): (
+        f"{RESOLVER_V1.name}@{RESOLVER_V1.version} ranks every authority class it shares with "
+        f"@{DEFAULT_RESOLVER.version} identically, so it can never select a different assertion — "
+        "its only behavioural difference is that it cannot rank `soft_human` at all (user feedback "
+        "and developer annotations produce it), and such a Belief is resolved by the code default instead."
+    ),
+}
+
+
+def active_version_caveat(component_kind: str, component_name: str, version: str) -> str | None:
+    """The caveat for one ``(kind, name, version)``, if this build has one."""
+
+    return _ACTIVE_VERSION_CAVEATS.get((component_kind, component_name, version))
+
+
 #: How long a reader's cached active-version map is trusted before it is read
 #: again. It is the **cross-worker convergence bound** and that is the whole
 #: reason it is not ``None``: see ``get_active_versions``.
@@ -1957,6 +2005,12 @@ _UNREADABLE_LOSS_PRODUCER = "<unreadable>"
 #: ongoing — and this pass runs once a second, so an unconditional line per tick
 #: is exactly the flood the assessment-failure reporter forbids.
 _OBSERVABILITY_LOSS_WARNING_INTERVAL_SECONDS = 60.0
+#: The active-resolver fallback WARNING's own suppression window, on the same
+#: discipline and for a sharper version of the same reason: an active row that
+#: cannot judge the evidence stands until an operator changes it, and *every*
+#: Belief write in the process hits it, so an unthrottled line would bury the
+#: log in one row's consequences.
+_RESOLVER_FALLBACK_WARNING_INTERVAL_SECONDS = 60.0
 
 
 def _verdict_value(value: object) -> dict[str, object]:
@@ -2062,6 +2116,11 @@ class SqlAnsichBackend:
         # default). See ``get_active_versions`` for the staleness contract.
         self._active_version_cache: dict[tuple[str, str], _ActiveVersionRecord] | None = None
         self._active_version_cache_at: float = 0.0
+        # Rate-limit state for the active-resolver fallback line. The condition
+        # it reports is sustained (a row stands until an operator changes it),
+        # so it needs the same throttle the loss-scan warning has.
+        self._last_resolver_fallback_warning_at: float | None = None
+        self._suppressed_resolver_fallback_warning_count = 0
         self._context_metrics = {
             "snapshot_count": 0,
             "snapshot_item_count": 0,
@@ -2658,6 +2717,19 @@ class SqlAnsichBackend:
             overrides = await self._active_version_overrides(session)
         return self._merge_active_versions(overrides)
 
+    async def get_active_resolver(self) -> NamedVersion:
+        """The Belief resolver this store currently selects with.
+
+        The public form of :meth:`_active_resolver`, for a reader that has no
+        session of its own — the release-quality comparison is the first, and it
+        needs *the same* answer the write path uses, not a second derivation of
+        it. Reads through the same per-process cache, so the two can only
+        disagree by one cache refresh, never by construction.
+        """
+
+        async with self._session_factory() as session:
+            return await self._active_resolver(session)
+
     async def _active_resolver(self, session: AsyncSession) -> NamedVersion:
         """The Belief resolver this store's current selection says to use.
 
@@ -2693,6 +2765,92 @@ class SqlAnsichBackend:
             )
             return DEFAULT_RESOLVER
         return resolver
+
+    def _warn_active_resolver_degraded(self, resolver: NamedVersion, error: Exception) -> None:
+        """Say that the active resolver could not judge this evidence.
+
+        Rate-limited on the same shape as ``_warn_loss_scan_truncated``, and for
+        the same reason: the condition is *sustained* by construction — the row
+        stands until an operator changes it, and every Belief write in the
+        process hits it — so an un-throttled line would bury the log in a
+        message about one row. Fail-open around the emit, because this runs
+        inside an assessor's transaction where a raising handler would abort
+        real work over a diagnostic.
+
+        The active version is named, because it is the cause: without it the
+        line reads as a defect in the evidence rather than as a consequence of
+        a deliberate switch an operator can undo.
+        """
+
+        now = time.monotonic()
+        last = self._last_resolver_fallback_warning_at
+        if last is not None and now - last < _RESOLVER_FALLBACK_WARNING_INTERVAL_SECONDS:
+            self._suppressed_resolver_fallback_warning_count += 1
+            return
+        suppressed = self._suppressed_resolver_fallback_warning_count
+        try:
+            logger.warning(
+                "Ansich active Belief resolver %s@%s could not resolve this evidence (%s); falling back to the code default %s@%s. Deactivate the row to stop this. (%d further occurrence(s) suppressed since the last line)",
+                resolver.name,
+                resolver.version,
+                error,
+                DEFAULT_RESOLVER.name,
+                DEFAULT_RESOLVER.version,
+                suppressed,
+            )
+        except Exception:  # pragma: no cover - a logging handler that raises
+            self._suppressed_resolver_fallback_warning_count = suppressed + 1
+            return
+        self._last_resolver_fallback_warning_at = now
+        self._suppressed_resolver_fallback_warning_count = 0
+
+    async def _resolve_under_active_resolver(
+        self,
+        session: AsyncSession,
+        assertions: list[BeliefAssertion],
+    ) -> ResolvedBelief:
+        """Resolve with the active resolver, falling back when it cannot judge.
+
+        The one live consult of the active-version row (RC5). Absent row ⇒
+        ``DEFAULT_RESOLVER``, which is the constant this call passed before the
+        row existed, so a store with an empty table behaves identically.
+
+        **The fallback covers a *known* version that raises, not only an
+        unknown one, and that is the whole point of this method.**
+        ``_active_resolver`` already falls back for a version this build cannot
+        name; it cannot help with the version this feature actually offers.
+        ``ansich-default@1.0.0``'s authority ladder omits ``soft_human``, and
+        ``soft_human`` is written in production every time someone rates a run
+        (``_evaluation_authority_class`` maps ``user_feedback`` to it) — so
+        ``resolve_current_belief`` raises for any ``(subject, field)`` holding
+        such an assertion. That raise lands inside the projector's or
+        assessor's transaction, charges an attempt, and walks the job to a
+        durable failure that re-collides on every retry, for as long as the row
+        stands. Catching it here is the same fail-open argument
+        ``_active_resolver`` is written on, applied to the branch that can
+        actually fire.
+
+        **Only a non-default active resolver is guarded**, deliberately. With
+        no row (or a row naming the code default) there is nothing to fall back
+        *to*, and a ``ValueError`` then means what it has always meant — empty
+        input, mismatched subjects, an authority class the current ladder does
+        not know — a bug that must not be swallowed into a silent re-resolve
+        with the identical argument.
+
+        What this does **not** do is make the switch harmless. It makes it
+        *non-destructive*: Beliefs keep being written, and each one records the
+        resolver that actually selected it, so an operator reading
+        ``ansich_current_beliefs`` sees the fallback rather than inferring it.
+        """
+
+        resolver = await self._active_resolver(session)
+        if resolver == DEFAULT_RESOLVER:
+            return resolve_current_belief(assertions, resolver=resolver)
+        try:
+            return resolve_current_belief(assertions, resolver=resolver)
+        except ValueError as error:
+            self._warn_active_resolver_degraded(resolver, error)
+            return resolve_current_belief(assertions, resolver=DEFAULT_RESOLVER)
 
     def _validate_activation_request(
         self,
@@ -2737,6 +2895,53 @@ class SqlAnsichBackend:
                 component_name=component_name,
                 version=version,
             )
+
+    @staticmethod
+    def _validated_actor(
+        actor: str,
+        *,
+        component_kind: str,
+        component_name: str,
+        version: str,
+    ) -> str:
+        """Refuse an actor the audit trail could not carry faithfully.
+
+        Both halves are checked here, before any write, rather than left to the
+        column and to ``Producer``'s ``min_length``.
+
+        *Blank* — an anonymous switch is not an audited one, and ``Producer``
+        would refuse it with a message about a field the caller never named.
+
+        *Too long* — this is the half that was silently wrong. The row's
+        ``activated_by`` and the Observation's ``producer.instance_id`` are two
+        records of the same fact, so they must be **one** value: truncating one
+        of them makes the audit trail disagree with itself on SQLite (which
+        stores an over-long string happily) while PostgreSQL raises a raw
+        driver error that is neither ``ActiveVersionError`` nor
+        ``RuntimeError`` — it escapes the CLI's handlers entirely and exits
+        ``1``, the code this CLI publishes as "the pass ran and work is owed;
+        re-run", which is the one reading that is wrong. Refusing up front makes
+        both stores agree and both exit ``2``.
+        """
+
+        actor = actor.strip()
+        if not actor:
+            raise ActiveVersionError(
+                "an active-version switch needs an actor; an unattributed switch is not an audited one",
+                reason="invalid_actor",
+                component_kind=component_kind,
+                component_name=component_name,
+                version=version,
+            )
+        if len(actor) > ACTIVE_VERSION_ACTOR_MAX_LENGTH:
+            raise ActiveVersionError(
+                f"actor is {len(actor)} characters; the audit trail stores at most {ACTIVE_VERSION_ACTOR_MAX_LENGTH} and must store the same value in both places",
+                reason="invalid_actor",
+                component_kind=component_kind,
+                component_name=component_name,
+                version=version,
+            )
+        return actor
 
     @staticmethod
     def _activation_observation(
@@ -2788,12 +2993,15 @@ class SqlAnsichBackend:
             producer=Producer(
                 name="ansich-active-version",
                 version="1",
-                instance_id=actor[:128],
+                # Not truncated: `_validated_actor` already bounded it, so
+                # this is the same string the row stores. Truncating here is
+                # what let the two records of who acted disagree.
+                instance_id=actor,
             ),
             source_event_id=f"active-version:{component_kind}:{component_name}:{version}:{activation_id}",
             correlation_id=activation_id,
             payload={
-                "action_type": "activate_version",
+                "action_type": ACTIVATE_VERSION_ACTION,
                 "status": "succeeded",
                 "component_kind": component_kind,
                 "component_name": component_name,
@@ -2849,14 +3057,12 @@ class SqlAnsichBackend:
             component_name=component_name,
             version=version,
         )
-        # An anonymous switch is not an audited one, and the actor is carried
-        # in two places (the row and the Observation's producer identity), so
-        # it is checked here rather than left to `Producer`'s `min_length` —
-        # which would refuse it too, with a message about a field the caller
-        # never named.
-        actor = actor.strip()
-        if not actor:
-            raise ValueError("an active-version switch needs an actor; an unattributed switch is not an audited one")
+        actor = self._validated_actor(
+            actor,
+            component_kind=component_kind,
+            component_name=component_name,
+            version=version,
+        )
         activation_id = new_id()
         occurred_at = datetime.now(UTC)
         observation = self._activation_observation(
@@ -5229,7 +5435,7 @@ class SqlAnsichBackend:
         # would be a much larger change than a row lookup: it would have to
         # teach the dispatch to discriminate first, or every switch would
         # silently keep running v1 while claiming v2.
-        resolved = resolve_current_belief(assertions, resolver=await self._active_resolver(session))
+        resolved = await self._resolve_under_active_resolver(session, assertions)
         current = await session.get(
             AnsichCurrentBeliefRow,
             (subject_id, field_name),

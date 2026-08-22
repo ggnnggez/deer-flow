@@ -2203,12 +2203,29 @@ version it cannot execute is ignore it. Refusing at the write is not enough on
 its own, which is why validation is re-asked at every start (below): a build can
 be rolled back underneath a row that was legal when written.
 
+The fourth refusal, `invalid_actor`, bounds the actor (blank, or longer than
+`ACTIVE_VERSION_ACTOR_MAX_LENGTH` — read off `activated_by`'s column rather than
+restated). It is typed rather than left to the column because the actor is
+stored **twice**, on the row and as the audit Observation's
+`producer.instance_id`, and those are two records of one fact: truncating one
+made the audit trail disagree with itself about who acted on SQLite, while
+PostgreSQL raised a raw `StringDataRightTruncationError` that is neither
+`ActiveVersionError` nor `RuntimeError`, escaped the CLI's handlers, and exited
+`1` — the code this CLI publishes as "work is owed; re-run me". Both stores now
+refuse identically and exit `2`. The CLI additionally catches bare `ValueError`
+(`ActiveVersionError` *is* one, and `except` on a subclass does not catch its
+parent), so no refusal can reach a traceback and the wrong exit code.
+
 **The row and its audit Observation are written in one transaction.** A crash
 between them must leave neither: a row with no audit is an unaccountable version
 switch, and an audit with no row is an audit of something that did not happen.
 The audit is an `operator.action_succeeded` carrying
-`payload.action_type="activate_version"` — a member of the new
-`ansich.operator.OperatorAuditActionType` family (process-scoped operator actions
+`payload.action_type="activate_version"` — written through the **typed**
+`sql.py::ACTIVATE_VERSION_ACTION` constant, not a bare string, so the shared
+`ansich.operator.OperatorAuditActionType` Literal does structural work (a test
+asserts the value that lands in the payload is one of its members; without that,
+widening the Literal for the raw-payload-read audit would be a coordination
+nothing reads). It is a member of that family (process-scoped operator actions
 that own no `ansich_operator_actions` ledger row, kept apart from
 `TaskOperatorActionType`'s `interrupt`/`rollback`, whose `OperatorActionView` has
 a required `task_id` no process-level action can have). It is subjected to
@@ -2247,12 +2264,44 @@ versions — which is tolerable only because it is *recorded*:
 each Belief, so the split is legible afterwards instead of silent.
 
 **One live consult exists, and it is the Belief resolver.**
-`_resolve_current_assessment` passes `await self._active_resolver(session)` where
-it used to pass the `DEFAULT_RESOLVER` constant; an absent row yields that same
-constant, so an empty table behaves identically. A version this build cannot
-execute **falls back to the code default with a warning rather than raising** —
-the raise would land inside an assessor's transaction and stop every Belief write
-in the process for as long as the stale row stood. The **projector half of
+`_resolve_current_assessment` goes through `_resolve_under_active_resolver`,
+which passes the active row's resolver where the code used to pass the
+`DEFAULT_RESOLVER` constant; an absent row yields that same constant, so an empty
+table behaves identically. Two fallbacks, and the second is the one that matters
+in practice. A version this build cannot **name** falls back in
+`_active_resolver`. A version this build knows and that **cannot rank the
+evidence** falls back at the call itself, guarded on `ValueError`:
+`ansich-default@1.0.0`'s authority ladder omits `soft_human`, and production
+writes `soft_human` every time a run is rated (`_evaluation_authority_class`
+maps `user_feedback` to it), so before the guard, activating the one non-default
+resolver this feature offers made `resolve_current_belief` raise inside the
+projector's/assessor's transaction for every `(subject, field)` holding such an
+assertion — an attempt charged, a durable failed job, a `projection_failure`
+Alert, and a re-collision on every retry, for as long as the row stood. The
+guard is scoped to a **non-default** active resolver on purpose: with no row
+there is nothing to fall back *to*, and a `ValueError` there means what it always
+meant (empty input, mismatched subjects, a class the current ladder does not
+know) and must not be swallowed into a silent re-resolve with the identical
+argument. The fallback is reported through `_warn_active_resolver_degraded`,
+rate-limited on the same discipline as `_warn_loss_scan_truncated` (the condition
+is sustained by construction — the row stands until an operator changes it, and
+every Belief write hits it) and naming the active version as the cause, because
+otherwise the line reads as a defect in the evidence rather than as a consequence
+of a switch someone can undo.
+
+**`ansich-default@1.0.0` has no upside, and the CLI says so.** It ranks every
+authority class it shares with `@2.0.0` in the same relative order — v2's only
+change is inserting `soft_human` between `configured_rule` and `automated` — so
+for any assertion set v1 can resolve, both versions select the *identical*
+assertion. Its single behavioural difference is the raise above. That fact is
+carried in `sql.py::_ACTIVE_VERSION_CAVEATS` (keyed `(kind, name, version)`,
+read through `active_version_caveat()`), rendered by the `versions` listing for
+every **known** version rather than only the active one — an operator reads that
+listing while deciding what to switch *to* — and printed on stderr **before**
+`activate` runs, the same placement and reasoning as the replay's known-defect
+warning. Activating it is still allowed (a build may want v1's reproducibility
+on a store holding no soft-human evidence) and no longer breaks anything.
+The **projector half of
 "active" is deliberately not consulted by live ingest**: `project_pending`'s
 dispatch branches on `projector_name` alone and is blind to the version, and
 `persist_and_project` fans out to `_PROJECTORS`, so an activated projector
@@ -2273,6 +2322,33 @@ fail-open passthroughs (a backend without the method answers `None`); the servic
 deliberately does **not** call validation from `start()`, because where in
 `start()` it runs and what a mismatch costs belongs to the startup task.
 
+**What validation deliberately does not report**, written on
+`ActiveVersionMismatch` itself: every reason is a statement about whether this
+build *knows* the version. A version it knows can still be **degraded at
+runtime** against the evidence a particular store holds (the `soft_human` case
+above), and that row comes back clean here. A startup `SELECT DISTINCT
+authority_class` was considered and rejected — it answers a question that goes
+stale the moment the next such assertion is written, so a clean answer would be a
+promise nobody can keep, and calling it a "mismatch" would conflate "this build
+cannot execute this version" with "this version is lossy on this data". The
+runtime condition is handled where it can be handled honestly: the read falls
+back and says so, and the CLI names the caveat before the switch.
+
+`AnsichService.get_active_resolver()` / `SqlAnsichBackend.get_active_resolver()`
+are the read for a caller with no session of its own, served from the same
+per-process cache so it cannot disagree with the write path by construction. Its
+first consumer is `compare_release_quality`, which used to stamp every
+`QualityComparisonView` with the `DEFAULT_RESOLVER` constant while its comment
+claimed the field named what selected the aggregated assertions. That was true
+until this row existed. The function now takes a `resolver` argument (still
+defaulting to the constant — `quality.py` stays framework-independent and takes
+the answer rather than going looking for it), the route passes the store's active
+one, and the field's docstring is relabelled honestly: it names the precedence
+semantics **in force for this comparison**, never the version that selected every
+assertion underneath it — each aggregated row carries its own resolver stamp, and
+after a switch (or inside the convergence window) those can legitimately
+disagree.
+
 Health carries it: `DatabaseHealth.active_versions` is
 `tuple[ActiveVersion, ...] | None`, folded in by the backend itself so the
 block's reachability and its version list cannot be assembled from two reads and
@@ -2286,7 +2362,15 @@ runs, the code default, the executable set). Tests:
 failure, the latch pins, typed refusals, UPSERT with a new audit, the resolver
 consult and its fallback, cache invalidation and the cross-worker window,
 validation's three states, the CLI) and `tests/ansich/test_database_health.py`
-(the health field and its route merge).
+(the health field and its route merge). The write path is also proved once on a
+real server:
+`tests/integration/test_postgres_multiworker.py::test_activate_version_writes_row_and_audit_atomically_on_postgres`
+covers the three things SQLite cannot answer — the flush-before-pointer ordering
+under **enforced** foreign keys (`tests/ansich/conftest.py` leaves
+`PRAGMA foreign_keys` off), a server-side `ROLLBACK` of an audit INSERT that
+really executed (asserted by reading the row back *inside* the doomed
+transaction, so a two-transaction implementation could not pass), and the
+`String(128)` bound PostgreSQL raises on and SQLite ignores.
 
 **Workspace change review**: `packages/harness/deerflow/workspace_changes/`
 captures a pre-run and post-run snapshot of the thread-owned `workspace` and
