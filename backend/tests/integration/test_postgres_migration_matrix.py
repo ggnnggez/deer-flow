@@ -309,6 +309,106 @@ async def test_bootstrap_schema_branches_on_postgres() -> None:
 
 
 # ---------------------------------------------------------------------------
+# 4b. 0028's constraints on the real dialect
+# ---------------------------------------------------------------------------
+
+
+async def _expect_integrity_error(engine: AsyncEngine, statement: str, parameters: dict) -> None:
+    """Run *statement* in its own transaction and require it to be refused.
+
+    Its own transaction because a failed statement aborts the surrounding one
+    on postgres -- sharing it would make every later assertion fail for the
+    wrong reason.
+    """
+    with pytest.raises(sa.exc.IntegrityError):
+        async with engine.begin() as conn:
+            await conn.execute(sa.text(statement), parameters)
+
+
+async def test_retention_constraints_hold_on_postgres() -> None:
+    """``0028``'s three checks, executed by the server rather than by SQLite.
+
+    SQLite enforces CHECK constraints too, so this is not about whether the
+    rule exists -- it is about whether the revision *renders* on this dialect.
+    ``0028`` is the batch's only migration and it is the one that alters an
+    existing column's nullability, which takes a table recreate on SQLite and a
+    plain ``ALTER ... DROP NOT NULL`` here; the two paths are different enough
+    that the SQLite proof says nothing about this one.
+    """
+    payload = {
+        "payload_id": "payload-pg-1",
+        "content_type": "application/json",
+        "encoding": "utf-8",
+        "compression": "none",
+        "byte_size": 4,
+        "sha256": "a" * 64,
+    }
+    async with _postgres_engine() as engine:
+        await _upgrade(engine)
+
+        tables = await _table_names(engine)
+        assert {"ansich_retention_state", "ansich_active_versions"} <= tables
+
+        # A live payload, then the same row tombstoned: body released, lineage kept.
+        async with engine.begin() as conn:
+            await conn.execute(
+                sa.text("INSERT INTO ansich_payloads (payload_id, content_type, encoding, compression, byte_size, sha256, body, created_at) VALUES (:payload_id, :content_type, :encoding, :compression, :byte_size, :sha256, :body, now())"),
+                {**payload, "body": b"{}\n\n"},
+            )
+            await conn.execute(
+                sa.text("UPDATE ansich_payloads SET body = NULL, deleted_at = now(), policy = 'raw_payload_days=7' WHERE payload_id = :payload_id"),
+                {"payload_id": payload["payload_id"]},
+            )
+        async with engine.connect() as conn:
+            row = (await conn.execute(sa.text("SELECT body, deleted_at, policy, sha256, byte_size FROM ansich_payloads WHERE payload_id = :payload_id"), {"payload_id": payload["payload_id"]})).one()
+        assert row.body is None
+        assert row.deleted_at is not None
+        assert (row.sha256, row.byte_size) == ("a" * 64, 4)
+
+        # Both halves at once, and neither half: each refused.
+        await _expect_integrity_error(
+            engine,
+            "INSERT INTO ansich_payloads (payload_id, content_type, encoding, compression, byte_size, sha256, body, deleted_at, created_at) "
+            "VALUES (:payload_id, :content_type, :encoding, :compression, :byte_size, :sha256, :body, now(), now())",
+            {**payload, "payload_id": "payload-pg-both", "body": b"{}"},
+        )
+        await _expect_integrity_error(
+            engine,
+            "INSERT INTO ansich_payloads (payload_id, content_type, encoding, compression, byte_size, sha256, created_at) VALUES (:payload_id, :content_type, :encoding, :compression, :byte_size, :sha256, now())",
+            {**payload, "payload_id": "payload-pg-neither"},
+        )
+
+        # Retention state is one row.
+        async with engine.begin() as conn:
+            await conn.execute(sa.text("INSERT INTO ansich_retention_state (id) VALUES (1)"))
+        async with engine.connect() as conn:
+            horizon = (await conn.execute(sa.text("SELECT observation_horizon_ingest_seq FROM ansich_retention_state"))).scalar()
+        assert horizon == 0
+        await _expect_integrity_error(engine, "INSERT INTO ansich_retention_state (id) VALUES (2)", {})
+
+        # The active-version row outlives its audit anchor.
+        async with engine.begin() as conn:
+            await conn.execute(
+                sa.text(
+                    "INSERT INTO ansich_observations (obs_id, schema_version, kind, occurred_at, recorded_at, task_id, subject_type, subject_id, "
+                    "fidelity_class, producer_name, producer_version, producer_instance_id, producer_seq, source_event_id, correlation_id, payload_json) "
+                    "VALUES ('obs-pg-1', 1, 'operator.action_succeeded', now(), now(), 'task-pg-1', 'scope', 'scope-pg-1', 'hard', "
+                    "'test-retention', '1', 'test-instance', 1, 'source:obs-pg-1', 'corr:obs-pg-1', '{}')"
+                )
+            )
+            await conn.execute(
+                sa.text(
+                    "INSERT INTO ansich_active_versions (component_kind, component_name, active_version, activated_at, activated_by, audit_obs_id) VALUES ('resolver', 'ansich-default', '2.0.0', now(), 'operator@example.com', 'obs-pg-1')"
+                )
+            )
+            await conn.execute(sa.text("DELETE FROM ansich_observations WHERE obs_id = 'obs-pg-1'"))
+        async with engine.connect() as conn:
+            active = (await conn.execute(sa.text("SELECT active_version, audit_obs_id FROM ansich_active_versions"))).one()
+        assert active.active_version == "2.0.0"
+        assert active.audit_obs_id is None
+
+
+# ---------------------------------------------------------------------------
 # 5. End-to-end service smoke on the migrated schema
 # ---------------------------------------------------------------------------
 

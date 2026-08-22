@@ -30,6 +30,42 @@ class AnsichAssessorConfig(BaseModel):
         return self
 
 
+class AnsichRetentionConfig(BaseModel):
+    """Time-tiered retention policy for the Ansich store.
+
+    Three tiers, each a maximum age in days, and one batch size. The tiers are
+    nested rather than independent: raw payload bodies expire first, then the
+    Observations that referenced them, and only then the structural Entity and
+    Relation rows those Observations built. That containment is enforced by the
+    validator below rather than left to the operator, because an inverted pair
+    is not a stricter policy — it is a broken store. A payload that outlives
+    its Observation is unreadable evidence kept at cost; a structural row that
+    dies before its Observations leaves the dangling references the RESTRICT
+    walls exist to prevent.
+
+    Retention is executed in bounded batches (``cleanup_batch_size``) with a
+    durable per-tier cursor, so a pass that is interrupted resumes where it
+    stopped rather than restarting or skipping. There is no "disable" value
+    here on purpose: zero is refused on every field because it would spell a
+    switch as a bound (``raw_payload_days: 0`` means "delete evidence on
+    arrival"; ``cleanup_batch_size: 0`` means a batch that deletes nothing and
+    therefore never terminates).
+    """
+
+    raw_payload_days: int = Field(default=7, ge=1)
+    observation_days: int = Field(default=30, ge=1)
+    structural_days: int = Field(default=90, ge=1)
+    cleanup_batch_size: int = Field(default=500, ge=1)
+
+    @model_validator(mode="after")
+    def _validate_tier_containment(self) -> Self:
+        if self.raw_payload_days > self.observation_days:
+            raise ValueError("raw_payload_days must not exceed observation_days")
+        if self.observation_days > self.structural_days:
+            raise ValueError("observation_days must not exceed structural_days")
+        return self
+
+
 class AnsichConfig(BaseModel):
     """Restart-required configuration for the embedded Ansich service.
 
@@ -149,6 +185,10 @@ class AnsichConfig(BaseModel):
     assessors: AnsichAssessorConfig = Field(
         default_factory=AnsichAssessorConfig,
         description="startup-only: Versioned runaway and frequency assessor thresholds.",
+    )
+    retention: AnsichRetentionConfig = Field(
+        default_factory=AnsichRetentionConfig,
+        description="startup-only: Time-tiered retention policy — raw payload bodies, then Observations, then structural rows.",
     )
 
     @property

@@ -15,7 +15,7 @@
 # ============================================================================
 # Bump this number when the config schema changes.
 # Run `make config-upgrade` to merge new fields into your local config.yaml.
-config_version: 35
+config_version: 36
 
 # ============================================================================
 # Logging
@@ -1891,6 +1891,18 @@ ansich:
     environment_leak_min_samples: 6
     environment_leak_window_seconds: 60
     environment_leak_min_growth: 50
+  # Time-tiered retention. The three ages are nested and must not invert:
+  # raw payload bodies expire first (the body is replaced by a tombstone that
+  # keeps sha256/byte_size, so lineage survives while the content does not),
+  # then the Observations that referenced them, then the structural Entity and
+  # Relation rows those Observations built. Retention runs in bounded batches
+  # with a durable per-tier cursor, so an interrupted pass resumes rather than
+  # restarting or skipping.
+  retention:
+    raw_payload_days: 7
+    observation_days: 30
+    structural_days: 90
+    cleanup_batch_size: 500
 
 # ============================================================================
 # Run Events Configuration

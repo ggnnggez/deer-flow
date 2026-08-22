@@ -948,7 +948,7 @@ def test_projection_dependency_deadline_migration_upgrades_sqlite(tmp_path) -> N
         engine.dispose()
 
     assert "dependency_pending_since" in column_names
-    assert revision == "0027_ansich_lease_generation"
+    assert revision == "0028_ansich_retention"
     assert len(revision) <= 32
 
 
@@ -972,12 +972,16 @@ def test_assessor_dependency_deadline_migration_upgrades_sqlite(tmp_path) -> Non
         engine.dispose()
 
     assert "dependency_pending_since" in column_names
-    assert revision == "0027_ansich_lease_generation"
+    assert revision == "0028_ansich_retention"
     assert len(revision) <= 32
 
 
-LEASE_GENERATION_REVISION = "0027_ansich_lease_generation"
 PRE_LEASE_GENERATION_REVISION = "0026_ansich_environment"
+#: The two tests below upgrade to ``head``, which lands past ``0027`` -- the
+#: revision they are actually about -- as soon as a later one exists, so the
+#: chain-head assertions track this rather than ``0027`` itself (the same split
+#: the heartbeat and evaluation migration tests already use).
+HEAD_REVISION = "0028_ansich_retention"
 PROJECTOR_STATUS_INDEX = "ix_ansich_projection_jobs_projector_status"
 CLAIM_INDEX = "ix_ansich_projection_jobs_claim"
 
@@ -1080,7 +1084,7 @@ def test_lease_generation_migration_roundtrips_sqlite(tmp_path) -> None:
     alembic_command.upgrade(config, "head")
 
     projection_columns, assessor_columns, projection_indexes, revision = _job_table_shape(database_path)
-    assert revision == LEASE_GENERATION_REVISION
+    assert revision == HEAD_REVISION
     assert len(revision) <= 32
     assert projection_columns["lease_generation"]["nullable"] is False
     assert assessor_columns["lease_generation"]["nullable"] is False
@@ -1115,7 +1119,7 @@ def test_lease_generation_migration_roundtrips_sqlite(tmp_path) -> None:
     alembic_command.upgrade(config, "head")
 
     projection_columns, assessor_columns, projection_indexes, revision = _job_table_shape(database_path)
-    assert revision == LEASE_GENERATION_REVISION
+    assert revision == HEAD_REVISION
     assert "lease_generation" in projection_columns
     assert "lease_generation" in assessor_columns
     assert projection_indexes[PROJECTOR_STATUS_INDEX] == ["projector_name", "status"]
@@ -1154,7 +1158,7 @@ def test_lease_generation_migration_is_idempotent_on_existing_schema(tmp_path) -
         engine.dispose()
 
     _projection_columns, _assessor_columns, projection_indexes, revision = _job_table_shape(database_path)
-    assert revision == LEASE_GENERATION_REVISION
+    assert revision == HEAD_REVISION
     assert projection_column_names.count("lease_generation") == 1
     assert assessor_column_names.count("lease_generation") == 1
     assert projection_indexes[PROJECTOR_STATUS_INDEX] == ["projector_name", "status"]

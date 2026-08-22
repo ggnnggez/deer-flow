@@ -28,6 +28,23 @@ def _utc_now() -> datetime:
 
 
 class AnsichPayloadRow(Base):
+    """An externalized Observation payload, present or tombstoned.
+
+    Retention's first tier deletes the *body* and keeps the row: ``body`` goes
+    NULL, ``deleted_at`` records when, and ``policy`` records which rule did it.
+    ``sha256`` and ``byte_size`` are deliberately retained — they are the
+    tombstone's lineage half, so a reader can still say what the bytes were and
+    how many there were, only not what they said.
+
+    The tombstone exists because the alternative is worse in both directions.
+    Deleting the row outright makes every hydrator raise (a missing payload row
+    is a corruption signal, and re-opening F10-23's Task-wide poison stall for a
+    *policy* outcome would be a silent permanent stall); and validating an empty
+    payload instead fabricates a verdict from nothing. With the tombstone a
+    reader distinguishes three states rather than two — present, expired by
+    policy, and genuinely missing — and only the third one is still loud.
+    """
+
     __tablename__ = "ansich_payloads"
 
     payload_id: Mapped[str] = mapped_column(String(36), primary_key=True)
@@ -36,8 +53,24 @@ class AnsichPayloadRow(Base):
     compression: Mapped[str] = mapped_column(String(32), nullable=False)
     byte_size: Mapped[int] = mapped_column(BigInteger, nullable=False)
     sha256: Mapped[str] = mapped_column(String(64), nullable=False)
-    body: Mapped[bytes] = mapped_column(LargeBinary, nullable=False)
+    # Nullable since 0028: NULL *and* a ``deleted_at`` is a tombstone, NULL
+    # without one is corruption, and the check constraint below is what keeps
+    # those two apart at write time instead of leaving readers to guess.
+    body: Mapped[bytes | None] = mapped_column(LargeBinary)
+    deleted_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    # The retention rule that made the tombstone (e.g. "raw_payload_days=7"),
+    # so an operator reading an expired row can tell which policy expired it
+    # rather than inferring it from the current configuration, which may since
+    # have changed.
+    policy: Mapped[str | None] = mapped_column(String(128))
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, default=_utc_now)
+
+    __table_args__ = (
+        CheckConstraint(
+            "(body IS NOT NULL AND deleted_at IS NULL) OR (body IS NULL AND deleted_at IS NOT NULL)",
+            name="ck_ansich_payload_tombstone_one_of",
+        ),
+    )
 
 
 class AnsichObservationRow(Base):
@@ -1717,3 +1750,87 @@ class AnsichToolEnvSampleRow(Base):
     obs_id: Mapped[str] = mapped_column(String(36), nullable=False)
 
     __table_args__ = (Index("ix_ansich_tool_env_samples_task", "task_id"),)
+
+
+class AnsichRetentionStateRow(Base):
+    """The single durable row retention resumes from.
+
+    One row, ``id = 1``, pinned by a check constraint: "the horizon" is a
+    definite article, and a second row would make every reader pick one.
+
+    Two different things live here and must not be confused. The three
+    **cursors** say how far the current (or last) pass walked each tier; they
+    exist so a pass interrupted mid-tier resumes instead of restarting the scan
+    or skipping the remainder, and each is typed by what its tier actually
+    walks — payloads and structural rows by their string primary keys,
+    Observations by ``ingest_seq``. Each is ``None`` until that tier has run at
+    least once, which is not the same statement as "starts at the beginning"
+    and must not be written as ``0`` or an empty string.
+
+    The **horizon** is a claim, not a position: ``observation_horizon_ingest_seq``
+    is the highest ``ingest_seq`` at or below which Observation-tier deletion is
+    *complete and contiguous*. It only advances over a fully deleted prefix, and
+    it advances in the same transaction as the batch that earned it, so it can
+    never claim a deletion that rolled back. Receipt resolution reads it and
+    nothing else: a sequence at or below the horizon that cannot be found is
+    expired evidence, not a lost write — without that distinction retention
+    would flip once-accepted receipts to ``failed`` and manufacture an integrity
+    alarm out of a policy outcome. ``0`` is honest here rather than fabricated:
+    ``ingest_seq`` starts at 1, so zero means "nothing has been deleted yet".
+
+    The three ``last_run_*`` fields are reporting only, and all three are
+    ``None`` until a pass has actually started/finished — never an epoch-zero
+    timestamp, which a health panel would render as a real run in 1970.
+    ``last_run_policy`` snapshots the policy that pass ran under, because the
+    configuration may have changed since.
+    """
+
+    __tablename__ = "ansich_retention_state"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=False)
+    payload_cursor: Mapped[str | None] = mapped_column(String(36))
+    observation_cursor: Mapped[int | None] = mapped_column(BigInteger)
+    structural_cursor: Mapped[str | None] = mapped_column(String(36))
+    observation_horizon_ingest_seq: Mapped[int] = mapped_column(BigInteger, nullable=False, server_default="0")
+    last_run_started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    last_run_finished_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    last_run_policy: Mapped[dict | None] = mapped_column(JSON(none_as_null=True))
+
+    __table_args__ = (CheckConstraint("id = 1", name="ck_ansich_retention_state_single_row"),)
+
+
+class AnsichActiveVersionRow(Base):
+    """Which version of a versioned component is currently authoritative.
+
+    Absent row means "the code default" — this table records *deviations* from
+    it, so an empty table is a complete answer rather than a missing one. The
+    only writer is the replay CLI's ``activate`` subcommand, which persists the
+    row and its audit Observation together; nothing reads configuration for
+    this, because a config field would be startup-only (contradicting the
+    "explicit, audited management action" this is supposed to be) and would
+    silently reinterpret history on deploy.
+
+    ``audit_obs_id`` points at the ``operator.action_*`` Observation that
+    recorded the switch, and its ``ON DELETE SET NULL`` is a retention decision
+    rather than a default. These rows are audit anchors, and the two other
+    choices each break something real: CASCADE would let the Observation tier
+    silently revert a deliberate operator switch back to the code default the
+    day its audit Observation ages out — a version change nobody made — and
+    RESTRICT would let one audit row pin an Observation, and with it the whole
+    contiguous prefix behind the horizon, out of retention forever. SET NULL
+    keeps the selection and degrades only the evidence pointer to unknown,
+    which is the same shape ``0021`` already gave the Task-summary assertion
+    pointer for exactly this reason.
+    """
+
+    __tablename__ = "ansich_active_versions"
+
+    component_kind: Mapped[str] = mapped_column(String(32), primary_key=True)
+    component_name: Mapped[str] = mapped_column(String(64), primary_key=True)
+    active_version: Mapped[str] = mapped_column(String(32), nullable=False)
+    activated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    activated_by: Mapped[str] = mapped_column(String(128), nullable=False)
+    audit_obs_id: Mapped[str | None] = mapped_column(
+        String(36),
+        ForeignKey("ansich_observations.obs_id", ondelete="SET NULL"),
+    )
