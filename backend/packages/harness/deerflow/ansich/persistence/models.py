@@ -17,6 +17,7 @@ from sqlalchemy import (
     String,
     Text,
     UniqueConstraint,
+    false,
 )
 from sqlalchemy.orm import Mapped, mapped_column
 
@@ -43,6 +44,16 @@ class AnsichPayloadRow(Base):
     payload instead fabricates a verdict from nothing. With the tombstone a
     reader distinguishes three states rather than two — present, expired by
     policy, and genuinely missing — and only the third one is still loud.
+
+    All three of ``body`` / ``deleted_at`` / ``policy`` move **together**, and
+    the check constraint says so: a row is wholly live (body, no tombstone
+    fields) or wholly tombstoned (no body, both tombstone fields). Leaving
+    ``policy`` free would have made the sentence above a convention rather than
+    a guarantee — a tombstone stamped without one proves that a body was
+    deleted and when, and nothing about under which rule, which is exactly the
+    question the column exists to answer once the configuration has since been
+    retuned. There is no writer yet (Task 9 owns it), so this is the moment
+    that choice is free.
     """
 
     __tablename__ = "ansich_payloads"
@@ -61,13 +72,14 @@ class AnsichPayloadRow(Base):
     # The retention rule that made the tombstone (e.g. "raw_payload_days=7"),
     # so an operator reading an expired row can tell which policy expired it
     # rather than inferring it from the current configuration, which may since
-    # have changed.
+    # have changed. The check below is what makes that a guarantee rather than
+    # a convention: it is NOT NULL on a tombstone and NULL on a live row.
     policy: Mapped[str | None] = mapped_column(String(128))
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, default=_utc_now)
 
     __table_args__ = (
         CheckConstraint(
-            "(body IS NOT NULL AND deleted_at IS NULL) OR (body IS NULL AND deleted_at IS NOT NULL)",
+            "(body IS NOT NULL AND deleted_at IS NULL AND policy IS NULL) OR (body IS NULL AND deleted_at IS NOT NULL AND policy IS NOT NULL)",
             name="ck_ansich_payload_tombstone_one_of",
         ),
     )
@@ -1767,6 +1779,17 @@ class AnsichRetentionStateRow(Base):
     least once, which is not the same statement as "starts at the beginning"
     and must not be written as ``0`` or an empty string.
 
+    ``structural_cursor`` holds an ``ansich_entities.entity_id`` and nothing
+    else. Naming the keyspace matters because the structural tier covers two
+    tables and both keys are ``String(36)`` uuid4 with no discriminator, so a
+    ``relation_id`` stored here would be read back as an ``entity_id`` on the
+    next pass and the resume would silently skip or re-walk a range rather than
+    fail. One column is the right shape because relations are not walked at
+    all: ``ansich_relations`` references ``ansich_entities`` with
+    ``ON DELETE CASCADE`` at both ends, so deleting the Entity takes its
+    Relations with it. A future tier that walks relations independently needs
+    its own column, not this one.
+
     The **horizon** is a claim, not a position: ``observation_horizon_ingest_seq``
     is the highest ``ingest_seq`` at or below which Observation-tier deletion is
     *complete and contiguous*. It only advances over a fully deleted prefix, and
@@ -1821,6 +1844,30 @@ class AnsichActiveVersionRow(Base):
     keeps the selection and degrades only the evidence pointer to unknown,
     which is the same shape ``0021`` already gave the Task-summary assertion
     pointer for exactly this reason.
+
+    The audit contract is a **tri-state**, and ``audit_recorded`` is what makes
+    it one. SET NULL and "nobody ever wrote an audit row" are two different
+    facts that would otherwise arrive at the same NULL — and they are the two
+    that matter most to whoever later asks "was this version switch
+    authorised?". A degraded audit write is a legitimate outcome (the raw-read
+    audit contract returns ``audit_status=degraded`` rather than failing the
+    action), so a row genuinely can be born pointer-less. Read the two columns
+    together:
+
+    ===================  =============  ==========================================
+    ``audit_recorded``   ``audit_obs_id``  meaning
+    ===================  =============  ==========================================
+    ``False``            ``NULL``       never audited — the write was degraded
+    ``True``             set            audited, evidence still present
+    ``True``             ``NULL``       audited, evidence expired under retention
+    ``False``            set            impossible; refused by the check below
+    ===================  =============  ==========================================
+
+    **Contract for Task 6's writer:** set ``audit_recorded=True`` in the same
+    statement that sets ``audit_obs_id``, and *never* unset it. It is a
+    latch — a record that evidence once existed, which has to outlive the
+    evidence itself or it proves nothing. Retention clears the pointer and must
+    leave the latch alone; that asymmetry is the whole mechanism.
     """
 
     __tablename__ = "ansich_active_versions"
@@ -1833,4 +1880,17 @@ class AnsichActiveVersionRow(Base):
     audit_obs_id: Mapped[str | None] = mapped_column(
         String(36),
         ForeignKey("ansich_observations.obs_id", ondelete="SET NULL"),
+    )
+    #: Latch: an audit Observation existed for this row once. Survives the FK's
+    #: SET NULL, which is what separates "expired" from "never audited".
+    audit_recorded: Mapped[bool] = mapped_column(Boolean, nullable=False, server_default=false())
+
+    __table_args__ = (
+        # A bare boolean expression rather than ``audit_recorded = true``: it
+        # renders identically on both dialects (postgres reads it as a boolean,
+        # SQLite as its 0/1 storage) without a dialect-specific literal.
+        CheckConstraint(
+            "audit_obs_id IS NULL OR audit_recorded",
+            name="ck_ansich_active_version_audit_pointer_latched",
+        ),
     )

@@ -22,6 +22,7 @@ head, then downgrade back to 0027 and up again), and on PostgreSQL by
 from __future__ import annotations
 
 import asyncio
+import importlib
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -215,6 +216,40 @@ def test_a_payload_with_neither_body_nor_tombstone_is_refused():
             session.commit()
 
 
+def test_a_tombstone_without_a_policy_is_refused():
+    """The tombstone arm requires ``policy``, so the column's promise is enforced.
+
+    ``policy`` exists so an operator reading an expired row can say which rule
+    expired it rather than inferring it from a configuration that may since have
+    been retuned twice. Leaving it merely conventional would make that a promise
+    the schema does not keep: a tombstone stamped without one proves a body was
+    deleted and when, and nothing about under which rule — and by the time
+    anyone noticed, the table would be full of tombstones and the repair would
+    be a migration over them. Task 9 writes the first tombstone; until it does,
+    this costs nothing.
+    """
+    engine = _engine()
+    with Session(engine) as session:
+        session.add(_payload(body=None, deleted_at=NOW))
+        with pytest.raises(IntegrityError):
+            session.commit()
+
+
+def test_a_live_payload_may_not_carry_a_policy():
+    """The other half of the same rule: all three columns move together.
+
+    A live row with a retention policy stamped on it is not a state anything
+    produces — but if it were writable, ``policy IS NOT NULL`` would stop being
+    readable as "this row is expired", which is the only reason a reader looks
+    at it.
+    """
+    engine = _engine()
+    with Session(engine) as session:
+        session.add(_payload(policy="raw_payload_days=7"))
+        with pytest.raises(IntegrityError):
+            session.commit()
+
+
 def test_a_tombstone_retains_the_lineage_half_and_the_policy_that_made_it():
     """sha256/byte_size stay; they are what a tombstone still proves."""
     engine = _engine()
@@ -300,6 +335,7 @@ def test_an_active_version_row_round_trips():
                 activated_at=NOW,
                 activated_by="operator@example.com",
                 audit_obs_id="obs-1",
+                audit_recorded=True,
             )
         )
         session.commit()
@@ -310,6 +346,113 @@ def test_an_active_version_row_round_trips():
         assert row.active_version == "2.0.0"
         assert row.activated_by == "operator@example.com"
         assert row.audit_obs_id == "obs-1"
+        assert row.audit_recorded is True
+
+
+def test_a_never_audited_row_is_distinguishable_from_an_expired_one():
+    """The tri-state: ``audit_recorded`` is what keeps the two NULLs apart.
+
+    Both a degraded audit write and retention's SET NULL leave
+    ``audit_obs_id IS NULL``, and they are opposite facts — "this switch was
+    never audited" versus "it was, and the evidence aged out under policy". For
+    an *audit anchor* that is the one distinction that matters, and it is the
+    same none-never-zero discipline the horizon column two tables up applies to
+    itself. The latch is the only thing that survives the FK action, so it is
+    the only thing that can carry the difference.
+    """
+    engine = _engine(foreign_keys=True)
+    with Session(engine) as session:
+        session.add(_observation("obs-1"))
+        session.flush()
+        # Audited: latch set in the same statement as the pointer.
+        session.add(
+            AnsichActiveVersionRow(
+                component_kind="projector",
+                component_name="task-heartbeat",
+                active_version="1",
+                activated_at=NOW,
+                activated_by="operator@example.com",
+                audit_obs_id="obs-1",
+                audit_recorded=True,
+            )
+        )
+        # Never audited: the audit write was degraded, so no pointer and no latch.
+        session.add(
+            AnsichActiveVersionRow(
+                component_kind="resolver",
+                component_name="ansich-default",
+                active_version="2.0.0",
+                activated_at=NOW,
+                activated_by="operator@example.com",
+            )
+        )
+        session.commit()
+
+        session.execute(sa.delete(AnsichObservationRow).where(AnsichObservationRow.obs_id == "obs-1"))
+        session.commit()
+
+    with Session(engine) as session:
+        rows = {row.component_kind: row for row in session.execute(select(AnsichActiveVersionRow)).scalars()}
+
+    expired = rows["projector"]
+    never = rows["resolver"]
+    # Both pointers read NULL...
+    assert expired.audit_obs_id is None
+    assert never.audit_obs_id is None
+    # ...and the latch is what tells them apart.
+    assert expired.audit_recorded is True, "the latch must outlive the evidence it describes"
+    assert never.audit_recorded is False
+
+
+def test_an_audit_pointer_without_the_latch_is_refused():
+    """The fourth combination is impossible, and the check says so.
+
+    A pointer with no latch would mean "evidence exists that never existed".
+    Forbidding it is what makes the other three readable as a closed set rather
+    than as three of four possibilities.
+    """
+    engine = _engine()
+    with Session(engine) as session:
+        session.add(_observation("obs-1"))
+        session.flush()
+        session.add(
+            AnsichActiveVersionRow(
+                component_kind="projector",
+                component_name="task-heartbeat",
+                active_version="1",
+                activated_at=NOW,
+                activated_by="operator@example.com",
+                audit_obs_id="obs-1",
+                audit_recorded=False,
+            )
+        )
+        with pytest.raises(IntegrityError):
+            session.commit()
+
+
+def test_the_audit_latch_defaults_to_never_audited():
+    """Absent means never audited, not unknown — so the default is False.
+
+    A row written without the latch is one nothing claimed to have audited, and
+    that is the honest reading of a default rather than a fabricated one.
+    """
+    engine = _engine()
+    with Session(engine) as session:
+        session.add(
+            AnsichActiveVersionRow(
+                component_kind="resolver",
+                component_name="ansich-default",
+                active_version="2.0.0",
+                activated_at=NOW,
+                activated_by="operator@example.com",
+            )
+        )
+        session.commit()
+
+    with Session(engine) as session:
+        row = session.execute(select(AnsichActiveVersionRow)).scalar_one()
+        assert row.audit_recorded is False
+        assert row.audit_obs_id is None
 
 
 def test_an_active_version_survives_its_audit_anchor_expiring():
@@ -336,6 +479,7 @@ def test_an_active_version_survives_its_audit_anchor_expiring():
                 activated_at=NOW,
                 activated_by="operator@example.com",
                 audit_obs_id="obs-1",
+                audit_recorded=True,
             )
         )
         session.commit()
@@ -565,5 +709,207 @@ async def test_migration_0028_is_reversible_and_re_appliable_on_sqlite(tmp_path:
         # migration's ``_has_tombstone_check`` guard is the only thing stopping
         # it, and a duplicate would survive silently until someone read the DDL.
         assert (await _payload_check_names(engine)).count("ck_ansich_payload_tombstone_one_of") == 1
+    finally:
+        await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_the_downgrade_keeps_live_payloads_and_drops_only_tombstones(tmp_path: Path):
+    """The dangerous direction, over real rows — ``0027``'s own precedent.
+
+    The reversibility test above walks an *empty* database back, so it proves
+    the DDL executes and nothing about the data. This direction is the one that
+    deletes rows on purpose, and on SQLite the whole thing is a table recreate:
+    a widened predicate, or a ``copy_from`` that loses rows in the copy, would
+    destroy every live payload on downgrade with the suite still green.
+    ``0027``'s downgrade test asserts exactly this property for its own table
+    ("drops columns, never job rows").
+    """
+    engine = create_async_engine(_sqlite_url(tmp_path))
+    try:
+        cfg = _get_alembic_config(engine)
+        await asyncio.to_thread(_upgrade, cfg, "head")
+
+        await _insert_payload(engine, payload_id="payload-live", body=b"{}\n\n")
+        await _insert_payload(engine, payload_id="payload-live-2", body=b"[1]")
+        await _insert_payload(
+            engine,
+            payload_id="payload-tombstoned",
+            body=None,
+            deleted_at="2026-08-22 12:00:00+00:00",
+            policy="raw_payload_days=7",
+        )
+
+        await asyncio.to_thread(alembic_command.downgrade, cfg, PRE_RETENTION_REVISION)
+
+        async with engine.connect() as conn:
+            rows = (await conn.execute(sa.text("SELECT payload_id, body FROM ansich_payloads ORDER BY payload_id"))).all()
+
+        # The tombstone is gone (the pre-0028 schema cannot express it) and both
+        # live payloads survived the recreate with their bodies intact.
+        assert [row.payload_id for row in rows] == ["payload-live", "payload-live-2"]
+        assert [row.body for row in rows] == [b"{}\n\n", b"[1]"]
+        columns = await _payload_columns(engine)
+        assert columns["body"]["nullable"] is False
+    finally:
+        await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_the_downgrade_refuses_a_referenced_tombstone_on_sqlite(tmp_path: Path):
+    """The refusal has to be explicit, because the FK is not enforced here.
+
+    ``ansich_observations.payload_ref_id`` is ``ON DELETE RESTRICT``, which
+    makes PostgreSQL refuse this delete on its own. The migration connection
+    runs with SQLite's foreign keys **off** (``migrations/env.py`` sets only
+    ``busy_timeout``), so on this dialect the same statement would succeed
+    silently and leave the Observation pointing at nothing — manufacturing the
+    corruption state the tombstone exists to stay distinguishable from, using
+    the tool that was supposed to refuse. The pre-flight query is what makes
+    both dialects behave the same way.
+
+    The raise aborts the migration transaction, so the refusal is also
+    all-or-nothing: the tombstone is still there afterwards.
+    """
+    engine = create_async_engine(_sqlite_url(tmp_path))
+    try:
+        cfg = _get_alembic_config(engine)
+        await asyncio.to_thread(_upgrade, cfg, "head")
+
+        await _insert_payload(
+            engine,
+            payload_id="payload-referenced",
+            body=None,
+            deleted_at="2026-08-22 12:00:00+00:00",
+            policy="raw_payload_days=7",
+        )
+        async with engine.begin() as conn:
+            await conn.execute(
+                sa.text(
+                    "INSERT INTO ansich_observations (obs_id, schema_version, kind, occurred_at, recorded_at, task_id, "
+                    "subject_type, subject_id, fidelity_class, producer_name, producer_version, producer_instance_id, "
+                    "producer_seq, source_event_id, correlation_id, payload_ref_id) "
+                    "VALUES ('obs-ref', 1, 'operator.action_succeeded', '2026-08-22 12:00:00+00:00', "
+                    "'2026-08-22 12:00:00+00:00', 'task-1', 'scope', 'scope-1', 'hard', 'test-retention', '1', "
+                    "'test-instance', 1, 'source:obs-ref', 'corr:obs-ref', 'payload-referenced')"
+                )
+            )
+
+        with pytest.raises(RuntimeError, match="still referenced"):
+            await asyncio.to_thread(alembic_command.downgrade, cfg, PRE_RETENTION_REVISION)
+
+        # Nothing was destroyed on the way to the refusal.
+        async with engine.connect() as conn:
+            remaining = (await conn.execute(sa.text("SELECT COUNT(*) FROM ansich_payloads WHERE payload_id = 'payload-referenced'"))).scalar()
+        assert remaining == 1
+    finally:
+        await engine.dispose()
+
+
+def test_the_downgrade_referrer_list_matches_every_real_foreign_key():
+    """The pre-flight refusal is only as complete as its referrer list.
+
+    That list is written out literally rather than reflected, because a
+    migration must describe the schema *at its own revision* and not whatever a
+    later one made of it. The cost of writing it by hand is that it can be
+    wrong, and a wrong entry is not a quiet no-op: a column that is not really a
+    foreign key makes the pre-check query itself fail (``bytea = varchar`` was
+    the actual mistake, and it took a live PostgreSQL to surface it because
+    SQLite compares those happily), while a *missing* entry silently narrows the
+    refusal to the referrers someone remembered.
+
+    At this revision the literal list and the ORM's foreign keys are the same
+    set, so pinning them together is honest. A later revision that adds a
+    referrer will turn this red — which is the right prompt: decide whether
+    0028's downgrade should refuse for it too, rather than discovering it on a
+    production rollback.
+    """
+    revision_module = importlib.import_module(f"deerflow.persistence.migrations.versions.{RETENTION_REVISION}")
+
+    actual = {(table.name, fk.parent.name, fk.ondelete) for table in Base.metadata.sorted_tables for fk in table.foreign_keys if fk.column.table.name == "ansich_payloads"}
+    declared = set(revision_module._PAYLOAD_REFERRERS)
+
+    assert {(table, column) for table, column, _ in actual} == declared
+    # All of them are RESTRICT, which is the premise the docstring leans on for
+    # the dialect that does enforce the FK.
+    assert {ondelete for _, _, ondelete in actual} == {"RESTRICT"}
+
+
+def test_the_downgrade_copy_spec_declares_the_check_only_when_it_exists():
+    """F5: the defensive branch must not break exactly when it fires.
+
+    ``copy_from`` tells alembic what the source table looks like, and on SQLite
+    that spec is what the recreate rebuilds from. Declaring the CHECK
+    unconditionally breaks the one case the ``_has_tombstone_check()`` guard
+    exists for — columns present, constraint absent — because the recreate then
+    emits ``CREATE TABLE … CHECK (… deleted_at …)`` over columns the same batch
+    is dropping. A defensive branch that fails when it fires is worse than no
+    branch.
+    """
+    revision_module = importlib.import_module(f"deerflow.persistence.migrations.versions.{RETENTION_REVISION}")
+    with_check = revision_module._payloads_table_after_upgrade(with_check=True)
+    without_check = revision_module._payloads_table_after_upgrade(with_check=False)
+
+    def check_names(table: sa.Table) -> set[str]:
+        return {c.name for c in table.constraints if isinstance(c, sa.CheckConstraint)}
+
+    assert check_names(with_check) == {"ck_ansich_payload_tombstone_one_of"}
+    assert check_names(without_check) == set()
+    # The columns are identical either way — only the constraint differs.
+    assert [c.name for c in with_check.columns] == [c.name for c in without_check.columns]
+
+
+#: ``ansich_payloads`` in its post-0028 shape with the CHECK left off — the state
+#: a manual ``ALTER`` (or a future revision that dropped the constraint) leaves
+#: behind, and the only state the ``_has_tombstone_check()`` guard exists for.
+_PAYLOADS_WITHOUT_CHECK_DDL = """
+CREATE TABLE ansich_payloads (
+    payload_id VARCHAR(36) NOT NULL,
+    content_type VARCHAR(128) NOT NULL,
+    encoding VARCHAR(32) NOT NULL,
+    compression VARCHAR(32) NOT NULL,
+    byte_size BIGINT NOT NULL,
+    sha256 VARCHAR(64) NOT NULL,
+    body BLOB,
+    deleted_at DATETIME,
+    policy VARCHAR(128),
+    created_at DATETIME NOT NULL,
+    PRIMARY KEY (payload_id)
+)
+"""
+
+
+@pytest.mark.asyncio
+async def test_the_downgrade_runs_with_the_check_already_absent(tmp_path: Path):
+    """The same branch, executed rather than inspected.
+
+    The state is built for real rather than patched: alembic loads a revision
+    module freshly per command, so a monkeypatched copy is not the object the
+    migration would run. Dropping and recreating ``ansich_payloads`` without the
+    constraint reproduces the manual-``ALTER`` shape the guard was written for,
+    and puts the downgrade on the guard-False path over a real database — which
+    is exactly where an unconditional ``copy_from`` spec fails.
+    """
+    engine = create_async_engine(_sqlite_url(tmp_path))
+    try:
+        cfg = _get_alembic_config(engine)
+        await asyncio.to_thread(_upgrade, cfg, "head")
+
+        async with engine.begin() as conn:
+            await conn.execute(sa.text("DROP TABLE ansich_payloads"))
+            await conn.execute(sa.text(_PAYLOADS_WITHOUT_CHECK_DDL))
+        assert await _payload_check_names(engine) == [], "the fixture must actually remove the constraint"
+
+        await _insert_payload(engine, payload_id="payload-live", body=b"{}\n\n")
+
+        await asyncio.to_thread(alembic_command.downgrade, cfg, PRE_RETENTION_REVISION)
+
+        columns = await _payload_columns(engine)
+        assert "deleted_at" not in columns
+        assert "policy" not in columns
+        assert columns["body"]["nullable"] is False
+        async with engine.connect() as conn:
+            body = (await conn.execute(sa.text("SELECT body FROM ansich_payloads WHERE payload_id = 'payload-live'"))).scalar()
+        assert body == b"{}\n\n"
     finally:
         await engine.dispose()

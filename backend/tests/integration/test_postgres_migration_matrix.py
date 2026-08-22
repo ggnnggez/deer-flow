@@ -67,6 +67,9 @@ POSTGRES_TEST_URL = os.environ.get("DEER_FLOW_TEST_POSTGRES_URL")
 # merge included); re-upgrading walks every ``upgrade`` a second time.
 PRE_ANSICH_REVISION = "0004_run_ownership"
 
+# The revision before 0028, for the one test that walks only that step back.
+PRE_RETENTION_REVISION = "0027_ansich_lease_generation"
+
 
 def _safe_url(url: str | URL) -> str:
     """Render *url* with the password masked, for skip reasons and messages."""
@@ -368,14 +371,21 @@ async def test_retention_constraints_hold_on_postgres() -> None:
         # Both halves at once, and neither half: each refused.
         await _expect_integrity_error(
             engine,
-            "INSERT INTO ansich_payloads (payload_id, content_type, encoding, compression, byte_size, sha256, body, deleted_at, created_at) "
-            "VALUES (:payload_id, :content_type, :encoding, :compression, :byte_size, :sha256, :body, now(), now())",
+            "INSERT INTO ansich_payloads (payload_id, content_type, encoding, compression, byte_size, sha256, body, deleted_at, policy, created_at) "
+            "VALUES (:payload_id, :content_type, :encoding, :compression, :byte_size, :sha256, :body, now(), 'raw_payload_days=7', now())",
             {**payload, "payload_id": "payload-pg-both", "body": b"{}"},
         )
         await _expect_integrity_error(
             engine,
             "INSERT INTO ansich_payloads (payload_id, content_type, encoding, compression, byte_size, sha256, created_at) VALUES (:payload_id, :content_type, :encoding, :compression, :byte_size, :sha256, now())",
             {**payload, "payload_id": "payload-pg-neither"},
+        )
+        # A tombstone with no policy: the row would prove that a body was deleted
+        # and when, and nothing about under which rule.
+        await _expect_integrity_error(
+            engine,
+            "INSERT INTO ansich_payloads (payload_id, content_type, encoding, compression, byte_size, sha256, deleted_at, created_at) VALUES (:payload_id, :content_type, :encoding, :compression, :byte_size, :sha256, now(), now())",
+            {**payload, "payload_id": "payload-pg-unstamped"},
         )
 
         # Retention state is one row.
@@ -398,14 +408,82 @@ async def test_retention_constraints_hold_on_postgres() -> None:
             )
             await conn.execute(
                 sa.text(
-                    "INSERT INTO ansich_active_versions (component_kind, component_name, active_version, activated_at, activated_by, audit_obs_id) VALUES ('resolver', 'ansich-default', '2.0.0', now(), 'operator@example.com', 'obs-pg-1')"
+                    "INSERT INTO ansich_active_versions (component_kind, component_name, active_version, activated_at, activated_by, audit_obs_id, audit_recorded) "
+                    "VALUES ('resolver', 'ansich-default', '2.0.0', now(), 'operator@example.com', 'obs-pg-1', true)"
                 )
             )
+            # A second row nothing ever audited: no pointer, no latch.
+            await conn.execute(sa.text("INSERT INTO ansich_active_versions (component_kind, component_name, active_version, activated_at, activated_by) VALUES ('projector', 'task-heartbeat', '1', now(), 'operator@example.com')"))
             await conn.execute(sa.text("DELETE FROM ansich_observations WHERE obs_id = 'obs-pg-1'"))
         async with engine.connect() as conn:
-            active = (await conn.execute(sa.text("SELECT active_version, audit_obs_id FROM ansich_active_versions"))).one()
-        assert active.active_version == "2.0.0"
-        assert active.audit_obs_id is None
+            rows = (await conn.execute(sa.text("SELECT component_kind, active_version, audit_obs_id, audit_recorded FROM ansich_active_versions ORDER BY component_kind"))).all()
+        by_kind = {row.component_kind: row for row in rows}
+        expired, never = by_kind["resolver"], by_kind["projector"]
+        assert expired.active_version == "2.0.0"
+        # Both pointers are NULL on the server too; the latch is the difference.
+        assert expired.audit_obs_id is None
+        assert never.audit_obs_id is None
+        assert expired.audit_recorded is True, "the latch must outlive the SET NULL"
+        assert never.audit_recorded is False
+        # A pointer without the latch -- "evidence that never existed" -- is refused.
+        async with engine.begin() as conn:
+            await conn.execute(
+                sa.text(
+                    "INSERT INTO ansich_observations (obs_id, schema_version, kind, occurred_at, recorded_at, task_id, subject_type, subject_id, "
+                    "fidelity_class, producer_name, producer_version, producer_instance_id, producer_seq, source_event_id, correlation_id, payload_json) "
+                    "VALUES ('obs-pg-2', 1, 'operator.action_succeeded', now(), now(), 'task-pg-1', 'scope', 'scope-pg-1', 'hard', "
+                    "'test-retention', '1', 'test-instance', 2, 'source:obs-pg-2', 'corr:obs-pg-2', '{}')"
+                )
+            )
+        await _expect_integrity_error(
+            engine,
+            "INSERT INTO ansich_active_versions (component_kind, component_name, active_version, activated_at, activated_by, audit_obs_id, audit_recorded) "
+            "VALUES ('projector', 'task-budget', '1', now(), 'operator@example.com', 'obs-pg-2', false)",
+            {},
+        )
+
+
+async def test_the_0028_downgrade_refuses_a_referenced_tombstone_on_postgres() -> None:
+    """The refusal the migration's docstring promises, asserted where it matters.
+
+    ``ansich_observations.payload_ref_id`` is ``ON DELETE RESTRICT``, so this
+    dialect would refuse the downgrade's delete on its own -- but the migration
+    does not rely on that, because SQLite's migration connection runs with
+    foreign keys off and would delete silently. The pre-flight check makes both
+    dialects refuse for the same stated reason, and this is the half of that
+    claim only a real server can execute. The matrix's own ``head -> 0004 ->
+    head`` leg runs this downgrade against an *empty* payloads table, so it
+    proves the DDL and nothing about this.
+    """
+    async with _postgres_engine() as engine:
+        await _upgrade(engine)
+
+        async with engine.begin() as conn:
+            await conn.execute(
+                sa.text(
+                    "INSERT INTO ansich_payloads (payload_id, content_type, encoding, compression, byte_size, sha256, body, deleted_at, policy, created_at) "
+                    "VALUES ('payload-pg-referenced', 'application/json', 'utf-8', 'none', 4, :sha256, NULL, now(), 'raw_payload_days=7', now())"
+                ),
+                {"sha256": "c" * 64},
+            )
+            await conn.execute(
+                sa.text(
+                    "INSERT INTO ansich_observations (obs_id, schema_version, kind, occurred_at, recorded_at, task_id, subject_type, subject_id, "
+                    "fidelity_class, producer_name, producer_version, producer_instance_id, producer_seq, source_event_id, correlation_id, payload_ref_id) "
+                    "VALUES ('obs-pg-ref', 1, 'operator.action_succeeded', now(), now(), 'task-pg-ref', 'scope', 'scope-pg-ref', 'hard', "
+                    "'test-retention', '1', 'test-instance', 1, 'source:obs-pg-ref', 'corr:obs-pg-ref', 'payload-pg-referenced')"
+                )
+            )
+
+        with pytest.raises(RuntimeError, match="still referenced"):
+            await _downgrade(engine, PRE_RETENTION_REVISION)
+
+        # The refusal aborts the migration transaction, so nothing was lost and
+        # the schema is still at head.
+        assert await _alembic_version(engine) == _get_head_revision()
+        async with engine.connect() as conn:
+            remaining = (await conn.execute(sa.text("SELECT COUNT(*) FROM ansich_payloads WHERE payload_id = 'payload-pg-referenced'"))).scalar()
+        assert remaining == 1
 
 
 # ---------------------------------------------------------------------------
