@@ -42,7 +42,7 @@ from datetime import UTC, datetime, timedelta
 
 import pytest
 from ansich import AnsichService, ObservationEnvelope, Producer, new_id
-from sqlalchemy import event, select
+from sqlalchemy import delete, event, select
 from sqlalchemy.dialects import postgresql, sqlite
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
@@ -53,9 +53,11 @@ from deerflow.ansich import create_sql_ansich_service
 from deerflow.ansich.persistence import sql as ansich_sql
 from deerflow.ansich.persistence.models import (
     AnsichActiveTaskReadModelRow,
+    AnsichAlertRow,
     AnsichBeliefAssertionRow,
     AnsichCurrentBeliefRow,
     AnsichEntityRow,
+    AnsichLlmAttemptRow,
     AnsichProjectionJobRow,
     AnsichProjectorVersionRow,
     AnsichTaskAncestryRow,
@@ -858,6 +860,302 @@ async def test_the_pre_fix_bare_insert_is_what_a_first_write_race_crashes_on(tmp
 
 
 # --------------------------------------------------------------------------
+# (c2) The current-Belief first writer, whose blast radius is the whole tick
+# --------------------------------------------------------------------------
+
+
+async def _heartbeat_belief_state(backend, task_id: str) -> tuple[list, list]:
+    async with backend._session_factory() as session:
+        current = list((await session.execute(select(AnsichCurrentBeliefRow).where(AnsichCurrentBeliefRow.subject_id == task_id, AnsichCurrentBeliefRow.field_name == "heartbeat"))).scalars())
+        assertions = list((await session.execute(select(AnsichBeliefAssertionRow).where(AnsichBeliefAssertionRow.subject_id == task_id, AnsichBeliefAssertionRow.field_name == "heartbeat"))).scalars())
+    return current, assertions
+
+
+@pytest.mark.anyio
+async def test_heartbeat_belief_first_write_race_converges_instead_of_discarding_the_tick(tmp_path, monkeypatch):
+    """The third site with an operations-tick blast radius.
+
+    Every Gateway worker on a host runs its own 1 Hz ``assess_operations`` over
+    the same running Tasks, and the whole tick is one transaction — so two of
+    them opening a Task's first ``heartbeat`` current-Belief row collided on
+    ``ansich_current_beliefs_pkey`` and discarded that tick's heartbeat, dwell,
+    budget, environment and both process-subject producers. Identical cost to
+    F10-33's episode collision, different constraint. The loser now takes the
+    winner's row under the lock and points it at its own Assertion, which is
+    what a tick that read second does.
+    """
+
+    async with _representative_state(tmp_path, "rollup-conflict-heartbeat") as (service, task_id, _budget):
+        backend = service._backend
+        await service.stop()
+        before_current, before_assertions = await _heartbeat_belief_state(backend, task_id)
+        state = _lock_missing_once(monkeypatch, "ansich_current_beliefs")
+        await backend.assess_operations(now=_ASSESSED_AT + timedelta(seconds=5))
+        after_current, after_assertions = await _heartbeat_belief_state(backend, task_id)
+
+    assert state["missed"] == 1
+    assert len(before_current) == 1
+    assert len(after_current) == 1, "the losing writer must converge on the winner's row, not add a second"
+    assert after_current[0].assertion_id != before_current[0].assertion_id
+    # The documented, bounded cost of the race: this pass appended its Assertion
+    # before it could know it had lost, so the collision leaves one extra
+    # heartbeat Assertion for that Task. Bounded at one — from here the row
+    # exists and the ordinary unchanged-skip applies.
+    assert len(after_assertions) == len(before_assertions) + 1
+
+
+@pytest.mark.anyio
+async def test_the_pre_fix_bare_current_belief_insert_is_what_discarded_the_tick(tmp_path, monkeypatch):
+    """The control: the whole tick used to go with it."""
+
+    async with _representative_state(tmp_path, "rollup-conflict-heartbeat-control") as (service, task_id, _budget):
+        backend = service._backend
+        await service.stop()
+        _lock_missing_once(monkeypatch, "ansich_current_beliefs")
+        original = ansich_sql._insert_ignoring_conflict
+
+        async def _bare_insert(session, model, values, *, index_elements, returning):
+            if model is not AnsichCurrentBeliefRow:
+                return await original(session, model, values, index_elements=index_elements, returning=returning)
+            session.add(model(**values))
+            await session.flush()
+            return True
+
+        monkeypatch.setattr(ansich_sql, "_insert_ignoring_conflict", _bare_insert)
+        with pytest.raises(IntegrityError):
+            await backend.assess_operations(now=_ASSESSED_AT + timedelta(seconds=5))
+
+
+# --------------------------------------------------------------------------
+# (d) F10-31: the LLM attempt projector's two Observations
+# --------------------------------------------------------------------------
+
+
+@contextlib.asynccontextmanager
+async def _attempt_state(tmp_path, name: str) -> AsyncIterator[tuple[object, str, str, ObservationEnvelope, ObservationEnvelope]]:
+    """A running Task whose single LLM attempt carries both its Observations.
+
+    Both are *persisted* -- the attempt row's two pointer columns are foreign
+    keys into ``ansich_observations``, so neither half can be projected while
+    the other Observation does not exist -- and the tests below re-project one
+    half at a time to reconstruct each side of the interleaving.
+    """
+
+    engine = create_async_engine(f"sqlite+aiosqlite:///{tmp_path / f'{name}.db'}")
+    session_factory = async_sessionmaker(engine, expire_on_commit=False)
+    async with engine.begin() as connection:
+        await connection.run_sync(Base.metadata.create_all)
+    service = create_sql_ansich_service(
+        session_factory,
+        operations_assessment_interval_ms=60_000,
+    )
+    only_test_driven_assessments(service)
+    await service.start()
+    task_id = new_id()
+    attempt_id = new_id()
+    requested = ObservationEnvelope(
+        kind="llm.requested",
+        occurred_at=_OCCURRED_AT + timedelta(seconds=1),
+        task_id=task_id,
+        subject_type="llm_attempt",
+        subject_id=attempt_id,
+        producer=_PRODUCER,
+        source_event_id=f"attempt:{attempt_id}:requested",
+        correlation_id=task_id,
+        payload={
+            "attempt_no": 1,
+            "actor_kind": "system_operation",
+            "operation_id": new_id(),
+            "operation_kind": "other",
+        },
+    )
+    responded = ObservationEnvelope(
+        kind="llm.responded",
+        occurred_at=_OCCURRED_AT + timedelta(seconds=2),
+        task_id=task_id,
+        subject_type="llm_attempt",
+        subject_id=attempt_id,
+        producer=_PRODUCER,
+        source_event_id=f"attempt:{attempt_id}:responded",
+        correlation_id=task_id,
+        payload={
+            "attempt_no": 1,
+            "latency_ms": 20,
+            "usage": {"total_tokens": 41},
+            "provider_model": "test-model-9",
+        },
+    )
+    try:
+        service.record_batch(
+            (
+                ObservationEnvelope.task_lifecycle(
+                    kind="task.created",
+                    task_id=task_id,
+                    source_kind="deerflow_run",
+                    source_id="run-attempt-race",
+                    occurred_at=_OCCURRED_AT,
+                    source_event_id="run:run-attempt-race:task:created",
+                ),
+                ObservationEnvelope.task_lifecycle(
+                    kind="task.started",
+                    task_id=task_id,
+                    source_kind="deerflow_run",
+                    source_id="run-attempt-race",
+                    occurred_at=_OCCURRED_AT,
+                    source_event_id="run:run-attempt-race:task:started",
+                ),
+                requested,
+                responded,
+            )
+        )
+        await service.flush_task(task_id)
+        # The tests drive projection themselves from here on: a live projector
+        # loop racing an injected race would be the one thing this cannot read.
+        await service.stop()
+        yield service._backend, task_id, attempt_id, requested, responded
+    finally:
+        with contextlib.suppress(Exception):
+            await service.stop()
+        await engine.dispose()
+
+
+async def _project_only(backend, task_id: str, observation: ObservationEnvelope) -> None:
+    """Leave the store holding exactly one worker's half of the attempt."""
+
+    async with backend._session_factory() as session, session.begin():
+        await session.execute(delete(AnsichLlmAttemptRow).where(AnsichLlmAttemptRow.task_id == task_id))
+    async with backend._session_factory() as session, session.begin():
+        await backend._project_step(session, observation)
+
+
+async def _attempt_row(backend, attempt_id: str) -> AnsichLlmAttemptRow:
+    async with backend._session_factory() as session:
+        rows = list((await session.execute(select(AnsichLlmAttemptRow).where(AnsichLlmAttemptRow.attempt_id == attempt_id))).scalars())
+    assert len(rows) == 1, f"exactly one attempt row expected, got {len(rows)}"
+    return rows[0]
+
+
+@pytest.mark.anyio
+async def test_llm_attempt_projection_locks_the_attempt_row_before_reading_it(tmp_path):
+    """The fifth conversion's shape pin: nothing reads the row unlocked first."""
+
+    async with _attempt_state(tmp_path, "attempt-lock-shape") as (backend, task_id, _attempt_id, requested, _responded):
+        await _project_only(backend, task_id, requested)
+        with _record_statements() as recorded:
+            async with backend._session_factory() as session, session.begin():
+                await backend._project_step(session, requested)
+
+    assert _index_of_first_touch(recorded, "ansich_llm_attempts") == _index_of_lock(recorded, "ansich_llm_attempts")
+
+
+@pytest.mark.anyio
+async def test_llm_attempt_first_write_race_composes_the_response_onto_the_winners_request(tmp_path, monkeypatch):
+    """Worker B (``llm.responded``) loses the insert and merges, not overwrites.
+
+    The state this reconstructs is the one PostgreSQL produced in the two-worker
+    tier: B read no attempt row, A's ``llm.requested`` committed, and B's insert
+    then collided on ``ansich_llm_attempts_pkey``. The pointer A wrote must
+    survive B's merge -- a fix that re-derived the row from B's Observation
+    alone would silently drop ``request_obs_id``, which no primary key would
+    catch.
+    """
+
+    async with _attempt_state(tmp_path, "attempt-race-response") as (backend, task_id, attempt_id, requested, responded):
+        await _project_only(backend, task_id, requested)
+        state = _lock_missing_once(monkeypatch, "ansich_llm_attempts")
+        async with backend._session_factory() as session, session.begin():
+            await backend._project_step(session, responded)
+        row = await _attempt_row(backend, attempt_id)
+
+    assert state["missed"] == 1
+    assert state["calls"] == 2, "the losing writer must take the lock a second time"
+    assert row.request_obs_id == requested.obs_id
+    assert row.response_obs_id == responded.obs_id
+    assert row.status == "success"
+    assert row.latency_ms == 20
+    assert row.usage_json == {"total_tokens": 41}
+    assert row.provider_model == "test-model-9"
+
+
+@pytest.mark.anyio
+async def test_llm_attempt_first_write_race_never_downgrades_the_winners_status(tmp_path, monkeypatch):
+    """The mirror interleaving: worker A (``llm.requested``) is the loser.
+
+    ``requested`` sits *below* ``success`` on the status lattice, so the losing
+    merge has to take the maximum rather than its own branch's value. The
+    response pointer and everything derived from it must survive too.
+    """
+
+    async with _attempt_state(tmp_path, "attempt-race-request") as (backend, task_id, attempt_id, requested, responded):
+        await _project_only(backend, task_id, responded)
+        state = _lock_missing_once(monkeypatch, "ansich_llm_attempts")
+        async with backend._session_factory() as session, session.begin():
+            await backend._project_step(session, requested)
+        row = await _attempt_row(backend, attempt_id)
+
+    assert state["missed"] == 1
+    assert row.request_obs_id == requested.obs_id
+    assert row.response_obs_id == responded.obs_id
+    assert row.status == "success"
+    assert row.latency_ms == 20
+
+
+@pytest.mark.anyio
+async def test_the_pre_fix_bare_attempt_insert_is_what_the_race_crashes_on(tmp_path, monkeypatch):
+    """The rollback path F10-31 registered, reproduced and then removed.
+
+    Same injected window, the upsert degraded to the ORM insert the projector
+    used before this change: it raises, the whole job transaction rolls back to
+    ``retry``, and the PG tier had to tolerate the violation by constraint name.
+    """
+
+    async with _attempt_state(tmp_path, "attempt-race-control") as (backend, task_id, _attempt_id, requested, responded):
+        await _project_only(backend, task_id, requested)
+        _lock_missing_once(monkeypatch, "ansich_llm_attempts")
+
+        async def _bare_insert(session, model, values, *, index_elements, returning):
+            session.add(model(**values))
+            await session.flush()
+            return True
+
+        monkeypatch.setattr(ansich_sql, "_insert_ignoring_conflict", _bare_insert)
+        with pytest.raises(IntegrityError):
+            async with backend._session_factory() as session, session.begin():
+                await backend._project_step(session, responded)
+
+
+@pytest.mark.parametrize(
+    ("current", "proposed", "expected"),
+    [
+        # The lattice itself: the maximum, in both argument orders.
+        ("incomplete", "requested", "requested"),
+        ("requested", "requested", "requested"),
+        ("incomplete", "success", "success"),
+        ("requested", "success", "success"),
+        ("success", "requested", "success"),
+        ("success", "success", "success"),
+        # `failed` is off the lattice, and both edges are deliberate.
+        ("requested", "failed", "failed"),
+        ("success", "failed", "failed"),
+        ("failed", "requested", "failed"),
+        ("failed", "success", "success"),
+        ("failed", "failed", "failed"),
+    ],
+)
+def test_llm_attempt_status_merge_takes_the_lattice_maximum(current, proposed, expected):
+    """``incomplete < requested < success``, with ``failed`` outside it.
+
+    The last two rows are the adjudicated edges, not accidents:
+    ``failed -> requested`` keeps the failure (a peer's request Observation may
+    not walk a recorded terminal back), while ``failed -> success`` keeps the
+    pre-F10-31 last-writer-wins answer for contradictory evidence no producer
+    emits.
+    """
+
+    assert ansich_sql._advance_llm_attempt_status(current, proposed) == expected
+
+
+# --------------------------------------------------------------------------
 # Dialect parity: the PostgreSQL half of the upsert never runs on SQLite
 # --------------------------------------------------------------------------
 
@@ -937,6 +1235,59 @@ _FIRST_WRITE_UPSERTS = (
         },
         ["obs_id", "projector_name", "projector_version"],
         AnsichProjectionJobRow.job_id,
+    ),
+    (
+        AnsichCurrentBeliefRow,
+        {
+            "subject_id": "task",
+            "field_name": "heartbeat",
+            "assertion_id": "assertion",
+            "resolver_name": "ansich-default",
+            "resolver_version": "2.0.0",
+        },
+        ["subject_id", "field_name"],
+        AnsichCurrentBeliefRow.subject_id,
+    ),
+    # F10-31 and F10-33: the fifth and sixth conversions. The attempt row's
+    # target is its primary key; the Alert episode's is a *named table-level*
+    # unique constraint over two columns, which is the one conflict target
+    # shape none of the sites above exercises.
+    (
+        AnsichLlmAttemptRow,
+        {
+            "attempt_id": "attempt",
+            "task_id": "task",
+            "step_id": None,
+            "actor_kind": "system_operation",
+            "attempt_no": 1,
+            "status": "incomplete",
+        },
+        ["attempt_id"],
+        AnsichLlmAttemptRow.attempt_id,
+    ),
+    (
+        AnsichAlertRow,
+        {
+            "entity_id": "alert",
+            "alert_key": "a" * 64,
+            "episode": 1,
+            "alert_type": "heartbeat_missing",
+            "subject_id": "task",
+            "source_assertion_id": "assertion",
+            "rule_name": "task-liveness",
+            "rule_version": "1",
+            "rule_config_hash": "b" * 64,
+            "stable_condition_key": "task-heartbeat",
+            "severity": "critical",
+            "shadow": False,
+            "opened_at": _OCCURRED_AT,
+            "as_of": _OCCURRED_AT,
+            "updated_at": _OCCURRED_AT,
+            "workflow_state": "open",
+            "workflow_version": 1,
+        },
+        ["alert_key", "episode"],
+        AnsichAlertRow.entity_id,
     ),
 )
 

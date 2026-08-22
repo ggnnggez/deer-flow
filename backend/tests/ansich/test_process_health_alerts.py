@@ -35,7 +35,8 @@ from ansich.process_health import (
 )
 from ansich.safety import host_scope_id
 from httpx import ASGITransport, AsyncClient
-from sqlalchemy import select, update
+from sqlalchemy import func, select, update
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 from support.ansich_settle import only_test_driven_assessments
 
@@ -104,7 +105,7 @@ async def _await_no_failed_projectors(session_factory, *, timeout: float = 20.0)
         await asyncio.sleep(0.01)
 
 
-async def _started_service(tmp_path, filename: str):
+async def _started_service(tmp_path, filename: str, **knobs):
     """A started SQL service whose host Scope is a property of this test."""
 
     engine = create_async_engine(f"sqlite+aiosqlite:///{tmp_path / filename}")
@@ -118,6 +119,7 @@ async def _started_service(tmp_path, filename: str):
         # immediately, which is how every failing projector below is made real.
         projector_dependency_timeout_seconds=0,
         operations_assessment_interval_ms=60_000,
+        **knobs,
     )
     only_test_driven_assessments(service)
     await service.start()
@@ -1288,6 +1290,254 @@ async def test_the_projector_loop_routes_a_failing_tick_to_the_reporter(tmp_path
         await engine.dispose()
 
     assert all(isinstance(error, RuntimeError) for error in reported)
+
+
+# --- F10-33: the episode first-writer race no longer costs the tick ----------
+
+
+def _hide_alert_type(monkeypatch: pytest.MonkeyPatch, alert_type: str) -> None:
+    """Hide one Alert type's existing episodes from the reconciliation read.
+
+    This is the injected half of the F10-33 race, and SQLite needs it injected
+    for the same reason ``test_rollup_serialization.py`` injects its own: one
+    writer at a time means "both workers read no episode and both reached the
+    insert" is not a state this engine can be driven into. What production
+    reaches is exactly the state left behind here -- the episode read found
+    nothing, and by the time the insert runs the peer's row is committed.
+    """
+
+    original = SqlAnsichBackend._load_reconciliation_alert_episodes
+
+    async def _patched(self, session, *, task_id):
+        episodes = await original(self, session, task_id=task_id)
+        return tuple(episode for episode in episodes if episode.alert_type != alert_type)
+
+    monkeypatch.setattr(SqlAnsichBackend, "_load_reconciliation_alert_episodes", _patched)
+
+
+def _bare_alert_insert(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Degrade only the episode upsert back to the pre-F10-33 ORM insert."""
+
+    original = sql_module._insert_ignoring_conflict
+
+    async def _patched(session, model, values, *, index_elements, returning):
+        if model is not AnsichAlertRow:
+            return await original(session, model, values, index_elements=index_elements, returning=returning)
+        session.add(model(**values))
+        await session.flush()
+        return True
+
+    monkeypatch.setattr(sql_module, "_insert_ignoring_conflict", _patched)
+
+
+async def _stale_heartbeat_task(service: AnsichService, *, suffix: str) -> str:
+    """A running Task whose only heartbeat is old enough to read ``stale``."""
+
+    task_id = new_id()
+    run_id = f"run-{suffix}"
+    service.record_batch(
+        (
+            ObservationEnvelope.task_lifecycle(
+                kind="task.created",
+                task_id=task_id,
+                source_kind="deerflow_run",
+                source_id=run_id,
+                occurred_at=_T0,
+                source_event_id=f"process-health:{suffix}:task:created",
+            ),
+            ObservationEnvelope.task_lifecycle(
+                kind="task.started",
+                task_id=task_id,
+                source_kind="deerflow_run",
+                source_id=run_id,
+                occurred_at=_T0,
+                source_event_id=f"process-health:{suffix}:task:started",
+            ),
+            ObservationEnvelope.task_heartbeat(
+                task_id=task_id,
+                run_id=run_id,
+                occurred_at=_T0,
+                elapsed_ms=0,
+                worker_id=f"{suffix}-worker",
+                ownership_epoch=f"{suffix}-epoch",
+                source_event_id=f"process-health:{suffix}:heartbeat:1",
+            ),
+        )
+    )
+    await service.flush_task(task_id)
+    return task_id
+
+
+async def _await_failed_job_count(session_factory, expected: int, *, timeout: float = 20.0) -> None:
+    deadline = time.monotonic() + timeout
+    while True:
+        async with session_factory() as session:
+            failed = int(await session.scalar(select(func.count()).select_from(AnsichProjectionJobRow).where(AnsichProjectionJobRow.status == "failed")) or 0)
+        if failed >= expected:
+            return
+        assert time.monotonic() < deadline, f"timed out waiting for {expected} failed jobs, saw {failed}"
+        await asyncio.sleep(0.01)
+
+
+async def _alerts_for_subject(session_factory, subject_id: str, alert_type: str) -> list[AnsichAlertRow]:
+    async with session_factory() as session:
+        return list(
+            (
+                await session.execute(
+                    select(AnsichAlertRow)
+                    .where(
+                        AnsichAlertRow.subject_id == subject_id,
+                        AnsichAlertRow.alert_type == alert_type,
+                    )
+                    .order_by(AnsichAlertRow.episode)
+                )
+            ).scalars()
+        )
+
+
+async def _duplicate_episodes(session_factory) -> list[tuple[str, int, int]]:
+    async with session_factory() as session:
+        return [tuple(row) for row in (await session.execute(select(AnsichAlertRow.alert_key, AnsichAlertRow.episode, func.count()).group_by(AnsichAlertRow.alert_key, AnsichAlertRow.episode).having(func.count() > 1))).all()]
+
+
+async def _collision_fixture(tmp_path, filename: str):
+    """A store where one tick must open a projection_failure episode a peer holds.
+
+    Three conditions are live at once and they are deliberately spread across
+    the tick's transaction: the stale-heartbeat Task is reconciled *before* the
+    two process rules, ``projection_failure`` is the colliding one, and the
+    second losing producer's ``observability_degradation`` episode is opened by
+    the rule that runs *after* it. Whatever a collision costs, this fixture is
+    positioned to see it on both sides.
+    """
+
+    engine, session_factory, service = await _started_service(
+        tmp_path,
+        filename,
+        heartbeat_stale_after_seconds=5,
+    )
+    failing_task_id = new_id()
+    service.record(_orphan_budget_consumed(failing_task_id, occurred_at=_T0, suffix=f"{filename}-failing"))
+    await service.flush_task(failing_task_id)
+    await _await_failed_projectors(session_factory, {"task-usage"})
+    service.record(
+        _lost_range(
+            occurred_at=_T0,
+            first_sequence=1,
+            last_sequence=2,
+            producer_name="loss-probe",
+            producer_instance_id="worker-a",
+            suffix=f"{filename}-a",
+        )
+    )
+    await service.flush_task(ANSICH_BOOTSTRAP_TASK_ID)
+
+    # The peer worker's tick. It opens the projection_failure episode the
+    # colliding tick below will try to open again.
+    await service.assess_operations(now=_T0 + timedelta(seconds=1))
+    peer = await _alerts(session_factory, "projection_failure")
+    assert [row.episode for row in peer] == [1]
+
+    # A second job fails in the SAME projector group. The verdict does not
+    # transition (still `failing`), but the episode's evidence list does, so the
+    # colliding tick's reconciliation is a confirm that genuinely has to write
+    # -- without it the loser and a no-op are the same observation.
+    second_failing_task_id = new_id()
+    service.record(_orphan_budget_consumed(second_failing_task_id, occurred_at=_T0 + timedelta(seconds=2), suffix=f"{filename}-failing-2"))
+    await service.flush_task(second_failing_task_id)
+    await _await_failed_job_count(session_factory, 2)
+
+    # Work that only the *second* tick can land, on either side of the collision.
+    stale_task_id = await _stale_heartbeat_task(service, suffix=f"{filename}-stale")
+    service.record(
+        _lost_range(
+            occurred_at=_T0 + timedelta(seconds=2),
+            first_sequence=3,
+            last_sequence=4,
+            producer_name="loss-probe",
+            producer_instance_id="worker-b",
+            suffix=f"{filename}-b",
+        )
+    )
+    await service.flush_task(ANSICH_BOOTSTRAP_TASK_ID)
+    return engine, session_factory, service, peer[0], stale_task_id
+
+
+@pytest.mark.anyio
+async def test_an_episode_collision_no_longer_discards_the_whole_assessment_tick(tmp_path, monkeypatch):
+    """F10-33: the collision costs one row re-read, not the tick.
+
+    Every Gateway worker on a host subjects the same host ``Scope`` and runs its
+    own 1 Hz assessment, so two of them opening one episode collided on
+    ``uq_ansich_alert_episode`` and took the entire ``assess_operations``
+    transaction down -- heartbeat, dwell, budget, environment and both
+    process-subject producers with it. With the lock-then-read posture the loser
+    re-reads the winner's row and confirms onto it, and everything else in the
+    tick lands.
+    """
+
+    engine, session_factory, service, peer_episode, stale_task_id = await _collision_fixture(tmp_path, "process-health-episode-collision.db")
+    try:
+        _hide_alert_type(monkeypatch, "projection_failure")
+        changed = await service.assess_operations(now=_T0 + timedelta(seconds=10))
+
+        collided = await _alerts(session_factory, "projection_failure")
+        degradation = await _alerts(session_factory, "observability_degradation")
+        heartbeat = await _alerts_for_subject(session_factory, stale_task_id, "heartbeat_missing")
+        duplicates = await _duplicate_episodes(session_factory)
+        async with session_factory() as session:
+            collided_evidence = list((await session.execute(select(AnsichAlertEvidenceRow.obs_id).where(AnsichAlertEvidenceRow.alert_id == collided[0].entity_id).order_by(AnsichAlertEvidenceRow.ordinal))).scalars())
+    finally:
+        await service.stop()
+        await engine.dispose()
+
+    assert changed >= 0
+
+    # The collision: one row, still the peer's, confirmed rather than duplicated.
+    assert len(collided) == 1
+    assert collided[0].entity_id == peer_episode.entity_id
+    assert collided[0].episode == 1
+    assert collided[0].resolved_at is None
+    assert collided[0].updated_at.replace(tzinfo=UTC) == _T0 + timedelta(seconds=10), "the loser must reconcile onto the winner's row, not walk away from it"
+    assert len(collided_evidence) == 2, "the confirm must carry this tick's evidence, which is what makes it a real write"
+    assert duplicates == []
+
+    # The tick survived on both sides of it.
+    assert sorted(row.stable_condition_key for row in degradation) == sorted(
+        (
+            observability_loss_condition_key("loss-probe", "worker-a"),
+            observability_loss_condition_key("loss-probe", "worker-b"),
+        )
+    ), "the rule that runs AFTER the collision must still have opened its episode"
+    assert [row.episode for row in heartbeat] == [1], "the Task reconciled BEFORE the collision must still have its episode"
+
+
+@pytest.mark.anyio
+async def test_the_pre_fix_bare_episode_insert_is_what_discarded_the_tick(tmp_path, monkeypatch):
+    """The registered cost of F10-33, reproduced and then removed.
+
+    Same injected window, the episode upsert degraded to the ORM insert the
+    reconciler used before this change. It raises out of ``assess_operations``
+    -- which ``_projector_loop`` swallows in production, a second later -- and
+    the whole batch goes with it: neither the heartbeat episode reconciled
+    before it nor the loss episode opened after it survives.
+    """
+
+    engine, session_factory, service, _peer_episode, stale_task_id = await _collision_fixture(tmp_path, "process-health-episode-collision-control.db")
+    try:
+        _hide_alert_type(monkeypatch, "projection_failure")
+        _bare_alert_insert(monkeypatch)
+        with pytest.raises(IntegrityError):
+            await service.assess_operations(now=_T0 + timedelta(seconds=10))
+
+        degradation = await _alerts(session_factory, "observability_degradation")
+        heartbeat = await _alerts_for_subject(session_factory, stale_task_id, "heartbeat_missing")
+    finally:
+        await service.stop()
+        await engine.dispose()
+
+    assert [row.stable_condition_key for row in degradation] == [observability_loss_condition_key("loss-probe", "worker-a")]
+    assert heartbeat == []
 
 
 # --- pure rules -------------------------------------------------------------

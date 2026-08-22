@@ -60,6 +60,7 @@ from ansich.alerts.episodes import (
     alert_conditions_from_assessment,
     dismiss_alert,
     reconcile_alert_conditions,
+    reconcile_alert_episode,
     resolve_alert_episode,
 )
 from ansich.alerts.views import (
@@ -2290,6 +2291,115 @@ async def _insert_ignoring_conflict(
     return inserted is not None
 
 
+def _current_belief_statement(subject_id: str, field_name: str):
+    return select(AnsichCurrentBeliefRow).where(
+        AnsichCurrentBeliefRow.subject_id == subject_id,
+        AnsichCurrentBeliefRow.field_name == field_name,
+    )
+
+
+async def _open_or_lock_current_belief(
+    session: AsyncSession,
+    *,
+    subject_id: str,
+    field_name: str,
+    assertion_id: str,
+    resolver_name: str,
+    resolver_version: str,
+) -> AnsichCurrentBeliefRow | None:
+    """Open a Belief's current row first-writer-safely; hand back a peer's.
+
+    ``None`` means this caller opened the row. Anything else is the peer's row,
+    taken under ``FOR UPDATE``, and the caller converges on it exactly as it
+    would have had it read second.
+
+    Every writer of ``ansich_current_beliefs`` shares one hazard and it is the
+    same one the four rollups closed: ``FOR UPDATE`` cannot lock a row that does
+    not exist, so two workers both read "no current Belief" and both insert on
+    ``(subject_id, field_name)``. What made this one worth its own conversion is
+    the **blast radius on the operations tick**: several Gateway workers each run
+    their own 1 Hz `assess_operations`, the whole tick is one transaction, and a
+    collision on a Task's very first `heartbeat` Belief therefore discarded that
+    tick's heartbeat, dwell, budget, environment and both process-subject
+    producers — the identical cost F10-33's episode collision carried, on a
+    different constraint. (On the *projector* paths the same shape costs one job
+    transaction and a `retry`, which is the bounded, self-healing case F10-6's
+    entry already records.)
+
+    The row's FK requires the assertion to exist first, so the caller flushes it
+    before calling; the explicit flush here is belt-and-braces for exactly the
+    reason ``_persist_alert_episode`` states — an ORM autoflush is not an
+    ordering guarantee anyone should have to re-derive at each call site.
+    """
+
+    await session.flush()
+    won = await _insert_ignoring_conflict(
+        session,
+        AnsichCurrentBeliefRow,
+        {
+            "subject_id": subject_id,
+            "field_name": field_name,
+            "assertion_id": assertion_id,
+            "resolver_name": resolver_name,
+            "resolver_version": resolver_version,
+        },
+        index_elements=["subject_id", "field_name"],
+        returning=AnsichCurrentBeliefRow.subject_id,
+    )
+    if won:
+        return None
+    return next(
+        iter(await _lock_rollup_targets(session, _current_belief_statement(subject_id, field_name))),
+        None,
+    )
+
+
+#: The LLM attempt's status lattice, ``incomplete < requested < success``.
+#: ``failed`` is deliberately NOT a member: it is a hard terminal verdict about
+#: the adapter call, not a rung on the way to one. See
+#: ``_advance_llm_attempt_status`` for what that costs at the two edges.
+_LLM_ATTEMPT_STATUS_LATTICE: dict[str, int] = {
+    "incomplete": 0,
+    "requested": 1,
+    "success": 2,
+}
+
+
+def _advance_llm_attempt_status(current: str, proposed: str) -> str:
+    """Merge two branches' status claims about one LLM attempt.
+
+    The two Observations of one attempt (``llm.requested`` / ``llm.responded``)
+    are separate projection jobs that two leased workers can hold at once
+    (F10-31), so neither branch may assume it is writing onto the state *it*
+    left behind. Within the lattice the answer is its maximum, which is what
+    makes the merge order-independent: whichever branch lands second reads the
+    other's row and can only raise the status, never lower it.
+
+    Two edges sit outside the lattice and are answered deliberately rather than
+    by accident, because ``failed`` is not ranked:
+
+    * ``llm.failed`` states a terminal outright (``proposed`` unranked ⇒ it
+      wins). An attempt that failed did fail.
+    * A branch proposing a *ranked* status onto an unranked ``failed`` row:
+      ``llm.requested`` (rank 1) must not walk a recorded failure back, so the
+      failure stands; ``llm.responded`` proposes the lattice's top and keeps the
+      pre-F10-31 last-writer-wins answer. That second case needs an attempt
+      carrying **both** an ``llm.failed`` and an ``llm.responded`` Observation —
+      contradictory evidence no producer emits, since one adapter call either
+      answers or raises. It is preserved verbatim rather than "fixed" here: this
+      change is a concurrency fix, and re-adjudicating contradictory terminals
+      is a different question with no evidence behind it.
+    """
+
+    proposed_rank = _LLM_ATTEMPT_STATUS_LATTICE.get(proposed)
+    if proposed_rank is None:
+        return proposed
+    current_rank = _LLM_ATTEMPT_STATUS_LATTICE.get(current)
+    if current_rank is None:
+        return proposed if proposed_rank == _LLM_ATTEMPT_STATUS_LATTICE["success"] else current
+    return current if current_rank >= proposed_rank else proposed
+
+
 def _list_task_views_statement(
     *,
     limit: int,
@@ -2454,6 +2564,15 @@ _STALE_REQUESTED_TAKEOVER_AFTER = timedelta(minutes=5)
 #: rule's config identity, so changing it is visible in the Assertions it
 #: produces.
 _OBSERVABILITY_LOSS_WINDOW_SECONDS = 900
+#: How many times one reconciled Alert episode may be re-decided against a peer
+#: that opened it first (F10-33). Two is what the race itself needs: pass one
+#: opens and may lose, pass two confirms onto the winner's row and an UPDATE
+#: cannot lose ``uq_ansich_alert_episode`` again. The third exists only for the
+#: case where the winner was resolved between the two passes, which turns the
+#: re-decision back into an ``opened`` of the *next* episode. Exhausting the
+#: bound leaves that one episode to the next tick — it is never raised, because
+#: this whole conversion exists to stop an episode collision discarding a tick.
+_ALERT_EPISODE_FIRST_WRITER_PASSES = 3
 #: Bound on how many ``observability.lost`` rows one assessment tick reads. The
 #: rows in a fifteen-minute window are unbounded under a sustained outage, and
 #: this pass runs once a second, so the scan has to have a ceiling.
@@ -6705,6 +6824,36 @@ class SqlAnsichBackend:
         subject_id: str,
         field_name: str,
     ) -> None:
+        # At most two passes: the second only runs when this worker lost the
+        # first-write race, and by then the row exists, so its lock is real.
+        # Re-resolving rather than reusing the first pass's answer is the point
+        # -- the peer's Assertion was invisible to that read under READ
+        # COMMITTED and has to be ranked against ours before either can be
+        # published. F10-6's entry named this first writer as the half its own
+        # lock-then-read conversion did not close.
+        for _pass in range(2):
+            if await self._resolve_current_assessment_once(
+                session,
+                subject_id=subject_id,
+                field_name=field_name,
+            ):
+                return
+
+    async def _resolve_current_assessment_once(
+        self,
+        session: AsyncSession,
+        *,
+        subject_id: str,
+        field_name: str,
+    ) -> bool:
+        """One resolution pass; ``False`` means a peer opened the row first."""
+
+        # Lock the current-Belief row BEFORE reading the Assertions it is
+        # reduced from. See `_lock_rollup_targets`.
+        current = next(
+            iter(await _lock_rollup_targets(session, _current_belief_statement(subject_id, field_name))),
+            None,
+        )
         assertion_rows = list(
             (
                 await session.execute(
@@ -6760,24 +6909,26 @@ class SqlAnsichBackend:
         # teach the dispatch to discriminate first, or every switch would
         # silently keep running v1 while claiming v2.
         resolved = await self._resolve_under_active_resolver(session, assertions)
-        current = await session.get(
-            AnsichCurrentBeliefRow,
-            (subject_id, field_name),
-        )
         if current is None:
-            session.add(
-                AnsichCurrentBeliefRow(
+            if (
+                await _open_or_lock_current_belief(
+                    session,
                     subject_id=subject_id,
                     field_name=field_name,
                     assertion_id=resolved.selected.assertion_id,
                     resolver_name=resolved.resolver.name,
                     resolver_version=resolved.resolver.version,
                 )
-            )
-        else:
-            current.assertion_id = resolved.selected.assertion_id
-            current.resolver_name = resolved.resolver.name
-            current.resolver_version = resolved.resolver.version
+                is not None
+            ):
+                # A peer opened it first. Say so rather than writing the answer
+                # reduced from inputs that did not include its Assertion.
+                return False
+            return True
+        current.assertion_id = resolved.selected.assertion_id
+        current.resolver_name = resolved.resolver.name
+        current.resolver_version = resolved.resolver.version
+        return True
 
     async def _refresh_behavior_belief(
         self,
@@ -7015,37 +7166,117 @@ class SqlAnsichBackend:
         )
         changed = 0
         by_id = {episode.alert_id: episode for episode in episodes}
-        for reconciliation in reconciliations:
-            if reconciliation.change == "noop" or reconciliation.alert is None:
-                continue
-            candidate = reconciliation.alert
-            previous = by_id.get(candidate.alert_id)
-            hydrated_previous = previous
-            if previous is not None:
-                hydrated_previous = previous.model_copy(
-                    update={
-                        "evidence": await self._load_alert_evidence(
-                            session,
-                            alert_id=previous.alert_id,
-                        )
-                    }
+        # Sorted before anything is written. The loser of the episode
+        # first-writer race inside `_persist_alert_episode` takes a FOR UPDATE
+        # on the winner's row (F10-33), so two workers walking one subject's
+        # episodes in different orders could take two row locks in opposite
+        # orders and deadlock on a real server. `(alert_key, episode)` is the
+        # unique key the race is fought over, so ordering by it is identical on
+        # every worker whatever produced the conditions -- which is the point,
+        # since the host `Scope` producers' condition order is a function of a
+        # partition that legitimately differs between workers. Every
+        # reconciliation here targets a distinct episode, so the sort changes
+        # nothing but the order of the writes.
+        for reconciliation in sorted(
+            reconciliations,
+            key=lambda item: (
+                "" if item.alert is None else item.alert.alert_key,
+                0 if item.alert is None else item.alert.episode,
+            ),
+        ):
+            for _pass in range(_ALERT_EPISODE_FIRST_WRITER_PASSES):
+                if reconciliation.change == "noop" or reconciliation.alert is None:
+                    break
+                candidate = reconciliation.alert
+                previous = by_id.get(candidate.alert_id)
+                hydrated_previous = previous
+                if previous is not None:
+                    hydrated_previous = previous.model_copy(
+                        update={
+                            "evidence": await self._load_alert_evidence(
+                                session,
+                                alert_id=previous.alert_id,
+                            )
+                        }
+                    )
+                    if reconciliation.change == "resolved":
+                        candidate = candidate.model_copy(update={"evidence": hydrated_previous.evidence})
+                        reconciliation = reconciliation.model_copy(update={"alert": candidate})
+                if previous is not None and self._same_alert_projection(
+                    hydrated_previous,
+                    candidate,
+                ):
+                    break
+                winner = await self._persist_alert_episode(
+                    session,
+                    reconciliation=reconciliation,
+                    possibly_affected_task_ids=possibly_affected_task_ids,
                 )
-                if reconciliation.change == "resolved":
-                    candidate = candidate.model_copy(update={"evidence": hydrated_previous.evidence})
-                    reconciliation = reconciliation.model_copy(update={"alert": candidate})
-            if previous is not None and self._same_alert_projection(
-                hydrated_previous,
-                candidate,
-            ):
-                continue
-            await self._persist_alert_episode(
-                session,
-                reconciliation=reconciliation,
-                possibly_affected_task_ids=possibly_affected_task_ids,
-            )
-            by_id[candidate.alert_id] = candidate
-            changed += 1
+                if winner is None:
+                    by_id[candidate.alert_id] = candidate
+                    changed += 1
+                    break
+                # A peer opened this episode first. Re-decide against the row it
+                # committed, through the same state machine, exactly as this
+                # pass would have decided had it read second: an unresolved
+                # winner turns this `opened` into a `confirmed` UPDATE of the
+                # winner's row, which cannot lose the unique key again.
+                by_id[winner.alert_id] = winner
+                reconciliation = self._reconcile_opened_episode_against_winner(candidate, winner)
+            else:
+                # Bounded, and deliberately not raised: this whole conversion
+                # exists to stop one episode collision discarding the tick, so
+                # exhausting the passes leaves this one episode to the next tick
+                # rather than taking heartbeat, dwell, budget and environment
+                # down with it.
+                logger.debug(
+                    "Ansich alert episode did not settle within %d first-writer passes: subject=%s",
+                    _ALERT_EPISODE_FIRST_WRITER_PASSES,
+                    subject_id,
+                    extra={
+                        "event": "ansich.alert_episode.first_writer_unsettled",
+                        "subject_id": subject_id,
+                    },
+                )
         return changed
+
+    @staticmethod
+    def _reconcile_opened_episode_against_winner(
+        candidate: AlertEpisode,
+        winner: AlertEpisode,
+    ) -> AlertReconciliation:
+        """Re-decide a lost ``opened`` episode against the row that won it.
+
+        Only an *active* condition can produce ``opened``, and every field an
+        ``AlertCondition`` carries survives onto the episode it opened, so the
+        condition is reconstructible from the candidate rather than having to be
+        threaded down through the persistence layer. Handing it back to
+        ``reconcile_alert_episode`` keeps the Alert state machine the single
+        authority on what a second reader does: normally a ``confirmed`` update
+        of the winner's row, but a winner an operator resolved in between opens
+        the next episode instead -- which is the correct answer and is why this
+        is not hand-written as a ``model_copy``.
+        """
+
+        condition = AlertCondition(
+            alert_type=candidate.alert_type,
+            subject_id=candidate.subject_id,
+            rule=candidate.rule,
+            rule_config_hash=candidate.rule_config_hash,
+            stable_condition_key=candidate.stable_condition_key,
+            active=True,
+            source_assertion_id=candidate.source_assertion_id,
+            as_of=candidate.as_of,
+            severity=candidate.severity,
+            shadow=candidate.shadow,
+            evidence=candidate.evidence,
+        )
+        return reconcile_alert_episode(
+            (winner,),
+            condition,
+            now=candidate.updated_at,
+            alert_id_factory=new_id,
+        )
 
     @staticmethod
     def _same_alert_projection(
@@ -7060,52 +7291,80 @@ class SqlAnsichBackend:
         *,
         reconciliation: AlertReconciliation,
         possibly_affected_task_ids: list[str] | None = None,
-    ) -> None:
+    ) -> AlertEpisode | None:
+        """Write one reconciled episode; report a lost first-writer race.
+
+        Returns ``None`` when the episode was written, and the *winner's*
+        hydrated episode when this call lost the race to open
+        ``(alert_key, episode)`` — the caller re-decides against it (F10-33).
+
+        Every Gateway worker on a host subjects the same host `Scope` and runs
+        its own 1 Hz assessment, so two of them opening one episode concurrently
+        used to collide on ``uq_ansich_alert_episode`` and abort the *entire*
+        ``assess_operations`` transaction — heartbeat, dwell, budget and
+        environment discarded along with both process-subject producers. The
+        lock-then-read posture the four rollups use makes that collision cost
+        one row re-read instead: ``INSERT … ON CONFLICT DO NOTHING`` on the
+        unique key, then a ``FOR UPDATE`` read of whoever won.
+        """
+
         alert = reconciliation.alert
         if alert is None:
-            return
+            return None
         row = await session.get(AnsichAlertRow, alert.alert_id)
         if row is None:
             if not alert.evidence:
                 raise ValueError("new Alert episode requires Observation evidence")
-            session.add(
-                AnsichEntityRow(
-                    entity_id=alert.alert_id,
-                    entity_type="alert",
-                    discovered_obs_id=alert.evidence[0].obs_id,
-                )
+            entity = AnsichEntityRow(
+                entity_id=alert.alert_id,
+                entity_type="alert",
+                discovered_obs_id=alert.evidence[0].obs_id,
             )
+            session.add(entity)
             # No ORM relationship() links AnsichEntityRow to AnsichAlertRow,
             # so SQLAlchemy's flush does not guarantee this INSERT precedes
             # the FK-dependent one below; flush explicitly to enforce order.
             await session.flush()
-            row = AnsichAlertRow(
-                entity_id=alert.alert_id,
-                alert_key=alert.alert_key,
-                episode=alert.episode,
-                alert_type=alert.alert_type,
-                subject_id=alert.subject_id,
-                source_assertion_id=alert.source_assertion_id,
-                rule_name=alert.rule.name,
-                rule_version=alert.rule.version,
-                rule_config_hash=alert.rule_config_hash,
-                stable_condition_key=alert.stable_condition_key,
-                severity=alert.severity,
-                shadow=alert.shadow,
-                opened_at=alert.opened_at,
-                as_of=alert.as_of,
-                updated_at=alert.updated_at,
-                resolved_at=alert.resolved_at,
-                resolution_reason=alert.resolution_reason,
-                workflow_state=alert.workflow_state,
-                workflow_version=alert.workflow_version,
-                dismissal_reason=alert.dismissal_reason,
+            won = await _insert_ignoring_conflict(
+                session,
+                AnsichAlertRow,
+                {
+                    "entity_id": alert.alert_id,
+                    "alert_key": alert.alert_key,
+                    "episode": alert.episode,
+                    "alert_type": alert.alert_type,
+                    "subject_id": alert.subject_id,
+                    "source_assertion_id": alert.source_assertion_id,
+                    "rule_name": alert.rule.name,
+                    "rule_version": alert.rule.version,
+                    "rule_config_hash": alert.rule_config_hash,
+                    "stable_condition_key": alert.stable_condition_key,
+                    "severity": alert.severity,
+                    "shadow": alert.shadow,
+                    "opened_at": alert.opened_at,
+                    "as_of": alert.as_of,
+                    "updated_at": alert.updated_at,
+                    "resolved_at": alert.resolved_at,
+                    "resolution_reason": alert.resolution_reason,
+                    "workflow_state": alert.workflow_state,
+                    "workflow_version": alert.workflow_version,
+                    "dismissal_reason": alert.dismissal_reason,
+                },
+                index_elements=["alert_key", "episode"],
+                returning=AnsichAlertRow.entity_id,
             )
-            session.add(row)
-            # AnsichAlertEvidenceRow.alert_id has no ORM relationship() back
-            # to AnsichAlertRow either, so the evidence inserts below are not
-            # guaranteed to be ordered after this row's INSERT; flush first.
-            await session.flush()
+            if not won:
+                # The Entity row was minted for an alert_id that now names
+                # nothing, and it is this call's to withdraw: `ansich_entities`
+                # has no inbound edge from `ansich_alerts` to carry it away, so
+                # leaving it behind would accumulate one orphan per collision.
+                await session.delete(entity)
+                await session.flush()
+                return await self._locked_alert_episode(
+                    session,
+                    alert_key=alert.alert_key,
+                    episode=alert.episode,
+                )
         else:
             row.source_assertion_id = alert.source_assertion_id
             row.rule_name = alert.rule.name
@@ -7184,6 +7443,44 @@ class SqlAnsichBackend:
                 # non-empty observation is honest; unioning across time would
                 # not be, so it is deliberately not done.
                 read_model.possibly_affected_task_ids = possibly_affected_task_ids
+        return None
+
+    async def _locked_alert_episode(
+        self,
+        session: AsyncSession,
+        *,
+        alert_key: str,
+        episode: int,
+    ) -> AlertEpisode | None:
+        """Take the winner's episode row under ``FOR UPDATE`` and hydrate it.
+
+        The read half of the F10-33 posture: the row this call could not insert
+        exists now, so it is lockable, and locking it before the caller decides
+        what to write onto it is the same discipline
+        ``_lock_rollup_targets`` documents for every other aggregate here.
+        """
+
+        row = next(
+            iter(
+                await _lock_rollup_targets(
+                    session,
+                    select(AnsichAlertRow).where(
+                        AnsichAlertRow.alert_key == alert_key,
+                        AnsichAlertRow.episode == episode,
+                    ),
+                )
+            ),
+            None,
+        )
+        if row is None:  # pragma: no cover - unreachable, asserted rather than assumed
+            return None
+        return self._alert_episode_from_row(
+            row,
+            evidence=await self._load_alert_evidence(
+                session,
+                alert_id=row.entity_id,
+            ),
+        )
 
     async def _resolve_terminal_alerts(
         self,
@@ -9223,9 +9520,13 @@ class SqlAnsichBackend:
                     now=asserted_at,
                     stale_after_seconds=self._heartbeat_stale_after_seconds,
                 )
-                current = await session.get(
-                    AnsichCurrentBeliefRow,
-                    (task_id, "heartbeat"),
+                # Lock the current-Belief row BEFORE reading the Assertion the
+                # unchanged-comparison below is made against (F10-6's posture,
+                # F10-35's blast radius): every Gateway worker on this host runs
+                # its own 1 Hz tick over the same running Tasks.
+                current = next(
+                    iter(await _lock_rollup_targets(session, _current_belief_statement(task_id, "heartbeat"))),
+                    None,
                 )
                 current_assertion = None
                 current_evidence: tuple[str, ...] = ()
@@ -9272,16 +9573,25 @@ class SqlAnsichBackend:
                             )
                         )
                     if current is None:
-                        session.add(
-                            AnsichCurrentBeliefRow(
-                                subject_id=task_id,
-                                field_name="heartbeat",
-                                assertion_id=assertion.assertion_id,
-                                resolver_name=belief.selected_by.name,
-                                resolver_version=belief.selected_by.version,
-                            )
+                        current = await _open_or_lock_current_belief(
+                            session,
+                            subject_id=task_id,
+                            field_name="heartbeat",
+                            assertion_id=assertion.assertion_id,
+                            resolver_name=belief.selected_by.name,
+                            resolver_version=belief.selected_by.version,
                         )
-                    else:
+                    if current is not None:
+                        # Either the row already existed, or a peer opened it
+                        # while this tick was deciding. Both converge the same
+                        # way: point it at this pass's Assertion, which is the
+                        # later assessment of the same rule over the same
+                        # evidence. The one cost of the race is that this pass's
+                        # Assertion was appended before the loss was known, so a
+                        # first-write collision leaves one extra (same-verdict)
+                        # `heartbeat` Assertion for that Task -- bounded at one,
+                        # because from here on the row exists and the ordinary
+                        # unchanged-skip applies.
                         current.assertion_id = assertion.assertion_id
                         current.resolver_name = belief.selected_by.name
                         current.resolver_version = belief.selected_by.version
@@ -10243,9 +10553,12 @@ class SqlAnsichBackend:
                 "shadow": not budget.enforcement,
                 "as_of_known": belief.as_of is not None,
             }
-            current = await session.get(
-                AnsichCurrentBeliefRow,
-                (budget_row.task_id, field_name),
+            # Lock before reading the Assertion this compares against, same
+            # posture and same 1 Hz multi-worker contention as the heartbeat
+            # block above.
+            current = next(
+                iter(await _lock_rollup_targets(session, _current_belief_statement(budget_row.task_id, field_name))),
+                None,
             )
             current_assertion = None
             current_evidence: tuple[str, ...] = ()
@@ -10292,16 +10605,15 @@ class SqlAnsichBackend:
                     )
                 )
             if current is None:
-                session.add(
-                    AnsichCurrentBeliefRow(
-                        subject_id=budget_row.task_id,
-                        field_name=field_name,
-                        assertion_id=assertion.assertion_id,
-                        resolver_name=belief.selected_by.name,
-                        resolver_version=belief.selected_by.version,
-                    )
+                current = await _open_or_lock_current_belief(
+                    session,
+                    subject_id=budget_row.task_id,
+                    field_name=field_name,
+                    assertion_id=assertion.assertion_id,
+                    resolver_name=belief.selected_by.name,
+                    resolver_version=belief.selected_by.version,
                 )
-            else:
+            if current is not None:
                 current.assertion_id = assertion.assertion_id
                 current.resolver_name = belief.selected_by.name
                 current.resolver_version = belief.selected_by.version
@@ -13291,26 +13603,13 @@ class SqlAnsichBackend:
             await self._project_tool_call(session, observation)
             return False
 
-        attempt = await session.get(AnsichLlmAttemptRow, observation.subject_id)
-        if attempt is None:
-            actor_kind = "system_operation"
-            if observation.step_id is not None:
-                step = await session.get(AnsichStepRow, observation.step_id)
-                if step is None:
-                    raise _ProjectionDependencyPending(f"step.started has not been projected: {observation.step_id}")
-                actor_kind = step.actor_kind
-            attempt = AnsichLlmAttemptRow(
-                attempt_id=observation.subject_id,
-                task_id=observation.task_id,
-                step_id=observation.step_id,
-                actor_kind=str(payload.get("actor_kind", actor_kind)),
-                operation_id=payload.get("operation_id") if isinstance(payload.get("operation_id"), str) else None,
-                operation_kind=payload.get("operation_kind") if isinstance(payload.get("operation_kind"), str) else None,
-                attempt_no=int(payload["attempt_no"]),
-                status="incomplete",
-            )
-            session.add(attempt)
+        attempt = await self._lock_or_open_llm_attempt(session, observation, payload)
 
+        # Each branch writes ONLY its own Observation pointer, so the two
+        # compose whichever order they land in: a `request_obs_id` a peer
+        # already set is never overwritten with `None` here, and neither is a
+        # `response_obs_id`. The status is merged through the lattice for the
+        # same reason (F10-31).
         if observation.kind == "llm.requested":
             attempt.request_obs_id = observation.obs_id
             attempt.actor_kind = str(payload.get("actor_kind", attempt.actor_kind))
@@ -13318,11 +13617,10 @@ class SqlAnsichBackend:
                 attempt.operation_id = str(payload["operation_id"])
             if isinstance(payload.get("operation_kind"), str):
                 attempt.operation_kind = str(payload["operation_kind"])
-            if attempt.status == "incomplete":
-                attempt.status = "requested"
+            attempt.status = _advance_llm_attempt_status(attempt.status, "requested")
         elif observation.kind == "llm.responded":
             attempt.response_obs_id = observation.obs_id
-            attempt.status = "success"
+            attempt.status = _advance_llm_attempt_status(attempt.status, "success")
             attempt.latency_ms = int(payload["latency_ms"])
             attempt.usage_json = dict(payload.get("usage", {}))
             attempt.response_metadata_json = dict(payload.get("response_metadata", {}))
@@ -13333,9 +13631,81 @@ class SqlAnsichBackend:
             attempt.provider_model = reported_model if isinstance(reported_model, str) else None
         elif observation.kind == "llm.failed":
             attempt.failure_obs_id = observation.obs_id
-            attempt.status = "failed"
+            attempt.status = _advance_llm_attempt_status(attempt.status, "failed")
             attempt.latency_ms = int(payload["latency_ms"])
         return False
+
+    async def _lock_or_open_llm_attempt(
+        self,
+        session: AsyncSession,
+        observation: ObservationEnvelope,
+        payload: Mapping[str, object],
+    ) -> AnsichLlmAttemptRow:
+        """Lock the attempt row before reading it, opening it if it is absent.
+
+        The fifth lock-then-read conversion (F10-31), and the one whose target
+        is not a rollup: the two Observations of a single attempt
+        (``llm.requested`` / ``llm.responded``) are separate projection jobs,
+        `skip_locked` hands them to two leased workers at once, and both then
+        read-modify-write the same ``ansich_llm_attempts`` row. Reading it
+        unlocked left both halves exposed --
+
+        * neither could lock an ``attempt_id`` row that does not exist yet, so
+          both reached the bare insert and one lost on
+          ``ansich_llm_attempts_pkey``, rolling its whole job transaction back
+          to ``retry`` (non-corrupting, and what the PG tier used to tolerate by
+          constraint name);
+        * and on an existing row the loser's ORM UPDATE carried the ``status``
+          it had read *before* the peer's commit.
+
+        Both close the same way the four rollups did: take the lock first, and
+        pair it with ``_insert_ignoring_conflict`` for the row it cannot take
+        because it is not there. Whoever loses that insert re-reads the winner's
+        row -- now lockable -- and merges onto it, which is exactly the state it
+        would have found had it read second in the first place. See
+        ``_lock_rollup_targets`` for why the lock has to precede the read.
+
+        One row is locked per call, so there is no traversal to order.
+        """
+
+        statement = select(AnsichLlmAttemptRow).where(AnsichLlmAttemptRow.attempt_id == observation.subject_id)
+        attempt = next(iter(await _lock_rollup_targets(session, statement)), None)
+        if attempt is not None:
+            return attempt
+        actor_kind = "system_operation"
+        if observation.step_id is not None:
+            step = await session.get(AnsichStepRow, observation.step_id)
+            if step is None:
+                raise _ProjectionDependencyPending(f"step.started has not been projected: {observation.step_id}")
+            actor_kind = step.actor_kind
+        # The row is opened `incomplete` and carries no Observation pointer:
+        # the caller's branch applies its own half immediately afterwards, on
+        # this row or on the winner's, through the one merge. Splitting the
+        # insert from the merge is what makes the two paths identical instead
+        # of two spellings of the same rules that can drift apart.
+        await _insert_ignoring_conflict(
+            session,
+            AnsichLlmAttemptRow,
+            {
+                "attempt_id": observation.subject_id,
+                "task_id": observation.task_id,
+                "step_id": observation.step_id,
+                "actor_kind": str(payload.get("actor_kind", actor_kind)),
+                "operation_id": (payload.get("operation_id") if isinstance(payload.get("operation_id"), str) else None),
+                "operation_kind": (payload.get("operation_kind") if isinstance(payload.get("operation_kind"), str) else None),
+                "attempt_no": int(payload["attempt_no"]),
+                "status": "incomplete",
+            },
+            index_elements=["attempt_id"],
+            returning=AnsichLlmAttemptRow.attempt_id,
+        )
+        # Won or lost, the row exists once that statement returns -- `ON
+        # CONFLICT DO NOTHING` waits out an uncommitted conflicting insert and
+        # proceeds if it aborts -- so this second pass always takes a real lock.
+        attempt = next(iter(await _lock_rollup_targets(session, statement)), None)
+        if attempt is None:  # pragma: no cover - unreachable, asserted rather than assumed
+            raise RuntimeError(f"LLM attempt row vanished between its upsert and its re-read: {observation.subject_id}")
+        return attempt
 
     async def _project_tool_call(
         self,

@@ -95,7 +95,7 @@ from ansich.belief.resolver import DEFAULT_RESOLVER
 from ansich.errors import ActiveVersionError
 from sqlalchemy.dialects import postgresql
 from sqlalchemy.engine import URL, make_url
-from sqlalchemy.exc import DBAPIError, IntegrityError
+from sqlalchemy.exc import DBAPIError
 from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, async_sessionmaker, create_async_engine
 from sqlalchemy.pool import NullPool
 from support.ansich_settle import only_test_driven_assessments
@@ -1150,29 +1150,23 @@ async def test_two_workers_fanning_over_overlapping_ancestors_both_complete() ->
 
         # The claim under test is "no deadlock", and that is asserted by name.
         #
-        # "No contention at all" is a different and *false* claim, so it is not
-        # made: this run intermittently records a first-writer
-        # ``UniqueViolationError`` on ``ansich_llm_attempts_pkey`` (roughly one
-        # run in ten here). Both Observations of one attempt (``llm.requested``
-        # and ``llm.responded``) are separate jobs, two workers can hold them at
-        # once, and neither can lock an ``attempt_id`` row that does not exist
-        # yet -- so both insert it and one loses.
-        # That is the same shape the four rollups closed with
-        # ``INSERT … ON CONFLICT DO NOTHING`` (F10-6/F10-20) at a call site
-        # outside that scope; it is not corrupting (the loser re-arms to
-        # ``retry`` and the next claim converges, which is what the settled
-        # backlog and the exact sums below say), and closing it belongs to
-        # whoever owns that projector, not to this tier. Tolerated by *shape*
-        # rather than by count, so a different error still fails here.
+        # This assertion used to carry a typed tolerance: the run intermittently
+        # (roughly one in ten here) recorded a first-writer
+        # ``UniqueViolationError`` on ``ansich_llm_attempts_pkey``, because both
+        # Observations of one attempt (``llm.requested`` / ``llm.responded``)
+        # are separate jobs, two workers can hold them at once, and neither
+        # could lock an ``attempt_id`` row that does not exist yet -- so both
+        # inserted it and one lost its whole job transaction. That was F10-31,
+        # and the fifth lock-then-read conversion
+        # (``_lock_or_open_llm_attempt``) closed it: the attempt row is locked
+        # before it is read, opened with ``INSERT … ON CONFLICT DO NOTHING``,
+        # and whoever loses re-reads the winner's row and merges onto it. So the
+        # tolerance is gone and this is now strict -- ANY projection error under
+        # the concurrent fan-out fails here.
         errors = await _projection_errors(worker_a)
         deadlocked = [item for item in errors if "deadlock" in item[3].lower()]
         assert not deadlocked, f"the ordered fan-out still deadlocked: {deadlocked}"
-        # Typed by CONSTRAINT IDENTITY, not just error class: only the known
-        # F10-31 first-writer race on the attempt row is tolerated. A duplicate
-        # on any OTHER constraint (a re-opened rollup conflict, an episode
-        # collision leaking here) must fail this test, not be absorbed.
-        unexpected = [item for item in errors if item[2] != "IntegrityError" or "ansich_llm_attempts_pkey" not in item[3]]
-        assert not unexpected, f"unexpected projection errors under concurrent fan-out: {unexpected}"
+        assert not errors, f"unexpected projection errors under concurrent fan-out: {errors}"
 
         async with worker_b.sessions() as session:
             summaries = {(row.task_id, row.aggregation_scope): row.value for row in (await session.execute(sa.select(AnsichTaskUsageRow).where(AnsichTaskUsageRow.dimension == "total_tokens"))).scalars()}
@@ -1201,7 +1195,11 @@ async def test_reversing_the_lock_traversal_order_deadlocks_on_postgres() -> Non
                 *_attempt(task_id, new_id(), offset_seconds=1, total_tokens=11),
             ]
         )
-        await _drain_projections(worker_a)
+        # F10-34: the *settle* helper, not the plain drain. `project_pending`
+        # returning 0 means "nothing claimable right now", not "nothing owed" --
+        # a job inside its retry backoff is invisible to it -- and this setup
+        # step needs both usage dimensions to exist before the script starts.
+        await _settle_projections(worker_a)
 
         async with worker_a.sessions() as session:
             dimensions = sorted({row.dimension for row in (await session.execute(sa.select(AnsichTaskUsageRow).where(AnsichTaskUsageRow.task_id == task_id, AnsichTaskUsageRow.aggregation_scope == "local"))).scalars()})
@@ -1574,30 +1572,23 @@ async def test_the_lease_generation_migration_and_its_index_land_on_real_postgre
 
 
 async def test_two_workers_assessing_the_same_task_never_duplicate_an_episode() -> None:
-    """The uq_ansich_alert_episode collision: loud if it happens, never corrupting.
+    """The uq_ansich_alert_episode collision costs a row re-read, not the tick.
 
     Several workers on one host each run their own periodic
     ``assess_operations``, and two of them opening the same Alert episode
-    concurrently collide on ``uq_ansich_alert_episode``. That collision is not
-    corrupting -- one tick's whole transaction is discarded and the next tick
-    redoes it a second later -- but it is not free either: the blast radius is
-    the entire tick.
+    concurrently used to collide on ``uq_ansich_alert_episode`` and discard the
+    entire losing tick -- heartbeat, dwell, budget and environment along with
+    both process-subject producers. That was F10-33, and the sixth
+    lock-then-read conversion closed it: the episode is opened with
+    ``INSERT … ON CONFLICT DO NOTHING``, and the loser takes the winner's row
+    under ``FOR UPDATE`` and re-decides against it through the same Alert state
+    machine.
 
-    Provoking it is genuinely racy, so this test is written to prove the
-    invariant unconditionally and to *observe* the collision opportunistically
-    across a bounded number of rounds. What is always asserted: at most one
-    episode row per ``(alert_key, episode)``; never more than one
-    ``heartbeat_missing`` Alert per Task (and exactly one on a round where no
-    tick was discarded -- a discarded tick takes its whole batch with it, which
-    is the blast radius, not something to demand of the losing side); no
-    exception other than the unique violation; and a following single-worker
-    tick that succeeds. Whether the collision was reached in this run is
-    reported, not required.
-
-    Note on the WARNING: ``AnsichService._report_assessment_failure`` is what
-    turns this into a rate-limited log line, and it lives in
-    ``_projector_loop``. These calls are direct, so the exception surfaces to
-    the caller here instead -- which is the same event, one frame earlier.
+    So this test is now **strict where it used to tolerate**. Provoking the race
+    is still genuinely racy, so the rounds below remain an opportunistic attempt
+    to reach it -- but no round may raise, every round must open exactly one
+    ``heartbeat_missing`` episode per Task (the whole-tick loss is what that
+    used to be relaxed for), and no ``(alert_key, episode)`` may exist twice.
     """
 
     async with _postgres_database() as url:
@@ -1624,7 +1615,6 @@ async def test_two_workers_assessing_the_same_task_never_duplicate_an_episode() 
                 services.append(service)
                 await service.start()
 
-            collisions = 0
             for round_index in range(_COLLISION_ROUNDS):
                 # Several Tasks per round: one tick is one transaction over
                 # every running Task, so more Tasks means a longer transaction
@@ -1659,9 +1649,7 @@ async def test_two_workers_assessing_the_same_task_never_duplicate_an_episode() 
                     timeout=_SCRIPT_TIMEOUT_SECONDS,
                 )
                 raised = [item for item in outcomes if isinstance(item, BaseException)]
-                for item in raised:
-                    assert isinstance(item, IntegrityError), f"an assessment tick failed for something other than the episode collision: {item!r}"
-                collisions += len(raised)
+                assert not raised, f"round {round_index}: an assessment tick was discarded, which F10-33 closed: {raised!r}"
 
                 async with factories[0]() as session:
                     opened = {
@@ -1677,24 +1665,19 @@ async def test_two_workers_assessing_the_same_task_never_duplicate_an_episode() 
                             )
                         ).all()
                     }
-                if raised:
-                    # A discarded tick takes its whole batch with it. That is
-                    # the blast radius, and it is what the next tick repairs --
-                    # not something to demand of the losing one.
-                    assert set(opened.values()) <= {1}
-                else:
-                    assert opened == dict.fromkeys(task_ids, 1), f"round {round_index} did not open one episode per Task: {opened}"
+                # Unconditional now. A round that lost the episode race used to
+                # be allowed to open NOTHING for its whole batch; the whole
+                # point of the conversion is that it opens exactly one episode
+                # per Task either way, because the loser confirms onto the
+                # winner's row instead of taking the transaction down.
+                assert opened == dict.fromkeys(task_ids, 1), f"round {round_index} did not open one episode per Task: {opened}"
 
-                if collisions:
-                    break
-
-            # Whatever happened above, the next tick succeeds.
+            # Every round ran; the next tick still succeeds.
             assert await driven[0](now=_OCCURRED_AT + timedelta(seconds=30)) >= 0
 
             async with factories[1]() as session:
                 duplicates = list((await session.execute(sa.select(AnsichAlertRow.alert_key, AnsichAlertRow.episode, sa.func.count()).group_by(AnsichAlertRow.alert_key, AnsichAlertRow.episode).having(sa.func.count() > 1))).all())
             assert duplicates == [], f"an episode was written twice: {duplicates}"
-            print(f"\n[episode-collision] provoked {collisions} unique-violation collision(s) in the bounded rounds")
         finally:
             for service in services:
                 with contextlib.suppress(Exception):

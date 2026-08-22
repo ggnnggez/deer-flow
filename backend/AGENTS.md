@@ -159,15 +159,13 @@ rebuild/retry queued behind it until `database.command_timeout`. It now pins one
 claimed and what `persistence/bootstrap.py::_postgres_lock` already did; SQLite
 could never surface this, because `pg_advisory_unlock` is a no-op there.
 (2) Two workers projecting the two Observations of one LLM attempt
-(`llm.requested` / `llm.responded`) intermittently collide on
-`ansich_llm_attempts_pkey`: neither can lock an `attempt_id` row that does not
-exist yet, so both insert it. It is the same first-writer shape the four rollups
-closed with `INSERT … ON CONFLICT DO NOTHING`, at a call site outside that
-scope, and it is **not** corrupting — the loser re-arms to `retry` and the next
-claim converges on the same read model — so it costs one attempt, exactly like
-`_refresh_behavior_belief`'s already-documented first-writer `IntegrityError`.
-The tier tolerates it by *shape* (a deadlock, or any other error, still fails)
-rather than by count.
+(`llm.requested` / `llm.responded`) intermittently collided on
+`ansich_llm_attempts_pkey`: neither could lock an `attempt_id` row that does not
+exist yet, so both inserted it. That was F10-31, the tier tolerated it by
+*shape* (a deadlock, or any other error, still failed) rather than by count —
+and **the tolerance is gone**: P11-C's fifth lock-then-read conversion closed
+the race and the concurrent fan-out test is now strict about every projection
+error. See the P11-C paragraph on the last two first-writer races below.
 
 The `detect-blocking-io` target parses `app/`, `packages/harness/deerflow/`,
 and `scripts/` with AST. By default it reports only blocking IO candidates that
@@ -1530,7 +1528,8 @@ residuals are named rather than papered over: `_resolve_current_assessment`'s
 own first write still collides as one retryable assessor attempt (bounded,
 self-healing, F10-6's entry says so), and the LLM-attempt projector's two
 Observations still collide on `ansich_llm_attempts_pkey` (F10-31 — a fifth
-lock-then-read conversion, not a one-liner). **Multi-row rollups also lock in a
+lock-then-read conversion, not a one-liner; **closed by P11-C**, see the
+last-two-races paragraph below). **Multi-row rollups also lock in a
 deterministic order**: the usage fan-out, the spawn backfill (**both** axes —
 ancestors *and* the descendant contribution read, since one ancestor with two
 descendants takes two locked high-water rows), the environment per-metric
@@ -1765,6 +1764,8 @@ heartbeat, dwell, budget and environment work along with both producers'.
 The next tick redoes it a second later; serializing Scope-subject reconciliation
 is not part of this slice and is registered as **F10-33**, owned by P11-C
 (alongside F10-31, the other remaining first-writer/unique-constraint race).
+**Both are closed by P11-C** — the paragraph below is what replaced the whole
+"discards that tick" sentence.
 
 **P11-B health database merge and the read-model stamp** (spec §4/§9). Ansich
 health now answers with **two numbers of different standing**, and the wording
@@ -2621,6 +2622,117 @@ health block, and its `None` means **never run** on a reachable store — which 
 ordinary, since retention is driven by a caller rather than by the store — while
 an unreachable block answers `None` too, so `status` is what tells the two
 apart.
+
+**P11-C: the remaining first-writer races take the lock-then-read posture**
+(F10-31, F10-33, and a third one the strictness itself found — see the end of
+this section). All were provoked on the two-worker PostgreSQL tier rather
+than reasoned about, and all close the same way the four P11-B rollups did —
+lock the target row *before* reading it, pair the lock with
+`_insert_ignoring_conflict` for the row that does not exist yet, and let the
+loser re-read the winner and converge. What differs is what each loser owed.
+
+**F10-31, the attempt projector** (`sql.py::_lock_or_open_llm_attempt`, the
+fifth conversion). The two Observations of one LLM attempt (`llm.requested` /
+`llm.responded`) are separate projection jobs handed to two leased workers by
+`skip_locked`, and the projector read the row with an unlocked `session.get`.
+Two halves were exposed: neither worker could lock an `attempt_id` that did not
+exist, so both reached the bare insert and one lost its whole job transaction on
+`ansich_llm_attempts_pkey` (non-corrupting — `retry`, then convergence — which
+is why the tier tolerated it by constraint name); and on an *existing* row the
+loser's ORM UPDATE carried the `status` it had read before the peer committed.
+The row is now locked first, opened `incomplete` through
+`INSERT … ON CONFLICT DO NOTHING` carrying **no** Observation pointer, and
+re-read under the lock whether this caller won or lost — so the insert and the
+merge are one path rather than two spellings of the same rules. The merge itself
+is what makes the order irrelevant: each branch writes **only its own** pointer,
+so `request_obs_id` and `response_obs_id` compose and a set pointer is never
+overwritten with `None`; and the status goes through
+`_advance_llm_attempt_status`, the maximum on `incomplete < requested < success`.
+`failed` is deliberately **outside** that lattice and both edges are adjudicated
+rather than accidental: `llm.failed` states a terminal outright, a later
+`llm.requested` may not walk a recorded failure back, and `llm.responded` onto a
+`failed` row keeps the pre-F10-31 last-writer-wins answer — a case that needs an
+attempt carrying both Observations, which no producer emits, and which is
+preserved verbatim because re-adjudicating contradictory terminals is a
+different question with no evidence behind it. The same pointer set twice with
+*different* values is impossible by construction: the value is the projecting
+Observation's own `obs_id`, one Observation is one job, and the column is
+`unique=True`. **The tier's typed tolerance is removed in the same change** —
+`test_the_concurrent_usage_fan_out...` now fails on *any* projection error.
+
+**F10-33, the episode opening** (`_persist_alert_episode` /
+`_reconcile_alerts_for_assessments`, the sixth). Every Gateway worker on a host
+subjects the same host `Scope` and runs its own 1 Hz assessment, so two of them
+opening one Alert episode collided on `uq_ansich_alert_episode` — and the blast
+radius was the **entire** `assess_operations` transaction: that tick's
+heartbeat, dwell, budget and environment work discarded along with both
+process-subject producers, silently (`_projector_loop` swallows it), self-healed
+by the next tick a second later except at shutdown's final assessment, where
+there is no next tick. The episode INSERT is now `ON CONFLICT DO NOTHING` on
+`(alert_key, episode)`; a loser withdraws the `ansich_entities` row it minted
+for an alert_id that now names nothing (no inbound edge would carry it away),
+takes the winner's row under `FOR UPDATE`, hydrates its evidence, and re-decides
+through `reconcile_alert_episode` — the same state machine, handed a condition
+rebuilt from the candidate, so an unresolved winner turns the `opened` into a
+`confirmed` UPDATE and a winner an operator resolved in between opens the next
+episode instead. That re-decision is **not** hand-written as a `model_copy`
+precisely so the second case stays correct. The retry is bounded by
+`_ALERT_EPISODE_FIRST_WRITER_PASSES` (3) and exhausting it is **logged at DEBUG
+and left to the next tick, never raised** — a raise there would reintroduce the
+whole-tick loss this conversion exists to remove. Reconciliations are now
+**sorted by `(alert_key, episode)` before any of them is written**, because the
+loser's `FOR UPDATE` is a second row lock and the host `Scope` producers' own
+condition order is a function of a partition that legitimately differs between
+workers; the sort belongs at the site that takes the locks, the same rule the
+process-subject Belief writes already follow. Every reconciliation in one call
+targets a distinct episode, so the sort changes nothing else.
+
+**A third race, found by removing the tolerance, and fixed in the same change.**
+The tier's episode test used to accept *any* `IntegrityError` as "the episode
+collision", and once it stopped doing so a second whole-tick loss surfaced
+immediately and reproducibly: `ansich_current_beliefs_pkey` on
+`(task_id, "heartbeat")`. Every worker runs its own 1 Hz tick over the same
+running Tasks, both read "no current Belief", and both insert — with the same
+blast radius as F10-33, because the tick is one transaction. Three
+operations-tick writers of `ansich_current_beliefs` therefore go through the
+shared `_open_or_lock_current_belief` (`INSERT … ON CONFLICT DO NOTHING` on
+`(subject_id, field_name)`, then `FOR UPDATE` on the peer's row): the heartbeat
+block, `_assess_budget_rows`, and `_resolve_current_assessment` — the last being
+the first-writer half **F10-6's own entry named and deferred**. All three also
+lock the row before reading the Assertion they compare against.
+`_resolve_current_assessment` is now a bounded two-pass loop rather than a
+single write, because its inputs are *every* Assertion for the subject/field and
+the peer's was invisible to the first pass under READ COMMITTED — publishing an
+answer reduced without it would be the lost update the lock exists to prevent.
+The heartbeat and budget losers instead point the peer's row at their own
+Assertion, which is exactly what a tick that read second does. **The one cost is
+stated rather than hidden**: those two append their Assertion before they can
+know they lost, so a first-write collision leaves one extra same-verdict
+Assertion for that subject — bounded at one, since from then on the row exists
+and the ordinary transition-only skip applies. The two *projector*-path writers
+of the same table (`_project_control`, the ToolCall execution Belief) are
+deliberately **not** converted: there a collision costs one job transaction and a
+`retry`, which is the bounded self-healing case F10-6 already records.
+
+Tests: `tests/ansich/test_rollup_serialization.py` (the attempt row's lock-shape
+pin, both interleavings of the merge — response onto the winner's request and
+request onto the winner's response without downgrading `success` — the pure
+lattice table including both `failed` edges, the pre-fix bare insert reproduced
+as the `IntegrityError` it used to be, and the same pair for the heartbeat
+current-Belief race including its bounded extra Assertion) and
+`tests/ansich/test_process_health_alerts.py` (a collision positioned with work
+on **both** sides of it inside one tick — a stale-heartbeat Task reconciled
+before it, a second losing producer's episode opened after it — proving the tick
+survives and the loser confirms onto the winner's row, plus the pre-fix bare
+insert reproduced as the whole-tick loss). Both races were provoked on the real
+server, so the tier carries the proof:
+`test_two_workers_assessing_the_same_task_never_duplicate_an_episode` is now
+strict (no round may raise, every round opens exactly one episode per Task)
+where it used to allow a discarded tick to open nothing. One test-side fix rides
+along: that file's traversal-order test drove its setup with `_drain_projections`
+and now uses `_settle_projections`, which is F10-34's known one-line remedy —
+`project_pending` returning 0 means "nothing claimable right now", not "nothing
+owed", and a job inside its retry backoff is invisible to it.
 
 **Workspace change review**: `packages/harness/deerflow/workspace_changes/`
 captures a pre-run and post-run snapshot of the thread-owned `workspace` and
