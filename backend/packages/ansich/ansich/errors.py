@@ -9,7 +9,9 @@ dependencies.
 
 from __future__ import annotations
 
-__all__ = ["StorageUnavailableError"]
+from typing import Literal
+
+__all__ = ["ReplayTargetError", "ReplayTargetRefusal", "StorageUnavailableError"]
 
 
 class StorageUnavailableError(Exception):
@@ -55,3 +57,55 @@ class StorageUnavailableError(Exception):
     "storage is unavailable" answer (the Gateway's 503) maps it there. The cost
     to the caller is a retry; the alternative was a wrong answer.
     """
+
+
+#: Why a replay target was refused. Three refusals, three different remedies,
+#: which is the whole reason the caller gets a code rather than a sentence:
+#: ``unknown_projector`` means the name is not registered in this build (a
+#: typo, or a projector that does not exist yet), ``unknown_version`` means the
+#: projector is real but this build cannot execute the version asked for
+#: (deploy the build that can), and ``not_executable`` means this build
+#: *declares* the version replayable and has no code to run it — a partial
+#: change, and a bug in the build rather than in the request.
+ReplayTargetRefusal = Literal[
+    "unknown_projector",
+    "unknown_version",
+    "not_executable",
+]
+
+
+class ReplayTargetError(ValueError):
+    """The requested ``(projector, version)`` cannot be replayed by this build.
+
+    Raised *before* a replay touches anything — no jobs minted, no read models
+    cleared — so a refusal costs the caller nothing but the answer. It is a
+    ``ValueError`` because it describes a bad argument: the store is fine, the
+    request names something this build cannot do.
+
+    The refusal is carried as :attr:`reason` (a
+    :data:`ReplayTargetRefusal` member) rather than left to be parsed out of
+    the message, so a CLI can map it to an exit code and a caller can branch on
+    it without matching prose. The message stays for a human reading a
+    terminal.
+
+    What this error deliberately does **not** assert: that replaying an
+    accepted target would produce jobs for historical Observations *of a
+    version that never ran*. It would not, on its own. A newly executable
+    version has no jobs for anything already ingested — live ingest mints jobs
+    only for the versions in the live registry — and minting them is exactly
+    what a replay is for. Accepting a target says "this build can run it",
+    never "this build already has".
+    """
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        reason: ReplayTargetRefusal,
+        projector_name: str,
+        projector_version: str,
+    ) -> None:
+        super().__init__(message)
+        self.reason: ReplayTargetRefusal = reason
+        self.projector_name = projector_name
+        self.projector_version = projector_version

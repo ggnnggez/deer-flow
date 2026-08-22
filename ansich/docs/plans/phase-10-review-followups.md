@@ -404,6 +404,18 @@
 - 为什么它不是 F10-10 的同一件事:F10-10 是「后台评估写者与测试自己驱动的评估赛跑」,门禁 `only_test_driven_assessments` 已经把那个写者按住;这一族的失败与评估无关,失败的是**重建自身的完整性**,而 barrier / 写侧改动只能让写入更宽、不可能更窄(`rebuild_projections()` 读的是持久流)。两族必须分开记,否则会把「等更久就好了」的错误结论套到这一族上。
 - 方向:让 `rebuild_projections()` 的完成条件把 dependency-pending 的 job 算进去——要么等它们结算或越过 `projector_dependency_timeout_seconds` 转 durable failed,要么在返回值里**显式报告**「仍有 N 个未结算」,由调用方决定。任何修法都要配一条「依赖延迟 job 未结算时重建不报完成」的回归;这同时是 §5 versioned replay「两次重放 digest 相同」得以成立的前提。
 - 留观(2026-08-22,批终审后的修复波目击,终审复审裁定归口本条而非 F10-30):`tests/ansich/test_spawn_usage_reconciliation.py::test_rebuild_mints_a_reconciliation_for_an_edge_that_has_none`(**2026-08-22 更正文件名**:此前这里写的是 `tests/ansich/test_sql_projection_jobs.py`,仓库里**没有**这个文件——同 RC15 那一类的悬空指针,由 P11-C Task 1 在落地本条修法时一并改掉)在「两文件并跑 + 外部负载」下红过一次——断言 `unsettled == 0`,实得 10。这不是 settle 预算输给负载(不是 F10-30 的家族形状),而正是本条修复后的**约定语义在测试侧未被消化**:`rebuild_projections()` 按本条的 (b) 支**报告而不等待**,负载下一轮返回时依赖延迟的作业就是可以有 10 条未结算,`unsettled==0` 只能靠调用方自己再驱一轮拿到。讨伐:单独 3/3 绿、同组合复跑 2/2 绿、两次全量绿。修法即 §5 改写处已开出的那一行:测试(以及任何要完整性的调用方)对 `unsettled==0` 做有界循环,而不是信任单轮。**该修法已由 P11-C Task 1 落地**(commit 见该批 task-1-report):`AnsichService.rebuild_until_settled(max_rounds=5)` 是那个有界循环,`tests/ansich/` 里全部八处「单轮 `rebuild_projections()` 之后断言 `unsettled == 0`」的调用点(含上面这条具名实例,以及 opt-in PG tier 的一处)都改成了调用它。**本条的状态翻转不在此处做**,留给控制者/T15 统一裁决。
+- **留观二(2026-08-22,P11-C 批 Task 3 的第三轮全量目击):T1 的转换覆盖的是 `unsettled == 0` 那一类调用点,而本条最初四次目击的形状——「单轮重建之后拿读模型对等」——一处都没被覆盖,现在又红了一次。** 目击:`tests/ansich/test_sql_heartbeat.py::test_late_spawn_backfill_carries_the_wall_time_high_water_mark`(断言在 :1227),失败全文:
+
+  ```
+  >       assert rebuilt_usage == usage
+  E       AssertionError: assert TaskUsageView...s='available') == TaskUsageView...s='available')
+
+  tests/ansich/test_sql_heartbeat.py:1227: AssertionError
+  FAILED tests/ansich/test_sql_heartbeat.py::test_late_spawn_backfill_carries_the_wall_time_high_water_mark[asyncio]
+  ```
+
+  调用点是 `usage = await get_task_usage(root)` → `await service.rebuild_projections()`(**单轮**)→ `rebuilt_usage = await get_task_usage(root)` → `assert rebuilt_usage == usage`。这与本条目击 1/3/4 逐字同型(目击 3 `test_sql_task_tree.py::…_backfills_a_late_spawn_without_double_counting` 的 `assert root_usage == rebuilt` 几乎是同一个用例的另一个写法),**不是** F10-30 的家族形状(不是 settle 预算输给负载,是重建单轮被当成完成)。**这是一次分诊,不是一个新成员**:按窄口 (1) 的分诊规则,失败形状属「重建单轮后断言完整性」⇒ 归 F10-26,不进 F10-30 的成员表。讨伐:该用例单独重跑 3 次 **3/3 `1 passed`**(2.77s / 2.85s / 2.86s);同一生产树的上一轮全量(只差一条新增的纯函数用例)是 **843 passed 全绿**;Task 3 的生产改动不碰任何既存代码路径(见 F10-30 那条的 Task 3 记账)。
+  **结构性缺口,值得单独看一眼再决定要不要动**:`tests/ansich/` + `tests/integration/` 里今天还有 43 处 `rebuild_projections()` 调用、只有 13 处 `rebuild_until_settled`,其中「重建后拿读模型对等」的写法在 `test_sql_heartbeat.py`(:182/:794/:1210)、`test_sql_task_tree.py`(:446)等处成片存在,全部仍是单轮。修法与留观一完全相同、也是一行:把这些调用点换成 `rebuild_until_settled()`。P11-C Task 3 **没有动它们**(超出该任务范围,且一次 flake 拿不到确定性红先),把它作为一条带证据的欠账交给控制者/T15 裁决:要么作为一次独立的测试侧扫尾,要么继续按 flake 记账。
 - 归属:P11-B(重放诚实性)。
 
 ## F10-27. 装配不对称:无存储分支漏传三个 knob
@@ -460,7 +472,7 @@
 
   10. `test_sql_safety.py::test_a_dependency_deferred_job_below_the_mark_re_judges_its_band_once`(断言在 :2294)——**P11-C 批 Task 1 的一次全量翻红,失败文本完整**(见下方记账)。第五个入口,回到 `test_sql_safety.py` 里,但构造与成员 1-4 都不同:它既不压 `terminal_flush_timeout_ms`、也不把轮询压到 60s,而是**自造了一个 `await anyio.sleep(0.3)` 当 settle 预算**,一共三处,每处后面紧跟 `assess_operations(now=…)` 再读结论。红的形状是 `assert trigger_conclusions == 4` 实得 **0**——触发器自己的 subject 一条结论都没有,即那 0.3 秒里 ToolCall 投影/scope-safety 证据根本没落地,评估无从判起。这是本族最直白的签名(「读到空态」),只是预算这次是一个硬编码的 sleep 而不是一个 flush 超时;修法同族(共享 settle helper 对持久行有界轮询),**不是**把 0.3 调大。
 
-  11. `test_sql_safety.py::test_absorbed_low_watermark_window_survives_an_evaluation_rollback`(断言在 :1946)——**P11-C 批 Task 2 的一次全量翻红,失败全文见下方记账**。第六个入口,与成员 10 同文件、同构造家族:它同样**自造了一个 `await anyio.sleep(0.5)` 当 settle 预算**——self-heal 那一步补投 blocking subject 的 ToolCall、`flush_task()`、`sleep(0.5)`、`assess_operations(now=…)`,然后数 `ansich_scope_conclusions` 的行。红的形状是 `assert late_conclusions == 4` 实得 **0**:那半秒里 blocking subject 的 ToolCall 投影没落地,scope-safety 的重试仍然停在依赖等待上,一条结论都没写。本族最直白的签名(「读到空态」),只是预算这次是 0.5 秒的硬编码 sleep;修法同族(共享 settle helper 对持久行有界轮询),**不是**把 0.5 调大。
+  11. `test_sql_safety.py::test_absorbed_low_watermark_window_survives_an_evaluation_rollback`(断言在 :1946)——**P11-C 批 Task 2 的一次全量翻红,失败全文见下方记账**。第六个入口,与成员 10 同文件、同构造家族:它同样**自造了一个 `await anyio.sleep(0.5)` 当 settle 预算**——self-heal 那一步补投 blocking subject 的 ToolCall、`flush_task()`、`sleep(0.5)`、`assess_operations(now=…)`,然后数 `ansich_scope_conclusions` 的行。红的形状是 `assert late_conclusions == 4` 实得 **0**:那半秒里 blocking subject 的 ToolCall 投影没落地,scope-safety 的重试仍然停在依赖等待上,一条结论都没写。本族最直白的签名(「读到空态」),只是预算这次是 0.5 秒的硬编码 sleep;修法同族(共享 settle helper 对持久行有界轮询),**不是**把 0.5 调大。**P11-C 批 Task 3 的全量把这条成员又目击了一次,断言位置换了**:红在 :1905 的 `assert mark is not None and mark.evidence_watermark < late_last_seq`(`ansich_assessor_watermarks` 里那一行还不存在),即在 self-heal 之前、两个 `sleep(0.3)` 那一段就已经空了。所以成员 1 那句「**不要按行号认这条成员**」对本成员同样成立:同一用例、同一构造家族(自造 sleep 当 settle 预算)、同一机理,读到空的只是换成了 watermark 行。放行记账见下。
 
 - **窄口放行记账**(本条收尾规定的「命令行、轮次、全文」):
   - P11-C 批 Task 1 全量,成员 10(**本条第一次由 P11-C 登记**):`cd backend && timeout 1800 env PYTHONPATH=. uv run pytest tests/ansich -q -p no:randomly --no-header -rf`(不接截断管道,全文落 `/tmp/ansich-final-run2.txt`)→ `1 failed, 815 passed, 28 warnings in 342.77s`。失败全文:
@@ -485,6 +497,17 @@
     ```
 
     讨伐,走 (2)(a):`cd backend && timeout 300 env PYTHONPATH=. uv run pytest "tests/ansich/test_sql_safety.py::test_absorbed_low_watermark_window_survives_an_evaluation_rollback" -q -p no:randomly --no-header` **连跑 3 次,3/3 `1 passed`**(8.14s / 8.01s / 8.08s)。(2)(b) 不必走,理由是**结构性的**而不是统计性的:Task 2 的生产改动只有三处——`contracts.py` 的 `environment.sampled` 守卫(只在 `payload is None` 时改变行为)、`_claim_projection_job` 的 hydrate 顺序(对**内联** payload 逐字等价:`payload = row.payload_json`、`payload_ref_id = row.payload_ref_id`,不进 hydrate 分支)、以及 `get_environment_history`。该用例的 payload 全部远小于默认的 65536 字节、一条都不外部化,也不读环境 history,**三处一处都不经过**;同一棵树的前一个状态(只差 `contracts.py` 的一处等价重写与 AGENTS.md)那一轮全量是 **821 passed 全绿**。**唯一可想象的间接关联要如实写下**:这一轮全量是与我自己另外两批 pytest(`test_gateway_ansich_environment.py`,以及三个 persistence/feedback 文件)**并发**跑的,机器被自己压住——那正是本族赖以翻红的那个变量;此外 Task 2 新增的 800 指标外部化用例本身也给同一次全量加了墙钟与 CPU 负载。两者都不改变任何语义,但都记在这里而不是略过。
+  - P11-C 批 Task 3 全量,成员 11(**同一成员的第二次目击,断言位置不同**):`cd backend && timeout 600 env PYTHONPATH=. uv run pytest tests/ansich -q`(全文落 `/tmp/claude-1000/.../blysazw2a.output`)→ `1 failed, 842 passed, 28 warnings in 323.38s`。失败全文:
+
+    ```
+    >       assert mark is not None and mark.evidence_watermark < late_last_seq
+    E               assert (None is not None)
+
+    tests/ansich/test_sql_safety.py:1905: AssertionError
+    FAILED tests/ansich/test_sql_safety.py::test_absorbed_low_watermark_window_survives_an_evaluation_rollback[asyncio] - assert (None is not None)
+    ```
+
+    **这一次红在 :1905,不是登记时的 :1946**,即在 self-heal 那一段之前就已经空了:两次 `flush_task()` + 两个硬编码 `anyio.sleep(0.3)` 之后,`ansich_assessor_watermarks` 里连一行 `(task, "scope-safety", "1.0.0")` 都还没有——scope-safety 的评估在那 0.6 秒里根本没跑到。机理与登记时逐字同族(自造 sleep 当 settle 预算 → 读到空态),只是这次读的是 watermark 行而不是结论行。因此本条对成员 1 写下的那句「**不要按行号认这条成员**」对成员 11 同样成立,门禁条件 (1) 按**用例名**判定、已满足。讨伐,走 (2)(a):`cd backend && timeout 300 env PYTHONPATH=. uv run pytest "tests/ansich/test_sql_safety.py::test_absorbed_low_watermark_window_survives_an_evaluation_rollback" -q -p no:randomly --no-header` **连跑 3 次,3/3 `1 passed`**(9.15s / 8.11s / 8.09s)。(2)(b) 不必走,理由是**结构性的**:Task 3 的生产改动只有三个新模块级常量(`_REPLAYABLE_VERSIONS`、`_EXECUTABLE_PROJECTOR_NAMES`、`_KNOWN_OBSERVATION_KINDS`)、两个新纯函数(`_literal_members`、`_validate_replay_target`)、一条新异常类型,以及 `_projectors_for_kind` 的一段 docstring——**没有任何既存代码路径被改动**(`_projectors_for_kind` 的函数体逐字不变),认领、投影、评估、watermark 四条路上一行都没动,新符号在本任务之外无调用方。**同一棵树的第二轮全量(安静机,`/tmp/t3-full-run2.txt`)是 `843 passed, 28 warnings in 309.38s` 全绿**,这是本次放行能拿出的最强旁证:红的那一轮与绿的这一轮之间树没有变。**第四轮全量(`/tmp/t3-full-run4.txt`,`1 failed, 843 passed in 319.43s`)本成员又红了一次,这次是登记时那个逐字的签名**——`assert 0 == 4`,`test_sql_safety.py:1946`——即本成员在 Task 3 这台机器上两个断言位置各出现过一次;这本身就是本条「同一用例、多个断言位置、同一机理」判断的直接证据,也说明本轮机器上这一族的翻红率相当高(五轮里两轮撞上它)。**唯一可想象的间接关联要如实写下**:本任务给 `tests/ansich` 新增了 20 条用例(其中一条建 SQLite 库并写一条 Observation),给同一次全量加了少量墙钟与 CPU——不改变任何语义,但那正是本族赖以翻红的那个变量,所以记在这里而不是略过。
   - T10 复审轮,成员 6 与成员 7:**2026-08-22 按本条自己的记录规则补齐**(此前只记了结论,已按 `task-10-review.md` 的复审段重建;凡是重建不出来的都在下面明说,不补造)。
     - 命令行:`cd backend && timeout 2400 env PYTHONPATH=. uv run pytest tests/ansich -q -p no:randomly --no-header -rf`;那一轮复审者把自己的 PostgreSQL 实验(90 万行灌库 + `EXPLAIN`)与全量**并发**跑,机器被自己压住(1056s,对照实施者的 379s)。
     - 结果:`802 passed / 2 failed`。失败文本(复审段落逐字保留的两行):成员 6 `AssertionError: 子 Task 内部确实完成了`;成员 7 `tools_executed=0 != 1`。

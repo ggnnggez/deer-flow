@@ -8,7 +8,7 @@ import time
 from collections.abc import AsyncIterator, Iterable, Mapping, Sequence
 from contextlib import asynccontextmanager
 from datetime import UTC, datetime, timedelta
-from typing import Literal, NamedTuple, cast
+from typing import Literal, NamedTuple, cast, get_args, get_origin
 from uuid import uuid4
 
 from ansich import (
@@ -111,6 +111,7 @@ from ansich.contracts import (
     ControlValue,
     DatabaseHealth,
     LostRange,
+    ObservationKind,
     ProjectorHealth,
     TaskLifecycleScope,
     UsageDimension,
@@ -134,7 +135,7 @@ from ansich.environment import (
     assess_environment_leak,
     assess_environment_pressure,
 )
-from ansich.errors import StorageUnavailableError
+from ansich.errors import ReplayTargetError, StorageUnavailableError
 from ansich.evaluation import (
     EVALUATION_OBSERVATION_KIND,
     EvaluationProjectionStatus,
@@ -369,6 +370,49 @@ _PROJECTOR_KINDS = {
     "environment-projector": frozenset({"environment.sampled"}),
     "evaluation-projector": frozenset({EVALUATION_OBSERVATION_KIND}),
 }
+#: Every projector version **this build can execute**, which is a different
+#: question from ``_PROJECTORS`` above and must stay a different structure
+#: (plan ruling RC2).
+#:
+#: ``_PROJECTORS`` is the *live* set: what ingest fans a new Observation out
+#: to. This is the *replayable* set: what an operator may aim
+#: ``deerflow.ansich.replay`` at. Today they name the same ten pairs, because
+#: there is exactly one version of everything — the split earns its keep the
+#: first time a second version exists.
+#:
+#: **Why a second version must not simply join ``_PROJECTORS``.** A v2 is
+#: written to replay history through and be compared against v1. Adding it to
+#: the live set makes every Observation admitted from that moment mint a v2 job
+#: as well, so the population being compared changes as the comparison runs,
+#: and every Task after the deploy carries projections nobody asked for. Worse,
+#: it is not reversible by removing the registration: the jobs are already
+#: durable. So a version arrives here first, is replayed deliberately, and only
+#: joins ``_PROJECTORS`` when it is meant to be what live ingest does.
+#:
+#: **What listing a version here claims.** The projection dispatch in
+#: ``project_pending`` branches on ``projector_name`` alone and is blind to the
+#: version, so listing ``("1", "2")`` is the author's assertion that the branch
+#: handles both — not something the code can check. It claims nothing about
+#: history: a version listed here has **no** jobs for Observations already
+#: ingested, and never will until a replay mints them.
+_REPLAYABLE_VERSIONS: dict[str, tuple[str, ...]] = {
+    "task-structural": ("1",),
+    "task-control": ("1",),
+    "task-step": ("1",),
+    "task-usage": ("1",),
+    "task-budget": ("1",),
+    "task-heartbeat": ("1",),
+    "task-safety": ("1",),
+    "environment-projector": ("1",),
+    "evaluation-projector": ("1",),
+    "task-spawn-reconcile": ("1",),
+}
+#: The projector names ``project_pending``'s dispatch chain has a branch for.
+#: Derived from ``_PROJECTORS`` rather than restated, because that tuple and
+#: the chain are written together — the chain's ``else`` raises on anything
+#: else, which is the failure ``not_executable`` exists to catch *before* a
+#: replay has minted a job that can only ever fail.
+_EXECUTABLE_PROJECTOR_NAMES = frozenset(name for name, _ in _PROJECTORS)
 _ASSESSOR_VERSIONS = {
     ACTION_REPETITION_ASSESSOR.name: ACTION_REPETITION_ASSESSOR.version,
     TOOL_FREQUENCY_ASSESSOR.name: TOOL_FREQUENCY_ASSESSOR.version,
@@ -520,8 +564,97 @@ class _DatabaseProjectionSnapshot(NamedTuple):
     complete_through: int | None
 
 
+def _literal_members(annotation: object) -> frozenset[str]:
+    """Every string ``annotation`` admits, flattening unions of ``Literal``s."""
+
+    if get_origin(annotation) is Literal:
+        return frozenset(str(value) for value in get_args(annotation))
+    members = get_args(annotation)
+    if not members:
+        return frozenset()
+    return frozenset().union(*(_literal_members(member) for member in members))
+
+
+#: The Observation kinds this build knows how to read. ``_PROJECTOR_KINDS``'
+#: claims are checked against it (D5-2's third clause) rather than trusted: a
+#: kind that is not in the contract names no Observation, so a projector
+#: claiming one would be replayed over an empty target set and report a clean
+#: pass over nothing.
+_KNOWN_OBSERVATION_KINDS = _literal_members(ObservationKind)
+
+
 def _projectors_for_kind(kind: str) -> tuple[tuple[str, str], ...]:
+    """The **live** registrations that claim ``kind`` — ingest's whole fan-out.
+
+    Deliberately reads ``_PROJECTORS`` and never ``_REPLAYABLE_VERSIONS``
+    (RC2): a version the code merely *can* execute must not cause live ingest
+    to mint a job for it. Keeping the two apart is what lets a second version
+    exist without changing what every new Observation costs.
+    """
+
     return tuple(registration for registration in _PROJECTORS if kind in _PROJECTOR_KINDS.get(registration[0], ()))
+
+
+def _validate_replay_target(projector_name: str, version: str) -> None:
+    """Refuse a replay target this build cannot honour, before it costs anything.
+
+    This is spec §5 step 1 — "the target projector is registered and schema
+    compatible" — and *schema compatible* is deliberately a narrow claim
+    (D5-2). It is three questions and no more:
+
+    1. Is ``projector_name`` a projector this build declares replayable?
+    2. Is ``version`` one of the versions it declares for that projector?
+    3. Can this build actually run it — a dispatch branch for the name, and
+       claimed kinds the Observation contract still recognises?
+
+    It is emphatically **not** a column-level or read-model-shape check.
+    Nothing here inspects tables; a projector that would crash on the data is
+    a projection error, reported per job, not a target refusal.
+
+    Returns ``None`` when the target is honourable and raises
+    :class:`~ansich.errors.ReplayTargetError` otherwise, carrying a typed
+    ``reason`` so a caller branches on the refusal rather than on prose.
+
+    ``not_executable`` is unreachable in this build and is meant to stay that
+    way: reaching it takes a projector listed in ``_REPLAYABLE_VERSIONS`` whose
+    name the dispatch chain has no branch for, or one claiming an Observation
+    kind the contract dropped — both are half-finished code changes. It exists
+    because the alternative is reporting such a build's own defect as
+    ``unknown_projector``, which sends the operator to fix their command line
+    instead of the deploy.
+
+    Accepting a target says only that this build can run it. It says nothing
+    about whether jobs for it already exist: a version that has never been in
+    the live set has no jobs for any Observation already ingested, and minting
+    them is exactly what the replay that follows is for.
+    """
+
+    versions = _REPLAYABLE_VERSIONS.get(projector_name)
+    if versions is None:
+        raise ReplayTargetError(
+            f"unknown Ansich projector {projector_name!r}: not registered in this build",
+            reason="unknown_projector",
+            projector_name=projector_name,
+            projector_version=version,
+        )
+    if version not in versions:
+        known = ", ".join(versions)
+        raise ReplayTargetError(
+            f"Ansich projector {projector_name!r} cannot replay version {version!r}; this build executes: {known}",
+            reason="unknown_version",
+            projector_name=projector_name,
+            projector_version=version,
+        )
+    unknown_kinds = sorted(set(_PROJECTOR_KINDS.get(projector_name, ())) - _KNOWN_OBSERVATION_KINDS)
+    if projector_name not in _EXECUTABLE_PROJECTOR_NAMES or unknown_kinds:
+        detail = f"claims unknown Observation kinds: {', '.join(unknown_kinds)}" if unknown_kinds else "has no projection dispatch branch"
+        raise ReplayTargetError(
+            f"Ansich projector {projector_name!r} declares version {version!r} replayable but this build {detail}",
+            reason="not_executable",
+            projector_name=projector_name,
+            projector_version=version,
+        )
+    return None
 
 
 def _assessors_after_projection(
