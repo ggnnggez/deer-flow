@@ -39,7 +39,7 @@ from _router_auth_helpers import make_authed_test_app
 from alembic import command as alembic_command
 from ansich import AnsichService, HardDeleteReport, ObservationEnvelope, Producer, RetentionPolicy, new_id
 from ansich.contracts import ANSICH_BOOTSTRAP_TASK_ID
-from ansich.errors import HardDeleteError, PayloadExpiredError
+from ansich.errors import HardDeleteError, HardDeleteRefusal, PayloadExpiredError
 from ansich.evaluation import EvaluationProjectionStatus
 from ansich.safety import ScopeKind, host_scope_id, scope_entity_id, scope_reference_hash
 from httpx import ASGITransport, AsyncClient
@@ -64,6 +64,7 @@ from deerflow.ansich.persistence.models import (
     AnsichBeliefEvidenceRow,
     AnsichContentBlobRow,
     AnsichContentBlockRow,
+    AnsichContentOccurrenceRow,
     AnsichEntityRow,
     AnsichObservationRow,
     AnsichPayloadRow,
@@ -73,6 +74,7 @@ from deerflow.ansich.persistence.models import (
     AnsichTaskHeartbeatRow,
 )
 from deerflow.ansich.persistence.sql import (
+    _HARD_DELETE_DEFERRABLE_PIN_REFUSALS,
     _HARD_DELETE_OWNER_SCOPE_KINDS,
     _HARD_DELETE_PROTECTED_ENTITY_TYPES,
     _HARD_DELETE_PROTECTED_PIN_EDGES,
@@ -4038,6 +4040,151 @@ async def test_an_erasure_that_removed_nothing_leaves_no_deliberate_deletion_mar
     async with sessions() as session:
         state = await session.get(AnsichRetentionStateRow, 1)
     assert int(state.observation_cursor or 0) == highest
+
+
+@pytest.mark.anyio
+async def test_a_surviving_unprotected_satellite_refuses_the_erasure_rather_than_stranding_it(hard_delete_backend):
+    """Review finding N6: the pin check names no types, and here is why.
+
+    A content block whose ``ansich_content_occurrences`` row belongs to a
+    **surviving** Task cannot be deleted (the occurrence is ``RESTRICT``), so the
+    satellite sweep skips it and it goes on pinning the doomed Task's
+    Observation. It is not a *protected* type, so a check filtered to those
+    three let it through: run 1 refused correctly, but the Task's Entity was
+    committed-gone, and run 2 then reported **success** — deleting the Scope and
+    leaving the erased owner's ``content.produced`` row with no handle left to
+    reach it. That is finding F1's class, resurrected through a narrower filter.
+
+    The referrer is built by hand because live ingest cannot produce it: a real
+    occurrence is minted for the Task that produced the block. What the shape
+    represents is real enough — a block one Task produced and another still
+    occupies — and the assertion is the one that matters either way: **run 2
+    must refuse too.**
+    """
+
+    backend, sessions = hard_delete_backend
+    store = await _build_hard_delete_store(backend)
+    planted_block = new_id()
+    async with sessions() as session, session.begin():
+        pinned_obs = str(await session.scalar(select(AnsichObservationRow.obs_id).where(AnsichObservationRow.task_id == store.root_id, AnsichObservationRow.kind == "task.heartbeat")))
+        session.add(AnsichEntityRow(entity_id=planted_block, entity_type="content_block", discovered_obs_id=pinned_obs))
+        await session.flush()
+        session.add(
+            AnsichContentBlockRow(
+                entity_id=planted_block,
+                kind="tool_result",
+                content_hash="d" * 64,
+                payload_obs_id=pinned_obs,
+                producer_obs_id=pinned_obs,
+                blob_key=None,
+                byte_size=1,
+                token_estimate=1,
+                sensitivity_flags_json=[],
+            )
+        )
+        await session.flush()
+        session.add(
+            AnsichContentOccurrenceRow(
+                task_id=store.neighbour_id,
+                source_identity="planted-occurrence",
+                content_hash="d" * 64,
+                kind="tool_result",
+                block_id=planted_block,
+                producer_obs_id=pinned_obs,
+                created_at=_RETENTION_OCCURRED_AT,
+            )
+        )
+
+    with pytest.raises(HardDeleteError) as first:
+        await backend.hard_delete_scope(store.scope_id, batch_size=2)
+    assert first.value.reason == "blocked"
+
+    # The finding, in one assertion: the second run must not report success.
+    with pytest.raises(HardDeleteError) as second:
+        await backend.hard_delete_scope(store.scope_id, batch_size=2)
+    assert second.value.reason == "blocked"
+
+    async with sessions() as session:
+        assert await session.scalar(select(AnsichObservationRow.obs_id).where(AnsichObservationRow.obs_id == pinned_obs)) is not None, "the pinned Observation is still there, which is why success would have been a lie"
+        assert await session.get(AnsichScopeRow, store.scope_id) is not None
+    assert await _referential_orphans(sessions) == []
+
+    # Clear the pin and the same call finishes.
+    async with sessions() as session, session.begin():
+        await session.execute(sa.delete(AnsichContentOccurrenceRow).where(AnsichContentOccurrenceRow.block_id == planted_block))
+        await session.execute(sa.delete(AnsichContentBlockRow).where(AnsichContentBlockRow.entity_id == planted_block))
+        await session.execute(sa.delete(AnsichEntityRow).where(AnsichEntityRow.entity_id == planted_block))
+
+    await backend.hard_delete_scope(store.scope_id, batch_size=2)
+
+    assert await _observation_task_ids(sessions, store.doomed_tasks) == 0
+    assert await _referential_orphans(sessions) == []
+
+
+@pytest.mark.anyio
+async def test_a_parent_scope_pin_is_deferrable_and_not_refused_up_front(hard_delete_backend):
+    """Review finding N5: one mirror, and ``parent_scope`` adjudicated as an action.
+
+    The pre-flight refuses only pins **no product action can clear**. A pinning
+    Scope that is itself a parent is not one of those: "erase its children
+    first" is a real sequence an operator can execute with this same API, so
+    treating it as unsatisfiable would refuse work that can be done. It
+    therefore falls through to the ordinary ``blocked`` path, exactly where every
+    other clearable pin lands.
+
+    What the earlier form got wrong was not the ruling but the **coupling**: the
+    pre-flight hand-wrote its own three-branch copy of the Scope refusals and
+    omitted ``parent_scope`` entirely, so it could not have adjudicated it either
+    way. Both callers now read one mirror, and the classification of what that
+    mirror answers is a declared set rather than an omission.
+    """
+
+    backend, sessions = hard_delete_backend
+    store = await _build_hard_delete_store(backend)
+    pinning_ref = "thread-pinning-parent"
+    pinning_id = _hd_scope_id(pinning_ref)
+    extra = [_hd_scope_snapshotted(store.root_id, external_ref=pinning_ref, run_id="run-doomed-parent", occurred_at=_RETENTION_OCCURRED_AT)]
+    assert await backend.persist_and_project(extra) == 1
+    await _settle_retention(backend)
+    # Make the pinning Scope a parent, so erasing *it* would answer parent_scope.
+    async with sessions() as session, session.begin():
+        await session.execute(update(AnsichScopeRow).where(AnsichScopeRow.entity_id == store.neighbour_scope_id).values(parent_scope_id=pinning_id))
+
+    # The mirror sees it — which is the coupling the finding was about.
+    assert SqlAnsichBackend._scope_refusal_reason(pinning_id, scope_kind="thread", host_scope=host_scope_id(backend._hostname), has_child=True)[0] == "parent_scope"
+    assert "parent_scope" in _HARD_DELETE_DEFERRABLE_PIN_REFUSALS
+
+    with pytest.raises(HardDeleteError) as refusal:
+        await backend.hard_delete_scope(store.scope_id, batch_size=2)
+
+    assert refusal.value.reason == "blocked", "a clearable pin must not be reported as unclearable"
+    assert refusal.value.blocker == "ansich_scopes.created_obs_id"
+    async with sessions() as session:
+        assert await session.get(AnsichScopeRow, store.scope_id) is not None
+
+
+def test_every_scope_refusal_the_mirror_can_answer_is_classified():
+    """The partition is total, and its default is the safe direction (N5).
+
+    A sixth refusal added to ``_scope_refusal_reason`` becomes an **up-front**
+    refusal with no edit to the partition — refuse before starting rather than
+    half-erase — and making it deferrable is then a deliberate one-line
+    adjudication. What must never happen is a reason falling through *unjudged*,
+    which is what the hand-written second copy did to ``parent_scope``.
+    """
+
+    host = host_scope_id("some-host")
+    answers = {
+        SqlAnsichBackend._scope_refusal_reason(host, scope_kind="host", host_scope=host, has_child=False),
+        SqlAnsichBackend._scope_refusal_reason("s-1", scope_kind="workspace", host_scope=host, has_child=False),
+        SqlAnsichBackend._scope_refusal_reason("s-2", scope_kind="thread", host_scope=host, has_child=True),
+    }
+    reasons = {answer[0] for answer in answers if answer is not None}
+    assert reasons == {"host_scope", "shared_scope_kind", "parent_scope"}
+    assert reasons & _HARD_DELETE_DEFERRABLE_PIN_REFUSALS == {"parent_scope"}
+    assert _HARD_DELETE_DEFERRABLE_PIN_REFUSALS <= set(get_args(HardDeleteRefusal))
+    # An erasable Scope answers nothing at all.
+    assert SqlAnsichBackend._scope_refusal_reason("s-3", scope_kind="thread", host_scope=host, has_child=False) is None
 
 
 def _hd_admin_user() -> User:

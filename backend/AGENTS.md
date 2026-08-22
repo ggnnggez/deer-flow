@@ -2750,9 +2750,34 @@ half-reported. **Both shapes are v1 limitations with the same resolution — a
 multi-Scope erasure or a pin transfer — and neither is in this build.** That is
 registered for the batch's flip pass rather than left in a report. Three entity
 types are never taken by the satellite sweep: another `Scope`, an
-`agent_release`, and `task` (owned by the Task loop); the phase-5 pin check
-refuses on **any** of them the run will not itself delete, since restricting it
-to the two that have a pretty edge name let a foreign Task entity fall through.
+`agent_release`, and `task` (owned by the Task loop).
+
+**The phase-5 pin check names no types at all, and that is the third and final
+form of it.** Two narrower ones leaked the same way: filtering to the map's two
+named types let a foreign Task Entity through, and filtering to the three
+*protected* types let a **content block whose occurrence belongs to a surviving
+Task** through — not protected, not deletable, and enough to strand the erased
+owner's `content.produced` row on the next run. The satellite sweeps have
+already removed every Entity of this Task they could, so an Entity still
+standing in `ansich_entities` at phase 5 is *by construction* one this erasure
+will not free. The check exempts exactly the two it will (the target Scope, the
+run's condemned Tasks) and refuses on everything else, which makes it exhaustive
+by construction rather than by an enumeration somebody has to maintain.
+
+**One mirror answers "would erasing this Scope be refused, and why".**
+`_scope_refusal_reason` is read by both callers — `_refuse_undeletable_scope_row`
+raises what it returns for the *requested* Scope, and the pre-flight asks it
+about a *pinning* Scope to decide whether the operator has a route. An earlier
+form hand-wrote the second copy and omitted `parent_scope` from it, so a pin it
+could have judged ran most of an erasure before blocking. What the mirror
+answers is then partitioned by `_HARD_DELETE_DEFERRABLE_PIN_REFUSALS`:
+**`parent_scope` is deferrable** — "erase the children first" is an action an
+operator can execute with this same API, and refusing up front would report work
+that can be done as work that cannot — so it falls through to the ordinary
+`blocked` path where every other clearable pin lands. Everything else the mirror
+can answer is unsatisfiable, and the default is that way round deliberately: a
+sixth refusal becomes an up-front refusal with no edit, which is the safe
+direction, and making it deferrable is a one-line adjudication.
 
 **The eighth family — `raw-read audit 中受保护引用` — was adjudicated as privacy
 deletion, and the split is by subject.** A §7 audit row whose target belonged to

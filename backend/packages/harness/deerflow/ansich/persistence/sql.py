@@ -147,7 +147,7 @@ from ansich.environment import (
     assess_environment_leak,
     assess_environment_pressure,
 )
-from ansich.errors import ActiveVersionError, HardDeleteError, PayloadExpiredError, ReplayTargetError, StorageUnavailableError
+from ansich.errors import ActiveVersionError, HardDeleteError, HardDeleteRefusal, PayloadExpiredError, ReplayTargetError, StorageUnavailableError
 from ansich.evaluation import (
     EVALUATION_OBSERVATION_KIND,
     EvaluationProjectionStatus,
@@ -1122,6 +1122,18 @@ _HARD_DELETE_OWNER_SCOPE_KINDS = frozenset({"owner", "thread"})
 #: is the edge the planner refuses on, but it is a column on the *surviving*
 #: row and names nothing an operator can act on; what they can act on is the
 #: Scope or the AgentRelease itself, so its own pin is the edge reported.
+#: Scope refusals a *pinning* Scope may carry and still be clearable by an
+#: operator, so the pre-flight lets the erasure proceed to the ordinary
+#: ``blocked`` path instead of refusing up front. Exactly one member today:
+#: ``parent_scope`` says "erase the children first", which is an action, and
+#: treating an action as an impossibility would refuse work that can be done.
+#:
+#: Everything else :meth:`_scope_refusal_reason` can answer is treated as
+#: unsatisfiable, and the default is deliberately that way round: a sixth
+#: refusal added later becomes an **up-front** refusal with no edit here, which
+#: is the safe direction (refuse before starting rather than half-erase), and
+#: making it deferrable is then a deliberate one-line adjudication.
+_HARD_DELETE_DEFERRABLE_PIN_REFUSALS = frozenset({"parent_scope"})
 _HARD_DELETE_PROTECTED_PIN_EDGES: dict[str, str] = {
     "scope": "ansich_scopes.created_obs_id",
     "agent_release": "ansich_agent_releases.discovered_obs_id",
@@ -3950,7 +3962,7 @@ class SqlAnsichBackend:
         counts = _HardDeleteCounts()
         async with self._maintenance_lock(), self._retention_lock():
             async with self._session_factory() as session:
-                await self._refuse_undeletable_scope_row(session, scope_id)
+                await self._refuse_undeletable_scope_row(session, scope_id, host_scope_id(self._hostname))
                 task_order = await self._hard_delete_task_order(session, scope_id)
                 await self._refuse_unsatisfiable_pins(session, scope_id, task_order)
             deferred: set[str] = set()
@@ -3995,7 +4007,7 @@ class SqlAnsichBackend:
             )
 
     @staticmethod
-    async def _refuse_undeletable_scope_row(session: AsyncSession, scope_id: str) -> None:
+    async def _refuse_undeletable_scope_row(session: AsyncSession, scope_id: str, host_scope: str) -> None:
         """The three refusals that read the store, answered **under the locks**.
 
         All three are cheap indexed reads and all three are typed rather than
@@ -4036,20 +4048,15 @@ class SqlAnsichBackend:
                 reason="unknown_scope",
                 scope_id=scope_id,
             )
-        if scope.scope_kind not in _HARD_DELETE_OWNER_SCOPE_KINDS:
-            raise HardDeleteError(
-                f"Ansich hard delete refused: Scope {scope_id} is a {scope.scope_kind!r} Scope, which is shared across owners; only {sorted(_HARD_DELETE_OWNER_SCOPE_KINDS)} name one owner's data",
-                reason="shared_scope_kind",
-                scope_id=scope_id,
-                blocker=f"{AnsichScopeRow.__tablename__}.scope_kind",
-            )
         child = await session.scalar(select(AnsichScopeRow.entity_id).where(AnsichScopeRow.parent_scope_id == scope_id).order_by(AnsichScopeRow.entity_id).limit(1))
-        if child is not None:
+        refusal = SqlAnsichBackend._scope_refusal_reason(scope_id, scope_kind=scope.scope_kind, host_scope=host_scope, has_child=child is not None)
+        if refusal is not None:
+            reason, explanation, blocker = refusal
             raise HardDeleteError(
-                f"Ansich hard delete refused: Scope {scope_id} is the parent of Scope {child}; delete the children first",
-                reason="parent_scope",
+                f"Ansich hard delete refused: Scope {scope_id} is {explanation}",
+                reason=reason,
                 scope_id=scope_id,
-                blocker=f"{AnsichScopeRow.__tablename__}.parent_scope_id",
+                blocker=blocker,
             )
 
     async def _refuse_unsatisfiable_pins(self, session: AsyncSession, scope_id: str, task_order: Sequence[str]) -> None:
@@ -4091,11 +4098,12 @@ class SqlAnsichBackend:
         entities = AnsichEntityRow.__table__
         observations = AnsichObservationRow.__table__
         scopes = AnsichScopeRow.__table__
+        parents = scopes.alias("child_scopes")
         host = host_scope_id(self._hostname)
-        discovered = entities.join(observations, observations.c.obs_id == entities.c.discovered_obs_id).outerjoin(scopes, scopes.c.entity_id == entities.c.entity_id)
+        discovered = entities.join(observations, observations.c.obs_id == entities.c.discovered_obs_id).outerjoin(scopes, scopes.c.entity_id == entities.c.entity_id).outerjoin(parents, parents.c.parent_scope_id == entities.c.entity_id)
         rows = sorted(
             await session.execute(
-                select(entities.c.entity_id, entities.c.entity_type, scopes.c.scope_kind)
+                select(entities.c.entity_id, entities.c.entity_type, scopes.c.scope_kind, parents.c.entity_id.label("child"))
                 .select_from(discovered)
                 .where(
                     observations.c.task_id.in_(sorted(task_order)),
@@ -4105,36 +4113,58 @@ class SqlAnsichBackend:
                 .order_by(entities.c.entity_id),
             )
         )
-        for entity_id, entity_type, scope_kind in rows:
-            why = self._unsatisfiable_pin_reason(str(entity_id), str(entity_type), None if scope_kind is None else str(scope_kind), host)
-            if why is None:
+        for entity_id, entity_type, scope_kind, child in rows:
+            if str(entity_type) == "agent_release":
+                why = "an immutable release identity with no erasure path in this build"
+            elif str(entity_type) != "scope":
                 continue
+            else:
+                refusal = self._scope_refusal_reason(str(entity_id), scope_kind=None if scope_kind is None else str(scope_kind), host_scope=host, has_child=child is not None)
+                if refusal is None or refusal[0] in _HARD_DELETE_DEFERRABLE_PIN_REFUSALS:
+                    # Either erasable outright, or refused for a reason the
+                    # operator can *act on* -- a parent Scope clears once its
+                    # children are erased. Both leave the ordinary `blocked`
+                    # path with a real remedy, which is where every other
+                    # clearable pin lands; refusing here would treat "do this
+                    # first" as "this cannot be done".
+                    continue
+                why = f"{refusal[1]}, so erasing it is itself refused as {refusal[0]}"
             raise HardDeleteError(
-                f"Ansich hard delete refused: an Observation of Scope {scope_id}'s Tasks is pinned by {entity_type} {entity_id}, {why}; this build has no way to clear that pin, so the erasure could not be finished once started",
+                f"Ansich hard delete refused: an Observation of Scope {scope_id}'s Tasks is pinned by {entity_type} {entity_id}, which is {why}; this build has no way to clear that pin, so the erasure could not be finished once started",
                 reason="unsatisfiable_pin",
                 scope_id=scope_id,
                 blocker=_HARD_DELETE_PROTECTED_PIN_EDGES.get(str(entity_type), f"{entities.name}.discovered_obs_id"),
             )
 
     @staticmethod
-    def _unsatisfiable_pin_reason(entity_id: str, entity_type: str, scope_kind: str | None, host_scope: str) -> str | None:
-        """Why this protected pin can never be cleared, or ``None`` if it can.
+    def _scope_refusal_reason(scope_id: str, *, scope_kind: str | None, host_scope: str, has_child: bool) -> tuple[HardDeleteRefusal, str, str | None] | None:
+        """Why erasing this ``Scope`` would be refused, or ``None`` if it would not.
 
-        The three answers mirror the refusals a caller would hit trying to erase
-        the pinning entity itself, which is what makes this a *derived*
-        statement about the product rather than a second opinion: change
-        ``_HARD_DELETE_OWNER_SCOPE_KINDS`` or add an AgentRelease erasure and
-        this predicate follows.
+        **One mirror, two callers**, which is the whole point of the shape
+        (review finding N5). :meth:`_refuse_undeletable_scope_row` asks it about
+        the *requested* Scope and raises what comes back;
+        :meth:`_refuse_unsatisfiable_pins` asks it about a Scope that is
+        *pinning* one of the doomed Observations, to decide whether the operator
+        has any route to clear the pin. An earlier form hand-wrote the second
+        copy and omitted ``parent_scope`` from it, which is exactly the drift a
+        second copy invites: the pre-flight passed a pin it could have judged,
+        the erasure ran most of the way, and only then blocked.
+
+        Returns ``(reason, explanation, blocker)``. ``unknown_scope`` is not
+        here, deliberately -- it is a statement about a row's *absence*, and the
+        pin caller is holding the row.
         """
 
-        if entity_type == "agent_release":
-            return "which is an immutable release identity with no erasure path in this build"
-        if entity_type != "scope":
-            return None
-        if entity_id == host_scope:
-            return "which is this process's host Scope and is refused as host_scope"
+        if scope_id == host_scope:
+            return ("host_scope", "this process's host Scope, which is its own anchor rather than one owner's data", None)
         if scope_kind is not None and scope_kind not in _HARD_DELETE_OWNER_SCOPE_KINDS:
-            return f"which is a {scope_kind!r} Scope and is refused as shared_scope_kind"
+            return (
+                "shared_scope_kind",
+                f"a {scope_kind!r} Scope, which is shared across owners; only {sorted(_HARD_DELETE_OWNER_SCOPE_KINDS)} name one owner's data",
+                f"{AnsichScopeRow.__tablename__}.scope_kind",
+            )
+        if has_child:
+            return ("parent_scope", "the parent of another Scope; the children have to be erased first", f"{AnsichScopeRow.__tablename__}.parent_scope_id")
         return None
 
     @staticmethod
@@ -4349,19 +4379,27 @@ class SqlAnsichBackend:
 
     @staticmethod
     async def _hard_delete_protected_pin(session: AsyncSession, scope_id: str, condemned: frozenset[str], obs_ids: Sequence[str]) -> str | None:
-        """The removable edge, when a **protected** Entity is what pins these rows.
+        """The removable edge, when a **surviving** Entity is what pins these rows.
 
-        The filter is *"a protected Entity this run is not going to delete"* and
-        nothing narrower. An earlier form enumerated two types by name and read
-        the edge out of a map, so an entity of any other protected type -- a
-        Task belonging to a different Scope that happened to discover one of
-        these Observations -- fell through the check entirely, deferred, and let
-        a later run report success with an Observation of the erased owner still
-        standing. The types this run *will* free are exactly two and both are
-        known here: the target Scope, and the Tasks in its own order.
+        **The filter is "an Entity this run is not going to delete", and it names
+        no types at all.** Two earlier forms narrowed it and both leaked in the
+        same direction: the first enumerated two entity types out of the naming
+        map, the second the three *protected* types. Neither is the property.
+        The satellite sweeps have already deleted every Entity of this Task they
+        could, so **an Entity still standing in ``ansich_entities`` when phase 5
+        runs is by construction one this erasure did not free** -- protected or
+        not. A content block whose occurrence belongs to a surviving Task is the
+        ordinary shape the type filter missed: it pins the Observation, the
+        Task's Entity is committed-gone, and a later run would report success
+        with the erased owner's ``content.produced`` row standing and no handle
+        left to reach it. Dropping the predicate makes the check exhaustive by
+        construction rather than by an enumeration somebody has to maintain.
 
-        ``_HARD_DELETE_PROTECTED_PIN_EDGES`` is now only a **naming** table --
-        it makes the answer say ``ansich_scopes.created_obs_id`` instead of the
+        The only exemptions are the two Entities this run *will* free and both
+        are known here: the target Scope, and the Tasks in its own order.
+
+        ``_HARD_DELETE_PROTECTED_PIN_EDGES`` is only a **naming** table -- it
+        makes the answer say ``ansich_scopes.created_obs_id`` instead of the
         surviving row's ``ansich_entities.discovered_obs_id`` -- so a type
         missing from it degrades the message rather than the refusal.
         """
@@ -4369,14 +4407,7 @@ class SqlAnsichBackend:
         if not obs_ids:
             return None
         entities = AnsichEntityRow.__table__
-        rows = sorted(
-            await session.execute(
-                select(entities.c.entity_id, entities.c.entity_type).where(
-                    entities.c.discovered_obs_id.in_(list(obs_ids)),
-                    entities.c.entity_type.in_(sorted(_HARD_DELETE_PROTECTED_ENTITY_TYPES)),
-                )
-            )
-        )
+        rows = sorted(await session.execute(select(entities.c.entity_id, entities.c.entity_type).where(entities.c.discovered_obs_id.in_(list(obs_ids)))))
         for entity_id, entity_type in rows:
             if str(entity_id) == scope_id or str(entity_id) in condemned:
                 continue
