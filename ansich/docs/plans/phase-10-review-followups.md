@@ -13,7 +13,7 @@
 | F10-3 | release 聚合格「成员按 cohort、取值取全局」是未记录的 §6 偏离 | ✅ 已修复 | 2026-08-18 | 本次变更(文档) |
 | F10-4 | 同上的代码侧:聚合取样应按 cohort 选择 assertion(或改为 per-cohort belief) | ⬜ 未修复 | — | — |
 | F10-5 | score delta 的真实分母 `score_count` 在视图边界被丢弃,门禁与展示都用 `assessed_count` | ⬜ 未修复 | — | — |
-| F10-6 | 兄弟 rollup(`_refresh_behavior_belief`、usage/budget 读模型)仍是未串行化的 read-modify-write | ✅ 已修复(首写者残留见该条) | 2026-08-21 | `82958027` / `029c549e` / `8fbc18df` / `ade44649` |
+| F10-6 | 兄弟 rollup(`_refresh_behavior_belief`、usage/budget 读模型)仍是未串行化的 read-modify-write | ✅ 已修复(**运维 tick 侧的首写者残留已由 P11-C 收口**;投影路径那半边仍是有界自愈形状,见该条) | 2026-08-21 / 2026-08-22 | `82958027` / `029c549e` / `8fbc18df` / `ade44649`(tick 侧首写者 `f1d52a79`) |
 | F10-7 | 缺 per-observation 持久化信号,存在「observation 丢失但回执永远 pending」的窗口 | ✅ 已修复 | 2026-08-20 | `6a70072a` / `6665611f` |
 | F10-8 | `contracts.py` 的 scope/authorization/effect 三个 `_validate_subject` 分支缺 payload-None 守卫(既存缺陷) | ✅ 已修复 | 2026-08-19 | `d463a604` |
 | F10-9 | 同一组常量六处复制(suite-bound kinds ×3、五维度集合 ×3) | ⬜ 未修复 | — | — |
@@ -28,20 +28,26 @@
 | F10-18 | 杂项(装修性/覆盖率补齐,详见该节逐条) | ⬜ 未修复 | — | — |
 | F10-19 | late spawn 边与 sum 型 contribution 并发时存在**永久**丢失窗口(wall_time 可自愈,token/step/tool 不可) | ⚠️ 部分修复(窗口收窄,PB8 的 DOMAIN 残留**永久**,见该条) | 2026-08-21 | `29d832ee` / `e7c7bc8c` / `48e580cc` |
 | F10-20 | `_refresh_usage_summary` 仍是未加锁的全量重算+无条件赋值——F10-6 的同族问题,就在本批加锁那一层的上面 | ✅ 已修复 | 2026-08-21 | `82958027`(PG 丢更新证伪 `562d1297`) |
-| F10-21 | 生产路径的 effect 恒 `scope_id=None`,`attempted_/realized_scope_violation` 两类结论在生产上不可达 | ⬜ 未修复 | — | — |
-| F10-22 | `sudo`/`env`/`timeout` 等包装命令下的 effect 分类未裁定,`sudo rm -rf` 目前落回 `process_execute` | ⬜ 未修复 | — | — |
+| F10-21 | 生产路径的 effect 恒 `scope_id=None`,`attempted_/realized_scope_violation` 两类结论在生产上不可达 | ⚠️ 部分修复(**诚实半边已落**:Scope Effects 视图声明不可达;Scope 绑定设计仍开着) | 2026-08-23 | `89f7a55c` |
+| F10-22 | `sudo`/`env`/`timeout` 等包装命令下的 effect 分类未裁定,`sudo rm -rf` 目前落回 `process_execute` | ⬜ 未修复(P11-C **明确不建**,理由入该条) | — | — |
 | F10-23 | `_assess_scope_safety_at` 直接校验原始行的 `payload_json`、不 hydrate externalized payload,externalized 的 `authorization.*`/`effect.*` 证据会把 assessor job 打成 durable failed(F10-8 同一危害类的 assessor 侧兄弟,既存) | ✅ 已修复(全扫残留见该条) | 2026-08-21 | `35aece8a` |
 | F10-24 | `budget_health:*` 有两个生产写者,`asserted_at` 决胜在模拟事件钟与真实 ingest 墙钟之间比较——证据序已由 `order_wall_time_evidence` 收敛(`ae731b18`),但**断言结构形状**(`as_of_known` vs `enforcement`/`shadow`)仍随决胜漂移 | ✅ 已修复(两半) | 2026-08-21 | `ae731b18`(证据序) / `c7ce07a8`(形状) |
 | F10-25 | `record_evaluation` 的重放查询无守卫:存储不可用时 `OperationalError` 直接抛给调用方,RA6 回执阶梯整条不可达(既存,自 `c1349843`) | ✅ 已修复 | 2026-08-21 | `35aece8a` / `0d9aa3cb` |
 | F10-26 | rebuild 完整性:`rebuild_projections()` 可能在依赖延迟的 job 尚未结算时就以「首轮空扫」宣告完成(本批四次目击) | ✅ 已修复(改为显式报告 `unsettled`) | 2026-08-21 | `d2cd58d2` / `7ad37ce7` |
 | F10-27 | 装配不对称:`create_embedded_ansich_service` 的无存储分支漏传三个 knob;`operations_assessment_interval_ms` 至今没有 `AnsichConfig` 字段,生产恒为 1000ms | ✅ 已修复(两半) | 2026-08-21 | `c7ce07a8` / `625a056c` |
 | F10-28 | 健康线的两处 UI 级留观:中性线态(phase/unknown)的**渲染层**零覆盖(图标三元式曾在本批被反转过);task 作用域在系统 phase 期间仍称「本任务数据完整」 | ⬜ 未修复 | — | — |
-| F10-29 | 环境外部化载荷类:externalized 的 `environment.sampled` 读不回(契约分支无守卫直接抛)、认领不了(先 envelope 后 hydrate 的顺序使投影作业 durable failed)、history 读者守卫跳过(其"从不外部化"注释已撤回)——同一危害类三实例 | ⬜ 未修复 | — | — |
+| F10-29 | 环境外部化载荷类:externalized 的 `environment.sampled` 读不回(契约分支无守卫直接抛)、认领不了(先 envelope 后 hydrate 的顺序把投影作业卡死在认领处)、history 读者守卫跳过(其"从不外部化"注释已撤回)——同一危害类三实例,收口时又扫出同类的第四、五个分支 | ✅ 已修复 | 2026-08-22 | `393a01e2` / `abefcb01` |
 | F10-30 | settle-budget flake 家族(与 F10-10 分开记):`tests/ansich/` 里全部「settle 之后紧接着读投影结果」的断言的等价类(最初以为只在 `test_sql_safety.py` 里,成员 6/7/8/9 证否;共十二名成员,第十、十一、十二名由 P11-C 的 Task 1 / Task 2 / Task 11 补登),多种构造、同一机理——flush 预算输给负载,行退回队列/作业未建;F10-10 的节奏门禁管不了 flush 预算。**不限于重负载**:成员 1/5 在安静机单独跑也翻红(T6 记),故按用例名而非行号认领(合并门禁的窄口见本条收尾) | ⬜ 未修复(测试侧;十二名成员,成员 5 已结案、成员 1 部分处理——见该条) | — | — |
-| F10-31 | LLM attempt 双观测的首写者 pkey 竞态:两 worker 各投影同一 attempt 的 request/response 观测,`ansich_llm_attempts_pkey` 碰撞——非破坏(输家整事务回滚→retry→收敛,和数正确),但需要第五处 lock-then-read 转换 | ⬜ 未修复 | — | — |
-| F10-32 | 活动 Task 读模型的「旧盖章」楔子:`c7ce07a8` 之前写下的行带旧语义水位,遇 durably failed 作业时被单调发布守卫永久跳过(已停 Task 那半边**静默**)。接受它的前提是「没有已部署群体」,而该前提**在此分支首次部署时失效** | ⬜ 未修复(带前提,须在首次部署前重判) | — | — |
-| F10-33 | 多 worker 下同一 host-Scope episode 并发碰撞 `uq_ansich_alert_episode`,一次碰撞丢掉**整轮** `assess_operations`(heartbeat/dwell/budget/environment 与两个生产者一起)——不腐蚀、下一轮自愈、已限速可见 | ⬜ 未修复 | — | — |
-| F10-34 | PG tier 的 `_drain_projections` 在**退避中的 `retry` 作业**面前停手,调用方把它当成「投影已完结」——同文件的 `_settle_projections` 正是为这半件事存在的,只是那个调用点没用它。**不是 F10-30**(不是 settle 预算输给负载),也**不是 F10-26**(不是重建单轮被当成完成) | ⬜ 未修复(测试侧;一行改法已知) | — | — |
+| F10-31 | LLM attempt 双观测的首写者 pkey 竞态:两 worker 各投影同一 attempt 的 request/response 观测,`ansich_llm_attempts_pkey` 碰撞——非破坏(输家整事务回滚→retry→收敛,和数正确),但需要第五处 lock-then-read 转换 | ✅ 已修复 | 2026-08-22 | `f1d52a79` |
+| F10-32 | 活动 Task 读模型的「旧盖章」楔子:`c7ce07a8` 之前写下的行带旧语义水位,遇 durably failed 作业时被单调发布守卫永久跳过(已停 Task 那半边**静默**)。接受它的前提是「没有已部署群体」,而该前提**在此分支首次部署时失效** | ✅ 已修复(**前提被杀掉,而不是被重判**:`0028` 的数据步删空该读模型表) | 2026-08-22 | `c0cdbfa3`(链:`d1b595b9` / `1d23af18` / `32097626`) |
+| F10-33 | 多 worker 下同一 host-Scope episode 并发碰撞 `uq_ansich_alert_episode`,一次碰撞丢掉**整轮** `assess_operations`(heartbeat/dwell/budget/environment 与两个生产者一起)——不腐蚀、下一轮自愈、已限速可见 | ✅ 已修复 | 2026-08-22 | `f1d52a79` |
+| F10-34 | PG tier 的 `_drain_projections` 在**退避中的 `retry` 作业**面前停手,调用方把它当成「投影已完结」——同文件的 `_settle_projections` 正是为这半件事存在的,只是那个调用点没用它。**不是 F10-30**(不是 settle 预算输给负载),也**不是 F10-26**(不是重建单轮被当成完成) | ✅ 已修复(测试侧;那个调用点已改用 `_settle_projections`) | 2026-08-22 | `f1d52a79` |
+| F10-35 | `ansich_current_beliefs` 首写者竞态的**整轮**爆炸半径:两 worker 的 1 Hz `assess_operations` 各自首写同一 `(task_id, "heartbeat")` 当前 Belief 行,`ansich_current_beliefs_pkey` 碰撞炸掉整个 tick 事务——与 F10-33 逐字同形,此前被 F10-31 的类型化容忍遮蔽 | ✅ 已修复 | 2026-08-22 | `f1d52a79` / `d2ca0392` |
+| F10-36 | **认领处的抛永远变不成一条运维可见的失败作业**:抛回滚自己的认领事务(`attempts` 不涨、作业到不了 `failed`),`_project_pending` 的 `except Exception: return 0` 吞掉它,而认领按 `ingest_seq` 排序——毒行一旦是最低可认领作业,**全进程投影永久静默停摆**,health 仍报 `reachable`/`failed_jobs=0` | ⬜ 未修复(既存形状;F10-29 的 hydrate 提前**扩大了它的暴露面**) | — | — |
+| F10-37 | `_project_control` 不幂等:对一条已投影的 control 观测重放会撞 `ansich_transitions.evidence_obs_id` 唯一约束 ⇒ `retry` → `failed`,所以 `task-control` 的**普通**重放今天就是坏的(rebuild 不受影响) | ⬜ 未修复(已在 `_NON_IDEMPOTENT_PROJECTORS` 登记,CLI 两处 stderr 警告) | — | — |
+| F10-38 | owner/thread 强删除的两条 v1 不可解形状:被**类型拒绝**的实体 pin(host/workspace/sandbox/authorization/external_origin Scope、AgentRelease)与**互相 pin**(两个各自可删的 Scope 共用一个 Task,预检都过、谁都完不成)——都被如实拒绝,但 v1 无产品内补救 | ⬜ 未修复(v1 限制,已诚实拒绝并写死拒绝理由) | — | — |
+| F10-39 | 保留策略下的无界增长残余:`ansich_content_blobs` 的 `inline_body`(阈值以下的正文,任何 tier 都不碰)、尚无 tier 触达的 blob 行,以及 tier 1 留下的 tombstone 空壳 | ⚠️ 部分收窄(T10 的 `_apply_plan_and_reclaim` 让三个删除者都回收自己弄成孤儿的 blob 行与正文;**不构成回收 tier**) | 2026-08-22 | `e764de4f` |
+| F10-40 | tier 2 删掉一条**活认领者**正在投影的观测时,投影方的外键失败经 `_record_projection_error` 的 `job is None` 早退**完全静默**:不计数、不打日志、不重臂,`stale_completion_count` 那条先例没有被套用 | ⬜ 未修复(有界、不毒批,但零可见性) | — | — |
 
 留观标记:F10-10 的第 4 条证据(`test_step_attempt_and_context_are_queryable_after_projection`)**未证实**——只做了排除法,没拿到原始失败文本。若它再轮换红,**先抓失败文本再修**,不要按已有的三条诊断类推。另:F10-10 的门禁只被 Task 8 的验收负载证明过(`e53cefbc` 记录了这条边界),Task 9 的更重负载下仍有 2 条已上门禁的测试翻红,详见该条的「后续观察」。
 
@@ -96,7 +102,8 @@
   - **多行 rollup 取锁前先排序**:usage 扇出、spawn backfill、environment 的 per-metric 更新都排序后再取锁,否则两个进程按 `set`/`dict` 的原生序遍历会在真 PG 上死锁(T9 的 tier 实测到 PostgreSQL 中止其中一方)。死锁自由的正面论证(serializing prefix:两条扇出路径都在拿聚合行之前先拿贡献行,并按聚合升序走)写在 `_backfill_spawn_usage` 的注释里。
   - **PG 实证**:T9 的双 worker tier 在真 PostgreSQL 上把改前的未加锁读跑成**红**(同一交错下祖先只拿到 59 tokens,正确值 107),改后同一交错绿(`562d1297`)。SQLite 侧只能钉语句顺序,那由 `tests/ansich/test_rollup_serialization.py` 负责。
 - **残留(不要把本条的 ✅ 读成「首写者竞态已清零」)**:
-  - site-1 共享的 `_resolve_current_assessment` 的首写没有一并收口——两个 worker 同时首写同一条 assertion 行会撞一次,输家整事务回滚、按 `retry` 重来后收敛。代价有界(一次可重试的 assessor attempt)且自愈,已在 `F10-18` 挂一行。
+  - ~~site-1 共享的 `_resolve_current_assessment` 的首写没有一并收口~~ —— **已由 P11-C 批 Task 11 收口(`f1d52a79`,`d2ca0392` 补锁序)**。该函数现在走 `_open_or_lock_current_belief`(`INSERT … ON CONFLICT DO NOTHING` + 赢家行 `FOR UPDATE` 重读)并改成**有界两遍**:输掉的那一遍必须**重新归约**,因为对手的 Assertion 在第一遍的 READ COMMITTED 快照里不可见,拿旧答案发布正是锁要阻止的丢更新。收口的动机不是本条原来记的「一次可重试的 attempt」——见 `F10-35`:这个碰撞真正炸掉的是**整轮** `assess_operations`,而不是一个作业事务。原来挂在 `F10-18` 的那一行随之作废。
+  - **仍然开着的是另一半,不要混读**:同一张 `ansich_current_beliefs` 的两处**纯投影路径**写入(`_project_control` 的 control 场、ToolCall 终态的 execution 场)**刻意未转换**——那里一次碰撞的代价是一个作业事务加一次 `retry`,即本条一直记录的有界自愈形状。`F10-35` 的条目里写清了边界并不齐整:被转换的三处里 `_assess_budget_rows` 自己也坐在投影路径上(`_project_control` 的终态分支会调它),那条路径上的行为因此**变了**(回滚重来 → 提交并多留一条同判定 Assertion)。
   - `_refresh_active_task_read_model` 上还有一层与锁无关的残留:它的输入读在更早的**已提交**会话里,锁串行化的是写者不是计算,所以更旧的一轮 tick 可能后完成。这一层由 T10 的单调发布守卫(裁决 PB7,`c7ce07a8`;UPDATE 与 DELETE 两边都守,`625a056c`)关闭,不是本条修的。
   - LLM attempt 投影站的同型首写者竞态在本批的 PG tier 上被实测到,单列 `F10-31`。
 - 原始诊断(留档):
@@ -262,8 +269,9 @@
 - `not_comparable` 行与 unassessed 行目前只靠文案区分,加一个结构性标记会更利于扫读;e2e 也还没渲染过 unassessed 行、没断言过 delta 的中性配色。
 - 迁移 id 与 `alembic_version.version_num` 的 `VARCHAR(32)` 上限已**贴边**:`0024_ansich_wall_time_watermarks` 与 `0021_ansich_summary_assertion_fk` 都正好 32 字符,余量为 0。本批已在 `tests/test_persistence_bootstrap.py::test_baseline_revision_id_is_known` 补一行 `max(len(...)) <= 32` 断言把它钉住,下一条更长的 revision id 会在测试里红,而不是在用户的 Gateway 启动时红。
 - 全部 72 张表在 PostgreSQL 方言下渲染的是 `json` 而不是 `jsonb`(模型统一用泛型 `sa.JSON`,`grep JSONB` 全仓库零命中,只有 `_helpers.py` 的反射等价对与文档提到该词)。`json` 不支持 `jsonb` 的 GIN 索引与包含查询,而 Ansich 的 `*_json` 列将来若要按内容过滤就会需要它。改成 `jsonb` 是一次跨全部 JSON 列的迁移(含 Ansich 之外的 `runs`/`run_events`),**登记为 Phase 11 的待裁决项**,本批只把文档里说反的两处(`backend/AGENTS.md`、`persistence/bootstrap.py` 的 docstring)改正。
+  - **裁决(2026-08-23,P11-C 批终,裁决 RC14):DEFERRED,并附一条本批亲自核过的确认。** P11-C 的 replay 与 retention 查询**没有一条按 JSON 内容过滤**:目标集过滤走 kind / `task_id` / `occurred_at` / `ingest_seq`(全部有索引),retention 三个 tier 走 `created_at` / `occurred_at` / `ingest_seq` / `entity_id`,§7 审计写入按 `source_event_id` 的唯一索引去重。因此本批**没有新增任何按内容过滤的消费者**,迁移的触发条件仍是原来那条——「第一个真的要对 `*_json` 列做包含查询或 GIN 索引的消费者」。在那之前,一次跨全部 JSON 列(含 Ansich 之外的 `runs`/`run_events`)的迁移换不到任何东西。
 - P11-B 的 `projection_failure` 生产者(`sql.py::_assess_projection_failures`)**只覆盖投影作业**:证据链是失败作业自带的 `obs_id`,而 `ansich_projection_jobs.obs_id` 是真列、`ansich_assessor_jobs` 只有 subject 与 `evidence_watermark`,没有自己的 Observation。因此一条 durably failed 的 **assessor 作业不产生任何 Alert**,只经由共享的 failed-job 计数与 `GET /operations/failed-jobs` 到达运营者。要补上需要按 `evidence_watermark` 反查证据(可行,但那是另一套证据推导),留待需要时;边界已写在生产者 docstring 与 `ansich/process_health.py::assess_projection_failure` 里,并由 `tests/ansich/test_process_health_alerts.py::test_a_failed_assessor_job_produces_no_projection_failure` 钉住。
-- `_resolve_current_assessment` 的**首写者**半边没有随 F10-6 的 lock-then-read 一起收口:两个 worker 同时首写同一条 assertion 行会撞一次,输家整事务回滚、按 `retry` 重来后收敛(与 `_refresh_behavior_belief` 已记录的首写者 `IntegrityError` 同型)。代价有界且自愈,修法是给这个首写者补一处 `_insert_ignoring_conflict`。**「第五处 lock-then-read 转换」这个编号不归本条**——它归 F10-31(`backend/AGENTS.md` 的 P11-B rollup 段落也是这么写的);本条只欠首写者那半边的收口,不是一次完整的锁-再-读改写,先前两条都自称「第五处」是记账重复,2026-08-22 的批终审据此改正。随下次触达该函数顺带处理。
+- ~~`_resolve_current_assessment` 的**首写者**半边没有随 F10-6 的 lock-then-read 一起收口~~ —— **已结清(2026-08-22,P11-C 批 Task 11,`f1d52a79`)**,详见 F10-6 的残留段与 F10-35。本行留档只为记两处**当时的诊断被后来的实测改正**:其一,代价不是「一次可重试的 assessor attempt」,而是**整轮** `assess_operations`(F10-35);其二,修法不是「补一处 `_insert_ignoring_conflict`」就够,还需要输家**重新归约**一遍(READ COMMITTED 下对手的 Assertion 在第一遍不可见)。「第五处 lock-then-read 转换」的编号归属(F10-31,不归本行)这一条记账更正仍然成立。
 - Task 9 的 PostgreSQL tier 文档里那条 `docker run ... postgres:16` 启动一行**本身没有被执行过**——该环境里 Docker 守护进程不可用,实际验收跑在一个由 `pgserver` wheel 自带的官方 PostgreSQL 16.2 二进制 `initdb` 出来的一次性本地 cluster 上(同一份服务端软件、同一个 5433 端口与 URL)。命令是标准写法,但"照抄即可跑通"这件事没有证据,`backend/Makefile` 的注释已就地标注。
 
 ## F10-19. late spawn 与 sum 型 contribution 的永久丢失窗口
@@ -307,7 +315,9 @@
 
 ## F10-21. 生产 effect 恒 `scope_id=None`,两类越权结论不可达
 
-- 状态:⬜ 未修复。来源:加固批 Task 5(effect class 扩充)时确认的**既存**缺口,非本批引入;phase-9-review-followups.md 的 M1 条目里已留档,在此登记为需要 owner 的独立项。
+- 状态:⚠️ 部分修复(2026-08-23,P11-C 批 Task 14,`89f7a55c`)。**只有诚实那半边落了地**,机理半边一行没动。来源:加固批 Task 5(effect class 扩充)时确认的**既存**缺口,非本批引入;phase-9-review-followups.md 的 M1 条目里已留档,在此登记为需要 owner 的独立项。
+- **落地的半边(裁决 RC14):** `frontend/src/components/workspace/ansich/scope-effects-panel.tsx` 的 Scopes 卡片底部常驻一句声明(`t.ansich.scopeViolationUnreachable`,两份 locale 都有),说明生产路径上记录的 effect 一律不带 Scope 绑定,因此两类 scope-violation 结论**在那里根本产不出来**——它们的缺席是仪表的性质,不是关于这个 Task 的证据。这句话的全部作用是**不让沉默被读成体检合格**;组件里配了一段注释说明它为什么必须留着。
+- **没落地的半边:** effect 的 Scope 绑定本身。下面的「方向」原样有效,归属不变。
 - 位置:`backend/packages/harness/deerflow/ansich/tool_middleware.py`(记录 effect 时 `scope_id=None`,projector 原样拷贝)与 `packages/ansich/ansich/scope_safety.py`(`attempted_scope_violation`/`realized_scope_violation` 都要求 `effect.scope_id is not None`)。
 - 现状:领域逻辑与测试都覆盖了这两类结论,但生产路径上没有任何 effect 携带 `scope_id`,因此它们在真实数据上**永远不会产生**。运营者看到的 scope-safety 结论实际只有 `policy_denial` 与 `unverified_effect` 两类;Task 5 新增的 `filesystem_delete`/`permission_change` 也不例外——分类更精确了,可达性没有变。
 - 方向:给 effect 绑定 Scope 是独立议题:需要先确定"一次 tool 调用的目标资源属于哪个 Scope"的判定规则(路径前缀?sandbox 挂载点?MCP server 身份?),再在 intent 探针处解析并落到 `scope_id`。在那之前,不要把这两类结论的零命中读成"没有越权"。
@@ -319,6 +329,7 @@
 - 位置:`tool_middleware.py::_leading_command_word` / `::_bash_effect_class`。
 - 现状:首命令词取的是**第一个非环境赋值 token 的 basename**,与 `rm`/`unlink`/`rmdir`、`chmod`/`chown`/`chgrp` 两个精确集合比对。因此 `sudo rm -rf /x`、`env rm x`、`timeout 5 rm x`、`xargs rm`、`command rm` 全部落回 `process_execute` + `unknown`。这个方向是**安全的**(不越权断言),但也意味着一次提权删除在 Scope Effects 面板上与一次普通命令执行长得一样。裁决 HR2 只处理了元字符闸门与 `NAME=value` 前缀,没有对"包装器"这一类给出规则。
 - 方向:需要一次独立裁决,而不是顺手加白名单——`sudo`/`env`/`nice`/`timeout`/`xargs`/`command` 各自的参数文法不同(`sudo -u user rm`、`env -i FOO=1 rm`、`timeout 5s rm`),一个"跳过 flag 及其取值"的通用规则很容易把 flag 的**取值**误当成命令词(`sudo -u rm whoami` 里的 `rm` 是用户名,不是命令)。保守可行的中间态是:只解包**无 flag** 的形式(`sudo rm …`、`env rm …`),其余仍退回 `process_execute`。任何方案都要配"包装器带 flag 时不误判"的负向用例。
+- **P11-C 的裁决(2026-08-23,裁决 RC14):明确不在本批建,理由入档。** P11-C 的四节(replay / retention / raw read 审计 / 关闭顺序)一次都没有触达 `tool_middleware.py::_effect_class`,而本条自己的归属写的就是「随下次触达该函数的改动一并裁决」。在一批不碰那个文件的工作里顺手加一条包装器白名单,等于把一次需要负向用例支撑的分类裁决塞进无关的评审面——本条要的是裁决,不是补丁。归属不变。
 - 归属:未定,建议随下次触达 `_effect_class` 的改动一并裁决。
 
 ## F10-23. assessor 读证据时不 hydrate externalized payload
@@ -392,6 +403,11 @@
 ## F10-26. rebuild 完整性:重建可能在依赖延迟的 job 未结算时就宣告完成
 
 - 状态:✅ 已修复(2026-08-21,P11-B 批 Task 3,`d2cd58d2`;PB5 与配套回归随 `7ad37ce7`,docstring 更正随 `563aeb6e`)。取的是方向里的**显式报告**那一支(裁决 RB9⑦ 选 (b)):`rebuild_projections()` 现在返回 `RebuildOutcome(replayed, unsettled)` 而不是一个裸计数。`unsettled` 数的是这一趟返回时仍处于 `pending`/`retry`/`processing` 的投影**与** assessor 作业(`failed` 行算「已结算,只是结算得很糟」,并且早已由 failed-job 计数暴露)。为什么不等:这个调用同时持着维护锁**和**调用方的 `_projection_lock`,等一个依赖最长要等 `projector_dependency_timeout_seconds`,那会把一个操作者和一条 projector loop 一起停在一个它管不着的时长上;而把一个 250ms 内就会结算的作业直接判成 durable failed 是在毁掉工作。rebuild 幂等,想要完整性的调用方再调一次即可;`AnsichService.rebuild_projections` 把仍返回裸 int 的 backend 规范化为 `unsettled=0`。
+- **三条留观的收尾裁决(2026-08-23,P11-C 批终,T15)。三条**全部**结清,本条的 ✅ 因此站得住,而且现在有了它一直缺的那一半——调用方侧的完整性循环。** 三条留观(见下)记的是同一件事在三个楼层的复发:测试与调用方把**单轮**读成完整性。修法始终是本条自己在 §5 改写处开出的那一行——对 `unsettled == 0` 做**有界循环**,而不是信任单轮——而 P11-C 把它落到了每一层:
+  - **留观一** → `AnsichService.rebuild_until_settled(max_rounds=5)`(Task 1,`113f244b`;文档下界告诫随 `d293b9ee`),`tests/ansich/` 里全部**八处**「单轮 `rebuild_projections()` 之后断言 `unsettled == 0`」的调用点(含具名实例与 opt-in PG tier 的一处)改成调用它。
+  - **留观二** → 那次目击暴露的是 T1 的清扫**没有覆盖到的另一种形状**:「裸 `rebuild_projections()` 之后断言读模型相等」。由专门的一次机械清扫(Task 3b,`d610792d`)处理:31 处可调用的裸站点里 **23 处**转换、**8 处**因机械原因留下(全部逐条分类入档,其中五处是**结构性**不可转换的——循环只存在于 `AnsichService` 上,那几处是 backend 级)。留下的站点没有内联标记,分类表是那份记录。
+  - **留观三** → 本条第一次不在 `rebuild_projections()` 上而在 `execute_replay()` 上,由 Task 11 第二轮转换(`1f5d805a`):测试侧 `_replay_until_settled` 与 `rebuild_until_settled` 逐字同型(每一趟是**独立的一次** `execute_replay`,退出条件是 `unsettled == 0` 而不是「某一轮没重放东西」,耗尽上界只报告不抛),两处调用点都改成它。
+  - **仍然开着、且属于本条的一句诚实话**:没有任何结构性装置阻止有人**再写**一处裸 `rebuild_projections()` + `unsettled == 0`(Task 3b 的实施者与复审都点了这一条,建议过一条约 40 行、以 AST 钉住那 8 处机械站点的守卫测试,先例在 `test_ansich_config.py`)。在那之前本条的修法靠的是清扫加评审,不是靠机器。这条守卫属于下一次测试卫生波(与 F10-30 同批)。
 - 「这一轮没认领到」与「重建完成了」自此是两句话,而且第二个理由是本批新加的:自 lease CAS 之后,一轮也可能因为**认领被别人接管**而返回零。
 - 附带闭合的一条 §5 前置:PB5(见 F10-10 假说 (c) 一节)修掉的是一次**实测到的** live-vs-replay Belief 分歧——没有 PB5 时同一份流「实时读到 present、重放读到 cleared」,而本条方向里写的「两次重放 digest 相同」正以此为前提。
 - 来源(留档):P11-A 批 Task 2 复审提出的机制假说(裁决 PA10 已入账),该批共四次目击。
@@ -404,7 +420,7 @@
   4. **Task 6(文本完整)**:`test_sql_evaluations.py::test_rebuild_reproduces_index_rows_stats_and_current_beliefs` —— `assert before == after`,而 `after` 是**空的**(`'stats': ()`、`'index': ()`):**重建什么都没产出**。这一条最贴合机制假说,也是本条最强的一次证据。
 - 为什么它不是 F10-10 的同一件事:F10-10 是「后台评估写者与测试自己驱动的评估赛跑」,门禁 `only_test_driven_assessments` 已经把那个写者按住;这一族的失败与评估无关,失败的是**重建自身的完整性**,而 barrier / 写侧改动只能让写入更宽、不可能更窄(`rebuild_projections()` 读的是持久流)。两族必须分开记,否则会把「等更久就好了」的错误结论套到这一族上。
 - 方向:让 `rebuild_projections()` 的完成条件把 dependency-pending 的 job 算进去——要么等它们结算或越过 `projector_dependency_timeout_seconds` 转 durable failed,要么在返回值里**显式报告**「仍有 N 个未结算」,由调用方决定。任何修法都要配一条「依赖延迟 job 未结算时重建不报完成」的回归;这同时是 §5 versioned replay「两次重放 digest 相同」得以成立的前提。
-- 留观(2026-08-22,批终审后的修复波目击,终审复审裁定归口本条而非 F10-30):`tests/ansich/test_spawn_usage_reconciliation.py::test_rebuild_mints_a_reconciliation_for_an_edge_that_has_none`(**2026-08-22 更正文件名**:此前这里写的是 `tests/ansich/test_sql_projection_jobs.py`,仓库里**没有**这个文件——同 RC15 那一类的悬空指针,由 P11-C Task 1 在落地本条修法时一并改掉)在「两文件并跑 + 外部负载」下红过一次——断言 `unsettled == 0`,实得 10。这不是 settle 预算输给负载(不是 F10-30 的家族形状),而正是本条修复后的**约定语义在测试侧未被消化**:`rebuild_projections()` 按本条的 (b) 支**报告而不等待**,负载下一轮返回时依赖延迟的作业就是可以有 10 条未结算,`unsettled==0` 只能靠调用方自己再驱一轮拿到。讨伐:单独 3/3 绿、同组合复跑 2/2 绿、两次全量绿。修法即 §5 改写处已开出的那一行:测试(以及任何要完整性的调用方)对 `unsettled==0` 做有界循环,而不是信任单轮。**该修法已由 P11-C Task 1 落地**(commit 见该批 task-1-report):`AnsichService.rebuild_until_settled(max_rounds=5)` 是那个有界循环,`tests/ansich/` 里全部八处「单轮 `rebuild_projections()` 之后断言 `unsettled == 0`」的调用点(含上面这条具名实例,以及 opt-in PG tier 的一处)都改成了调用它。**本条的状态翻转不在此处做**,留给控制者/T15 统一裁决。
+- 留观(2026-08-22,批终审后的修复波目击,终审复审裁定归口本条而非 F10-30):`tests/ansich/test_spawn_usage_reconciliation.py::test_rebuild_mints_a_reconciliation_for_an_edge_that_has_none`(**2026-08-22 更正文件名**:此前这里写的是 `tests/ansich/test_sql_projection_jobs.py`,仓库里**没有**这个文件——同 RC15 那一类的悬空指针,由 P11-C Task 1 在落地本条修法时一并改掉)在「两文件并跑 + 外部负载」下红过一次——断言 `unsettled == 0`,实得 10。这不是 settle 预算输给负载(不是 F10-30 的家族形状),而正是本条修复后的**约定语义在测试侧未被消化**:`rebuild_projections()` 按本条的 (b) 支**报告而不等待**,负载下一轮返回时依赖延迟的作业就是可以有 10 条未结算,`unsettled==0` 只能靠调用方自己再驱一轮拿到。讨伐:单独 3/3 绿、同组合复跑 2/2 绿、两次全量绿。修法即 §5 改写处已开出的那一行:测试(以及任何要完整性的调用方)对 `unsettled==0` 做有界循环,而不是信任单轮。**该修法已由 P11-C Task 1 落地**(commit 见该批 task-1-report):`AnsichService.rebuild_until_settled(max_rounds=5)` 是那个有界循环,`tests/ansich/` 里全部八处「单轮 `rebuild_projections()` 之后断言 `unsettled == 0`」的调用点(含上面这条具名实例,以及 opt-in PG tier 的一处)都改成了调用它。**本条的状态翻转不在此处做**,留给控制者/T15 统一裁决。**已裁决(2026-08-23,T15):本留观结清**,见本条开头的「三条留观的收尾裁决」。
 - **留观二(2026-08-22,P11-C 批 Task 3 的第三轮全量目击):T1 的转换覆盖的是 `unsettled == 0` 那一类调用点,而本条最初四次目击的形状——「单轮重建之后拿读模型对等」——一处都没被覆盖,现在又红了一次。** 目击:`tests/ansich/test_sql_heartbeat.py::test_late_spawn_backfill_carries_the_wall_time_high_water_mark`(断言在 :1227),失败全文:
 
   ```
@@ -416,8 +432,8 @@
   ```
 
   调用点是 `usage = await get_task_usage(root)` → `await service.rebuild_projections()`(**单轮**)→ `rebuilt_usage = await get_task_usage(root)` → `assert rebuilt_usage == usage`。这与本条目击 1/3/4 逐字同型(目击 3 `test_sql_task_tree.py::…_backfills_a_late_spawn_without_double_counting` 的 `assert root_usage == rebuilt` 几乎是同一个用例的另一个写法),**不是** F10-30 的家族形状(不是 settle 预算输给负载,是重建单轮被当成完成)。**这是一次分诊,不是一个新成员**:按窄口 (1) 的分诊规则,失败形状属「重建单轮后断言完整性」⇒ 归 F10-26,不进 F10-30 的成员表。讨伐:该用例单独重跑 3 次 **3/3 `1 passed`**(2.77s / 2.85s / 2.86s);同一生产树的上一轮全量(只差一条新增的纯函数用例)是 **843 passed 全绿**;Task 3 的生产改动不碰任何既存代码路径(见 F10-30 那条的 Task 3 记账)。
-  **结构性缺口,值得单独看一眼再决定要不要动**:`tests/ansich/` + `tests/integration/` 里今天还有 43 处 `rebuild_projections()` 调用、只有 13 处 `rebuild_until_settled`,其中「重建后拿读模型对等」的写法在 `test_sql_heartbeat.py`(:182/:794/:1210)、`test_sql_task_tree.py`(:446)等处成片存在,全部仍是单轮。修法与留观一完全相同、也是一行:把这些调用点换成 `rebuild_until_settled()`。P11-C Task 3 **没有动它们**(超出该任务范围,且一次 flake 拿不到确定性红先),把它作为一条带证据的欠账交给控制者/T15 裁决:要么作为一次独立的测试侧扫尾,要么继续按 flake 记账。**控制者裁决取了「独立扫尾」那一支,已由 P11-C Task 3b 落地**:`backend/tests/` 里 31 处裸 `rebuild_projections()` 调用点全部分诊过——23 处「单轮之后断言读模型/投影完整性」(含本留观具名的 `test_sql_heartbeat.py:1210`,以及目击 1 的 `test_sql_task_lifecycle.py:209`、目击 3 的 `test_sql_task_tree.py:446`)改为 `rebuild_until_settled()`,8 处考的是重建自身的单轮机制(`test_lease_cas.py` 四处的 `replayed`/`unsettled`/`lease_generation` 计数、`test_task_lifecycle.py` 三处的 outcome 归一化与互斥探针、`tests/integration/test_postgres_multiworker.py:823` 的两个并发单轮重建)按其语义留原样,没有一处属于「断言与结算无关」;本条的状态翻转仍不在此处做。
-- **留观三(2026-08-22,P11-C 批 Task 11 修复轮的全量目击;本条第一次不在 `rebuild_projections()` 上、而在 `execute_replay()` 上):** 目击:`tests/ansich/test_replay.py::TestExecuteReplay::test_two_replays_of_one_observation_set_agree` 的 `assert second.unsettled == 0`,实得 **1**。这正是本条的签名,只是换了一层楼:`execute_replay` **自己**就是那个有界循环(默认 `max_rounds=5`),但它的五轮跑在**同一次调用之内、彼此紧挨**,而依赖延迟的作业被 `available_at = now + 250ms` 挡在 claim 的 `available_at <= now` 谓词之外——再紧的空转也够不着它。于是一次 pass 完全可以耗尽自己的轮次仍带着 `unsettled == 1` 返回,而调用点把这**单次 pass** 读成完整性,就是本条的错误升了一级(`RebuildOutcome` 与 `execute_replay` 的 docstring 各自的下界告诫,说的都是这件事)。讨伐:该用例**单独重跑 3 次,3/3 `1 passed`**;同一门禁在批 BASE `f1d52a79` 上**全绿(1065 passed)**,故「BASE 上同样红」不成立——**减项与 F10-30 成员 12 那条相同,必须并读**:BASE 那棵树没有本修复轮新增的五条起服务用例(1065 对 1068),而本条与 F10-30 一样是负载敏感的,所以 BASE 全绿只能读作「那个负载下没红」。**该站点已由 Task 11 第二轮转换**:测试侧新增 `_replay_until_settled`(与 `rebuild_until_settled` 逐字同型——每一趟是**独立的一次** `execute_replay`,退出条件是 `unsettled == 0` 而不是「某一轮没重放东西」,耗尽上界只报告不抛),两处调用点都改成它,周围断言逐字未动;修完该用例单独 3/3 绿、整文件 133 passed 全绿。**本条的状态翻转仍不在此处做。**
+  **结构性缺口,值得单独看一眼再决定要不要动**:`tests/ansich/` + `tests/integration/` 里今天还有 43 处 `rebuild_projections()` 调用、只有 13 处 `rebuild_until_settled`,其中「重建后拿读模型对等」的写法在 `test_sql_heartbeat.py`(:182/:794/:1210)、`test_sql_task_tree.py`(:446)等处成片存在,全部仍是单轮。修法与留观一完全相同、也是一行:把这些调用点换成 `rebuild_until_settled()`。P11-C Task 3 **没有动它们**(超出该任务范围,且一次 flake 拿不到确定性红先),把它作为一条带证据的欠账交给控制者/T15 裁决:要么作为一次独立的测试侧扫尾,要么继续按 flake 记账。**控制者裁决取了「独立扫尾」那一支,已由 P11-C Task 3b 落地**:`backend/tests/` 里 31 处裸 `rebuild_projections()` 调用点全部分诊过——23 处「单轮之后断言读模型/投影完整性」(含本留观具名的 `test_sql_heartbeat.py:1210`,以及目击 1 的 `test_sql_task_lifecycle.py:209`、目击 3 的 `test_sql_task_tree.py:446`)改为 `rebuild_until_settled()`,8 处考的是重建自身的单轮机制(`test_lease_cas.py` 四处的 `replayed`/`unsettled`/`lease_generation` 计数、`test_task_lifecycle.py` 三处的 outcome 归一化与互斥探针、`tests/integration/test_postgres_multiworker.py:823` 的两个并发单轮重建)按其语义留原样,没有一处属于「断言与结算无关」;本条的状态翻转仍不在此处做。**已裁决(2026-08-23,T15):本留观结清**,见本条开头的「三条留观的收尾裁决」;那里同时记下了它留下的唯一残留——没有任何结构性装置阻止再写一处裸调用。
+- **留观三(2026-08-22,P11-C 批 Task 11 修复轮的全量目击;本条第一次不在 `rebuild_projections()` 上、而在 `execute_replay()` 上):** 目击:`tests/ansich/test_replay.py::TestExecuteReplay::test_two_replays_of_one_observation_set_agree` 的 `assert second.unsettled == 0`,实得 **1**。这正是本条的签名,只是换了一层楼:`execute_replay` **自己**就是那个有界循环(默认 `max_rounds=5`),但它的五轮跑在**同一次调用之内、彼此紧挨**,而依赖延迟的作业被 `available_at = now + 250ms` 挡在 claim 的 `available_at <= now` 谓词之外。于是一次 pass 完全可以耗尽自己的轮次仍带着 `unsettled == 1` 返回,而调用点把这**单次 pass** 读成完整性,就是本条的错误升了一级(`RebuildOutcome` 与 `execute_replay` 的 docstring 各自的下界告诫,说的都是这件事)。**措辞更正(2026-08-23,T15)**:此前这里写的是「再紧的空转也够不着它」,那说得太绝对。准确的说法是——那五轮之间**没有任何时间感知或可用性感知的退出条件**,而每一轮都要跑一次完整的 `assess_operations`,那是要花墙钟的;所以 250ms 的退避会不会在某一轮里自己走完纯属偶然,取决于那一轮的工作恰好花了多久。这也正是该断言**通常绿、只在负载下才红**而不是恒红的原因。讨伐:该用例**单独重跑 3 次,3/3 `1 passed`**;同一门禁在批 BASE `f1d52a79` 上**全绿(1065 passed)**,故「BASE 上同样红」不成立——**减项与 F10-30 成员 12 那条相同,必须并读**:BASE 那棵树没有本修复轮新增的五条起服务用例(1065 对 1068),而本条与 F10-30 一样是负载敏感的,所以 BASE 全绿只能读作「那个负载下没红」。**该站点已由 Task 11 第二轮转换**:测试侧新增 `_replay_until_settled`(与 `rebuild_until_settled` 逐字同型——每一趟是**独立的一次** `execute_replay`,退出条件是 `unsettled == 0` 而不是「某一轮没重放东西」,耗尽上界只报告不抛),两处调用点都改成它,周围断言逐字未动;修完该用例单独 3/3 绿、整文件 133 passed 全绿。**本条的状态翻转仍不在此处做。****已裁决(2026-08-23,T15):本留观结清**,见本条开头的「三条留观的收尾裁决」。**另记一条比该转换的 docstring 自称的更强的保证**:`_replay_until_settled` 的 docstring 只举了「两趟之间释放并重取维护锁、其间做了真活」这个**基于时间**的弱理由;强的那一半是**结构性**的——新的一趟 `execute_replay` 会调 `mint_replay_jobs`,它的 re-pend 对每一条命中选择器的目标作业写 `available_at = now` **并且** `dependency_pending_since = None`,所以对**目标** `(projector, version)` 的作业,第二趟是结构上清掉退避,不是靠运气。残留也要一起读:`unsettled` 取自 `unsettled_job_count()`,那是**全库**的,所以属于**别的** projector 的未结算作业不会被下一趟 re-pend,对它们额外的趟数仍然只是在耗时间。
 - 归属:P11-B(重放诚实性)。
 
 ## F10-27. 装配不对称:无存储分支漏传三个 knob
@@ -439,13 +455,20 @@
 
 ## F10-29. 环境外部化载荷类(F10-8/F10-23 的第三面)
 
-- 状态:⬜ 未修复。来源:P11-B 批 Task 4 的清扫发现(评审升级了严重度)。
-- 三个实例,同一危害类(externalized payload 的读者不 hydrate):
+- 状态:✅ 已修复(2026-08-22,P11-C 批 Task 2,`393a01e2`;同类的第四、五个分支由同任务修复轮 `abefcb01` 收口)。三个实例一次收口,每个配一条红先回归。
+- **三个实例的落法:**
+  1. `contracts.py` 的 `environment.sampled` 改成 F10-8 同款 `if self.payload is not None:` 守卫。被替掉的那句无条件 `raise` **没有丢**:envelope 末尾那条「`payload` 与 `payload_ref_id` 恰有其一」的通则对每个 kind 都成立,所以在一条已存储的行上 `payload is None` **就等于**「已外部化」——守卫因此不放过任何东西。回归:`test_contracts_environment.py::test_externalized_environment_sample_validates_on_read_back`,以及 `::test_a_sample_with_neither_a_payload_nor_a_ref_is_still_rejected`(通则仍然拦得住,守卫没有削弱契约)。
+  2. `_claim_projection_job` 改成**先 hydrate 再建 envelope**:`_observation_from_row` 拆出 `_observation_envelope(row, *, payload, payload_ref_id)`,认领方把 hydrate 过的 payload 交进去、只校验一次。原来的顺序是「先按裸行建 envelope、再 `model_copy` 补 payload」,而 `model_copy` 不跑任何校验器——所以既让「校验器要求 payload 的 kind」在认领事务里就抛,也让**其它每一个 kind** 的、投影真正会读的那份 payload 从来没被校验过。`payload` 行真的不见了仍然抛(原样保留;tombstone 那一态归 T9)。回归两条(`test_lease_cas.py`):`::test_an_externalized_environment_sample_is_hydrated_before_its_envelope_is_built` 与 `::test_the_claim_validates_the_hydrated_payload_instead_of_patching_it_in`。
+  3. `get_environment_history` 改成在自己的 session 里走 `_hydrated_observation_payload`(且过滤在循环**内**,不先 hydrate 整个窗口再筛),那段 RETRACTION 注释改写为描述 hydrate 与「跳过」的真实代价(大样本静默掉出趋势序列)。回归:`test_environment_projector.py::test_an_externalized_environment_sample_projects_reads_back_and_keeps_its_history` 的第 (c) 条。缺 payload 行时它现在**会抛**,但那是路由已有的 `except Exception` 包出来的结构化 **503**(不是 500),且是本类自己的规矩:读不出的证据要报告,不许伪造。
+- **红先证据用的是生产默认阈值**:回归里没有任何地方调低 `inline_payload_max_bytes`,而是造一条 800 个指标、约 71 KB 的 `environment.sampled`,先断言该行确实是 `payload_json IS NULL AND payload_ref_id IS NOT NULL`,再断言三条腿:公共读回校验通过、认领+投影落地(800 条 state 行、零投影错误行)、history 带完整 `(value, limit)` 出现。
+- **同一危害类在本条登记时漏掉的另外两个实例,一并收口(`abefcb01`)**:`contracts.py` 的 `task.heartbeat` 与 `budget.configured` 走的是 `payload = self.payload or {}` 再校验——同一危害类的另一种写法(伪造一个 `{}` 而不是直接抛),后果一样:externalized 的这两类 Observation 一条都读不回来。两处都改成 `and self.payload is not None:` 守卫。它们此前不可达**只是因为 payload 小**,而这正是 `environment.sampled` 在 800 指标样本出现之前一直成立的那个论证。回归三条(`tests/ansich/test_contracts.py`):两条 externalized 读回(各自红先),外加一条内联负向用例钉住「守卫没有放松存在 payload 时的校验」。收口之后,`contracts.py` 里**全部九个按 kind 校验 payload 的分支**(`observability.lost`、`operator.action_*`、`scope.snapshotted`、`environment.sampled`、`authorization.*`、`effect.*`、`evaluation.recorded`、`task.heartbeat`、`budget.configured`)都守卫在 `payload is not None` 上,`backend/AGENTS.md` 的那句断言因此是逐字为真的。(**计数更正**:本条的草稿一度写「全部十个分支」,复审复算是 8–9;逐分支点名后的准确数是**九**。)
+- **登记时的措辞按实测机理更正了一句**:本条原写「认领即失败 ⇒ 作业 durable failed」。实测不是。抛发生在认领事务**内部**,`attempts` 的自增随事务一起回滚,所以那条作业**永远到不了 `failed`**,一直停在 `pending/attempts=0`;投影循环也**没有**死(复审实测:循环存活,约 1090 次空转认领)。这条通用形状本身与本条的三个实例无关,但它的暴露面被本条的修法扩大了——单列为 **F10-36**,按那条读,不要按「作业 durable failed」读本条。
+- 原始诊断(留档)——三个实例,同一危害类(externalized payload 的读者不 hydrate):
   1. `packages/ansich/ansich/contracts.py` 的 `environment.sampled` 校验分支对 `payload is None` **无守卫直接抛**(F10-8 修的三个分支有守卫,这个没有)——externalized 环境样本经任何公共读(`list_timeline`/`list_observations`/告警证据)都读不回;
   2. `_claim_projection_job` 先 `_observation_from_row` 后 hydrate 的顺序使这类行**认领即失败**——`environment-projector@1` 的作业 durable failed("写得进、读不出、作业永不落地",F10-8 当年"比诊断记录的还要广一层"的同款形状);
   3. `sql.py` 环境 history 读者对 payload-ref 行守卫跳过——其"环境载荷从不外部化"的注释已在 `0d9aa3cb` 撤回(它们**可以**外部化,默认 65536 字节阈值下概率低)。
-- 概率:低(环境样本 payload 小);方向:契约分支补 F10-8 同款守卫 + history 读者走 hydrate;每实例配回归。
-- 归属:下一次触达环境观测的改动,或 P11-C。
+- 概率(原始记载):低(环境样本 payload 小);方向:契约分支补 F10-8 同款守卫 + history 读者走 hydrate;每实例配回归。**「概率低」这条判断本身被 800 指标样本证伪**,这也是把同类第四、五个分支一并扫掉的理由。
+- 归属:已完成(P11-C 批 Task 2)。
 
 ## F10-30. settle-budget flake 家族(与 F10-10 明确分开)
 
@@ -540,14 +563,21 @@
 
 ## F10-31. LLM attempt 双观测的首写者 pkey 竞态
 
-- 状态:⬜ 未修复。来源:P11-B 批 T9 双 worker PG tier 的实测发现(评审确认机理与登记裁定)。
-- 位置:`backend/packages/harness/deerflow/ansich/persistence/sql.py` 的 attempt 投影站(~:9499-9516 区,按符号定位):`session.get(AnsichLlmAttemptRow, …)` → 构造 → `session.add`,随后按分支**变更**该 ORM 对象(`request_obs_id`/`response_obs_id` 与 `incomplete→requested`/`→success` 状态转移)。
+- 状态:✅ 已修复(2026-08-22,P11-C 批 Task 11,`f1d52a79`)。第五处 lock-then-read 转换落在 `sql.py::_lock_or_open_llm_attempt`:先对 attempt 行取锁再读,行不存在时用 `_insert_ignoring_conflict`(`attempt_id`)以 `incomplete`、**不带任何观测指针**开行,然后**无论赢输都**在锁下重读,再走同一段分支合并——插入与合并是一条路径,而不是同一套规则的两种写法。
+  - **合并语义已裁定**:两个 obs 指针**各写各的**因而天然组合(已置指针永不被 `None` 覆盖);状态走 `_advance_llm_attempt_status`,取 `incomplete < requested < success` 的格上极大值;`failed` **不在**该格内,两条边显式裁定——`llm.requested` 不得把已记录的失败退回,而 `llm.responded` 落在 `failed` 行上**保留**改动前的「后写者胜」(需要同一 attempt 同时携带 `llm.failed` 与 `llm.responded`,没有生产者会发出;逐字保留是因为「重新裁决互相矛盾的终态」是另一个问题,而且没有证据支撑)。
+  - 「同一指针被双方写成不同值」**由构造上不可能**:指针值就是投影方观测自身的 `obs_id`,一条观测归一个作业,列上还有 `unique=True`。
+  - 顺带收口了本条未记的另一半:**既有行上**的读-改-写此前也无锁,输家的 ORM UPDATE 会带着读到的旧 `status`。
+  - **同一提交移除了 PG tier 按约束名的类型化容忍**(`test_the_concurrent_usage_fan_out…` 现在对任何投影错误都翻红)。移除这条容忍**立刻暴露出同型的第二个竞态**,单列为 `F10-35`——这正是类型化容忍这条纪律存在的理由。
+- 原始诊断(留档)——位置:`backend/packages/harness/deerflow/ansich/persistence/sql.py` 的 attempt 投影站(~:9499-9516 区,按符号定位):`session.get(AnsichLlmAttemptRow, …)` → 构造 → `session.add`,随后按分支**变更**该 ORM 对象(`request_obs_id`/`response_obs_id` 与 `incomplete→requested`/`→success` 状态转移)。
 - 现状:同一 attempt 的 request 与 response 两条观测被两个 worker 并发投影时,首写者竞态在 `ansich_llm_attempts_pkey` 上碰撞。**非破坏**:输家的整个作业事务回滚→`retry`→下次认领读到赢家的行→收敛(tier 断言精确和数 24/36/60 与零未结算)。T9 的双 worker 用例按**约束名类型化容忍**这一形状(仅 `ansich_llm_attempts_pkey`;别的约束上的重复键仍然翻红)。
 - 方向:不是一行 `ON CONFLICT` 能了——需要 T5 形状的第五处 lock-then-read 转换:`_insert_ignoring_conflict` + 赢家行的 `FOR UPDATE` 重读 + 输家字段如何合成(两个 obs 指针与 status 转移的组合语义)要一并裁定。归 attempt 投影器的下一次触达,或 P11-C。
 
 ## F10-32. 活动 Task 读模型的「旧盖章」楔子(以及那条必须被重判的前提)
 
-- 状态:⬜ 未修复(**登记为带前提的接受**,不是无条件接受)。来源:P11-B 批 T10 修复轮的控制者裁定,批终审(F11)要求给它一个编号、一个归属,以及一个能把下面那条前提**带到部署那一刻**的载体。
+- 状态:✅ 已修复(2026-08-22,P11-C 批 Task 8,`c0cdbfa3`;该迁移随修复轮 `d1b595b9` / `1d23af18` / `32097626` 继续加固,但数据步本身自 `c0cdbfa3` 起未变)。**修法不是重判那条前提,而是把前提杀掉**:迁移 `0028_ansich_retention` 带一个数据步 `DELETE FROM ansich_active_task_read_model`,即下面「方向」里点名的 (b)。
+  - **为什么这样比在部署时重判更好**:那条前提(「没有已部署群体带着旧盖章」)会**静默**失效,没有任何测试会因此翻红,所以任何形式的「记得去查」都是把一次必答题挂在人的记性上。删掉行之后,问题不存在了——`ansich_active_task_read_model` 是**纯读模型**,下一轮运维 tick 全量重建(`rebuild_projections()` 本来就是这么干的),全部代价是升级后首次启动的一到两秒里 Running 透镜为空。
+  - **本条的三选一因此已被回答**:选的是 (b)。(a)「去查目标环境」与 (c)「写进发布说明并接受陈旧」都不再需要。
+- 原始诊断(留档;**登记为带前提的接受**,不是无条件接受)。来源:P11-B 批 T10 修复轮的控制者裁定,批终审(F11)要求给它一个编号、一个归属,以及一个能把下面那条前提**带到部署那一刻**的载体。
 - 位置:`backend/packages/harness/deerflow/ansich/persistence/sql.py::_is_staler_publish` 与 `_refresh_active_task_read_model` 里的守卫站与清扫站;叙述在 `backend/AGENTS.md` 的「P11-B health database merge and the read-model stamp」段末。
 - 现状:`c7ce07a8` 之前写下的 `ansich_active_task_read_model` 行,`projection_watermark` 里装的是**旧语义**(那个 worker 自己投影到的最高 `ingest_seq`),它**位于或高于**新的全库连续性标记。只要库里还有一条 durably `failed` 的作业,这种行的基准就高于此后每一轮 tick 的标记,于是被单调发布守卫(裁决 PB7)整行跳过:
   - Task 还在跑 → 每轮 tick 一条 DEBUG,**可见**;
@@ -559,7 +589,12 @@
 
 ## F10-33. 多 worker 下同一 host-Scope episode 的并发碰撞会丢掉整轮 assess_operations
 
-- 状态:⬜ 未修复(裁决:本批不建;批终审 F11 要求给它编号与继任批次)。来源:P11-B 批 T8 实施者自报、T8 复审校正严重度(「loud」是错的:`_projector_loop` 当时是**静默**吞掉的),T9 的双 worker tier 在真 PG 上**实际provoke出来**过一次。
+- 状态:✅ 已修复(2026-08-22,P11-C 批 Task 11,`f1d52a79`;锁序补齐见 `d2ca0392`)。采用「方向」里前一条的**变体**——不是对 Scope 主体加咨询锁,而是把 lock-then-read 姿势用在 **episode** 上:
+  - `_persist_alert_episode` 以 `ON CONFLICT (alert_key, episode) DO NOTHING` 开 episode;输家撤回自己刚铸的 `ansich_entities` 行(`ansich_alerts` 没有能把它带走的入边),`_locked_alert_episode` 在 `FOR UPDATE` 下重读赢家行并水合证据,`_reconcile_opened_episode_against_winner` 用**从候选反推的 `AlertCondition`** 重新交给 `reconcile_alert_episode` 裁决——**不是**手写 `model_copy`,因为两轮之间被运维 resolve 掉的赢家应当开下一号 episode 而不是 confirm。
+  - 一次碰撞的代价从**整轮** `assess_operations` 降成**一次行重读**。重试由 `_ALERT_EPISODE_FIRST_WRITER_PASSES`(3)有界,**耗尽只打 DEBUG 并留给下一轮,绝不 raise**——在那里 raise 等于把本条要消除的整轮丢失又请回来。
+  - 同一调用点的 reconciliations 现在按 `(alert_key, episode)` **排序后再写**:输家的 `FOR UPDATE` 是这笔事务里的第二把行锁,而 host `Scope` 两个生产者的条件顺序本就依赖 worker 间合法不同的分区——「排序放在取锁的那一站」是本仓库既有的规矩。
+  - **PG tier 的用例改严**:`test_two_workers_assessing_the_same_task_never_duplicate_an_episode` 从「发生就响」改为任何一轮都不得 raise、每一轮每个 Task 恰好一条 episode(此前允许输家整批不开的那条放宽已删除)。**要如实读它**:碰撞被吸收之后从断言上不可见,所以「没进入争用窗口」与「进入并处理了」两种跑法长得一样——它是**严格的回归守卫,不是一次现场演示**。留下的可观测物是 `SqlAnsichBackend.episode_first_writer_loss_count`(进程本地调试计数器,tier 只打印从不断言;要求一次真竞态才算数会让一次诚实的绿变 flaky)。
+- 原始诊断(留档)。来源:P11-B 批 T8 实施者自报、T8 复审校正严重度(「loud」是错的:`_projector_loop` 当时是**静默**吞掉的),T9 的双 worker tier 在真 PG 上**实际provoke出来**过一次。
 - 位置:`sql.py::_persist_and_reconcile_process_health` → `_reconcile_alerts_for_assessments` → `uq_ansich_alert_episode`;叙述在 `backend/AGENTS.md` 的「What this slice did **not** establish」段。
 - 现状:一台主机上的每个 Gateway worker 都以**同一个** host `Scope` 为主体、各自跑自己的 1 Hz 评估,于是两个 worker 同时开同一条 episode 会在 `uq_ansich_alert_episode` 上碰撞。**不腐蚀**,而且是任何 `host` 作用域环境告警早就有的既存暴露;但代价不小:炸的是**整个** `assess_operations` 事务,那一轮的 heartbeat、dwell、budget、environment 与两个 process-subject 生产者一起被丢掉。P11-B 至少让它不再无声——`AnsichService._report_assessment_failure` 每次都带 traceback 打 DEBUG、并按 `_ASSESSMENT_WARNING_INTERVAL_SECONDS` 限速打一条 WARNING(带被压制计数),两者都 fail-open。下一轮(一秒后)重做。
 - 方向:要么给 Scope 主体的对账串行化(一把按 `scope_id` 的咨询锁,或把 episode 的开启改成 `ON CONFLICT DO NOTHING` + 重读赢家行——即 T5 的 lock-then-read 姿势用在 episode 上),要么把这两个生产者从共享的 `assess_operations` 事务里拆出来,让一次碰撞只丢掉它们自己那一段而不是整轮。前者更根治,后者更便宜;两条都需要各自的死锁面/语义评估,不是一行改动。
@@ -567,7 +602,10 @@
 
 ## F10-34. PG tier 的 `_drain_projections` 在退避作业前停手,被当成「投影已完结」
 
-- 状态:⬜ 未修复(测试侧;生产行为无关,一行改法已知)。来源:P11-C 批 Task 9b 的 PostgreSQL tier 全量一次翻红。
+- 状态:✅ 已修复(2026-08-22,P11-C 批 Task 11,`f1d52a79`)。出事的那个调用点 `test_reversing_the_lock_traversal_order_deadlocks_on_postgres` 的 setup 已从 `_drain_projections` 改为 `_settle_projections`——即本条「方向」里开出的那一行,不多不少:`_drain_projections` 自己的语义**没有**被改动(那会影响它全部调用点,本条主张过要单独评估),`rounds` 也没有被调大。Task 11 是那次触达该文件的改动,按本条的归属「任何下一次触达该文件的改动顺带处理」顺手结清。
+  - **同一批里的相邻工作要一起读,但不要混为一谈**:P11-C 的 Task 3b 做的是 F10-26 的修法(把 31 处裸 `rebuild_projections()` 完整性断言转成有界循环),那是另一条的形状;本条是 `_drain_projections` 在退避作业前停手,两者的分诊在下面写得很清楚。
+  - **仍然开着的是那条更彻底的一步**:让 `_drain_projections` 自己在返回前确认没有 `retry` 作业在退避。本条不主张它,归属仍是「下一次测试卫生波」。
+- 原始诊断(留档;测试侧,生产行为无关,一行改法已知)。来源:P11-C 批 Task 9b 的 PostgreSQL tier 全量一次翻红。
 - 位置:`backend/tests/integration/test_postgres_multiworker.py::_drain_projections`(:497)与出事的那个调用点 `test_reversing_the_lock_traversal_order_deadlocks_on_postgres`(:1204)。
 - 失败全文:
 
@@ -588,3 +626,72 @@
   - **唯一可想象的间接关联如实写下**:红的那一轮 PG tier 是与 `tests/ansich` 的 1000+ 条 SQLite 全量**并发**跑的,机器被我自己压住——争用正是首写者竞态(`F10-31` / `F10-6` 残留)赖以发生的那个变量,而这条 helper 的弱点是把那次竞态的后果从「慢」变成了「红」。
 - 方向:那个调用点改用 `_settle_projections`(它做的正是「drain → 把退避的 `available_at` 拉到当下 → 再 drain」,严格更强,不会削弱该用例证明的任何东西)。更彻底的一步是让 `_drain_projections` 自己在返回前确认没有 `retry` 作业在退避——但那会改变它对**所有**调用点的语义,应当单独评估;本条只主张改这一个调用点。**不要**靠调大 `rounds`:那个界不是问题所在。
 - 归属:下一次测试卫生波(与 F10-30 / F10-26 的 settle helper 工作同一批),或任何下一次触达该文件的改动顺带处理。
+
+## F10-35. `ansich_current_beliefs` 首写者竞态的**整轮**爆炸半径
+
+- 状态:✅ 已修复(2026-08-22,P11-C 批 Task 11,`f1d52a79`,与 F10-31/F10-33 同一提交;锁序由 `d2ca0392` 补齐)。来源:**移除 F10-31 的类型化容忍之后立刻暴露**——PG tier 3/3 稳定翻红在 `ansich_current_beliefs_pkey`,`(subject_id, field_name) = (<task>, "heartbeat")`。在批 BASE `3cd8bb44` 上该用例**是绿的**,因为它把**任何** `IntegrityError` 都当作「episode 碰撞」吞掉——那条容忍一直在遮蔽第二个同型的整轮丢失。
+- 位置:`sql.py` 的 `assess_operations` heartbeat 段、`_assess_budget_rows`、`_resolve_current_assessment`(后者即 F10-6 记下并延期的那半边)。
+- 机理:同一台主机上每个 Gateway worker 各跑自己的 1 Hz `assess_operations`,**整轮是一个事务**;两个 worker 同时为同一个 Task 首写 `heartbeat` 当前 Belief 行,双方都读到「没有」,双方都 insert。爆炸半径与 F10-33 逐字相同:heartbeat / dwell / budget / environment 与两个 process-subject 生产者一起被丢掉。
+- 修法:三处运维轮写入统一走 `_open_or_lock_current_belief`(`INSERT … ON CONFLICT (subject_id, field_name) DO NOTHING` + 赢家行的 `FOR UPDATE` 重读),且都改为「先锁行、再读用来比较的 Assertion」。`_resolve_current_assessment` 改为**有界两遍**并在第二遍**重新归约**(它的输入是该 subject/field 的*全部* Assertion,对手那条在第一遍的 READ COMMITTED 快照里不可见);heartbeat / budget 两处的输家把赢家行指向自己这一遍的 Assertion——与「读第二」的那一轮同解。两遍的上界**对任意 W 都够**,论证写在循环处:`ON CONFLICT` 只在冲突插入**已提交**之后才报告一次失败,所以第二遍的 `FOR UPDATE` 必然找得到那行;W−1 个输家在一把非 `skip_locked` 的锁上排队,而没有任何东西会删掉这行。耗尽两遍只打 DEBUG(`ansich.current_belief.first_writer_unsettled`),不 raise。
+- **已知代价(如实记账,不是遗漏)**:heartbeat / budget 两处在知道自己输掉之前就已追加了 Assertion(当前 Belief 行的外键要求 Assertion 先存在),因此一次首写碰撞会给该 subject 多留**一条同判定的 Assertion**——**每个输家一条**,W 个并发首写者就是 **W−1** 条,不是「一条」。真正值得声明的界是**每个 subject 一次性**:此后行已存在,普通的 unchanged-skip 生效。Belief Assertion 本就是只追加、保留冲突项的模型,所以这是有界的诚实代价而非腐蚀;测试对这个增量有断言。**另一半代价要一起读**:每条多出来的 Assertion 都是「保留但未选中」的,因此把该字段的 `conflicting_assertion_count` 永久加一——一条从来没有人有分歧的 `heartbeat` Belief 会读作「有 1 条冲突」。按该字段自身的定义(「保留并被搁置」,不是「有分歧」;由 `test_conflicting_assertion_count_counts_retained_non_selected_assertions` 具名钉住,前端冲突徽标也照此渲染)这不是算错,所以本批选择在 `belief/resolver.py` 的字段声明处**如实写下**而不是收窄语义。
+- **争用也变了,而且不是免费的**:改前一轮什么都没变的 tick 在这张表上**一把行锁都不取**;现在每个运行中 Task 每一轮 1 Hz tick 都取一次 `FOR UPDATE` 并持到提交,于是两个 worker 的 tick 从「只在有转移时串行」变成端到端串行。这是正确的姿势,死锁自由由两处 `ORDER BY`(`assess_operations` 的运行中 Task 选择按 `task_id`;`_periodic_budget_rows_statement` 按 `(task_id, dimension, aggregation_scope)`)保证;但多 worker 下 tick 变慢从此是**预期后果而不是谜团**。恢复转移门禁需要「先无锁检查、要写再取锁并在锁下**重新**检查」两遍走 tick 最热的循环,已具名为下一步,**刻意不与正确性修复同批**。
+- **不在本条范围,但边界不是「tick / 投影」那么齐整**:同一张表的两处**纯投影路径**写入(`_project_control` 的 `control`、ToolCall 终态的 `execution`)不转换——那里一次碰撞的代价是一个作业事务 + `retry`,即 F10-6 已记录的有界自愈形状,不是一整轮。**但要说清楚:被转换的三处里 `_assess_budget_rows` 本身也会从 `_project_control` 的终态分支被调用**,即它同时坐在投影路径上。在那条路径上本次改动把「回滚重来、最终收敛到一条 Assertion」换成了「提交,并多留一条同判定的 Assertion」——对可用性严格更好,但那是本条声称「未触及」的路径上的行为变化,写明而不是留给读者以为 tick / 投影是一条干净的分界线。
+- 归属:已完成(P11-C 批 Task 11)。剩下的转移门禁恢复见上,归下一次触达运维 tick 的改动。
+
+## F10-36. 认领处的抛永远变不成一条运维可见的失败作业(全局静默停摆)
+
+- 状态:⬜ 未修复。**既存形状,P11-C 一处未动**;登记在此是因为 F10-29 的 hydrate 提前**扩大了它的暴露面**,而按旧措辞(「作业 durable failed」)读它会把人引向错的补救方向。来源:P11-C 批 Task 2 复审实测。
+- 位置:`sql.py::_claim_projection_job`(抛出点)、`packages/ansich/ansich/service.py::_project_pending`(service.py:3129-3140 的 `except Exception: return 0`)、认领语句的 `ORDER BY AnsichObservationRow.ingest_seq`。
+- 现状,三段连锁,每一段都被单独实测过:
+  1. **抛回滚自己的认领事务**,`attempts` 的自增随之回滚,所以那条作业**永远到不了 `failed`**——观测到的稳定态是 `status='pending', attempts=0`,永远。
+  2. **循环不死**:`_project_pending` 把后端调用整个包在 `try/except Exception: return 0` 里,`ValidationError`(是 `ValueError`)与 `RuntimeError` 都被吞成「本轮处理了 0 条」,循环照转、照撞同一行(复审实测:循环存活,约 1090 次空转认领)。**不要按「投影循环会死」读本条**——那会把人引向「补一个 supervision / 重启」的错方向,复审已实测证伪。
+  3. **危害在第三段,而且是静默的**:认领按 `ingest_seq` 排序,一旦这条毒行成为最低的可认领作业,**每一轮 `project_pending` 都在它这里中止**,后面的作业一条都碰不到——**全进程、所有 Task 的投影就此永久停摆**。而它不吵:异常被那条 blanket `except` 吃掉,健康面又只数 `status='failed'`,于是 health 报 `reachable`、`failed_jobs=0`、`projection_failure` 告警一条都不产,只有 `lag_ms` 与 `complete_through` 会动。
+- **P11-C 扩大了什么(如实写下)**:F10-29 把 hydrate 提到 envelope 构造**之前**,于是**任何**一条不再满足自身契约的 externalized payload 都会在认领处抛(改前那份 payload 根本没被校验过)。这是正确的方向——不校验就投影是更坏的选择——但它把一个此前只有畸形内联行才能触发的形状,变成了任何「契约收紧之后的旧外部化行」都能触发。
+- 方向:三条候选,都不便宜,需要一次裁决而不是顺手改一行:(a) **让认领处的抛把行标成 durable failed**——需要在认领事务**之外**、用一条独立事务记 attempt/错误行,否则回滚照旧;(b) **让认领跳过毒行**(把抛的那一条移出本轮候选集,而不是中止整批),代价是要能区分「这一行有毒」与「存储暂时不可用」;(c) **至少让它不静默**:在 `_project_pending` 的 `except` 里按作业 id 限速打一条 WARNING,并给一个进程本地计数器(`stale_completion_count` 的先例)。(c) 最便宜且与 (a)/(b) 不冲突,建议先做。**不要**靠调健康面的阈值:失败作业计数在本形状里恒为 0,它不是个可以调的数。
+- 归属:下一次触达认领/投影循环的改动,或 Phase 12 的运维可见性批。与 `F10-40` 是同一类缺口(投影侧的丢失没有观测面),两条应当一起裁决。
+
+## F10-37. `_project_control` 不幂等,`task-control` 的普通重放今天就是坏的
+
+- 状态:⬜ 未修复。**既存缺陷,由 P11-C 批 Task 5 在真库上直接观测到,刻意未修**(那是一次 projector 幂等性改动,不在 §5 的范围里,值得自己的红先用例)。
+- 位置:`sql.py::_project_control` 写 `ansich_transitions` 的那一段;`evidence_obs_id` 上有唯一约束。
+- 现状:对一条**已投影**的 control Observation 重新投影会撞 `ansich_transitions.evidence_obs_id` ⇒ 作业进 `retry`,耗尽 attempts 后 `failed`。直接观测:在一个已结算的库上跑 `execute_replay(projector_name="task-control")`,结束时 `unsettled=1`,`last_error` 里是 `IntegrityError`。**rebuild 不受影响**,因为它连 Belief 一起删,`should_select_control_candidate` 面对的是干净的起点。T4 的 tier 看不见它,因为那里唯一的 `task-control` 用例出于无关的理由断言 `unsettled > 0`。
+- **今天怎么被挡住的(是警告,不是拒绝)**:登记在 `_NON_IDEMPOTENT_PROJECTORS`,`replay_cli` 在开跑前和「这趟还欠账」的报告旁各打一次 stderr 警告。之所以不拒绝:**同一条命令在那些 Observation 从未被投影过的库上是对的**。之所以必须警告:退出码 `1` 读起来像临时积压,而操作者顺手的两个补救(再跑一次、`retry_failed_projections`)都会撞回同一处,永远清不掉。
+- 方向:给该 projector 补幂等——把 transition 的写入改成「按 `evidence_obs_id` 的 upsert / `INSERT … ON CONFLICT DO NOTHING`」,并裁定重放遇到已存在 transition 时 `from_value` 该取哪一个(这正是 `--replace` 拒绝 `task-control` 的同一条性质:它的 `from_value` 取自共享的 current control Belief)。修完之后 `task-control` 才谈得上进 `_REPLACE_PROVEN_PROJECTORS`,那是另一条独立的证明义务(见 §5 第 6 条)。
+- 归属:下一次触达 `_project_control` 的改动,或任何一次要让 `task-control` 可重放的工作。
+
+## F10-38. owner/thread 强删除的两条 v1 不可解形状
+
+- 状态:⬜ 未修复(**v1 限制,已诚实拒绝**)。来源:P11-C 批 Task 10 的第 2/3 轮复审压力测试。**两条都不会半途留下残骸**:一条在动第一笔删除之前就被预检拒掉,另一条以 `blocked` 点名那条可移除的边并回滚本次 Task 的 Entity 删除,整次擦除保持可重跑。
+- 位置:`sql.py::hard_delete_scope` → `_refuse_unsatisfiable_pins`(预检)与 `_hard_delete_protected_pin`(phase 5 的拒绝)。
+- 两条形状:
+  1. **被类型拒绝的 pin。** 一次擦除只删一个 Scope。当该 Scope 名下某个 Task 的一条 Observation 是**外部**某实体的 *discovery* Observation 时,那个实体以 `RESTRICT` 证据指针把该行按住。若那个实体自己的擦除是**按类型被拒**的——host `Scope`,或 `workspace`/`sandbox`/`authorization`/`external_origin` 类的 Scope,或一条 AgentRelease——那么这次擦除**永远不可能完成**。`_refuse_unsatisfiable_pins` 在取到锁之后、第一笔删除之前就以 `unsatisfiable_pin` 答复,并且它**读的是那几条拒绝自己用的同一组常量**,所以新增一条类型拒绝会自动被它跟上。
+  2. **互相 pin。** 两个 `owner`/`thread` Scope 的 provenance 穿过同一个 Task:每一个单独看都是可擦除的,预检因此都过,但**谁都完不成**——各自都被对方按住,答 `blocked` 并点名那条边。
+- **v1 没有产品内补救,这一点必须写明**,否则运维会以为「再跑一次」或「先删另一个」能救。今天唯一的出路是操作者用带外手段直接移除那些外部行。
+- 方向:三条,择一,`(3)` 最便宜:
+  1. **多 Scope 擦除**——把一组 Scope 当作一个单位收下,`(2)` 随之消失,`(1)` 仍在。
+  2. **provenance 转移**——把 `discovered_obs_id`/`created_obs_id` 重新指向一条幸存的 Observation。两条都解,但它改写证据指针,需要一次独立的语义裁决(那条指针的含义就是「这条证据发现了这个实体」)。
+  3. **就地 tombstone 的擦除模式**——被 pin 的 Observation 不删行,而是把它的 payload 按 tombstone 抹掉。两条都解,而且**与既有的 tombstone 机器天然组合**(tier 1 已经在做同一件事),因此是本条推荐的一条。
+- 归属:owner 擦除的下一个批次(v2),或任何一次因为合规请求撞上这两条形状的工作。
+
+## F10-39. 保留策略下的无界增长残余(`inline_body` / blob 行 / tombstone 空壳)
+
+- 状态:⚠️ 部分收窄(2026-08-22,P11-C 批 Task 10,`e764de4f`)。**不是修复,是把其中一条真漏收掉了。**
+- 位置:`sql.py::_PAYLOAD_REFERRER_TIERS`(tier 1 的按表 aging 规则)、`_reclaim_orphaned_content_blobs` / `_apply_plan_and_reclaim`(T10 的收窄)。
+- **T10 收窄了什么**:`ansich_content_blobs` 自己也是一个 payload 引用者,所以只要 blob 站着,它的正文就**不是**孤儿,tier 1 的回收正确地不碰它——于是一个删掉了最后一条指向该 blob 的 `ansich_content_blocks` 行、然后就停手的删除者,会把 blob **和**正文一起留下,而 tier 1 按设计拒绝过期孤儿,那些字节就永远躺着。三个删除者(tier 2、tier 3、owner 擦除)现在统一走 `_apply_plan_and_reclaim`:在计划落地**之前**读出 blob key,删掉不再被指向的 blob,并把它们的 payload id 折进同一次残余引用检查。**这条真漏是 tier 3 的**(以及新的擦除路径);**tier 2 从来没漏过**——它的计划根是 `ansich_observations`,而 `ansich_content_blocks` 不在那条 CASCADE 闭包里(它的 `producer_obs_id`/`payload_obs_id` 都是阻塞边),所以 tier 2 根本删不到 block。说成「修好了 tier 2 和 tier 3」是过度声称,已在 `backend/AGENTS.md` 与该任务报告里撤回。
+- **仍然无界的是这三样**:
+  1. **`inline_body` 字节**——阈值(`inline_payload_max_bytes`)以下的 blob 正文直接躺在 `ansich_content_blobs.inline_body` 里,**没有任何 tier 碰它**,而按条数算它是 blob 的**大多数**。tier 1 只对**外部化**的正文写 tombstone。
+  2. **尚无 tier 触达的 blob 行**——blob 行只在它最后一条 `ansich_content_blocks` 被某个删除者带走时才被回收;没有哪一个 tier 以 blob 自身的年龄为条件删它。
+  3. **tier 1 留下的 tombstone 空壳**——`ansich_payloads` 行本身留着(那正是 tombstone 的意义:让读者分得清 *按策略过期* 与 *丢失*),没有任何东西最终清掉它们。
+- **登记时的措辞更正**:Task 9b 的原始表述是「blob 的正文被 blob 行保护住,而没有东西删 blob 行,所以去重后的正文会累积」。这句话点错了字节:tier 1 **确实**会给一条老 blob 的**外部化**正文写 tombstone(`ansich_content_blobs` 在 `_PAYLOAD_REFERRER_TIERS` 里是按 `created_at` aging 的声明成员)。真正无界的是上面那三样。
+- 方向:一个**回收 tier**(第四层),以 blob 自身的 `created_at` 与「无人指向」为条件删 blob 行与 `inline_body`,并在 tombstone 超过某个远大于 `raw_payload_days` 的期限后清掉空壳。**不要**把它做成放宽 tier 1 的孤儿谓词——那条谓词的收紧(tier 1 拒绝一切孤儿)是 T9 用来关掉一次真实竞态的护栏,`backend/AGENTS.md` 的那一段专门写了「补救在删除者那一侧或一个回收 tier,**绝不**在谓词上」。
+- 归属:Phase 12 的存储容量工作,或第一次有人在生产上量到 `ansich_content_blobs` 的体积。
+
+## F10-40. tier 2 删掉活认领者的观测时,投影侧的外键失败**完全静默**
+
+- 状态:⬜ 未修复。来源:P11-C 批 Task 9b 复审的端到端追踪(实现者自报了这条形状,复审把它追到底并确认「有界、不毒批、但零可见性」)。
+- 位置:`sql.py::_run_observation_retention_tier`(tier 2 刻意没有在飞守卫)、`_record_projection_error`(`sql.py:5379-5382` 的 `job = session.get(...)` → `if job is None: return`)。
+- 现状:tier 2 **刻意**不为在飞的认领者让路——一个卡了一个月的作业不该把它的证据永远按住,这与 tier 1 把 `failed` 排除在 `_IN_FLIGHT_JOB_STATUSES` 之外是同一条道理。代价的一半是良性的(认领者的 settle 返回 `False`,走既有的 stale-completion 通道,`stale_completion_count` 会涨);**另一半不是**:如果那个认领者在自己的事务里已经写下了引用该 Observation 的行,PostgreSQL 会在语句处报外键失败,异常被 `project_pending` 的 blanket `except` 接住并路由到 `_record_projection_error`,而它的**第一个动作**就是 `session.get(AnsichProjectionJobRow, job_id)` 后 `if job is None: return`——作业行已经随它的 Observation 一起走了,于是这个处理器**静默返回**:不写 durable 错误行(写了反而会撞 `ansich_projection_errors.job_id` 的外键,变成第二次抛)、不重臂、不计数、不打日志。**批的其余部分活着**(`project_pending` 的 `for _ in range(limit)` 继续下一次认领),所以它有界、不毒批。
+- **要不要接受这份沉默,是本条要裁决的问题。** 一边:被删的是**已过期的证据**,那次投影投的也是已过期的证据,没有任何策略没判过的**状态**因此丢失。另一边:本仓库有一条方向相反的先例没有被套用——`stale_completion_count` 存在,正是因为一次「本来就该丢」的写入丢失也被判定值得一个进程本地计数器;而本条比它**更罕见也更不可见**(settle-drop 那条路至少会让计数器涨,这条路什么都不涨)。
+- **PG tier 没有覆盖这一支**:`test_observation_retention_deletes_a_claimed_job_beside_its_owner_on_postgres` 编排的是「B 认领 → A 清扫 → B 的 settle 返回 `False`」,即**友好**的那种交错——认领者从头到尾没有写过任何引用那条注定被删的 Observation 的行。真正要证的那一支只有散文,没有测试。
+- 方向:(a) 在 `job is None` 的早退处加一行 DEBUG,或复用 `stale_completion_count`(最便宜,且不改变任何行为);(b) 补一条编排出来的 PG tier 用例(认领 → 投影一条 heartbeat → 清扫 → 断言投影方的事务失败且循环继续),或者在实现者那条 concern 旁边如实写一句「本支未被覆盖」。两者不冲突。与 `F10-36` 是同一类缺口(投影侧的丢失没有观测面),两条应当一起裁决。
+- 归属:下一次触达 retention tier 2 或 `_record_projection_error` 的改动。

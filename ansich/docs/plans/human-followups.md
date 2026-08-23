@@ -9,7 +9,7 @@
 | 编号 | 摘要 | 状态 | 施工时机归属 | 修复时间 | Commit |
 | ---- | ---- | ---- | ------------ | -------- | ------ |
 | U1 | Context Lineage UI 重构：总览→细节渐进式披露，local graph 树状化 | ⬜ 未修复 | Phase 10 之后、Phase 12 之前 | — | — |
-| U2 | 按来源浏览块内容（raw/model-visible 对照） | ⬜ 未修复 | Phase 11 同批（依赖 raw read 强审计） | — | — |
+| U2 | 按来源浏览块内容（raw/model-visible 对照） | ⬜ 未修复（**阻塞已解除，可排期**：§7 raw read 强审计已由 P11-C 落地） | Phase 11 之后（前置已就位） | — | — |
 | U3 | 投影 Degraded 无 failed jobs 细节，无法下钻排查 | ✅ 已修复 | 可提前，建议随 Phase 9 顺带或独立小迭代 | 2026-07-21 | 5b5d03a7 |
 | U4 | Context Compression 不显示执行时机（发生时间与触发 operation） | ⬜ 未修复 | 随时可做，建议与 U3 同批随 Phase 9 顺带 | — | — |
 | D1 | 缺开发文档：概念词汇表（ContentBlock/Step/…） | ✅ 已修复 | 立即，不依赖任何 Phase | 2026-07-21 | `152f44c2`（Phase 10 扩写 `2dedd08a`） |
@@ -27,12 +27,13 @@
 
 ## U2. 按来源浏览块内容
 
-- 状态：⬜ 未修复。
+- 状态：⬜ 未修复，但**前置阻塞已于 2026-08-23 解除**（裁决 RC14）。P11-C 的 §7 已把四条 raw body 路由改成 fail-closed 强审计：`admin gate → subject 解析 → 落库的 requested 审计行 → 读 → terminal 审计`，访问记录在向存储要正文**之前**提交，写不下审计就 503 且一个字节都不读；`Cache-Control: no-store` 覆盖 handler 产出的每一种答案；`ansich.raw_read_max_bytes` 给单次读一个上界；结局是一套封闭词表（`served` 是唯一意味着字节过线的那个）。同批的 §6 也把 payload 独立 retention 落地了（tombstone + 三种读者状态 + 410 Gone）。因此本条当年那句「在审计口径与 retention 拆分就位前开放内容浏览，读取路径将来要重写一遍」的理由**已经过期**。
+- **为什么 P11-C 自己不建（裁决 RC14）**：前端的内容浏览是它自己的一批工作（视图、脱敏口径、raw/model-visible 对照的信息架构），而在 §7 定稿**之前**建它就等于建两遍——那正是本条原本的归属理由。这个理由随本批到期，所以本条现在是**可排期**的，不再是被阻塞的。开工时要照着已经落地的口径做：读走那四条已审计的 `no-store` 路由（**不要**新开一条绕过审计点的读路径），渲染时把 tombstone 的 410 与「从来没有过」区分开，并且不要把 raw body 放进 TanStack 的长缓存或 localStorage（`fetchAnsichContentPayload` 已经带 `{cache: "no-store"}`）。
 - 现象：考虑做各个来源（user input / tool raw result / memory / skill / summary …）的内容浏览。
 - 相关位置：Phase 4 API 明确为 metadata-only；payload 分层 Phase 2 已落地；Phase 11 计划包含 payload/structure 独立 retention 与 raw read 强审计。
 - 现状：UI 只能看谱系元数据（kind/producer/边），无法浏览块内容；排查"模型到底看到了什么"只能直接查库。
 - 方向：按 producer kind / snapshot membership 提供内容浏览视图，raw 与 model-visible 对照展示，payload 按既有分层脱敏。
-- 归属：**Phase 11 同批**。内容浏览本质是 raw read，Phase 11 正要落地 raw read 强审计与 payload 独立 retention；在审计口径与 retention 拆分就位前开放内容浏览，读取路径将来要重写一遍，且浏览行为会绕过未来的审计点。提前做等于做两遍。
+- 归属（原始记载，已到期）：**Phase 11 同批**。内容浏览本质是 raw read，Phase 11 正要落地 raw read 强审计与 payload 独立 retention；在审计口径与 retention 拆分就位前开放内容浏览，读取路径将来要重写一遍，且浏览行为会绕过未来的审计点。提前做等于做两遍。**现归属：下一个前端批次，无前置依赖。**
 
 ## U3. 投影 Degraded 无 failed jobs 细节
 
@@ -88,5 +89,5 @@
 1. ~~**立即**：D1（概念词汇表）；D2 的 tooltip 内联层同批。~~ **已完成**：D1 由 `152f44c2` 落地并扩写至 Phase 10（`2dedd08a`）；D2 的内联层由 `3425a7a1` 落地（D2 的正式文档仍在第 5 档）。
 2. ~~**Phase 9 期间（可提前）**：U3（failed jobs 下钻）；U4（compression 执行时机）。~~ **半完成**：U3 已由 `5b5d03a7` 落地；**U4 仍未做**，且已过其建议窗口——按它自己的归属说明，若拖到 U1 开工仍未修，就必须并入 U1（重构后的渐进式详情面板要把执行时机作为一级信息）。
 3. **Phase 10 完成后（**现已到期**）**：U1（Lineage UI 重构）与 A1（obs layer 抽象）设计**现在就该启动**——Phase 10 已完成，谱系实体种类已稳定，而 Phase 12 的验收演练是 U1 的硬期限。这两项是本文件当前的主要欠账。
-4. **Phase 11 同批**：U2（依赖 raw read 强审计与 retention）；A1 的实际迁移（与 collector/queue/lease 加固碰同一批代码，同批做只动一次）。U3 已提前完成，此档不再挂它。
+4. **Phase 11 同批**：U2（依赖 raw read 强审计与 retention——**这两项依赖已由 P11-C 的 §6/§7 结清，U2 自 2026-08-23 起可排期，见该条**）；A1 的实际迁移（与 collector/queue/lease 加固碰同一批代码，同批做只动一次）。U3 已提前完成，此档不再挂它。
 5. **Phase 12 前清零**：U1 完成 UX 收敛；D2 的正式使用文档随 §9 门禁交付；本文件所有剩余项要么关闭要么显式登记为 known gap。
