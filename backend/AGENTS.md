@@ -144,7 +144,12 @@ everything outside `tests/integration/` still runs on SQLite only.
 PostgreSQL, never in CI — nothing in CI sets `DEER_FLOW_TEST_POSTGRES_URL`, so
 CI executes the self-skip. Its P11-B acceptance was a local PostgreSQL 16.2
 cluster `initdb`-ed by the `pgserver` wheel (the Docker daemon was unavailable
-in that WSL2 environment), 19 passed on five consecutive rounds. So every claim
+in that WSL2 environment), 19 passed on five consecutive rounds. **That 19 is
+the whole `tests/integration/` layer, not the multiworker file** — a
+distinction worth stating because the file is what gets talked about: at P11-B
+it was 14 cases beside the migration matrix's 5. P11-C took the layer to **28**
+(multiworker 14 → 21, matrix unchanged) on the same kind of `pgserver` 16.2
+cluster. So every claim
 this tier proves is a claim proven **on a developer machine at a point in
 time**, and a change that breaks it will not be caught by a push: run it
 yourself when touching leases, claims, rollups or maintenance.
@@ -422,7 +427,7 @@ Before changing a later authorization phase, read the [authorization RFC](../doc
 
 Setup: Copy `config.example.yaml` to `config.yaml` in the **project root** directory.
 
-**Config Versioning**: `config.example.yaml` has a `config_version` field. On startup, `AppConfig.from_file()` compares user version vs example version and emits a warning if outdated. Missing `config_version` = version 0. Run `make config-upgrade` to auto-merge missing fields. When changing the config schema, bump `config_version` in `config.example.yaml`.
+**Config Versioning**: `config.example.yaml` has a `config_version` field. On startup, `AppConfig.from_file()` compares user version vs example version and emits a warning if outdated. Missing `config_version` = version 0. Run `make config-upgrade` to auto-merge missing fields. When changing the config schema, bump `config_version` in `config.example.yaml`. **Bump once per batch, not once per key**: the first key-adding change in a batch owns the bump and later ones in the same batch add their keys without touching it, since the number exists to tell a user their file is behind — a second bump inside one release says the same thing twice and makes the warning noisier without making it more accurate. That rule is a convention, deliberately **not** a test: a test asserting "exactly one bump per batch" would have to know what a batch is, and there is no such fact in the tree. What is pinned instead is a floor — a batch's schema test asserts `config_version >= N` for the value its own change requires (see `tests/ansich/test_retention.py::test_config_example_mirrors_the_retention_block_with_a_single_version_bump`), which catches a forgotten bump without turning the next batch's bump into a false red.
 
 **Config Caching**: `get_app_config()` caches the parsed config, but automatically reloads it when the resolved config path or file content signature changes. The signature includes file metadata and a content digest, so Gateway and LangGraph reads stay aligned with `config.yaml` edits even on object-store or network mounts where mtime can remain stale.
 

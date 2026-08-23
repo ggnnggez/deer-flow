@@ -2202,8 +2202,22 @@ def _periodic_budget_rows_statement():
     remove, arrived at from the other side. PostgreSQL promises no order without
     `ORDER BY`, and `synchronize_seqscans` (on by default) makes a second backend
     join an in-progress scan mid-heap and wrap around, so two workers running
-    this identical query legitimately get different orders. The key is the
-    triple this row set is unique on, so the order is total.
+    this identical query legitimately get different orders.
+
+    **The key is not unique, and the order it gives is not total** -- that is a
+    correction, because an earlier version of this docstring claimed it was.
+    `AnsichTaskBudgetRow`'s uniqueness constraint is
+    `uq_ansich_task_budget_configuration` over **four** columns
+    (`task_id, dimension, aggregation_scope, configured_obs_id`), and rows are
+    keyed by one `budget.configured` Observation each, so a Task that
+    reconfigures a budget on the same dimension and scope has two rows sharing
+    this sort triple and their relative order is unspecified. **The lock
+    ordering is still correct, for a different reason**: tied rows map to the
+    *same* `ansich_current_beliefs` row (`field_name` is
+    `budget_health:{dimension}:{scope}`), so the sequence of **distinct rows
+    locked** is identical on every worker whatever the tie order. Adding
+    `entity_id` as a final tiebreak would make the total-order claim true and
+    change nothing else; the tie argument is what holds it up today.
 
     The two Belief traversals in one tick are over disjoint row sets — the
     heartbeat loop takes `field_name='heartbeat'`, this one takes
@@ -3998,6 +4012,17 @@ class SqlAnsichBackend:
         change under a lock, so taking two advisory locks to answer them would
         queue a rebuild and a retention sweep behind a request that was never
         going to touch the store.
+
+        **The host-Scope test here is the one remaining second copy in this
+        family, and that is deliberate rather than an oversight.** Every other
+        refusal reason reads the same constants its mirror reads, so a new
+        refusal follows automatically; this one cannot, because it is answered
+        before the locks and therefore before anything reads the store. The
+        authoritative copy is :meth:`_refuse_undeletable_scope_row`, which is
+        handed ``host_scope_id(self._hostname)`` explicitly and would refuse the
+        same id anyway — this check only makes it *cheap*. Changing what counts
+        as the host Scope means changing both, and the two live one method
+        apart for exactly that reason.
         """
 
         if scope_id == ANSICH_BOOTSTRAP_TASK_ID:
@@ -4387,6 +4412,13 @@ class SqlAnsichBackend:
     @staticmethod
     async def _hard_delete_protected_pin(session: AsyncSession, scope_id: str, condemned: frozenset[str], obs_ids: Sequence[str]) -> str | None:
         """The removable edge, when a **surviving** Entity is what pins these rows.
+
+        **The name is a leftover and it now misdescribes the method**, which is
+        worth one sentence rather than a rename churn through its tests: nothing
+        here is filtered to "protected" types any more (see below), and the
+        sibling constant ``_HARD_DELETE_PROTECTED_PIN_EDGES`` keeps the word
+        only because the *messages* it supplies happen to name protected types.
+        Read both as "pin", not as "protected pin".
 
         **The filter is "an Entity this run is not going to delete", and it names
         no types at all.** Two earlier forms narrowed it and both leaked in the
@@ -4798,6 +4830,17 @@ class SqlAnsichBackend:
         a lease the row no longer shows, and any other worker may now claim it
         too. What a claim always moves is the expiry, so the cutoff is what
         tells the two apart.
+
+        The one sub-window only PostgreSQL has is covered by semantics rather
+        than by a test, and its direction is safe: if a peer's claim commits
+        *during* this UPDATE, PostgreSQL blocks on the row lock and then
+        re-evaluates this same WHERE against the new row version
+        (EvalPlanQual) — where the cutoff predicate declines it. Under the old
+        status-only re-check that path stole the row; under this one it cannot.
+        The deterministic interleave the regression test stages is SQLite-only
+        (pysqlite's first-DML transaction semantics), but the predicate itself
+        is dialect-independent and the bulk statement shape is separately
+        proved on a real server by the tier's sweep-beside-a-live-peer case.
 
         The counts are what the UPDATE **moved**, not what the SELECT chose,
         because that predicate may legitimately decline part of the row set and
@@ -8869,7 +8912,14 @@ class SqlAnsichBackend:
         Returns ``(wrote, winner)``, and the pair is deliberately not collapsed
         into one optional value — three outcomes have to stay distinguishable:
 
-        * ``(True, None)`` — this call wrote the episode.
+        * ``(True, None)`` — this call wrote the episode. **One fourth encoding
+          shares it**: a reconciliation whose ``alert`` is ``None`` returns the
+          same pair having written nothing at all. That is dead today (every
+          caller breaks on ``reconciliation.alert is None`` before reaching
+          here) and harmless, but it is listed so a future caller counting
+          "wrote" from this pair does not count a phantom; giving it
+          ``(False, None)`` or a named sentinel would be the fix if it ever
+          becomes reachable.
         * ``(False, winner)`` — it lost the race to open ``(alert_key, episode)``
           and hands back the winner's hydrated episode for the caller to
           re-decide against (F10-33).

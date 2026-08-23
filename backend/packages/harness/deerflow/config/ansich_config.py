@@ -198,7 +198,7 @@ class AnsichConfig(BaseModel):
     raw_read_max_bytes: int = Field(
         default=1_048_576,
         ge=1,
-        description="startup-only: Largest raw payload body one audited admin read may return; a larger body is refused with 413 and the refusal is audited.",
+        description="startup-only: Approximate bound on the raw payload body one audited admin read may return; a larger body is refused with 413 and audited. Measured on the payload document, not the response envelope.",
     )
     environment_probe_enabled: bool = Field(
         default=True,

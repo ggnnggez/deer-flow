@@ -61,9 +61,21 @@ _BENCHMARK_EVALUATION_KINDS: frozenset[str] = frozenset({"benchmark_assertion", 
 #: router tests and alternative ASGI compositions. Production always snapshots.
 _DEFAULT_EVALUATION_SETTINGS = snapshot_ansich_evaluation_settings(None)
 _DEFAULT_RAW_READ_SETTINGS = snapshot_ansich_raw_read_settings(None)
-#: Every response of the four §7 raw-body routes carries it, on the refusals as
-#: well as on the served body: a 410 is heuristically cacheable, and a 403 or a
-#: 413 still names an id somebody asked for.
+#: Every response the four §7 raw-body *handlers* produce carries it, on the
+#: refusals as well as on the served body: a 410 is heuristically cacheable, and
+#: a 403 or a 413 still names an id somebody asked for.
+#:
+#: **Two refusals are produced outside the handler and therefore carry no
+#: ``Cache-Control`` at all**, which is why the claim above says "handler" and
+#: not "route": an over-long ``purpose`` is refused by FastAPI's own
+#: ``RequestValidationError`` handler (422, before the handler runs, reading
+#: nothing), and an unauthenticated request by ``AuthMiddleware.dispatch``
+#: (401, before ``call_next``). Neither status is in RFC 7231 §6.1's
+#: heuristically cacheable set, so a shared cache will not store either absent
+#: explicit freshness -- benign, but the invariant is not total and the 422 body
+#: echoes the caller's ``purpose`` beside a URL naming a payload id. Closing it
+#: would take a route-scoped validation handler or moving the bound into the
+#: handler; narrowing the claim is the choice recorded here.
 _NO_STORE: dict[str, str] = {"Cache-Control": "no-store"}
 #: Bound on the audited free-text ``purpose``. Over it the request is refused by
 #: FastAPI's own validation (422) before the handler runs, which reads nothing.
@@ -368,7 +380,18 @@ async def _open_audited_raw_read(
 
 
 def _raw_read_byte_size(document: object) -> int:
-    """The size of what would cross the wire, measured on the serialized body."""
+    """The size of the inner document, which bounds the response approximately.
+
+    **Not a Content-Length ceiling**, and the two deviations run in opposite
+    directions so neither cancels the other reliably. (a) ``json.dumps``
+    defaults to ``(", ", ": ")`` while Starlette's ``JSONResponse.render`` uses
+    the compact separators, so this **over**-counts by a byte per separator and
+    a structure-heavy body is refused slightly early. (b) ``document`` is the
+    payload alone — the response envelope (``{"payload": …}``, the release
+    wrapper, and on the ToolCall routes the whole ``{role}_result`` block beside
+    it) is **not** measured, so the served response is larger than the number
+    checked here. ``ensure_ascii=False`` is deliberate and does match Starlette.
+    """
 
     return len(json.dumps(document, default=str, ensure_ascii=False).encode("utf-8"))
 

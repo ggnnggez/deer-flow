@@ -1895,6 +1895,8 @@ ansich:
   # Every read of a raw payload body goes through the four audited admin
   # endpoints, and a body larger than this is refused (413) rather than served.
   # The refusal is audited like any other outcome, so the attempt is on record.
+  # It is an approximate bound: the size is measured on the payload document,
+  # not on the response envelope wrapped around it.
   raw_read_max_bytes: 1048576
   # Enable OS-level environment sampling (fd/io/disk/pressure) as a second
   # Ansich evidence source, subject to sandbox/host Scopes rather than Tasks.

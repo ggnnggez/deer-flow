@@ -255,17 +255,29 @@ async def _replay_until_settled(
 
     ``execute_replay`` is itself bounded, but its rounds run back to back
     *inside one call*, and a dependency-deferred job is parked behind a 250ms
-    ``available_at`` that no amount of tight looping can reach. So one pass can
-    exhaust its rounds and still return ``unsettled == 1``, and a caller that
-    reads that single pass as completeness is making the F10-26 mistake one
-    level up -- exactly what the pass's own docstring warns its ``unsettled``
-    cannot be read as.
+    ``available_at``. The loop has **no time-aware or availability-aware exit**,
+    so whether that deferral happens to clear inside a round is incidental to
+    how long that round's work took -- which is why the assertion this helper
+    replaces was usually green and red under load, rather than always red. So
+    one pass can exhaust its rounds and still return ``unsettled == 1``, and a
+    caller that reads that single pass as completeness is making the F10-26
+    mistake one level up -- exactly what the pass's own docstring warns its
+    ``unsettled`` cannot be read as.
 
     Each pass here is therefore a **separate** call, the same reason
     ``rebuild_until_settled`` re-calls ``rebuild_projections`` rather than
-    looping inside it: a fresh pass releases and re-takes the maintenance lock
-    and does real work in between, which is what lets the deferred job become
-    claimable. A replay is idempotent, so a re-drive costs work and never
+    looping inside it. That buys two things and the stronger one is easy to
+    miss. The weak, time-based half: a fresh pass releases and re-takes the
+    maintenance lock and does real work in between. **The strong, structural
+    half**: a fresh ``execute_replay`` calls ``mint_replay_jobs``, whose re-pend
+    sets ``available_at = now`` *and* ``dependency_pending_since = None`` for
+    every targeted job -- so for jobs of the target ``(projector, version)``
+    matching the selector, the next pass clears the deferral by construction,
+    not by luck. **The residual, stated because ``unsettled`` is store-wide**: a
+    job belonging to a *different* projector is not re-pended by the next pass,
+    and for those the extra passes still help only by elapsing time.
+
+    A replay is idempotent, so a re-drive costs work and never
     correctness. Exhausting ``passes`` is reported, not raised -- the last
     report comes back with ``unsettled`` still non-zero and the caller's own
     assertion is what fails, carrying the number with it.
