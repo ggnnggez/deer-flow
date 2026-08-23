@@ -48,6 +48,7 @@
 | F10-38 | owner/thread 强删除的两条 v1 不可解形状:被**类型拒绝**的实体 pin(host/workspace/sandbox/authorization/external_origin Scope、AgentRelease)与**互相 pin**(两个各自可删的 Scope 共用一个 Task,预检都过、谁都完不成)——都被如实拒绝,但 v1 无产品内补救 | ⬜ 未修复(v1 限制,已诚实拒绝并写死拒绝理由) | — | — |
 | F10-39 | 保留策略下的无界增长残余:`ansich_content_blobs` 的 `inline_body`(阈值以下的正文,任何 tier 都不碰)、尚无 tier 触达的 blob 行,以及 tier 1 留下的 tombstone 空壳 | ⚠️ 部分收窄(T10 的 `_apply_plan_and_reclaim` 让三个删除者都回收自己弄成孤儿的 blob 行与正文;**不构成回收 tier**) | 2026-08-22 | `e764de4f` |
 | F10-40 | tier 2 删掉一条**活认领者**正在投影的观测时,投影方的外键失败经 `_record_projection_error` 的 `job is None` 早退**完全静默**:不计数、不打日志、不重臂,`stale_completion_count` 那条先例没有被套用 | ⬜ 未修复(有界、不毒批,但零可见性) | — | — |
+| F10-41 | **时间 retention 的三层没有任何调用者**:`run_retention` 只被测试调用——不在运维 tick 里、没有调度器条目、没有路由,所以 §6 测过的每一种保留状态在生产上都产不出来,`retention_last_run` 永远是 `None` | ⬜ 未修复(能力已落地、未接线;owner 强删除**不在**本条范围,它有路由) | — | — |
 
 留观标记:F10-10 的第 4 条证据(`test_step_attempt_and_context_are_queryable_after_projection`)**未证实**——只做了排除法,没拿到原始失败文本。若它再轮换红,**先抓失败文本再修**,不要按已有的三条诊断类推。另:F10-10 的门禁只被 Task 8 的验收负载证明过(`e53cefbc` 记录了这条边界),Task 9 的更重负载下仍有 2 条已上门禁的测试翻红,详见该条的「后续观察」。
 
@@ -96,7 +97,7 @@
 
 ## F10-6. 兄弟 rollup 仍是未串行化的 read-modify-write
 
-- 状态:✅ 已修复(2026-08-21,P11-B 批 Task 5,`82958027`;锁**序**由 `029c549e`/`8fbc18df`/`ade44649` 三次补齐)。四处 rollup 全部拉到参考实现 `_recompute_release_quality_stats` 的姿势:`_refresh_behavior_belief`、`_refresh_active_task_read_model`、`_project_budget`,以及单独登记的 `_refresh_usage_summary`(F10-20)。四个细节值得记:
+- 状态:✅ 已修复(2026-08-21,P11-B 批 Task 5,`82958027`;锁**序**由 `029c549e`/`8fbc18df`/`ade44649` 三次补齐;**运维 tick 侧的首写者残留 2026-08-22 由 P11-C 批 Task 11 `f1d52a79` 收口**,见下面的残留段)。四处 rollup 全部拉到参考实现 `_recompute_release_quality_stats` 的姿势:`_refresh_behavior_belief`、`_refresh_active_task_read_model`、`_project_budget`,以及单独登记的 `_refresh_usage_summary`(F10-20)。四个细节值得记:
   - **先锁目标行、再读输入,并且是一次「调用」而不是读上的一个标志**:`_lock_rollup_targets(session, statement)` 必须由读的那段代码先调用,所以「读完再锁」在结构上写不出来(锁在读之后会留下一模一样的窗口)。`FOR UPDATE` 在 SQLite 上是 no-op,那里本来就只有一个写者。
   - **首写者是锁做不到的那一半**:`FOR UPDATE` 锁不住还不存在的行,于是每处配 `_insert_ignoring_conflict`(`INSERT … ON CONFLICT DO NOTHING`,返回「这次是不是我赢的」),输家重读赢家那行——此刻已可加锁——再收敛上去。这两个 helper 合起来就是本仓库今后所有聚合读-改-写的**既定写法**。
   - **多行 rollup 取锁前先排序**:usage 扇出、spawn backfill、environment 的 per-metric 更新都排序后再取锁,否则两个进程按 `set`/`dict` 的原生序遍历会在真 PG 上死锁(T9 的 tier 实测到 PostgreSQL 中止其中一方)。死锁自由的正面论证(serializing prefix:两条扇出路径都在拿聚合行之前先拿贡献行,并按聚合升序走)写在 `_backfill_spawn_usage` 的注释里。
@@ -641,7 +642,7 @@
 ## F10-36. 认领处的抛永远变不成一条运维可见的失败作业(全局静默停摆)
 
 - 状态:⬜ 未修复。**既存形状,P11-C 一处未动**;登记在此是因为 F10-29 的 hydrate 提前**扩大了它的暴露面**,而按旧措辞(「作业 durable failed」)读它会把人引向错的补救方向。来源:P11-C 批 Task 2 复审实测。
-- 位置:`sql.py::_claim_projection_job`(抛出点)、`packages/ansich/ansich/service.py::_project_pending`(service.py:3129-3140 的 `except Exception: return 0`)、认领语句的 `ORDER BY AnsichObservationRow.ingest_seq`。
+- 位置:`sql.py::_claim_projection_job`(抛出点)、`packages/ansich/ansich/service.py::_project_pending`(`service.py:4054-4065`,那句 `except Exception: return 0` 在 :4064-4065)、认领语句的 `ORDER BY AnsichObservationRow.ingest_seq`。
 - 现状,三段连锁,每一段都被单独实测过:
   1. **抛回滚自己的认领事务**,`attempts` 的自增随之回滚,所以那条作业**永远到不了 `failed`**——观测到的稳定态是 `status='pending', attempts=0`,永远。
   2. **循环不死**:`_project_pending` 把后端调用整个包在 `try/except Exception: return 0` 里,`ValidationError`(是 `ValueError`)与 `RuntimeError` 都被吞成「本轮处理了 0 条」,循环照转、照撞同一行(复审实测:循环存活,约 1090 次空转认领)。**不要按「投影循环会死」读本条**——那会把人引向「补一个 supervision / 重启」的错方向,复审已实测证伪。
@@ -689,9 +690,21 @@
 ## F10-40. tier 2 删掉活认领者的观测时,投影侧的外键失败**完全静默**
 
 - 状态:⬜ 未修复。来源:P11-C 批 Task 9b 复审的端到端追踪(实现者自报了这条形状,复审把它追到底并确认「有界、不毒批、但零可见性」)。
-- 位置:`sql.py::_run_observation_retention_tier`(tier 2 刻意没有在飞守卫)、`_record_projection_error`(`sql.py:5379-5382` 的 `job = session.get(...)` → `if job is None: return`)。
+- 位置:`sql.py::_run_observation_retention_tier`(tier 2 刻意没有在飞守卫)、`_record_projection_error`(`sql.py:7029` 起,`job = await session.get(...)` → `if job is None: return` 在 :7063-7065)。
 - 现状:tier 2 **刻意**不为在飞的认领者让路——一个卡了一个月的作业不该把它的证据永远按住,这与 tier 1 把 `failed` 排除在 `_IN_FLIGHT_JOB_STATUSES` 之外是同一条道理。代价的一半是良性的(认领者的 settle 返回 `False`,走既有的 stale-completion 通道,`stale_completion_count` 会涨);**另一半不是**:如果那个认领者在自己的事务里已经写下了引用该 Observation 的行,PostgreSQL 会在语句处报外键失败,异常被 `project_pending` 的 blanket `except` 接住并路由到 `_record_projection_error`,而它的**第一个动作**就是 `session.get(AnsichProjectionJobRow, job_id)` 后 `if job is None: return`——作业行已经随它的 Observation 一起走了,于是这个处理器**静默返回**:不写 durable 错误行(写了反而会撞 `ansich_projection_errors.job_id` 的外键,变成第二次抛)、不重臂、不计数、不打日志。**批的其余部分活着**(`project_pending` 的 `for _ in range(limit)` 继续下一次认领),所以它有界、不毒批。
 - **要不要接受这份沉默,是本条要裁决的问题。** 一边:被删的是**已过期的证据**,那次投影投的也是已过期的证据,没有任何策略没判过的**状态**因此丢失。另一边:本仓库有一条方向相反的先例没有被套用——`stale_completion_count` 存在,正是因为一次「本来就该丢」的写入丢失也被判定值得一个进程本地计数器;而本条比它**更罕见也更不可见**(settle-drop 那条路至少会让计数器涨,这条路什么都不涨)。
 - **PG tier 没有覆盖这一支**:`test_observation_retention_deletes_a_claimed_job_beside_its_owner_on_postgres` 编排的是「B 认领 → A 清扫 → B 的 settle 返回 `False`」,即**友好**的那种交错——认领者从头到尾没有写过任何引用那条注定被删的 Observation 的行。真正要证的那一支只有散文,没有测试。
 - 方向:(a) 在 `job is None` 的早退处加一行 DEBUG,或复用 `stale_completion_count`(最便宜,且不改变任何行为);(b) 补一条编排出来的 PG tier 用例(认领 → 投影一条 heartbeat → 清扫 → 断言投影方的事务失败且循环继续),或者在实现者那条 concern 旁边如实写一句「本支未被覆盖」。两者不冲突。与 `F10-36` 是同一类缺口(投影侧的丢失没有观测面),两条应当一起裁决。
 - 归属:下一次触达 retention tier 2 或 `_record_projection_error` 的改动。
+
+## F10-41. 时间 retention 的三层没有任何调用者
+
+- 状态:⬜ 未修复。**这不是一个缺陷,是一段没接上电的能力**——P11-C 的 §6 把三层 retention、跨 pass 收敛、tombstone、horizon 与健康面全部落地并测到,然后没有把它接到任何会跑它的东西上。来源:P11-C 批 Task 14 的实施者顺带发现(「nothing calls `run_retention`」),批终审裁定按本文件自己的标准给它一个号——F10-38/39/40 都为更小的缺口拿了号,而这一条的后果比那三条都大。
+- 位置:`packages/ansich/ansich/service.py::run_retention`(以及它转发到的 `sql.py::SqlAnsichBackend.run_retention`)。**生产侧调用者:零。** 今天所有调用点都在 `backend/tests/ansich/test_retention.py` 与 `backend/tests/integration/test_postgres_multiworker.py` 里。
+- 现状,三句话:
+  1. **产不出来**:tier 1 的 payload tombstone、tier 2 的 Observation 删除与 horizon 推进、tier 3 的结构解钉,一次都不会在生产上发生。于是 §6 为「读者的三种状态」写的那一整套(410 Gone、`expired_points`、按 `expired` 结算的认领、回执的 horizon 那一级)在生产上**全部是死代码**,尽管它们各自都被测到。
+  2. **健康面如实但容易被读反**:`DatabaseHealth.retention_last_run` 会一直是 `None`,而 `None` 在一个可达的库上的含义是「从未跑过」——这是**正确**的答案,但一个运维看见它会以为是自己没配,而不是「产品还没接线」。
+  3. **本条不含 owner 强删除**:`hard_delete_scope` 有自己的路由(`POST /api/ansich/retention/hard-delete`),它是可达的。不可达的只有**时间**那三层。
+- 方向:接线,而不是改任何 §6 的代码。两条候选,建议前者:(a) 一个由 `scheduler` 驱动的周期性 pass(与 `config.yaml -> scheduler` 同一套开关),按 `RetentionPolicy` 从配置取三个 tier 年龄与 `cleanup_batch_size`,**并且必须循环**——`RetentionReport.finished` 回答的是「这一趟被上界停住了吗」而不是「库里空了」,跨 pass 收敛之下调用方无论如何都要再跑一趟(§6 的偏离 6 与 `backend/AGENTS.md` 的 `RetentionReport.finished` 段各写了一遍);(b) 一条 admin 路由,让运维手动触发一趟。无论哪条,接线的那一批都要顺带回答本文件里已经登记的两个相邻问题:`F10-39`(没有任何 tier 回收 `inline_body`/blob 行/tombstone 空壳,一旦真的开始跑,这条从「理论增长」变成「在增长」)与 `F10-40`(tier 2 撞上活认领者时那次完全静默的投影丢失,一旦真的开始跑就会真的发生)。
+- **三处记录互相指向,不要只读一处**:本条、`ansich/docs/plans/11-resilience-replay-and-retention.md` §6 实现状态的偏离 6、以及 `ansich/docs/plans/README.md` 的 P11-C 条目「明确没有清零的残留」那一段。
+- 归属:**下一个 retention 批次的第一件事**(接线先于任何新 tier;`F10-39` 要的回收 tier 排在它后面)。

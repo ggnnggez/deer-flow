@@ -147,8 +147,9 @@ cluster `initdb`-ed by the `pgserver` wheel (the Docker daemon was unavailable
 in that WSL2 environment), 19 passed on five consecutive rounds. **That 19 is
 the whole `tests/integration/` layer, not the multiworker file** — a
 distinction worth stating because the file is what gets talked about: at P11-B
-it was 14 cases beside the migration matrix's 5. P11-C took the layer to **28**
-(multiworker 14 → 21, matrix unchanged) on the same kind of `pgserver` 16.2
+it was 14 cases beside the migration matrix's 5. P11-C took the layer to **28**,
+and **both terms grew** — multiworker 14 → 21, matrix 5 → 7 (`0028`'s upgrade,
+downgrade round trip and refusal path) — on the same kind of `pgserver` 16.2
 cluster. So every claim
 this tier proves is a claim proven **on a developer machine at a point in
 time**, and a change that breaks it will not be caught by a push: run it
@@ -3813,14 +3814,27 @@ recreate them empty (a horizon of `0`, which is a lie the guard exists to
 prevent). The rule that came out of it is unconditional: **in every revision, a
 guard that can refuse runs before anything destructive, forever.**
 That rule was then audited across the whole chain rather than asserted for the
-one revision. **Result: zero instances in `0001`..`0027`.** No downgrade in that
-range contains a refusal at all — every guard in them is a `has_table` /
-`has_column` existence check that immediately precedes its own operation
-(idempotency, not refusal), so there is nothing whose order could be inverted;
-and the one data-preserving step that could have been stranded,
+one revision, and the audit has to look at helpers rather than only at what is
+lexically inside `downgrade()` — the one instance it found hides in a helper.
+**Result: one DML instance, zero DDL instances.**
+`0021_ansich_summary_assertion_fk`'s downgrade runs
+`DELETE FROM ansich_task_summaries WHERE assertion_id IS NULL` and *then* calls
+`_assertion_fk_name()`, which raises when the foreign key it needs is missing —
+destruction before a guard, in shape exactly the defect `0028` was caught with.
+**It is safe, and the reason is worth knowing because it is the reason the DDL
+case is not**: what precedes the raise there is *DML*, which is inside the
+migration transaction on both dialects (SQLite autocommits DDL, not DML), and no
+DDL has run at that point, so the DELETE rolls back with the failed revision.
+The hazard is specific to statements SQLite commits behind alembic's back.
+Everything else in `0001`..`0027` is clean: no other downgrade refuses at all —
+their guards are `has_table` / `has_column` existence checks that immediately
+precede their own operation (idempotency, not refusal) — and the one
+data-preserving step that could have been stranded,
 `0009_ansich_content_blobs`' `_restore_observation_bodies()`, already runs before
-any drop. `0028` is the only revision in the chain that refuses, and its
-pre-flight is now its first statement, with survival assertions on both dialects.
+any drop. (`0014`'s cycle-detection raise is upgrade-only and sits behind purely
+additive work.) So `0028` is the only revision whose refusal is
+DDL-order-sensitive, and its pre-flight is now its first statement, with survival
+assertions on both dialects.
 
 - `persistence/bootstrap.py` — `bootstrap_schema(engine, backend=...)`, the three-branch decision + locking
 - Tests: `tests/test_persistence_bootstrap.py` (branches), `tests/test_persistence_bootstrap_concurrency.py` (concurrency), `tests/test_persistence_bootstrap_regression.py` (issue #3682), `tests/test_persistence_migrations_env.py` (filter), `tests/blocking_io/test_persistence_bootstrap.py` (asyncio.to_thread anchor)

@@ -720,7 +720,9 @@ async def get_agent_release_manifest(
     """Return the complete sanitized manifest through an audited, non-cached path.
 
     One of the four §7 raw-body routes: admin, subject-resolved, audited before
-    the read and again after it, ``no-store`` on every answer it can give.
+    the read and again after it, ``no-store`` on every answer **this handler**
+    produces (see ``_NO_STORE`` for the two refusals raised outside it, which
+    carry no ``Cache-Control``).
     """
 
     service, audit = await _open_audited_raw_read(
