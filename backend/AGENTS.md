@@ -3173,15 +3173,19 @@ about sane budgets rather than about the schema's `ge=1`.
 collector would like" but what the Gateway's **serial** shutdown leaves it.
 This sequence runs *last* — it lives in `langgraph_runtime`'s `finally`, which
 is the outermost context manager in `app.py`'s lifespan, so it exits after
-everything nested inside: preStop sleep 5s (`gateway.preStopSleepSeconds`) +
-channel stop 5s + browser sessions 5s (`app.py::_SHUTDOWN_HOOK_TIMEOUT_SECONDS`)
-+ memory flush 30s (`memory.shutdown_flush_timeout_seconds`) + in-flight run
-drain 5s (`deps.py::_RUN_DRAIN_TIMEOUT_SECONDS`) = **50s before this step
-starts**. The gateway chart's `terminationGracePeriodSeconds` was 45 and its
+everything nested inside. The **budgeted** terms are preStop sleep 5s
+(`gateway.preStopSleepSeconds`) + channel stop 5s + browser sessions 5s
+(`app.py::_SHUTDOWN_HOOK_TIMEOUT_SECONDS`) + memory flush 30s
+(`memory.shutdown_flush_timeout_seconds`) + in-flight run drain 5s
+(`deps.py::_RUN_DRAIN_TIMEOUT_SECONDS`) = **50s before this step starts** — and
+they are the terms that carry a bound, not the whole list: the scheduled-task
+service stop sits between two of them with **no timeout at all**, and the OIDC
+close and `close_engine` are unbudgeted, which is part of what the buffer is
+for. This step's own worst case is 5s + up to 0.25s of per-step grace. The gateway chart's `terminationGracePeriodSeconds` was 45 and its
 comment budgeted only three of those terms, so the sum already did not fit
 before this sequence existed; P11-C raises it to **60** and writes the whole
 table into `values.yaml`, the deployment template, the chart README and
-`app.py`'s own caveat, which leaves 55 + 5s of buffer. **A larger
+`app.py`'s own caveat, which leaves 55s of budgeted terms + 5s of buffer. **A larger
 `shutdown_budget_ms` is only honoured if the pod's grace period is raised with
 it** — SIGKILL landing mid-sequence loses the process-loss bucket step 7 exists
 to write down, and the report that would have said so with it. One consequence
@@ -3247,11 +3251,15 @@ restart into a Gateway that will not come up.
   row the generation moves and the ordinary CAS drops the zombie's write.
   Bounded at `_LEASE_SWEEP_MAX_ROWS` (1000) per job table, ordered by `job_id`,
   and `LeaseSweepReport.truncated` says so rather than letting the counts read
-  as the whole answer. The counts are the UPDATE's **rowcount**, not the
-  SELECT's row set: the read takes no `FOR UPDATE`, so a peer can claim one of
-  those rows in between and the write's `status == 'processing'` re-check
-  declines it — counting the intent would make the startup line claim a re-arm
-  that did not happen. It takes no maintenance lock: it creates and re-pends
+  as the whole answer. **The read takes no `FOR UPDATE`, so the write
+  re-checks the lease cutoff the read used** — a peer that claimed one of those
+  rows in between leaves it `processing` (that is what a claim writes), so a
+  status-only re-check would read a *fresh* claim as the dead one and re-arm it
+  out from under a live worker; what a claim always moves is the expiry, which
+  is what tells them apart. The counts are the UPDATE's **rowcount** rather
+  than the SELECT's row set for the same reason: that predicate may decline
+  part of the set, and counting the intent would make the startup line claim a
+  re-arm that did not happen. It takes no maintenance lock: it creates and re-pends
   nothing, so Global Constraint 4 is untouched, and queueing startup behind a
   running rebuild would trade legibility for a slow boot.
 * **Active-version validation** (D8-5). `start()` calls T6's

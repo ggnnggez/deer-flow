@@ -4788,11 +4788,21 @@ class SqlAnsichBackend:
         *live* worker claims the row the generation moves and the ordinary CAS
         drops the zombie's write as it always has.
 
-        The counts are what the UPDATE **moved**, not what the SELECT planned
-        to move: a peer can claim one of these rows between the two statements,
-        the re-check declines it, and a report that counted the intent would
-        overstate exactly the number an operator reads to decide whether
-        projection is moving.
+        **The read takes no ``FOR UPDATE``, so the write re-checks the lease
+        bound the read used**, and that predicate is load-bearing rather than
+        defensive. A peer claiming one of these rows in between leaves it
+        ``processing`` — that is what a claim writes — so a re-check on status
+        alone would read a *fresh* claim as the dead one this sweep came for
+        and re-arm it out from under a live worker, which is worse than the
+        phantom row the sweep exists to clear: the peer keeps projecting under
+        a lease the row no longer shows, and any other worker may now claim it
+        too. What a claim always moves is the expiry, so the cutoff is what
+        tells the two apart.
+
+        The counts are what the UPDATE **moved**, not what the SELECT chose,
+        because that predicate may legitimately decline part of the row set and
+        a report counting the intent would overstate exactly the number an
+        operator reads to decide whether projection is moving.
 
         Bounded twice over: at most ``limit`` rows per table, read in
         ``job_id`` order so two passes cannot interleave into a cycle, and both
@@ -4834,14 +4844,33 @@ class SqlAnsichBackend:
                 for status, job_ids in (("retry", retry_ids), ("pending", pending_ids)):
                     if not job_ids:
                         continue
-                    result = await session.execute(update(model).where(model.job_id.in_(job_ids), model.status == "processing").values(status=status, lease_owner=None, lease_expires_at=None))
-                    # The rowcount, never `len(job_ids)`: the SELECT takes no
-                    # `FOR UPDATE`, so under READ COMMITTED a peer can claim one
-                    # of these rows between the read and the write. The
-                    # `status == 'processing'` re-check correctly declines to
-                    # move such a row -- and counting the intent instead would
-                    # have the startup line claim it re-armed work it did not
-                    # touch, in a report whose whole purpose is legibility.
+                    result = await session.execute(
+                        update(model)
+                        .where(
+                            model.job_id.in_(job_ids),
+                            model.status == "processing",
+                            # The lease bound, re-checked against the same
+                            # cutoff the SELECT used, and it is the predicate
+                            # that makes this write safe rather than merely
+                            # tidy. A peer claiming one of these rows between
+                            # the two statements leaves it `processing` --
+                            # `_claim_projection_job` sets exactly that status
+                            # -- so a `status`-only re-check reads a *fresh*
+                            # claim as the dead one this sweep came for and
+                            # re-arms it out from under a live worker. What a
+                            # claim always moves is the expiry: it writes
+                            # `now + projector_lease_seconds`, which is past
+                            # this cutoff by construction.
+                            model.lease_expires_at.is_not(None),
+                            model.lease_expires_at <= moment,
+                        )
+                        .values(status=status, lease_owner=None, lease_expires_at=None)
+                    )
+                    # The rowcount, never `len(job_ids)`: the row set above is
+                    # what the SELECT chose, and the predicate may legitimately
+                    # decline some of it. Counting the intent would have the
+                    # startup line claim it re-armed work it never touched, in
+                    # a report whose whole purpose is legibility.
                     moved = int(result.rowcount or 0)
                     if status == "retry":
                         to_retry += moved

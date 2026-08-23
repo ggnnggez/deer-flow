@@ -1847,6 +1847,11 @@ ansich:
   # Budget for the writer's drain at shutdown. It bounds the in-flight attempt
   # itself (a persist that never returns is cancelled), not just the queued
   # backlog; whatever cannot be placed by then is charged as lost and reported.
+  #
+  # Clamped by shutdown_budget_ms below: the drain is one step of the shutdown
+  # sequence and gets the smaller of this value and its 0.4 share of that
+  # budget -- 2s at the 5s default -- so anything above that share is inert
+  # during shutdown. Raising this alone changes nothing.
   stop_drain_timeout_ms: 10000
   # Total budget for the whole shutdown sequence: stop recording, stop this
   # service's timers, let terminal barriers finish, drain the writer, stop
@@ -1859,12 +1864,17 @@ ansich:
   # which exits after everything nested inside it:
   #   preStop sleep            5s   (gateway.preStopSleepSeconds)
   #   channel stop             5s
+  #   scheduled-task stop      --   UNBOUNDED (no timeout at its call site)
   #   browser sessions         5s
   #   memory flush            30s   (memory.shutdown_flush_timeout_seconds)
   #   in-flight run drain      5s
-  #   ansich shutdown          5s   <- this key
+  #   ansich shutdown          5s   <- this key (+ up to 0.25s of step grace)
+  #   OIDC close, close_engine --   unbudgeted
   #                          ----
-  #                           55s   against terminationGracePeriodSeconds 60
+  #                           55s   of budgeted terms, against
+  #                                 terminationGracePeriodSeconds 60
+  # Those are the terms that carry a bound, not the whole list -- the unbounded
+  # and unbudgeted ones are part of what the remaining buffer is for.
   # Raising this key means raising the pod's grace period with it. A budget the
   # orchestrator will not honour is not a budget: SIGKILL landing mid-sequence
   # loses the process-wide loss bucket the last step exists to write down, and

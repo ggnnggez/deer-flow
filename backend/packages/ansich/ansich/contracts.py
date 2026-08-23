@@ -1211,10 +1211,13 @@ class LeaseSweepReport(BaseModel):
     ordinary CAS covers the case and re-arming without a bump is safe.
 
     ``to_retry`` / ``to_pending`` count rows the sweep's UPDATE **moved**, not
-    rows its SELECT chose: a peer worker can claim one of them in between, the
-    write's own ``status == 'processing'`` re-check declines it, and this
-    report says so by being one lower rather than by claiming a re-arm that did
-    not happen.
+    rows its SELECT chose. The two differ because the read takes no lock and
+    the write therefore re-checks the lease cutoff the read used: a peer that
+    claimed one of those rows in between has moved its expiry past the cutoff
+    and is declined, which is what keeps a sweep from re-arming a *live*
+    worker's fresh claim — a claim leaves the row ``processing``, so status
+    alone cannot tell the two apart. This report is one lower in that case
+    rather than claiming a re-arm that did not happen.
 
     ``truncated`` is the bound saying so out loud: the sweep reads at most
     ``limit`` rows per table so startup cannot turn into a full scan of a table

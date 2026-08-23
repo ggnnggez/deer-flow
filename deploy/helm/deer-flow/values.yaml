@@ -33,12 +33,16 @@ gateway:
   # it, and the sum is what this has to cover:
   #   preStop sleep            5s   (preStopSleepSeconds, below)
   #   channel stop             5s   (app.py _SHUTDOWN_HOOK_TIMEOUT_SECONDS)
-  #   browser sessions         5s   (same)
+  #   scheduled-task stop      --   UNBOUNDED (no timeout at its call site)
+  #   browser sessions         5s   (same constant as channel stop)
   #   memory queue drain      30s   (memory.shutdown_flush_timeout_seconds)
   #   in-flight run drain      5s   (deps.py _RUN_DRAIN_TIMEOUT_SECONDS)
-  #   ansich shutdown          5s   (ansich.shutdown_budget_ms)
+  #   ansich shutdown          5s   (ansich.shutdown_budget_ms, +<=0.25s grace)
+  #   OIDC close, close_engine --   unbudgeted
   #                          ----
-  #                           55s   + buffer
+  #                           55s   of budgeted terms, + buffer
+  # The unbounded and unbudgeted steps above are part of what the buffer is
+  # for; this list is the terms that carry a bound, not every step.
   # K8s defaults to 30s, which SIGKILLs the memory drain mid-flight and silently
   # re-introduces the memory loss that shutdown_flush is fixing; 45s (the value
   # before the ansich shutdown sequence existed) covered only three of the six

@@ -235,13 +235,15 @@ kubectl -n deer-flow exec deploy/deer-flow-provisioner -- curl -s localhost:8002
   | --- | --- | --- |
   | preStop sleep | 5s | `gateway.preStopSleepSeconds` |
   | channel stop | 5s | `app.py::_SHUTDOWN_HOOK_TIMEOUT_SECONDS` |
-  | browser sessions | 5s | same |
+  | scheduled-task service stop | **unbounded** | no timeout at its call site |
+  | browser sessions | 5s | same constant as channel stop |
   | memory queue drain | 30s | `memory.shutdown_flush_timeout_seconds` |
   | in-flight run drain | 5s | `deps.py::_RUN_DRAIN_TIMEOUT_SECONDS` |
-  | Ansich shutdown | 5s | `ansich.shutdown_budget_ms` (runs last) |
-  | **total** | **55s** | + buffer → 60 |
+  | Ansich shutdown | 5s (+≤0.25s) | `ansich.shutdown_budget_ms` (runs last) |
+  | OIDC close, engine close | unbudgeted | — |
+  | **total of the budgeted terms** | **55s** | + buffer → 60 |
 
-  K8s defaults to 30s, which SIGKILLs the memory drain mid-flight and silently re-introduces the memory loss the drain is fixing; the previous 45s default covered only three of the six terms. **When you raise any of those timeouts, raise `gateway.terminationGracePeriodSeconds` to match the new sum.**
+  Those are the steps that carry a bound, not every step: the unbounded and unbudgeted rows are part of what the buffer is for. K8s defaults to 30s, which SIGKILLs the memory drain mid-flight and silently re-introduces the memory loss the drain is fixing; the previous 45s default covered only three of the budgeted terms. **When you raise any of those timeouts, raise `gateway.terminationGracePeriodSeconds` to match the new sum.**
 - **Gateway replicas.** Postgres + the Redis stream bridge together make the
   gateway's *persisted* state (checkpointer + run/thread metadata) and *live
   stream* path cross-pod-safe. The default is still 1 replica: **do not raise

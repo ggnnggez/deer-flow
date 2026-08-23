@@ -20,8 +20,9 @@ from ansich.contracts import ActiveVersionMismatch, AnsichHealth
 from ansich.lifecycle import LEGAL_TRANSITIONS, LifecycleInputs, derive_status
 from ansich.memory import InMemoryAnsichBackend
 from pydantic import ValidationError
-from sqlalchemy import select, update
+from sqlalchemy import create_engine, event, select, update
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
+from sqlalchemy.orm import sessionmaker
 from support.ansich_settle import only_test_driven_assessments
 
 from deerflow.ansich.persistence.models import AnsichBeliefAssertionRow, AnsichProjectionJobRow
@@ -822,6 +823,90 @@ async def test_the_lease_sweep_buckets_expired_leases_by_attempts(tmp_path) -> N
         # Untouched: somebody is still working on it.
         assert swept[live].status == "processing"
         assert swept[live].lease_owner == "live-peer"
+
+
+@pytest.mark.anyio
+async def test_the_lease_sweep_declines_a_row_a_peer_claimed_after_the_read(tmp_path) -> None:
+    """The window between the sweep's unlocked SELECT and its UPDATE, staged.
+
+    The read takes no ``FOR UPDATE``, so a peer can claim one of the rows it
+    chose before the write lands — and a claim leaves the row ``processing``,
+    which is precisely what the sweep is looking for. Re-checking the status
+    alone therefore reads a *fresh* claim as the dead one and re-arms it out
+    from under a live worker: worse than the phantom row the sweep exists to
+    clear, because the peer keeps projecting under a lease the row no longer
+    shows and any other worker may now claim it too. What a claim always moves
+    is the expiry, so the write re-checks the cutoff the read used.
+
+    Staged rather than raced, and the hook fires **after** the SELECT rather
+    than before it: before, the peer's claim is simply filtered out by the
+    read's own predicate and the test passes whatever the write does. After is
+    the actual window — the row set is already chosen, and the world changes
+    under it. The claim runs on a **separate synchronous connection** to the
+    same file (a second connection, as a second worker would be) and is written
+    through the ORM so the timestamp round-trips exactly as SQLAlchemy stores
+    it, which a hand-built string would not guarantee. It commits because
+    pysqlite starts a transaction at the first DML rather than at the SELECT,
+    so the sweep is holding nothing when the peer writes.
+
+    Disarming the write's lease predicate turns this red in both halves at
+    once: the peer's row comes back ``retry`` with its owner cleared, and the
+    report says two rows were re-armed.
+    """
+
+    database_path = tmp_path / "sweep-race.db"
+    engine = create_async_engine(f"sqlite+aiosqlite:///{database_path}")
+    async with engine.begin() as connection:
+        await connection.run_sync(Base.metadata.create_all)
+    sessions = async_sessionmaker(engine, expire_on_commit=False)
+    peer_engine = create_engine(f"sqlite:///{database_path}")
+    peer_sessions = sessionmaker(peer_engine, expire_on_commit=False)
+    backend = SqlAnsichBackend(sessions)
+
+    try:
+        await backend.persist_and_project([_observation("run-sweep-race")])
+        async with sessions() as session:
+            jobs = list(await session.scalars(select(AnsichProjectionJobRow).order_by(AnsichProjectionJobRow.job_id)))
+        assert len(jobs) >= 2
+        stolen, dead = jobs[0].job_id, jobs[1].job_id
+        async with sessions() as session, session.begin():
+            for job_id in (stolen, dead):
+                await session.execute(update(AnsichProjectionJobRow).where(AnsichProjectionJobRow.job_id == job_id).values(status="processing", attempts=1, lease_owner="dead-worker", lease_expires_at=_EXPIRED_AT, lease_generation=3))
+
+        claimed: list[str] = []
+
+        def claim_between_the_select_and_the_update(_connection, _cursor, statement, _parameters, _context, _executemany):
+            if claimed or "ansich_projection_jobs" not in statement or not statement.lstrip().upper().startswith("SELECT"):
+                return
+            claimed.append(stolen)
+            with peer_sessions() as peer, peer.begin():
+                # Exactly what `_claim_projection_job` writes: same status, a
+                # fresh owner, a lease well past the sweep's cutoff, and the
+                # generation raised.
+                peer.execute(update(AnsichProjectionJobRow).where(AnsichProjectionJobRow.job_id == stolen).values(status="processing", attempts=2, lease_owner="live-peer", lease_expires_at=_LIVE_UNTIL, lease_generation=4))
+
+        event.listen(engine.sync_engine, "after_cursor_execute", claim_between_the_select_and_the_update)
+        try:
+            report = await backend.sweep_expired_leases()
+        finally:
+            event.remove(engine.sync_engine, "after_cursor_execute", claim_between_the_select_and_the_update)
+
+        assert claimed == [stolen], "the hook must have fired on the sweep's own read"
+        async with sessions() as session:
+            rows = {job.job_id: job for job in await session.scalars(select(AnsichProjectionJobRow))}
+        # The peer's claim is untouched — status, owner, lease and generation
+        # all still the peer's.
+        assert (rows[stolen].status, rows[stolen].lease_owner, rows[stolen].lease_generation) == ("processing", "live-peer", 4)
+        assert rows[stolen].lease_expires_at is not None
+        # The genuinely dead row is still swept, so the predicate declines a
+        # row rather than the pass.
+        assert rows[dead].status == "retry"
+        assert rows[dead].lease_owner is None
+        # And the count is what moved, not what was chosen.
+        assert (report.to_retry, report.to_pending) == (1, 0)
+    finally:
+        peer_engine.dispose()
+        await engine.dispose()
 
 
 @pytest.mark.anyio

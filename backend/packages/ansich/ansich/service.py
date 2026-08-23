@@ -109,10 +109,15 @@ _PRODUCER_ACCOUNT_LIMIT = 256
 #: `terminal_flush_timeout_ms`, the loss drain by being one backend write — so
 #: their share is a backstop rather than a working budget.
 #:
-#: At the 25s default that is 2.5s / 10s / 5s / 5s / 2.5s, and the writer's
-#: share matching `stop_drain_timeout_ms`'s own 10s default is the point: the
-#: total budget clamps a *misconfigured* writer timeout without shortening the
-#: default one.
+#: At the 5s default that is 0.5s / 2s / 1s / 1s / 0.5s. The writer's 2s is
+#: **below** `stop_drain_timeout_ms`'s own 10s default, so at defaults the
+#: budget clamps that knob rather than deferring to it — deliberately: the 5s
+#: is what the Gateway's serial shutdown leaves before the pod's grace period
+#: ends (see the config field), and a 10s drain the orchestrator SIGKILLs
+#: half-way is worth less than a 2s one it lets finish, because what the drain
+#: cannot place is charged and then written down by step 7. A deployment that
+#: wants the full 10s raises `shutdown_budget_ms` *and* the pod's grace period
+#: together; raising the knob alone changes nothing.
 _SHUTDOWN_STEP_SHARES: dict[str, float] = {
     "drain_terminal_barriers": 0.1,
     "drain_writer": 0.4,
@@ -2497,6 +2502,18 @@ class AnsichService:
         remaining = deadline - started_at
         budget = min(self._shutdown_budget_seconds * _SHUTDOWN_STEP_SHARES.get(name, 1.0), remaining)
         if budget <= 0:
+            # Unreachable at any sane budget — each waiting step is capped by
+            # its own share, so the four before the last cannot spend more than
+            # 0.9 of the total plus their graces — and the shape of what it
+            # skips is worth naming rather than discovering: the step's action
+            # never runs, so `join_projector` in particular never reaches its
+            # explicit `projector_task.cancel()` and the loop is left running
+            # by a `stop()` that has already returned. `stop()`'s `finally`
+            # drops the task reference either way, so nothing joins it later.
+            # Reachable only by a sub-300ms budget (below which the graces
+            # dominate, see `_SHUTDOWN_STEP_GRACE_SECONDS`) or by a step that
+            # overran its own bound; both are misconfiguration or a wedge that
+            # the report already names step by step.
             return ShutdownStep(name=name, ok=False, timed_out=True, duration_ms=0, detail="budget_exhausted")
         try:
             detail = await asyncio.wait_for(action(budget), timeout=budget + _SHUTDOWN_STEP_GRACE_SECONDS)

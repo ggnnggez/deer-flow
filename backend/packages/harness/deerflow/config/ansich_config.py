@@ -141,7 +141,11 @@ class AnsichConfig(BaseModel):
             "startup-only: total budget for the writer's drain at collector stop. It bounds the in-flight "
             "attempt itself — the drain cancels a persist that has not returned — not merely the queued "
             "backlog or a number of retries, so a wedged storage call cannot hold shutdown open. Whatever "
-            "the drain could not place by then is charged as lost and reported in one warning."
+            "the drain could not place by then is charged as lost and reported in one warning. "
+            "CLAMPED BY shutdown_budget_ms: the drain is one step of the shutdown sequence and takes the "
+            "smaller of this value and its share of that budget (0.4 of it, so 2s at the 5s default), which "
+            "means a value above that share is INERT during shutdown. Raising this alone changes nothing; "
+            "raise shutdown_budget_ms — and the pod's grace period — with it."
         ),
     )
     shutdown_budget_ms: int = Field(
@@ -154,12 +158,16 @@ class AnsichConfig(BaseModel):
             "loss bucket down. Each step takes the smaller of its own share and what is left, and a step "
             "that times out does not stop the ones after it. "
             "The 5s default is what the Gateway's SERIAL shutdown leaves: this sequence runs LAST, in the "
-            "langgraph_runtime context manager's finally, after preStop sleep (5s) + channel stop (5s) + "
-            "browser sessions (5s) + memory flush (memory.shutdown_flush_timeout_seconds, 30s) + in-flight "
-            "run drain (5s) = 50s, against the gateway chart's terminationGracePeriodSeconds of 60s. 50 + 5 "
-            "leaves 5s of buffer; a larger budget here is only honoured if the pod's grace period is raised "
-            "with it, because SIGKILL landing mid-drain would lose the process-loss bucket this sequence "
-            "exists to write down -- and the report saying so with it."
+            "langgraph_runtime context manager's finally, after the other BUDGETED terms -- preStop sleep "
+            "(5s) + channel stop (5s) + browser sessions (5s) + memory flush "
+            "(memory.shutdown_flush_timeout_seconds, 30s) + in-flight run drain (5s) = 50s -- against the "
+            "gateway chart's terminationGracePeriodSeconds of 60s. Those five plus this one are the terms "
+            "that carry a bound, not the whole list: the scheduled-task service stop is UNBOUNDED (no "
+            "timeout at its call site), and closing the OIDC service and the database engine are unbudgeted "
+            "too, which is part of what the remaining buffer is for. This step itself can also run up to "
+            "0.25s past its budget (five per-step graces of 50ms). A larger budget here is only honoured if "
+            "the pod's grace period is raised with it, because SIGKILL landing mid-sequence would lose the "
+            "process-loss bucket this sequence exists to write down -- and the report saying so with it."
         ),
     )
     heartbeat_interval_seconds: int = Field(

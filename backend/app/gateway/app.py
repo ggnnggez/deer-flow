@@ -338,15 +338,18 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
         #
         # K8s caveat: ``shutdown_flush_timeout_seconds`` must fit inside the
         # pod's ``terminationGracePeriodSeconds`` **together with every other
-        # step**, because they are serial and this one is in the middle:
-        # preStop sleep (5s) + channel stop (5s) + browser session close (5s) +
-        # this drain (30s) + the in-flight run drain (5s, deps.py) + the Ansich
-        # shutdown sequence (``ansich.shutdown_budget_ms``, 5s, which runs last
-        # because ``langgraph_runtime`` wraps this whole block) + buffer. The
-        # gateway Helm deployment carries that arithmetic; get it wrong and K8s
-        # SIGKILLs whichever step is running when the grace period ends, which
-        # for the last two means losing exactly the records they exist to
-        # write.
+        # step**, because they are serial and this one is in the middle. The
+        # budgeted terms: preStop sleep (5s) + channel stop (5s) + browser
+        # session close (5s) + this drain (30s) + the in-flight run drain (5s,
+        # deps.py) + the Ansich shutdown sequence
+        # (``ansich.shutdown_budget_ms``, 5s plus up to 0.25s of per-step
+        # grace, and it runs last because ``langgraph_runtime`` wraps this whole
+        # block) + buffer. Those are the ones that carry a bound, not the whole
+        # list: the scheduled-task service stop above is unbounded, and closing
+        # the OIDC service and the engine are unbudgeted. The gateway Helm
+        # deployment carries that arithmetic; get it wrong and K8s SIGKILLs
+        # whichever step is running when the grace period ends, which for the
+        # last two means losing exactly the records they exist to write.
         try:
             app_cfg = get_app_config()
             if app_cfg.memory.enabled:
