@@ -120,21 +120,29 @@ _SHUTDOWN_STEP_SHARES: dict[str, float] = {
     "join_projector": 0.2,
     "drain_unreported_loss": 0.1,
 }
-#: How often a shutdown step that can only be observed by polling re-checks,
-#: and the grace the claim-stop step waits past its own deadline.
+#: How often a shutdown step that can only be observed by polling re-checks.
 _SHUTDOWN_POLL_INTERVAL_SECONDS = 0.005
 #: How long the step wrapper's own `wait_for` waits past the budget it handed
 #: the step.
 #:
-#: Three of the seven steps carry an inner deadline of their own — the writer
-#: drain cancels its task, the claim-stop step writes a deadline the loop
-#: reads — and an inner and an outer bound set to the *same* instant race:
-#: whichever fires first decides whether the step's own cleanup (charging the
-#: queue, recording why the drain stopped) runs at all. The grace makes the
-#: inner deadline always win, which leaves the wrapper as what it should be: a
+#: Four of the seven steps carry an inner deadline of their own — the writer
+#: drain cancels its task, the barrier wait polls against a deadline, the
+#: claim-stop step writes one the loop reads — and an inner and an outer bound
+#: set to the *same* instant race: whichever fires first decides whether the
+#: step's own cleanup (charging the queue, reporting that claiming stopped
+#: while a round was still in flight) runs at all. The grace makes the inner
+#: deadline always win, which leaves the wrapper as what it should be: a
 #: backstop for a step that ignores the budget it was given, not the working
-#: bound. The cost is bounded and stated — at most this much per step past the
-#: total, which is why it is 50ms and not a second.
+#: bound. **Every inner deadline is therefore set at or below the budget the
+#: step was handed, never at `budget + grace`, or the two tie again.**
+#:
+#: The cost is bounded and stated — at most this much per step past the total,
+#: which is why it is 50ms and not a second. The floor that follows: below
+#: roughly 300ms of total budget the graces dominate, `total_ms` can exceed
+#: `budget_ms`, and the later steps record `budget_exhausted` without running.
+#: Honest rather than wrong — the field means "what the steps were given", and
+#: a budget that small is a misconfiguration — but "the budget is a wall" is a
+#: statement about sane budgets, not about the schema's `ge=1`.
 _SHUTDOWN_STEP_GRACE_SECONDS = 0.05
 # How many charged Observation ids the receipt path can still name. Loss is
 # already accounted permanently in `dropped_count` and `_lost_ranges`; this set
@@ -210,7 +218,7 @@ class AnsichService:
         writer_backoff_max_ms: int = 5_000,
         writer_item_max_attempts: int = 2,
         stop_drain_timeout_ms: int = 10_000,
-        shutdown_budget_ms: int = 25_000,
+        shutdown_budget_ms: int = 5_000,
         health_database_timeout_ms: int = 2_000,
         hostname: str | None = None,
         unavailable_reason: str | None = None,
@@ -417,7 +425,7 @@ class AnsichService:
         writer_backoff_max_ms: int = 5_000,
         writer_item_max_attempts: int = 2,
         stop_drain_timeout_ms: int = 10_000,
-        shutdown_budget_ms: int = 25_000,
+        shutdown_budget_ms: int = 5_000,
     ) -> AnsichService:
         return cls(
             InMemoryAnsichBackend(),
@@ -631,12 +639,21 @@ class AnsichService:
         recovery of the same Run is absorbed by the backend's producer dedupe
         rather than filing a second row.
 
-        Returns how many rows were recorded. Fail-open at every level: an
-        unresolvable Task, an unreadable store, a refused intake — each one
-        costs that Run its correlation and nothing else.
+        **Returns how many Runs' evidence the intake accepted, which is not
+        how many rows became durable, and the two legitimately differ.** The
+        dedupe above is the ordinary case: a second recovery of the same Run is
+        accepted here — the queue takes it, because nothing on the accept path
+        knows the store already holds it — and the backend then absorbs it, so
+        the count says `1` while nothing new is written. That is the honest
+        thing to report from a non-blocking intake (the alternative would be a
+        read-back that this call has no business doing), and it is why the
+        name, the log line and this sentence all say *accepted* rather than
+        *recorded*. Fail-open at every level: an unresolvable Task, an
+        unreadable store, a refused intake — each one costs that Run its
+        correlation and nothing else.
         """
 
-        recorded = 0
+        accepted = 0
         for run_id in run_ids:
             try:
                 task = await self.get_task_by_source(source_kind, run_id)
@@ -675,14 +692,14 @@ class AnsichService:
                 logger.debug("Ansich orphan correlation could not record evidence for run %s", run_id, exc_info=True)
                 continue
             if receipt.accepted:
-                recorded += 1
-        if recorded:
+                accepted += 1
+        if accepted:
             logger.info(
-                "Ansich recorded unknown-outcome evidence for %d orphaned Run(s)",
-                recorded,
-                extra={"event": "ansich.startup.orphan_correlation", "orphaned_run_count": recorded},
+                "Ansich queued unknown-outcome evidence for %d orphaned Run(s); a Run recovered before is absorbed by the producer dedupe",
+                accepted,
+                extra={"event": "ansich.startup.orphan_correlation", "orphaned_run_evidence_accepted": accepted},
             )
-        return recorded
+        return accepted
 
     @property
     def host_scope_id(self) -> str | None:
@@ -2508,6 +2525,13 @@ class AnsichService:
         if name == "drain_terminal_barriers":
             with self._lock:
                 return f"outstanding_barriers={len(self._barrier_in_flight_tokens)}"
+        if name == "stop_projection_claiming":
+            # Reached only when the step's *own* deadline did not get to
+            # answer — the wrapper's grace expired first, which means the wait
+            # itself never returned rather than that a round was still in
+            # flight (that case is `ok`, below). The claim stop is in force
+            # either way: the deadline it wrote is what the loop reads.
+            return "claim_stop_deadline_reached,wait_did_not_return" if self._projection_claim_deadline_hit else "claim_stop_wait_did_not_return"
         if name == "join_projector":
             return "projector_cancelled"
         if name == "drain_unreported_loss":
@@ -2561,13 +2585,23 @@ class AnsichService:
         and its budget is the smallest share. What it buys is ordering: a
         barrier holds rows off the queue, and the writer drain that follows
         must not charge rows somebody is mid-way through placing.
+
+        The loop honours ``budget_seconds`` itself rather than relying on the
+        wrapper's ``wait_for`` to end it. Both bounds exist and the wrapper's
+        grace keeps this one first, which is the point: a bare ``while True``
+        here would become an unbounded loop the day anybody changed the
+        wrapper, and a poll loop is the one shape where that mistake is
+        invisible until a shutdown never returns.
         """
 
+        deadline = time.monotonic() + budget_seconds
         while True:
             with self._lock:
                 outstanding = len(self._barrier_in_flight_tokens)
             if outstanding == 0:
                 return None
+            if time.monotonic() >= deadline:
+                raise TimeoutError("terminal barriers did not finish within the step budget")
             await asyncio.sleep(_SHUTDOWN_POLL_INTERVAL_SECONDS)
 
     async def _drain_writer_step(self, budget_seconds: float) -> str | None:
@@ -2587,12 +2621,24 @@ class AnsichService:
         one place ``_running`` cannot express the rule, since it runs with
         ``_running`` already false.
 
-        The wait carries a small grace past the deadline so the ordinary
-        outcome is reported as what it is: the drain stops claiming *because*
-        of the deadline and then sets its event, and a wait that expired at the
-        very same instant would have reported a wedge that did not happen. A
-        genuine timeout here therefore means the loop never came back from a
-        claim.
+        **What this step delivers is the claim stop, not the loop's
+        acknowledgement of it**, and getting that backwards is what made an
+        earlier form report a wedge on every healthy shutdown with a real
+        store. ``_may_claim_projection`` is checked *between* rounds, so the
+        drain sets its event at ``deadline + whatever is left of the round it
+        was inside`` — tens of milliseconds against a database, routinely. The
+        deliverable has already landed by then: past the deadline no further
+        round can claim, whether or not the loop has noticed yet, and the round
+        still in flight is step 6's to bound. So a wait that expires here is
+        reported as ``ok`` with ``round_in_flight`` on the detail, and the only
+        genuine wedge — a loop that never comes back at all — is reported by
+        the join, which is the step that can actually do something about it.
+
+        The wait is exactly ``budget_seconds``, one grace short of the
+        wrapper's own ``budget + _SHUTDOWN_STEP_GRACE_SECONDS``. That headroom
+        is what the grace is *for*: it makes this deadline the one that
+        decides, so the honest branch below runs instead of the wrapper's
+        generic timeout arm.
         """
 
         finished = self._projection_claim_finished
@@ -2601,7 +2647,14 @@ class AnsichService:
         self._projection_claim_deadline = time.monotonic() + budget_seconds
         if self._projector_wake_event is not None:
             self._projector_wake_event.set()
-        await asyncio.wait_for(finished.wait(), timeout=budget_seconds + _SHUTDOWN_POLL_INTERVAL_SECONDS)
+        try:
+            await asyncio.wait_for(finished.wait(), timeout=budget_seconds)
+        except TimeoutError:
+            # The deadline is behind us by construction — the wait started when
+            # it was written and lasted the whole budget — so claiming has
+            # stopped even though the loop is still inside the round it was
+            # given. Not a failure, and named rather than left to inference.
+            return "claim_stop_deadline_reached,round_in_flight"
         return "claim_stop_deadline_reached" if self._projection_claim_deadline_hit else None
 
     async def _join_projector(self, budget_seconds: float) -> str | None:
@@ -2616,6 +2669,16 @@ class AnsichService:
         the budget is: what is left is one ``assess_operations()``, which is a
         single transaction, so the cancellation either lands between
         transactions or rolls one back.
+
+        **The second await is itself a residual, of the RA7 class but by a
+        different mechanism.** ``asyncio.timeouts`` cancels a task once and
+        does not re-cancel, so a projector that ignores cancellation — a
+        backend blocking the loop, or one shielding itself — leaves ``stop()``
+        waiting here past the budget. That is not the backend shielding itself
+        *from* the sequence but this handler electing to wait a second time,
+        and it is the price of not leaking the loop into a closing store: the
+        alternative, returning while the task runs on, is the failure this
+        handler exists to prevent.
         """
 
         projector_task = self._projector_task
@@ -2640,6 +2703,12 @@ class AnsichService:
         budget. On a timeout the bucket keeps its ranges and the count keeps
         reporting them — the same honest state the ``live`` guard leaves for a
         range that can still grow.
+
+        ``budget_seconds`` is accepted and deliberately unused: this step is
+        one awaited backend call with nothing to poll and no inner deadline to
+        set, so the wrapper's ``wait_for`` is the bound. The parameter stays in
+        the signature because every step shares one, and saying so here is
+        cheaper than a reader inferring that the bound was forgotten.
         """
 
         await self._drain_unreported_global_ranges()

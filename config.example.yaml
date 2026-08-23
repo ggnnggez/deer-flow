@@ -1852,13 +1852,24 @@ ansich:
   # service's timers, let terminal barriers finish, drain the writer, stop
   # claiming projections, join the projector, and write the process-wide loss
   # bucket down. Each step takes the smaller of its own share and what is left,
-  # and a step that times out never stops the ones after it. Kept under a
-  # Kubernetes pod's default 45s terminationGracePeriodSeconds (the gateway
-  # chart's value) with room for the lifespan's own steps -- run drain, memory
-  # flush, close_engine -- because a budget the pod cannot honour is not a
-  # budget: SIGKILL would land mid-drain and the report nobody reads would say
-  # the shutdown was clean.
-  shutdown_budget_ms: 25000
+  # and a step that times out never stops the ones after it.
+  #
+  # The default is what the Gateway's SERIAL shutdown leaves. This sequence
+  # runs LAST -- it lives in the langgraph_runtime context manager's finally,
+  # which exits after everything nested inside it:
+  #   preStop sleep            5s   (gateway.preStopSleepSeconds)
+  #   channel stop             5s
+  #   browser sessions         5s
+  #   memory flush            30s   (memory.shutdown_flush_timeout_seconds)
+  #   in-flight run drain      5s
+  #   ansich shutdown          5s   <- this key
+  #                          ----
+  #                           55s   against terminationGracePeriodSeconds 60
+  # Raising this key means raising the pod's grace period with it. A budget the
+  # orchestrator will not honour is not a budget: SIGKILL landing mid-sequence
+  # loses the process-wide loss bucket the last step exists to write down, and
+  # the report that would have said so goes with it.
+  shutdown_budget_ms: 5000
   # Outer Run liveness is independent of LangGraph/model/tool events. The stale
   # rule must allow at least two complete heartbeat intervals.
   heartbeat_interval_seconds: 10

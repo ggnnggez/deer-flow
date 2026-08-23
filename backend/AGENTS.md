@@ -3125,6 +3125,25 @@ it, so spec §8's "close DB" cannot be inside a sequence that runs before them.
 What replaces it in the collector's seven is the process-loss drain, the one
 shutdown-time write nothing else performs.
 
+**Four spec-letter deviations, all recorded.** (1) the `close DB` substitution
+above; (2) the heartbeat timer is the lifespan's to stop, not the collector's —
+`AnsichTaskHeartbeat` lives in `runtime/runs/worker.py`, and the `ansich`
+package may not import `deerflow` at all, so step 2 stops the timers this
+service owns and says so in its detail (`service_timers_only`); (3) a shutdown
+phase is not a lifecycle status (H8-A, below); and (4) spec:122's step 6 is
+"完成/**释放**当前 lease" and only *complete* is implemented. On a join timeout
+the projector is cancelled while it may hold a **committed** claim
+(`status='processing'`, `lease_expires_at = now + projector_lease_seconds`) and
+nothing releases it. The row stays a phantom `processing` for up to
+`projector_lease_seconds` (30s) — which is exactly the condition RC12's startup
+sweep cleans up, except that a restart *faster* than the lease finds it not yet
+expired, so that start's sweep skips it (`lease_expires_at <= now`) and the row
+waits out its TTL before the claim path's own expiry arm takes it. Nothing is
+lost and no work is duplicated (the CAS still guards the outcome); the cost is
+that one job's re-projection is deferred by up to a lease, and a release
+mechanism was judged not worth a second write path on the shutdown timeout
+branch.
+
 **The report is not a lifecycle status, and that is ruling H8-A.**
 `ansich/lifecycle.py` is untouched: its seven states and the 17-edge
 `LEGAL_TRANSITIONS` closure — whose *illegal complement* is a pinned merge
@@ -3132,24 +3151,45 @@ gate — would have had to widen to carry a shutdown phase vocabulary, spending 
 proven invariant on wording. A shutdown phase lives in the report, where it can
 be as detailed as it likes and nothing derives a status from it.
 
-**Apportioning.** `ansich.shutdown_budget_ms` (25000, startup-only, no
+**Apportioning.** `ansich.shutdown_budget_ms` (5000, startup-only, no
 `config_version` bump — this batch bumped once at its first key) is the whole
 sequence's wall. Each step takes `min(its share, what is left)`, shares being
 `_SHUTDOWN_STEP_SHARES` (writer 0.4, claim-stop and join 0.2 each, barriers and
 loss drain 0.1 each), so an early finish rolls its remainder forward and one
 slow step cannot eat the budget. The writer's share is the largest because it
-is the only step holding rows nobody else can place — at the 25s default it is
-exactly `stop_drain_timeout_ms`'s own 10s, so the total budget clamps a
-*misconfigured* writer timeout without shortening the default one. **A step's
-timeout never aborts the steps after it**: they are independent, and skipping
-step 7 because step 4 wedged is precisely how the process-loss bucket used to
-be lost. A step with no budget left is still recorded, as
-`timed_out` with `detail="budget_exhausted"`, rather than being dropped. The
-25-vs-45 rationale is written at the config key: 25s sits under a pod's default
-45s `terminationGracePeriodSeconds` (the gateway chart's value) with room for
-the lifespan's own steps, because a budget the orchestrator will not honour is
-not a budget — SIGKILL would land mid-drain and the report nobody reads would
-say the shutdown was clean.
+is the only step holding rows nobody else can place. **A step's timeout never
+aborts the steps after it**: they are independent, and skipping step 7 because
+step 4 wedged is precisely how the process-loss bucket used to be lost. A step
+with no budget left is still recorded, as `timed_out` with
+`detail="budget_exhausted"`, rather than being dropped. A step's own inner
+deadline is always set at or below the budget it was handed, one
+`_SHUTDOWN_STEP_GRACE_SECONDS` (50ms) short of the wrapper's `wait_for`, so the
+step — not the wrapper — is what decides how its expiry is reported; below
+roughly 300ms of total budget those graces dominate and `total_ms` can exceed
+`budget_ms`, which is honest but means "the budget is a wall" is a statement
+about sane budgets rather than about the schema's `ge=1`.
+
+**Why 5s, and the arithmetic that fixes it.** The number is not "what the
+collector would like" but what the Gateway's **serial** shutdown leaves it.
+This sequence runs *last* — it lives in `langgraph_runtime`'s `finally`, which
+is the outermost context manager in `app.py`'s lifespan, so it exits after
+everything nested inside: preStop sleep 5s (`gateway.preStopSleepSeconds`) +
+channel stop 5s + browser sessions 5s (`app.py::_SHUTDOWN_HOOK_TIMEOUT_SECONDS`)
++ memory flush 30s (`memory.shutdown_flush_timeout_seconds`) + in-flight run
+drain 5s (`deps.py::_RUN_DRAIN_TIMEOUT_SECONDS`) = **50s before this step
+starts**. The gateway chart's `terminationGracePeriodSeconds` was 45 and its
+comment budgeted only three of those terms, so the sum already did not fit
+before this sequence existed; P11-C raises it to **60** and writes the whole
+table into `values.yaml`, the deployment template, the chart README and
+`app.py`'s own caveat, which leaves 55 + 5s of buffer. **A larger
+`shutdown_budget_ms` is only honoured if the pod's grace period is raised with
+it** — SIGKILL landing mid-sequence loses the process-loss bucket step 7 exists
+to write down, and the report that would have said so with it. One consequence
+to know: at 5s the writer's share is 2s, *below* `stop_drain_timeout_ms`'s 10s
+default, so the knob is now clamped by the budget at defaults. That is the
+honest direction — a 10s promise the orchestrator kills at is worth less than a
+2s one it honours, and what the drain cannot place is charged and then written
+down by step 7 rather than dying with the process.
 
 **Two of the seven are new machinery rather than a wrapper.**
 *`stop_projection_claiming`* is a distinct signal, not `_running`: the
@@ -3160,7 +3200,15 @@ always has claimable work never ends. The step writes a deadline
 finished if it can be and left to a peer worker (or the next start) if it
 cannot — the jobs are durable either way — and the step reports
 `claim_stop_deadline_reached` when the deadline rather than an empty store is
-why it stopped. *`join_projector`* bounds what is left, which is one
+why it stopped. **What that step delivers is the claim stop, not the loop's
+acknowledgement of it**, and the difference is not pedantic: the deadline is
+checked *between* rounds, so against a real store the drain answers tens of
+milliseconds late, and an earlier form that waited 5ms for the answer reported
+a wedge that had not happened — `completed=False` on every healthy shutdown of
+a Gateway with a projection backlog. Past the deadline no round can claim
+whether or not the loop has noticed, so an expiry here is `ok` with
+`claim_stop_deadline_reached,round_in_flight`, and the round still in flight is
+the join's to bound. *`join_projector`* bounds what is left, which is one
 `assess_operations()`; RC10's episode lock-then-read is what makes running that
 at shutdown survivable, because before it a collision discarded the whole tick
 and at shutdown there is no next tick to self-heal. The cancellation is
@@ -3199,7 +3247,11 @@ restart into a Gateway that will not come up.
   row the generation moves and the ordinary CAS drops the zombie's write.
   Bounded at `_LEASE_SWEEP_MAX_ROWS` (1000) per job table, ordered by `job_id`,
   and `LeaseSweepReport.truncated` says so rather than letting the counts read
-  as the whole answer. It takes no maintenance lock: it creates and re-pends
+  as the whole answer. The counts are the UPDATE's **rowcount**, not the
+  SELECT's row set: the read takes no `FOR UPDATE`, so a peer can claim one of
+  those rows in between and the write's `status == 'processing'` re-check
+  declines it — counting the intent would make the startup line claim a re-arm
+  that did not happen. It takes no maintenance lock: it creates and re-pends
   nothing, so Global Constraint 4 is untouched, and queueing startup behind a
   running rebuild would trade legibility for a slow boot.
 * **Active-version validation** (D8-5). `start()` calls T6's
@@ -3221,7 +3273,12 @@ restart into a Gateway that will not come up.
   Task (`{"component": "run_lifecycle", "reason":
   "orphaned_run_reconciliation"}`), through the ordinary queue and on a
   deterministic `source_event_id` under a fixed producer instance, so a second
-  recovery of the same Run dedupes. **It never claims a terminal** (spec:127):
+  recovery of the same Run dedupes. The call returns (and logs) how many Runs'
+  evidence the **intake accepted**, which is deliberately not how many rows
+  became durable: a re-recovery is accepted by the queue — nothing on the
+  accept path knows the store already holds it — and then absorbed by that
+  dedupe, so the count says one while nothing new is written, and the name, the
+  log line and the docstring all say *accepted* rather than *recorded*. **It never claims a terminal** (spec:127):
   the RunManager's statement is about the *Run*, and Ansich's control Belief is
   hard-fidelity evidence about what the Agent did, so `failed` would fabricate
   a terminal nobody observed and `completed` would be worse. The Task's control
@@ -3581,7 +3638,7 @@ Focused regression coverage for the updater lives in `backend/tests/test_memory_
 - `file_lock_timeout_seconds` - Scope-lock wait; Markdown facts and the recovery journal are required storage invariants rather than configurable modes
 - `retrieval_adapter` - Optional dotted factory receiving `DeerMemConfig` and returning a retrieval-port implementation
 - `debounce_seconds` - Wait time before processing (default: 30)
-- `shutdown_flush_timeout_seconds` - Host-shared hard budget (seconds) to drain the memory backend's pending-update buffer on Gateway graceful shutdown (default: 30; 1–300). Each pending item does one LLM call, so large IM batches may need more. The Gateway lifespan calls `MemoryManager.shutdown_flush(timeout)` after channels/scheduler stop; the backend short-circuits on an idle buffer, so the host calls it unconditionally (no pending/processing gate). Must fit inside the pod's K8s `terminationGracePeriodSeconds` (gateway Helm chart sets this; default 45s) or K8s SIGKILLs the drain mid-flight.
+- `shutdown_flush_timeout_seconds` - Host-shared hard budget (seconds) to drain the memory backend's pending-update buffer on Gateway graceful shutdown (default: 30; 1–300). Each pending item does one LLM call, so large IM batches may need more. The Gateway lifespan calls `MemoryManager.shutdown_flush(timeout)` after channels/scheduler stop; the backend short-circuits on an idle buffer, so the host calls it unconditionally (no pending/processing gate). Must fit inside the pod's K8s `terminationGracePeriodSeconds` **together with the other serial shutdown steps** (gateway Helm chart sets this; default 60s, which is preStop 5 + channels 5 + browser 5 + this 30 + run drain 5 + ansich 5 + buffer) or K8s SIGKILLs whichever step is running when the window ends.
 - `model_name` - LLM for updates (null = default model)
 - `max_facts` / `fact_confidence_threshold` - Fact storage limits (100 / 0.7)
 - `max_injection_tokens` - Token limit for prompt injection (2000)

@@ -145,16 +145,21 @@ class AnsichConfig(BaseModel):
         ),
     )
     shutdown_budget_ms: int = Field(
-        default=25_000,
+        default=5_000,
         ge=1,
         description=(
             "startup-only: total budget for the collector's whole shutdown sequence (spec 11 section 8): "
             "stop recording, stop this service's own timers, finish outstanding terminal barriers, drain "
             "the writer, stop claiming new projection work, join the projector, and write the process-wide "
             "loss bucket down. Each step takes the smaller of its own share and what is left, and a step "
-            "that times out does not stop the ones after it. The 25s default sits under a pod's default 45s "
-            "terminationGracePeriodSeconds with room for the Gateway lifespan's own steps, because a budget "
-            "the orchestrator will not honour is not a budget."
+            "that times out does not stop the ones after it. "
+            "The 5s default is what the Gateway's SERIAL shutdown leaves: this sequence runs LAST, in the "
+            "langgraph_runtime context manager's finally, after preStop sleep (5s) + channel stop (5s) + "
+            "browser sessions (5s) + memory flush (memory.shutdown_flush_timeout_seconds, 30s) + in-flight "
+            "run drain (5s) = 50s, against the gateway chart's terminationGracePeriodSeconds of 60s. 50 + 5 "
+            "leaves 5s of buffer; a larger budget here is only honoured if the pod's grace period is raised "
+            "with it, because SIGKILL landing mid-drain would lose the process-loss bucket this sequence "
+            "exists to write down -- and the report saying so with it."
         ),
     )
     heartbeat_interval_seconds: int = Field(

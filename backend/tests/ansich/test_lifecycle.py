@@ -898,8 +898,13 @@ async def test_orphan_correlation_writes_unknown_evidence_and_never_a_terminal(t
             assert task is not None and task.control.value == "running"
 
             assert await service.record_orphaned_run_evidence([run_id]) == 1
-            # A second recovery of the same Run is absorbed by the producer
-            # dedupe rather than filing the correlation twice.
+            # The return is **acceptances**, not rows filed, and the second
+            # call is where those two numbers legitimately part: a
+            # re-recovery of the same Run is accepted by the queue — nothing on
+            # the accept path knows the store already holds it — and then
+            # absorbed by the producer dedupe. So this is `1` and the row count
+            # below is still `1`; reading this number as "a row was written"
+            # is the mistake the name and the log line both refuse to make.
             assert await service.record_orphaned_run_evidence([run_id]) == 1
             assert await service.record_orphaned_run_evidence(["a-run-ansich-never-saw"]) == 0
             await service.flush_task(task_id)
@@ -910,6 +915,8 @@ async def test_orphan_correlation_writes_unknown_evidence_and_never_a_terminal(t
         finally:
             await service.stop()
 
+        # The durable truth beside the acceptance count above: two accepted
+        # recoveries, one row.
         degraded = [observation for observation in observations if observation.kind == "observability.degraded"]
         assert len(degraded) == 1
         assert degraded[0].payload == {"component": "run_lifecycle", "reason": "orphaned_run_reconciliation"}

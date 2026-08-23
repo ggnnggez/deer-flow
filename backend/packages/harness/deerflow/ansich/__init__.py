@@ -97,7 +97,7 @@ def create_sql_ansich_service(
     writer_backoff_max_ms: int = 5_000,
     writer_item_max_attempts: int = 2,
     stop_drain_timeout_ms: int = 10_000,
-    shutdown_budget_ms: int = 25_000,
+    shutdown_budget_ms: int = 5_000,
     health_database_timeout_ms: int = 2_000,
     projector_lease_seconds: int = 30,
     projector_max_attempts: int = 5,

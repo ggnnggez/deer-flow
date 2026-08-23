@@ -485,8 +485,17 @@ class _ScopeAwareBackend(_RecordingBackend):
         return [observation for observation in self.persisted if observation.kind == "observability.lost"]
 
 
+# One projection round against a real store is a claim, a projection and a
+# commit — tens of milliseconds, routinely. The fake round is that slow on
+# purpose: a sub-millisecond one passes for a reason production does not enjoy,
+# and it is exactly what hid the claim-stop step's false-wedge report (the
+# deadline is checked *between* rounds, so the loop legitimately answers one
+# round late).
+_PROJECTION_ROUND_SECONDS = 0.03
+
+
 class _EndlessProjectorBackend(_RecordingBackend):
-    """A store whose projection queue never empties.
+    """A store whose projection queue never empties, at a realistic round cost.
 
     Not a pathology: it is what a busy multi-worker store looks like from one
     worker at the moment it shuts down. The point is that the post-loop drain
@@ -499,7 +508,7 @@ class _EndlessProjectorBackend(_RecordingBackend):
 
     async def project_pending(self, *, limit: int = 100) -> int:
         self.rounds += 1
-        await asyncio.sleep(0)
+        await asyncio.sleep(_PROJECTION_ROUND_SECONDS)
         return 1
 
 
@@ -633,6 +642,16 @@ async def test_the_post_stop_projection_drain_stops_claiming_at_its_deadline() -
     always had claimable work. The claim-stop step writes a deadline the loop
     reads before every round, and reports that the deadline — not an empty
     store — is why it stopped.
+
+    **The step succeeds even though the loop answers one round late, and that
+    is the claim worth pinning.** ``_may_claim_projection`` is checked between
+    rounds, so with a realistic round the drain acknowledges the deadline tens
+    of milliseconds after it passes — while the deliverable, "no further round
+    may claim", landed the moment the deadline was written. An earlier form
+    waited 5ms for the acknowledgement and reported a wedge that had not
+    happened, which put ``completed=False`` on every healthy shutdown of a
+    Gateway with a backlog. The round still in flight is the *join's* to bound,
+    and the join returning cleanly here is what says nothing was wedged.
     """
 
     backend = _EndlessProjectorBackend()
@@ -648,11 +667,19 @@ async def test_the_post_stop_projection_drain_stops_claiming_at_its_deadline() -
     assert elapsed < _STOP_CEILING_SECONDS
     claim_stop = _steps(report)["stop_projection_claiming"]
     assert claim_stop.ok is True
-    assert claim_stop.detail == "claim_stop_deadline_reached"
+    assert claim_stop.timed_out is False
+    # Which of the two ok-details lands depends on whether the loop was inside
+    # a round when the deadline passed, which is a race the test does not need
+    # to win; both say the deadline is why claiming stopped.
+    assert claim_stop.detail is not None
+    assert claim_stop.detail.startswith("claim_stop_deadline_reached")
     # The loop is joined, not abandoned: a projector still running here would
     # project into a store the Gateway lifespan is about to close.
     assert _steps(report)["join_projector"].ok is True
     assert service._projector_task is None
+    # The whole point of the two facts above: a healthy shutdown against a
+    # store with a backlog reports itself complete.
+    assert report.completed is True
     assert service.get_health().status == "stopped"
 
 

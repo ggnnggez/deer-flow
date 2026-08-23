@@ -1210,6 +1210,12 @@ class LeaseSweepReport(BaseModel):
     generation moves and the zombie's write is dropped as usual — so the
     ordinary CAS covers the case and re-arming without a bump is safe.
 
+    ``to_retry`` / ``to_pending`` count rows the sweep's UPDATE **moved**, not
+    rows its SELECT chose: a peer worker can claim one of them in between, the
+    write's own ``status == 'processing'`` re-check declines it, and this
+    report says so by being one lower rather than by claiming a re-arm that did
+    not happen.
+
     ``truncated`` is the bound saying so out loud: the sweep reads at most
     ``limit`` rows per table so startup cannot turn into a full scan of a table
     with no retention. A truncated sweep is not a failure — the claim path

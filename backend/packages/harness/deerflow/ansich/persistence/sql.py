@@ -4788,6 +4788,12 @@ class SqlAnsichBackend:
         *live* worker claims the row the generation moves and the ordinary CAS
         drops the zombie's write as it always has.
 
+        The counts are what the UPDATE **moved**, not what the SELECT planned
+        to move: a peer can claim one of these rows between the two statements,
+        the re-check declines it, and a report that counted the intent would
+        overstate exactly the number an operator reads to decide whether
+        projection is moving.
+
         Bounded twice over: at most ``limit`` rows per table, read in
         ``job_id`` order so two passes cannot interleave into a cycle, and both
         reads are served by each table's ``(status, ...)``-leading claim index.
@@ -4828,9 +4834,19 @@ class SqlAnsichBackend:
                 for status, job_ids in (("retry", retry_ids), ("pending", pending_ids)):
                     if not job_ids:
                         continue
-                    await session.execute(update(model).where(model.job_id.in_(job_ids), model.status == "processing").values(status=status, lease_owner=None, lease_expires_at=None))
-                to_retry += len(retry_ids)
-                to_pending += len(pending_ids)
+                    result = await session.execute(update(model).where(model.job_id.in_(job_ids), model.status == "processing").values(status=status, lease_owner=None, lease_expires_at=None))
+                    # The rowcount, never `len(job_ids)`: the SELECT takes no
+                    # `FOR UPDATE`, so under READ COMMITTED a peer can claim one
+                    # of these rows between the read and the write. The
+                    # `status == 'processing'` re-check correctly declines to
+                    # move such a row -- and counting the intent instead would
+                    # have the startup line claim it re-armed work it did not
+                    # touch, in a report whose whole purpose is legibility.
+                    moved = int(result.rowcount or 0)
+                    if status == "retry":
+                        to_retry += moved
+                    else:
+                        to_pending += moved
         return LeaseSweepReport(to_retry=to_retry, to_pending=to_pending, truncated=truncated)
 
     async def persist_and_project(self, observations: list[ObservationEnvelope]) -> int:

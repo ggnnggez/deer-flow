@@ -119,7 +119,7 @@ class SpyAnsichService:
                 ShutdownStep(name="drain_unreported_loss", ok=False, timed_out=True, duration_ms=2_500, detail="unreported_global_lost_ranges=2"),
             ),
             total_ms=2_503,
-            budget_ms=25_000,
+            budget_ms=5_000,
             completed=False,
         )
 
@@ -164,4 +164,4 @@ async def test_gateway_lifespan_correlates_orphaned_runs_and_logs_the_shutdown_r
     assert steps[1].shutdown_step_detail == "unreported_global_lost_ranges=2"
     (summary,) = [record for record in caplog.records if getattr(record, "event", None) == "ansich.shutdown.completed"]
     assert summary.shutdown_completed is False
-    assert summary.shutdown_budget_ms == 25_000
+    assert summary.shutdown_budget_ms == 5_000

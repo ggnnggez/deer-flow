@@ -337,10 +337,16 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
         # would (review #6 on the original PR).
         #
         # K8s caveat: ``shutdown_flush_timeout_seconds`` must fit inside the
-        # pod's ``terminationGracePeriodSeconds`` (channel stop + browser
-        # session close + this drain + buffer), set on the gateway Helm
-        # deployment -- or K8s SIGKILLs the drain mid-flight and the loss this
-        # is fixing is silently re-introduced.
+        # pod's ``terminationGracePeriodSeconds`` **together with every other
+        # step**, because they are serial and this one is in the middle:
+        # preStop sleep (5s) + channel stop (5s) + browser session close (5s) +
+        # this drain (30s) + the in-flight run drain (5s, deps.py) + the Ansich
+        # shutdown sequence (``ansich.shutdown_budget_ms``, 5s, which runs last
+        # because ``langgraph_runtime`` wraps this whole block) + buffer. The
+        # gateway Helm deployment carries that arithmetic; get it wrong and K8s
+        # SIGKILLs whichever step is running when the grace period ends, which
+        # for the last two means losing exactly the records they exist to
+        # write.
         try:
             app_cfg = get_app_config()
             if app_cfg.memory.enabled:
