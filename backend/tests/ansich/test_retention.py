@@ -2746,7 +2746,14 @@ async def test_a_bounded_pass_resumes_mid_observation_tier(retention_backend):
 
     rest = await backend.run_retention(_POLICY, now=aged)
 
-    assert rest.resumed_from_cursor is False, "tier 2 resumes from the horizon, not from a cursor"
+    # Batch-final B6: this used to assert `False` with the reason "tier 2
+    # resumes from the horizon, not from a cursor" -- which describes the
+    # mechanism correctly and answers the wrong question. The field says whether
+    # *this pass picked up where another stopped*, and this one plainly did; the
+    # horizon is the position it picked up from, so it is now the third term the
+    # flag reads. Reporting `False` here made the commonest resume in the whole
+    # tiering invisible.
+    assert rest.resumed_from_cursor is True, "tier 2's resume position is the horizon, and a resume is a resume"
     assert bounded.observations_deleted + rest.observations_deleted == total
     assert await _observation_ids(sessions) == []
 
@@ -3367,6 +3374,10 @@ async def test_a_parent_scope_is_refused_before_anything_is_deleted(hard_delete_
     assert refusal.value.reason == "parent_scope"
     assert refusal.value.blocker == "ansich_scopes.parent_scope_id"
     assert refusal.value.scope_id == store.scope_id
+    # T10 N7 / batch-final B11: the message names *which* child, which is the
+    # one thing in this refusal the operator can act on. The reason and the
+    # blocker column say what rule fired; neither says where to go next.
+    assert store.neighbour_scope_id in str(refusal.value)
     assert await _observation_task_ids(sessions, store.doomed_tasks) == before
 
 
@@ -4151,7 +4162,7 @@ async def test_a_parent_scope_pin_is_deferrable_and_not_refused_up_front(hard_de
         await session.execute(update(AnsichScopeRow).where(AnsichScopeRow.entity_id == store.neighbour_scope_id).values(parent_scope_id=pinning_id))
 
     # The mirror sees it — which is the coupling the finding was about.
-    assert SqlAnsichBackend._scope_refusal_reason(pinning_id, scope_kind="thread", host_scope=host_scope_id(backend._hostname), has_child=True)[0] == "parent_scope"
+    assert SqlAnsichBackend._scope_refusal_reason(pinning_id, scope_kind="thread", host_scope=host_scope_id(backend._hostname), child_scope_id="child-scope")[0] == "parent_scope"
     assert "parent_scope" in _HARD_DELETE_DEFERRABLE_PIN_REFUSALS
 
     with pytest.raises(HardDeleteError) as refusal:
@@ -4175,16 +4186,16 @@ def test_every_scope_refusal_the_mirror_can_answer_is_classified():
 
     host = host_scope_id("some-host")
     answers = {
-        SqlAnsichBackend._scope_refusal_reason(host, scope_kind="host", host_scope=host, has_child=False),
-        SqlAnsichBackend._scope_refusal_reason("s-1", scope_kind="workspace", host_scope=host, has_child=False),
-        SqlAnsichBackend._scope_refusal_reason("s-2", scope_kind="thread", host_scope=host, has_child=True),
+        SqlAnsichBackend._scope_refusal_reason(host, scope_kind="host", host_scope=host, child_scope_id=None),
+        SqlAnsichBackend._scope_refusal_reason("s-1", scope_kind="workspace", host_scope=host, child_scope_id=None),
+        SqlAnsichBackend._scope_refusal_reason("s-2", scope_kind="thread", host_scope=host, child_scope_id="s-2-child"),
     }
     reasons = {answer[0] for answer in answers if answer is not None}
     assert reasons == {"host_scope", "shared_scope_kind", "parent_scope"}
     assert reasons & _HARD_DELETE_DEFERRABLE_PIN_REFUSALS == {"parent_scope"}
     assert _HARD_DELETE_DEFERRABLE_PIN_REFUSALS <= set(get_args(HardDeleteRefusal))
     # An erasable Scope answers nothing at all.
-    assert SqlAnsichBackend._scope_refusal_reason("s-3", scope_kind="thread", host_scope=host, has_child=False) is None
+    assert SqlAnsichBackend._scope_refusal_reason("s-3", scope_kind="thread", host_scope=host, child_scope_id=None) is None
 
 
 def _hd_admin_user() -> User:

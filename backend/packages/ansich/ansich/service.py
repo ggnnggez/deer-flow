@@ -91,6 +91,11 @@ _DROP_WARNING_INTERVAL_SECONDS = 60.0
 # incidents, and sharing one window would let either silence the other. What is
 # suppressed is counted, so the next line says how much it stands for.
 _ASSESSMENT_WARNING_INTERVAL_SECONDS = 60.0
+# And again for the projection drain, on its own window for the same reason: a
+# stalled projection queue and a failing assessment tick are different
+# incidents, and the projector loop polls faster than the tick, so sharing a
+# window would let the noisier one silence the quieter.
+_PROJECTION_WARNING_INTERVAL_SECONDS = 60.0
 _PRODUCER_ACCOUNT_LIMIT = 256
 #: How `stop()` apportions `shutdown_budget_ms` across its waiting steps.
 #:
@@ -404,6 +409,8 @@ class AnsichService:
         self._suppressed_drop_warning_count = 0
         self._last_assessment_warning_at: float | None = None
         self._suppressed_assessment_warning_count = 0
+        self._last_projection_warning_at: float | None = None
+        self._suppressed_projection_warning_count = 0
         self._loop: asyncio.AbstractEventLoop | None = None
         self._wake_event: asyncio.Event | None = None
         self._stop_event: asyncio.Event | None = None
@@ -4052,6 +4059,32 @@ class AnsichService:
             )
 
     async def _project_pending(self) -> int:
+        """One bounded projection drain, and the swallow that must not be silent.
+
+        The swallow itself is right and stays: the projector loop is periodic,
+        the next pass is a poll interval away, and letting a claim-time raise
+        kill the loop would trade one bad row for a collector that never projects
+        again.
+
+        **What was wrong is that it said nothing** (F10-36, batch-final finding
+        B5). A raise inside ``_claim_projection_job`` rolls back its own claim,
+        so ``attempts`` never increments and the job never reaches ``failed`` --
+        and because claims are ordered by ``ingest_seq``, one poison row is the
+        lowest claimable job forever and **all** projection stalls process-wide
+        while health still reports ``reachable`` and ``failed_jobs=0``. That
+        makes this the quietest failure in the system, and it is where RC6's one
+        deliberately-*loud* payload state (``missing`` -- corruption, as opposed
+        to a tombstone's policy outcome) arrives to be silenced. A reader of RC6
+        reasonably believes corruption will be noticed; this line is what starts
+        making that true.
+
+        It is a report, not a remedy: the poison row still blocks the queue, and
+        F10-36 owns the fix. Rate-limited on ``_report_assessment_failure``'s
+        window and shape for the same reason -- at the projector poll cadence a
+        per-failure warning is a flood -- with the suppressed count riding the
+        next line so the limit hides frequency, never the fact.
+        """
+
         project_pending = getattr(self._backend, "project_pending", None)
         if not callable(project_pending):
             return 0
@@ -4061,8 +4094,57 @@ class AnsichService:
         try:
             async with projection_lock:
                 return int(await project_pending(limit=self._batch_size * 2))
-        except Exception:
+        except Exception as error:
+            self._report_projection_failure(error)
             return 0
+
+    def _report_projection_failure(self, error: BaseException) -> None:
+        """Say a projection drain failed — always quietly, sometimes loudly.
+
+        ``_report_assessment_failure``'s sibling, on its **own** window, because
+        a stalled projection queue and a failing assessment tick are different
+        incidents and one sharing the other's window would let either silence
+        the other. Every logging call is fail-open: reporting a failure must not
+        become a second failure.
+        """
+
+        detected_at = datetime.now(UTC).isoformat()
+        try:
+            logger.debug(
+                "Ansich projection drain failed: %s",
+                error,
+                exc_info=error,
+                extra={
+                    "event": "ansich.projection.drain_failed",
+                    "detected_at": detected_at,
+                    "error_type": type(error).__name__,
+                },
+            )
+        except Exception:
+            pass
+        warning_at = time.monotonic()
+        if self._last_projection_warning_at is not None and warning_at - self._last_projection_warning_at < _PROJECTION_WARNING_INTERVAL_SECONDS:
+            self._suppressed_projection_warning_count += 1
+            return
+        suppressed = self._suppressed_projection_warning_count
+        try:
+            logger.warning(
+                "Ansich projection drain failed: error_type=%s detected_at=%s suppressed_projection_warnings=%d; a raise at claim time never becomes a failed job and stalls every projection behind it (F10-36)",
+                type(error).__name__,
+                detected_at,
+                suppressed,
+                extra={
+                    "event": "ansich.projection.drain_failed",
+                    "detected_at": detected_at,
+                    "error_type": type(error).__name__,
+                    "error_message": str(error),
+                    "suppressed_projection_warning_count": suppressed,
+                },
+            )
+        except Exception:
+            return
+        self._last_projection_warning_at = warning_at
+        self._suppressed_projection_warning_count = 0
 
     async def _project_until_task_settled(self, task_id: str) -> None:
         has_pending_for_task = getattr(self._backend, "has_pending_for_task", None)

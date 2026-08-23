@@ -1098,8 +1098,13 @@ class RetentionReport(BaseModel):
 
     ``batches`` counts committed batches across every tier that ran, which is
     also the number of times the durable cursor advanced. ``resumed_from_cursor``
-    says this pass began from a cursor an earlier interrupted pass left behind,
-    so a short report is legible as "picking up" rather than as "nothing to do".
+    says this pass began from a position an earlier pass left behind, so a short
+    report is legible as "picking up" rather than as "nothing to do". It reads
+    **three** positions, not two: the payload and structural cursors, and the
+    Observation deletion horizon, which is tier 2's resume position because that
+    tier has no cursor column of its own (spec §6 deviation 3). Without the
+    third term a pass resuming mid-tier-2 -- the commonest resume there is --
+    reported ``False``.
 
     ``finished`` is the completeness claim and it is deliberately weak: it is
     true only when every tier that ran walked its whole candidate set to the
@@ -1408,7 +1413,18 @@ class ReplayReport(BaseModel):
     durable failure anywhere in the projector is worth saying, but the number is
     not always this pass's own doing.
 
-    ``digest`` is ``None`` in exactly three situations, and none of them is an
+    ``expired_evidence`` is how many of the **targeted Observations** have had
+    their payload bodies tombstoned by retention's tier 1, and it is the
+    machine-readable half of the ``replayed`` caveat above (batch-final finding
+    B2). Those rows are targeted, minted and re-pended like any other, settle
+    ``completed``, and derive nothing — so a replay across a retention pass
+    honestly produces a *different* read model from the same Observation set, and
+    spec §11's determinism condition is a statement about a store no retention
+    pass has crossed. It is counted from the Observation and payload rows rather
+    than from this pass's jobs, so it answers for the whole target set and a dry
+    run can report it too. ``0`` means the evidence is all still there.
+
+    ``digest`` is ``None`` in exactly four situations, and none of them is an
     error the caller can fix by retrying:
 
     * ``unsettled > 0`` — a digest over a store that still owes work describes
@@ -1416,12 +1432,17 @@ class ReplayReport(BaseModel):
       history replayed to completion. Refusing to compute it is the point.
     * ``failed > 0`` — the same principle for the one state in which owned rows
       are *known* never to have been written.
+    * ``expired_evidence > 0`` — the digest would be honest about the rows it
+      hashed and dishonest about what it can be compared *with*: the same
+      Observation set replayed before the retention pass produced rows this one
+      cannot. Refusing the number is the only way to keep "two digests differ"
+      meaning "determinism is broken" rather than "somebody's retention ran".
     * the target projector exclusively owns no read-model table, so there is
       nothing to hash that the projector alone wrote (see
       ``_PROJECTOR_OWNED_TABLES``). Hashing the empty set would make every such
       replay "reproducible" by construction.
 
-    Because of the third case, **a missing digest is not by itself an incomplete
+    Because of the last case, **a missing digest is not by itself an incomplete
     pass**: three projectors honestly have none, and treating that as a failure
     would page an operator for a clean replay. ``unsettled`` and ``failed`` are
     what say whether work is owed.
@@ -1432,8 +1453,11 @@ class ReplayReport(BaseModel):
 
     ``errors`` is the free-text channel for everything above that has to be
     said in words: a round budget spent with work still owed, durably failed
-    jobs found for the target, a digest that was not computed and why. It is
-    prose for a human and is never parsed.
+    jobs found for the target, a digest that was not computed and why, and
+    **which of the two reasons an empty target set has** — a range retention or
+    an owner erasure removed, versus a filter that matched nothing (finding B4).
+    Both produce ``targeted == 0`` and the store can tell them apart, so it does.
+    It is prose for a human and is never parsed.
     """
 
     model_config = ConfigDict(frozen=True)
@@ -1446,6 +1470,7 @@ class ReplayReport(BaseModel):
     replayed: int
     unsettled: int
     failed: int = 0
+    expired_evidence: int = 0
     errors: tuple[str, ...] = ()
     watermark: int | None = None
     digest: str | None = None

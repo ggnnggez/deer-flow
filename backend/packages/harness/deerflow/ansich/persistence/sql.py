@@ -867,7 +867,7 @@ _DIGEST_SURROGATE_ORDER: dict[str, tuple[str, ...]] = {
 #: defect this batch found rather than introduced, and did not fix; see
 #: ``_NON_IDEMPOTENT_PROJECTORS``.)
 #:
-#: **Membership has two conditions, and both are mechanised.**
+#: **Membership has three conditions, and all three are mechanised.**
 #:
 #: 1. *Restoration.* ``tests/ansich/test_replay.py::TestReplaceIsDeterministic``
 #:    parametrizes over this set: for each member it replays, digests,
@@ -891,14 +891,35 @@ _DIGEST_SURROGATE_ORDER: dict[str, tuple[str, ...]] = {
 #:    ``tests/ansich/conftest.py`` leaves ``PRAGMA foreign_keys`` off, so the
 #:    cascade never fires there and only PostgreSQL would show it.
 #:
+#: 3. *Payload containment.* **This delete loop is a fourth last-referrer
+#:    deleter, and the obligation does not name it** (batch-final finding B1).
+#:    ``backend/AGENTS.md``'s rule -- whoever removes a payload's last referrer
+#:    owns the payload row -- binds the Observation tier, the structural tier and
+#:    the owner hard delete, which all discharge it through
+#:    ``_apply_plan_and_reclaim``; the replace path issues a bare
+#:    ``delete(model)`` per owned table and reclaims nothing. Tier 1 refuses
+#:    orphans in *both* directions, so a payload this path orphans is never
+#:    tombstoned and never swept: a permanent, uncatchable full-body leak whose
+#:    remedy is the deleter, never a widening of that predicate. So the owned
+#:    set, closed under cascade, must intersect ``_payload_referrer_columns()``'s
+#:    tables in the **empty set** -- pinned by
+#:    ``TestReplaceOwnsNoPayloadReferrer``. The counterexample this one exists
+#:    for is ``task-safety``: it *owns* ``ansich_authorization_snapshots``, whose
+#:    ``payload_id`` is a ``RESTRICT`` reference into ``ansich_payloads``, and
+#:    its cascade closure is empty -- so condition 2 already passes for it and
+#:    only the restorability proof stands between the allowlist and a leak. A
+#:    member that ever needs to own a referrer must route its delete through
+#:    ``_apply_plan_and_reclaim`` first; the condition is the cheap gate, not the
+#:    only possible answer.
+#:
 #: ``task-step`` therefore carries **two independent disqualifiers**: the
 #: cascade above, and (report §3) the fact that several of its projections
 #: short-circuit on rows in ``ansich_steps``, a shared table a replace does not
 #: clear. Neither is fixed by extending the fixture.
 #:
 #: Everything not listed is refused with ``replace_restore_unproven`` --
-#: unproven, not impossible. The way in is to satisfy both conditions and let
-#: the checks answer.
+#: unproven, not impossible. The way in is to satisfy all three conditions and
+#: let the checks answer.
 _REPLACE_PROVEN_PROJECTORS: frozenset[str] = frozenset(
     {
         "task-heartbeat",
@@ -2240,6 +2261,29 @@ def _periodic_budget_rows_statement():
     )
 
 
+def _running_task_ids_statement():
+    """Running Tasks' ids, in a worker-independent order.
+
+    The heartbeat half of the same lock-ordering requirement
+    ``_periodic_budget_rows_statement`` carries in full: ``assess_operations``
+    walks this result taking one ``FOR UPDATE`` on ``ansich_current_beliefs``
+    per Task inside a single transaction held to commit, so two workers reading
+    it in different native orders can take two rows in opposite orders and
+    deadlock -- and PostgreSQL resolves that by aborting one whole tick.
+
+    It is a module-level statement rather than an inline chain for one reason
+    that matters: the ``ORDER BY`` is the property, and a property nothing can
+    look at is one the next refactor can drop in silence. Both drivers are now
+    statements a test can compile and read the clause off
+    (``TestTheTickTraversalsAreOrdered``); before that, dropping either
+    ``ORDER BY`` left the whole suite green, since the PostgreSQL deadlock arms
+    script raw locks rather than exercising these drivers and SQLite cannot
+    deadlock at all (batch-final finding B7/R3).
+    """
+
+    return select(AnsichTaskSummaryRow.task_id).where(AnsichTaskSummaryRow.control_value == "running").order_by(AnsichTaskSummaryRow.task_id)
+
+
 def _projector_status_counts_statement():
     """Per-``(projector, version, status)`` counts over *unsettled* jobs only.
 
@@ -3322,7 +3366,16 @@ class SqlAnsichBackend:
                 # only `structural_cursor` set, and reading that as a fresh
                 # start would make the resume invisible on exactly the passes
                 # that resumed.
-                resumed_from_cursor = state.payload_cursor is not None or state.structural_cursor is not None
+                #
+                # **Three terms, not two** (batch-final finding B6). Tier 2 has
+                # no cursor column of its own -- the horizon *is* its resume
+                # position (§6 deviation 3), and `observation_cursor` belongs to
+                # the owner hard delete -- so a pass that stopped inside tier 2
+                # and one starting from scratch were reported identically. A
+                # non-zero horizon read here, before this pass moves it, means
+                # tier 2 will resume above a prefix an earlier pass deleted,
+                # which is the same statement the other two cursors make.
+                resumed_from_cursor = state.payload_cursor is not None or state.structural_cursor is not None or int(state.observation_horizon_ingest_seq or 0) > 0
                 state.last_run_started_at = started_at
                 state.last_run_finished_at = None
                 state.last_run_policy = policy.snapshot()
@@ -3601,6 +3654,21 @@ class SqlAnsichBackend:
         read ``expired`` for evidence that is merely *missing its job*. The
         prefix is the whole of what makes "at or below the horizon" a statement
         rather than a guess.
+
+        **There is no ``kind`` predicate here, and that includes §7's audit
+        rows** (batch-final finding B3). ``operator.action_*`` Observations --
+        including ``raw_payload_read``, the only record of who obtained raw
+        bytes -- are ordinary Observations and age out under ``observation_days``
+        like a heartbeat. Deliberate, not an oversight: the audit of a read of
+        one owner's data is itself data about that owner, and pinning it outside
+        retention would make it outlive the evidence it describes (the same
+        reading spec:97 ruled for ``activate_version``'s audit anchor). The
+        consequence an operator has to know is that ``observation_days`` is
+        therefore also the access-audit retention period -- written at
+        ``AnsichRetentionConfig``, where the knob is, and in ``backend/AGENTS.md``'s
+        §7 paragraph. Owner **hard delete** of audit rows is a separate,
+        separately-argued ruling (RC8's eighth delete family) and says nothing
+        about time.
 
         **The delete batch and the horizon advance commit in one transaction.**
         Not "horizon first" and not "horizon after": either order leaves a
@@ -4081,7 +4149,7 @@ class SqlAnsichBackend:
                 scope_id=scope_id,
             )
         child = await session.scalar(select(AnsichScopeRow.entity_id).where(AnsichScopeRow.parent_scope_id == scope_id).order_by(AnsichScopeRow.entity_id).limit(1))
-        refusal = SqlAnsichBackend._scope_refusal_reason(scope_id, scope_kind=scope.scope_kind, host_scope=host_scope, has_child=child is not None)
+        refusal = SqlAnsichBackend._scope_refusal_reason(scope_id, scope_kind=scope.scope_kind, host_scope=host_scope, child_scope_id=None if child is None else str(child))
         if refusal is not None:
             reason, explanation, blocker = refusal
             raise HardDeleteError(
@@ -4133,7 +4201,14 @@ class SqlAnsichBackend:
         parents = scopes.alias("child_scopes")
         host = host_scope_id(self._hostname)
         discovered = entities.join(observations, observations.c.obs_id == entities.c.discovered_obs_id).outerjoin(scopes, scopes.c.entity_id == entities.c.entity_id).outerjoin(parents, parents.c.parent_scope_id == entities.c.entity_id)
-        rows = sorted(
+        # Ordered by the statement, not re-sorted in Python (batch-final finding
+        # B10). The `sorted()` that used to wrap this compared 4-tuples whose
+        # second and third members come from outer joins and can be `None`, so a
+        # tie on `entity_id` would have raised `TypeError` mid-refusal -- and it
+        # bought nothing, because the `ORDER BY` below already gives the total
+        # order the loop needs (`entity_id` is the primary key, so there are no
+        # ties to break).
+        rows = list(
             await session.execute(
                 select(entities.c.entity_id, entities.c.entity_type, scopes.c.scope_kind, parents.c.entity_id.label("child"))
                 .select_from(discovered)
@@ -4151,7 +4226,7 @@ class SqlAnsichBackend:
             elif str(entity_type) != "scope":
                 continue
             else:
-                refusal = self._scope_refusal_reason(str(entity_id), scope_kind=None if scope_kind is None else str(scope_kind), host_scope=host, has_child=child is not None)
+                refusal = self._scope_refusal_reason(str(entity_id), scope_kind=None if scope_kind is None else str(scope_kind), host_scope=host, child_scope_id=None if child is None else str(child))
                 if refusal is None or refusal[0] in _HARD_DELETE_DEFERRABLE_PIN_REFUSALS:
                     # Either erasable outright, or refused for a reason the
                     # operator can *act on* -- a parent Scope clears once its
@@ -4169,7 +4244,7 @@ class SqlAnsichBackend:
             )
 
     @staticmethod
-    def _scope_refusal_reason(scope_id: str, *, scope_kind: str | None, host_scope: str, has_child: bool) -> tuple[HardDeleteRefusal, str, str | None] | None:
+    def _scope_refusal_reason(scope_id: str, *, scope_kind: str | None, host_scope: str, child_scope_id: str | None) -> tuple[HardDeleteRefusal, str, str | None] | None:
         """Why erasing this ``Scope`` would be refused, or ``None`` if it would not.
 
         **One mirror, two callers**, which is the whole point of the shape
@@ -4195,8 +4270,18 @@ class SqlAnsichBackend:
                 f"a {scope_kind!r} Scope, which is shared across owners; only {sorted(_HARD_DELETE_OWNER_SCOPE_KINDS)} name one owner's data",
                 f"{AnsichScopeRow.__tablename__}.scope_kind",
             )
-        if has_child:
-            return ("parent_scope", "the parent of another Scope; the children have to be erased first", f"{AnsichScopeRow.__tablename__}.parent_scope_id")
+        if child_scope_id is not None:
+            # The child's id is named, because it is the one **actionable**
+            # thing in this refusal (T10 N7 / batch-final B11): "erase the
+            # children first" without saying which child leaves the operator to
+            # go and find them, and the caller already holds the id. One child
+            # is enough -- the refusal repeats until the last one is gone, and
+            # listing them all would turn a message into a report.
+            return (
+                "parent_scope",
+                f"the parent of another Scope; the children have to be erased first, starting with {child_scope_id}",
+                f"{AnsichScopeRow.__tablename__}.parent_scope_id",
+            )
         return None
 
     @staticmethod
@@ -4306,6 +4391,20 @@ class SqlAnsichBackend:
         used to be collected here and thrown away, which is why an operator was
         told the proximate ``ansich_entities.discovered_obs_id`` instead of the
         removable Scope or AgentRelease that actually holds the row (F4).
+
+        **A ``blocked`` erasure leaves a resurrection window, and it is a known
+        v1 limitation rather than an oversight** (batch-final finding B8,
+        registered as a third shape under **F10-38**). Phase 2 has already
+        committed when phase 5 raises: the ``ansich_tasks`` row, its read models
+        and its assessor jobs are gone, while the Observations and their
+        projection jobs stand and both locks release. A replay or rebuild over
+        those surviving Observations re-derives the Task row and the read-model
+        rows -- partially resurrecting data an owner asked to have erased, until
+        the erasure is resumed. Phase 2's commit is *load-bearing* (it unpins
+        ``ansich_content_occurrences`` for the second satellite sweep) and the
+        surviving Scope row is the resumption anchor by design (T10 F1), so
+        neither half can simply be moved; the honest remedy is to resume the
+        erasure, and F10-38 carries the candidate fixes.
         """
 
         observations = AnsichObservationRow.__table__
@@ -5248,6 +5347,17 @@ class SqlAnsichBackend:
         have since expired -- and there the honest answer is precisely this one:
         the replay cannot re-derive those rows, says so, and does not report a
         failure an operator would try to fix.
+
+        **It is also reachable *concurrently*, inside one operator session, and
+        that is the shape that matters** (batch-final finding B9). The in-flight
+        guard runs under ``_PG_RETENTION_LOCK_KEY`` while a replay's re-pend runs
+        under ``_maintenance_lock`` -- distinct keys, deliberately, so a sweep
+        never serialises behind a rebuild -- so tier 1 can tombstone a payload
+        *underneath* jobs a replay re-pended a moment earlier. The outcome is
+        still correct (that is what this method is), but "since expired" would
+        read as a historical accident rather than as a live race, and it is the
+        live race that makes ``ReplayReport.expired_evidence`` worth reading on a
+        store an operator is sweeping right now.
         """
 
         async with self._session_factory() as session, session.begin():
@@ -6323,6 +6433,82 @@ class SqlAnsichBackend:
                 minted = await session.scalar(select(func.count()).select_from(AnsichObservationRow).where(condition, ~job_exists))
         return int(minted or 0), int(re_pended or 0)
 
+    @staticmethod
+    def _expired_evidence_condition(condition):
+        """Targeted Observations whose body retention has already taken.
+
+        A tombstone is the row with ``body IS NULL`` beside a ``deleted_at``
+        stamp -- the shape ``ck_ansich_payload_tombstone_one_of`` enforces --
+        and the join is an ``EXISTS`` so it costs one index probe per candidate
+        rather than materialising a payload id set.
+        """
+
+        payloads = AnsichPayloadRow.__table__
+        tombstoned = select(payloads.c.payload_id).where(
+            payloads.c.payload_id == AnsichObservationRow.payload_ref_id,
+            payloads.c.body.is_(None),
+            payloads.c.deleted_at.is_not(None),
+        )
+        return and_(condition, AnsichObservationRow.payload_ref_id.is_not(None), tombstoned.exists())
+
+    async def count_expired_evidence_targets(
+        self,
+        *,
+        projector_name: str,
+        projector_version: str,
+        selector: ReplaySelector,
+    ) -> int:
+        """How many of a target set's Observations have lost their bodies.
+
+        Batch-final finding B2. The number spec §11's determinism condition is
+        silently false without: a replay of a tombstoned Observation mints,
+        re-pends and then settles ``completed`` having derived **nothing**
+        (``_settle_expired_evidence_job``), so two digests taken either side of a
+        retention pass compare unequal with nothing in either report to say why.
+        Neither the digest gate's ``unsettled`` nor its ``failed`` can see it --
+        an expired settle is neither -- which is why it is counted here rather
+        than inferred from the pass.
+
+        Read from the **Observation and payload rows**, not from the jobs, so it
+        answers for the whole target set rather than for whatever this pass
+        happened to claim, and so a dry run can answer it too. It takes no lock:
+        a tombstone is permanent, so this count can only be *low* against a
+        concurrent tier-1 sweep, never high, and the pass reads it after its own
+        drive loop where the low direction is the one that cannot mislead.
+        """
+
+        condition = _replay_observation_condition(projector_name, projector_version, selector)
+        async with self._session_factory() as session:
+            count = await session.scalar(select(func.count()).select_from(AnsichObservationRow).where(self._expired_evidence_condition(condition)))
+        return int(count or 0)
+
+    async def observation_deletion_marks(self) -> tuple[int, int]:
+        """``(retention horizon, erasure cursor)`` -- what this store has deleted.
+
+        Batch-final finding B4. The two marks the receipt ladder already reads as
+        one question -- *has a deliberate deletion happened here* -- exposed for
+        the replay path, which could otherwise report a range retention removed
+        and a range the operator mistyped with the identical ``targeted: 0``.
+
+        Both are ``0`` on a store nothing has ever deleted, and ``0`` is a
+        complete answer rather than a missing one (``ingest_seq`` starts at 1);
+        see ``observation_retention_horizon`` for why reading it as "unknown"
+        reproduces the FC-3 flip.
+        """
+
+        async with self._session_factory() as session:
+            marks = (
+                await session.execute(
+                    select(
+                        AnsichRetentionStateRow.observation_horizon_ingest_seq,
+                        AnsichRetentionStateRow.observation_cursor,
+                    ).where(AnsichRetentionStateRow.id == _RETENTION_STATE_ID)
+                )
+            ).first()
+        if marks is None:
+            return 0, 0
+        return int(marks[0] or 0), int(marks[1] or 0)
+
     async def mint_replay_jobs(
         self,
         *,
@@ -6366,6 +6552,20 @@ class SqlAnsichBackend:
            by ``TestReplaceCascadeIsContained``). Within that closure a replace
            is still *not* a scoped rebuild: it re-derives one projector's own
            rows against a shared zone that keeps standing.
+
+           **This loop is also a last-referrer deleter and reclaims nothing**
+           (batch-final finding B1). ``backend/AGENTS.md``'s obligation binds the
+           two retention tiers and the owner hard delete by name -- all three
+           discharge it through ``_apply_plan_and_reclaim`` -- and this is the
+           fourth deleter, issuing a bare whole-table ``DELETE``. Membership
+           condition 3 there is what keeps that harmless: no proven projector's
+           cascade closure may reach a payload referrer at all, so this loop
+           never removes a payload's last referrer and has nothing to reclaim.
+
+           This delete does **not** consult the retention state, and it does not
+           have to: ``mint_replay_jobs`` refuses ``replace`` outright when any
+           targeted Observation's payload is tombstoned (see the check below),
+           so a replace never empties a table it can only half re-derive.
 
            One residual cost, currently **unreachable**: of the two minted-key
            tables (``_DIGEST_RANDOM_KEY_COLUMNS``) only
@@ -6429,6 +6629,17 @@ class SqlAnsichBackend:
         its ``FOR UPDATE`` set in that same order, so the two writers cannot
         cross-hold.
 
+        **A ``replace`` over expired evidence is refused here** (batch-final
+        finding B2), inside the transaction and before its first delete, so the
+        refusal leaves the store as it found it. ``_validate_replace_request``
+        cannot ask this -- it is pure, and this is a question about rows -- but
+        it is the same class of refusal: a replace whose target set includes a
+        tombstoned payload would empty the owned tables and re-derive only the
+        Observations whose bodies survive, reporting a digest over the remainder.
+        A plain replay of the same range is merely un-derivable and is allowed
+        (it says so in ``ReplayReport.expired_evidence``); only the destructive
+        combination is refused.
+
         Observations and payloads are never written, read-only, always
         (Global Constraint 3).
 
@@ -6462,6 +6673,22 @@ class SqlAnsichBackend:
         async with self._maintenance_lock():
             async with self._session_factory() as session, session.begin():
                 if replace:
+                    # Asked before the first delete, so a refusal costs nothing
+                    # but the answer (finding B2). Counted inside this session
+                    # rather than through `count_expired_evidence_targets` so it
+                    # is the *same* transaction the delete would run in: a
+                    # tier-1 sweep that lands between a separate read and this
+                    # write would otherwise slip a tombstone past the check.
+                    expired_targets = int(await session.scalar(select(func.count()).select_from(AnsichObservationRow).where(self._expired_evidence_condition(condition))) or 0)
+                    if expired_targets:
+                        raise ReplayTargetError(
+                            f"Ansich replay of {projector_name!r} cannot --replace over expired evidence: {expired_targets} targeted Observation(s) "
+                            "have retention-tombstoned payloads, so a whole-table delete would clear rows this pass cannot re-derive. "
+                            "Replay without --replace to re-derive what survives (the report counts what could not), or rebuild_projections() to re-derive the whole projection zone",
+                            reason="replace_over_expired_evidence",
+                            projector_name=projector_name,
+                            projector_version=projector_version,
+                        )
                     owned = frozenset(_PROJECTOR_OWNED_TABLES.get(projector_name, ()))
                     # Iterated in the rebuild's own order rather than the map's,
                     # so the foreign keys between the owned tables are respected
@@ -7754,6 +7981,19 @@ class SqlAnsichBackend:
           ``RuntimeError``, because a tombstone-less missing row is corruption
           and nothing about retention makes it less so. Retention never deletes
           a payload row; it empties one and stamps it.
+
+          **"Loud" is a property of this raise, not of what happens to it**
+          (batch-final finding B5, mechanism registered as **F10-36**). On the
+          claim path this raise happens inside ``_claim_projection_job``, so it
+          rolls its own claim back -- ``attempts`` never increments and the job
+          never reaches ``failed`` -- and ``AnsichService._project_pending``
+          catches it. Since claims are ordered by ``ingest_seq``, one such row is
+          the lowest claimable job forever and **all** projection stalls
+          process-wide. As of the same finding that swallow logs (DEBUG always,
+          WARNING rate-limited), so the corruption is at least *reported*; the
+          stall itself is F10-36's to fix. A reader of RC6 should know that the
+          one state kept deliberately loud is the one with the quietest
+          consequence.
 
         The fourth possibility, a row carrying neither an inline payload nor a
         reference, returns an empty dict and is deliberately **not** folded into
@@ -11149,8 +11389,10 @@ class SqlAnsichBackend:
             # the whole-tick loss this batch removes, by another door. See
             # `_periodic_budget_rows_statement` for the same argument in full
             # and for why the two Belief traversals in a tick do not need a
-            # serializing prefix against each other.
-            task_ids = tuple((await session.execute(select(AnsichTaskSummaryRow.task_id).where(AnsichTaskSummaryRow.control_value == "running").order_by(AnsichTaskSummaryRow.task_id))).scalars())
+            # serializing prefix against each other. The statement is built by
+            # `_running_task_ids_statement` so that the ordering it carries is
+            # something a test can read (finding B7/R3).
+            task_ids = tuple((await session.execute(_running_task_ids_statement())).scalars())
             for task_id in task_ids:
                 heartbeat_row = await session.scalar(
                     select(AnsichTaskHeartbeatRow)

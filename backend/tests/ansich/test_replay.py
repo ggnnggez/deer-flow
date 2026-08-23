@@ -51,8 +51,10 @@ from deerflow.ansich.persistence.models import (
     AnsichBeliefAssertionRow,
     AnsichCurrentBeliefRow,
     AnsichObservationRow,
+    AnsichPayloadRow,
     AnsichProjectionJobRow,
     AnsichProjectorVersionRow,
+    AnsichRetentionStateRow,
     AnsichStepRow,
     AnsichTaskBudgetRow,
     AnsichTaskHeartbeatRow,
@@ -79,6 +81,7 @@ from deerflow.ansich.persistence.sql import (
     SqlAnsichBackend,
     _active_version_registry,
     _cascade_delete_closure,
+    _payload_referrer_columns,
     _projectors_for_kind,
     _replay_observation_condition,
     _validate_replay_target,
@@ -1082,6 +1085,245 @@ class TestExecuteReplay:
         assert late_job.status == "completed"
 
 
+async def _tombstone_the_evidence(sessions: async_sessionmaker, obs_ids: set[str]) -> None:
+    """Turn live Observations into ones whose bodies retention has taken.
+
+    Written directly rather than driven through ``run_retention`` because what
+    is under test is the *replay's* reading of a tombstone, and the tier that
+    makes one has its own file. The shape is exactly what tier 1 leaves behind:
+    the payload row survives with ``body`` NULL beside its ``deleted_at`` and
+    ``policy`` stamp (``ck_ansich_payload_tombstone_one_of`` refuses anything
+    else), the lineage half is retained, and the Observation keeps pointing at
+    it with ``payload_json`` cleared -- which is what makes it *expired* rather
+    than *missing*.
+    """
+
+    async with sessions() as session, session.begin():
+        for obs_id in sorted(obs_ids):
+            row = await session.scalar(select(AnsichObservationRow).where(AnsichObservationRow.obs_id == obs_id))
+            assert row is not None
+            payload_id = new_id()
+            session.add(
+                AnsichPayloadRow(
+                    payload_id=payload_id,
+                    content_type="application/json",
+                    encoding="utf-8",
+                    compression="none",
+                    byte_size=128,
+                    sha256="0" * 64,
+                    body=None,
+                    deleted_at=datetime.now(UTC),
+                    policy="raw_payload_days=7",
+                )
+            )
+            row.payload_json = None
+            row.payload_ref_id = payload_id
+
+
+class TestReplayOverExpiredEvidenceIsNotSilent:
+    """Batch-final B2: the digest and the report were blind to tombstones.
+
+    Three facts composed into a silent falsehood. A replayed Observation whose
+    payload tier 1 tombstoned settles ``completed`` (it is a policy outcome, not
+    a failure), so neither ``unsettled`` nor ``failed`` can see it; the digest
+    gate had only those two clauses plus "owns no table"; and ``ReplayReport``
+    had no field for it, with the tombstone's lineage stamped into a
+    ``last_error`` that only the failed-job route reads. So two digests taken
+    either side of a retention pass compare **unequal**, and spec §11's
+    determinism condition reports a policy outcome as a violation with nothing
+    in either report to tell them apart.
+    """
+
+    @pytest.mark.anyio
+    async def test_the_count_and_the_refused_digest_name_the_expired_evidence(
+        self,
+        backend: tuple[SqlAnsichBackend, async_sessionmaker],
+        populated: dict[str, object],
+    ) -> None:
+        sql_backend, sessions = backend
+        expired = {sorted(populated["heartbeats_a"])[0]}
+        await _tombstone_the_evidence(sessions, expired)
+
+        report = await _replay_until_settled(sql_backend, projector_name="task-heartbeat", projector_version="1", selector=ReplaySelector())
+
+        assert report.unsettled == 0
+        assert report.failed == 0
+        assert report.expired_evidence == len(expired)
+        # The gate, and the whole point of it: nothing else in the report would
+        # have said this pass derived less than its target set.
+        assert report.digest is None
+        assert any("expired evidence" in error for error in report.errors)
+        # And the settle really is the `completed`-not-`failed` shape the gate
+        # exists to see past, rather than a failure the other clauses catch.
+        async with sessions() as session:
+            job = await session.scalar(
+                select(AnsichProjectionJobRow).where(
+                    AnsichProjectionJobRow.obs_id == next(iter(expired)),
+                    AnsichProjectionJobRow.projector_name == "task-heartbeat",
+                )
+            )
+        assert job is not None
+        assert job.status == "completed"
+
+    @pytest.mark.anyio
+    async def test_a_dry_run_reports_it_before_anything_is_re_pended(
+        self,
+        backend: tuple[SqlAnsichBackend, async_sessionmaker],
+        populated: dict[str, object],
+    ) -> None:
+        """Where an operator finds out, since the destructive form is refused."""
+
+        sql_backend, sessions = backend
+        await _tombstone_the_evidence(sessions, set(sorted(populated["heartbeats_a"])[:2]))
+        before = await _row_counts(sessions)
+
+        report = await plan_replay(sql_backend, projector_name="task-heartbeat", projector_version="1", selector=ReplaySelector())
+
+        assert await _row_counts(sessions) == before
+        assert report.expired_evidence == 2
+        assert any("tombstoned" in error for error in report.errors)
+
+    @pytest.mark.anyio
+    async def test_a_store_whose_evidence_is_intact_reports_zero_and_digests(
+        self,
+        backend: tuple[SqlAnsichBackend, async_sessionmaker],
+        populated: dict[str, object],
+    ) -> None:
+        """The clause must not fire on the ordinary store, or it says nothing."""
+
+        sql_backend, _ = backend
+        report = await _replay_until_settled(sql_backend, projector_name="task-heartbeat", projector_version="1", selector=ReplaySelector())
+        assert report.expired_evidence == 0
+        assert report.digest is not None
+        assert report.errors == ()
+
+    @pytest.mark.anyio
+    async def test_replace_over_expired_evidence_is_refused_before_it_deletes(
+        self,
+        backend: tuple[SqlAnsichBackend, async_sessionmaker],
+        populated: dict[str, object],
+    ) -> None:
+        """The one case where the loss is destructive rather than un-derivable.
+
+        A plain replay of a tombstoned range re-derives what survives and says
+        what it could not. A ``--replace`` empties the owned tables **first**, so
+        the rows whose evidence expired do not come back at all -- and the pass
+        would have reported a digest and exited ``0`` over it. The refusal is
+        raised inside the mint's transaction before its first delete, so the row
+        counts are the assertion that nothing was touched.
+        """
+
+        sql_backend, sessions = backend
+        await _tombstone_the_evidence(sessions, {sorted(populated["heartbeats_a"])[0]})
+        before = await _row_counts(sessions)
+
+        with pytest.raises(ReplayTargetError) as refused:
+            await execute_replay(
+                sql_backend,
+                projector_name="task-heartbeat",
+                projector_version="1",
+                selector=ReplaySelector(),
+                replace=True,
+            )
+
+        assert refused.value.reason == "replace_over_expired_evidence"
+        assert await _row_counts(sessions) == before
+
+
+class TestAnEmptyTargetSetSaysWhichKindOfEmpty:
+    """Batch-final B4: a deleted range and a mistargeted one read identically.
+
+    ``targeted: 0``, ``errors`` empty, exit ``0`` -- for an operator who typo'd a
+    ``--task-id`` and for one replaying a range retention or an owner erasure
+    removed. The store can answer it: the receipt ladder already reads the same
+    two marks as one question, and the replay path simply never consulted them.
+    """
+
+    @pytest.mark.anyio
+    async def test_a_range_below_the_deletion_marks_names_retention(
+        self,
+        backend: tuple[SqlAnsichBackend, async_sessionmaker],
+        populated: dict[str, object],
+    ) -> None:
+        sql_backend, sessions = backend
+        async with sessions() as session, session.begin():
+            session.add(AnsichRetentionStateRow(id=1, observation_horizon_ingest_seq=400, observation_cursor=None))
+
+        report = await plan_replay(
+            sql_backend,
+            projector_name="task-heartbeat",
+            projector_version="1",
+            selector=ReplaySelector(ingest_from=200, ingest_to=300),
+        )
+
+        assert report.targeted == 0
+        assert any("deleted evidence at or below ingest_seq 400" in error for error in report.errors)
+
+    @pytest.mark.anyio
+    async def test_a_hard_delete_cursor_answers_where_the_horizon_cannot(
+        self,
+        backend: tuple[SqlAnsichBackend, async_sessionmaker],
+        populated: dict[str, object],
+    ) -> None:
+        """The non-contiguous deleter's mark, which never raises the horizon."""
+
+        sql_backend, sessions = backend
+        async with sessions() as session, session.begin():
+            session.add(AnsichRetentionStateRow(id=1, observation_horizon_ingest_seq=0, observation_cursor=900))
+
+        report = await execute_replay(
+            sql_backend,
+            projector_name="task-heartbeat",
+            projector_version="1",
+            selector=ReplaySelector(ingest_from=800, ingest_to=850),
+        )
+
+        assert report.targeted == 0
+        assert any("erasure cursor 900" in error for error in report.errors)
+
+    @pytest.mark.anyio
+    async def test_a_mistargeted_range_says_the_filter_is_why(
+        self,
+        backend: tuple[SqlAnsichBackend, async_sessionmaker],
+        populated: dict[str, object],
+    ) -> None:
+        """The discriminator's other half, on a store that has deleted nothing.
+
+        Without this arm the note would be a constant dressed as an answer.
+        """
+
+        sql_backend, _ = backend
+        report = await plan_replay(
+            sql_backend,
+            projector_name="task-heartbeat",
+            projector_version="1",
+            selector=ReplaySelector(task_id="task-that-never-existed"),
+        )
+
+        assert report.targeted == 0
+        assert any("the filter, not retention, is why it is empty" in error for error in report.errors)
+
+    @pytest.mark.anyio
+    async def test_a_range_entirely_above_the_marks_is_not_blamed_on_retention(
+        self,
+        backend: tuple[SqlAnsichBackend, async_sessionmaker],
+        populated: dict[str, object],
+    ) -> None:
+        sql_backend, sessions = backend
+        async with sessions() as session, session.begin():
+            session.add(AnsichRetentionStateRow(id=1, observation_horizon_ingest_seq=40, observation_cursor=None))
+
+        report = await plan_replay(
+            sql_backend,
+            projector_name="task-heartbeat",
+            projector_version="1",
+            selector=ReplaySelector(ingest_from=900, ingest_to=1000),
+        )
+
+        assert report.targeted == 0
+        assert any("the filter, not retention, is why it is empty" in error for error in report.errors)
+
+
 class TestActiveTaskReadModelIsNotFrozen:
     """Global Constraint 4 / ruling RC3 -- the batch's most dangerous interaction.
 
@@ -1937,6 +2179,55 @@ class TestReplaceCascadeIsContained:
             "ansich_scope_conclusions",
             "ansich_task_spawns",
         } <= escapes
+
+
+class TestReplaceOwnsNoPayloadReferrer:
+    """Batch-final B1: ``--replace`` is a **fourth** last-referrer deleter.
+
+    ``backend/AGENTS.md``'s obligation -- *whoever removes a payload's last
+    referrer owns the payload row* -- was written after ``--replace`` shipped, and
+    binds itself by name to the Observation tier, the structural tier and the
+    owner hard delete, all three of which discharge it through
+    ``_apply_plan_and_reclaim``. The replace path is the fourth deleter and
+    discharges nothing: it issues a bare whole-table ``DELETE`` per owned table.
+
+    Tier 1 refuses orphans **in both directions**, so a payload whose last
+    referrer this path removed is never tombstoned and never swept -- an
+    uncatchable full-body leak, and AGENTS pre-refuses the wrong remedy (widening
+    that predicate). Rather than route the delete through the reclaim machinery
+    for a leak no member can produce today, this is a **third mechanised
+    membership condition** beside restorability and cascade containment: a
+    proven projector's owned set, closed under cascade, must touch no payload
+    referrer at all. It costs nothing while the allowlist stays payload-free and
+    turns red on the one-line edit that would arm the trap.
+    """
+
+    def test_no_proven_projectors_delete_reaches_a_payload_referrer(self) -> None:
+        referrers = {table.name for table, _column in _payload_referrer_columns()}
+        for projector_name in sorted(_REPLACE_PROVEN_PROJECTORS):
+            owned = frozenset(model.__table__.name for model in _PROJECTOR_OWNED_TABLES[projector_name])
+            reached = _cascade_delete_closure(owned) & referrers
+            assert not reached, f"--replace --projector {projector_name} deletes payload referrer(s) {sorted(reached)} without reclaiming their payload rows; see the last-referrer-deleter obligation in backend/AGENTS.md"
+
+    def test_task_safety_is_the_counterexample_this_condition_exists_for(self) -> None:
+        """Named, because it is the projector one line away from arming the trap.
+
+        ``task-safety`` **owns** ``ansich_authorization_snapshots``, whose
+        ``payload_id`` is a ``RESTRICT`` foreign key into ``ansich_payloads``, and
+        its cascade closure is empty -- so membership condition 2 already passes
+        for it and only the restorability proof is missing. Authorization
+        snapshots are plausibly re-derivable from ``authorization.*``
+        Observations, so that proof is the likely one to be attempted; this
+        condition is what stops the attempt from also shipping a payload leak.
+        """
+
+        referrers = {table.name for table, _column in _payload_referrer_columns()}
+        owned = frozenset(model.__table__.name for model in _PROJECTOR_OWNED_TABLES["task-safety"])
+        assert "task-safety" not in _REPLACE_PROVEN_PROJECTORS
+        # Condition 2 passes for it, which is exactly why condition 3 has to
+        # exist: cascade containment is not payload containment.
+        assert not (_cascade_delete_closure(owned) - owned)
+        assert _cascade_delete_closure(owned) & referrers == {"ansich_authorization_snapshots"}
 
 
 class TestReplaceIsProjectorScoped:

@@ -36,6 +36,7 @@ variant.
 from __future__ import annotations
 
 import contextlib
+import inspect
 from collections.abc import AsyncIterator, Iterator
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
@@ -1455,3 +1456,52 @@ async def test_first_write_upsert_refuses_a_dialect_it_cannot_render():
             index_elements=["task_id"],
             returning=AnsichTaskUsageRow.task_id,
         )
+
+
+class TestTheTickTraversalsAreOrdered:
+    """Batch-final B7/R3: nothing pinned the two restored ``ORDER BY``s.
+
+    T11's F1 fix ordered both of the operations tick's ``FOR UPDATE`` drivers
+    and proved, in the PostgreSQL tier, that the *crossed* order deadlocks. What
+    it could not prove is that the shipped path still sorts: the tier arm scripts
+    raw locks rather than driving these statements, and SQLite cannot deadlock at
+    all -- so deleting either ``ORDER BY`` left the whole suite green, and the
+    next refactor could undo a whole finding in silence.
+
+    The pin is the compiled statement, not a comment and not the row order of a
+    fixture: an ``ORDER BY`` a test can only observe through the rows it returns
+    is indistinguishable from a storage order that happened to agree. Both
+    drivers are module-level statement builders so that this can read the clause
+    off them, and the assertion is the **whole** clause rather than "ORDER BY
+    appears" -- a re-sorted or half-dropped key list is the same bug re-spelled,
+    and it is the *sequence* of locks, not their sortedness, that has to match
+    between workers.
+    """
+
+    def _order_by_clause(self, statement, dialect) -> str:
+        compiled = " ".join(str(statement.compile(dialect=dialect)).split()).lower()
+        assert " order by " in compiled, compiled
+        return compiled.split(" order by ", 1)[1]
+
+    @pytest.mark.parametrize("dialect", [sqlite.dialect(), postgresql.dialect()], ids=["sqlite", "postgresql"])
+    def test_the_heartbeat_driver_orders_by_task_id(self, dialect) -> None:
+        clause = self._order_by_clause(ansich_sql._running_task_ids_statement(), dialect)
+        assert clause == "ansich_task_summaries.task_id"
+
+    @pytest.mark.parametrize("dialect", [sqlite.dialect(), postgresql.dialect()], ids=["sqlite", "postgresql"])
+    def test_the_budget_driver_orders_by_the_triple_it_locks_on(self, dialect) -> None:
+        clause = self._order_by_clause(ansich_sql._periodic_budget_rows_statement(), dialect)
+        assert clause == "ansich_task_budgets.task_id, ansich_task_budgets.dimension, ansich_task_budgets.aggregation_scope"
+
+    def test_the_tick_uses_those_statements_rather_than_its_own(self) -> None:
+        """Otherwise the pin describes two builders nothing calls.
+
+        ``assess_operations`` is the single caller of both, and an inline
+        ``select`` beside them would satisfy every assertion above while locking
+        in native order.
+        """
+
+        source = inspect.getsource(ansich_sql.SqlAnsichBackend.assess_operations)
+        assert "_running_task_ids_statement()" in source
+        assert "_periodic_budget_rows_statement()" in source
+        assert "select(AnsichTaskSummaryRow.task_id)" not in source

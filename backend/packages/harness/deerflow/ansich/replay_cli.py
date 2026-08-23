@@ -26,6 +26,16 @@ that has to parse prose to decide whether to page someone will get it wrong:
   malformed filter, a ``--replace`` this build will not honour, or no SQL store
   configured). Re-running changes nothing.
 
+**A missing digest now has a fourth reason, and it is not a failure either**
+(batch-final finding B2): ``expired`` counts targeted Observations whose payload
+retention has already removed. Their jobs settle without deriving anything, so
+the read model this pass produced cannot be compared with one derived before the
+sweep -- the digest is refused rather than reported, and the count says why. The
+exit code is deliberately unchanged by it: nothing is owed and re-running would
+not bring the bytes back. ``--replace`` over such a target set is **refused**
+(``replace_over_expired_evidence``, exit ``2``), because there the owned tables
+are emptied before the re-derive and the missing rows do not come back.
+
 ``--replace`` is the destructive flag and reads as one: it empties the target
 projector's own read-model tables and re-derives them, so the report's digest
 describes rows this history actually produces rather than rows that merely
@@ -196,7 +206,11 @@ def exit_code(report: ReplayReport) -> int:
     ``_PROJECTOR_OWNED_TABLES``); paging on that would make a clean replay of
     ``task-structural`` look like an incident and train an operator to ignore
     the code. When a digest is missing *because* work is owed, the two counts
-    below already say so.
+    below already say so. ``expired_evidence`` is the same shape and stays out
+    for the same reason plus one of its own: a pass over evidence retention
+    removed owes nothing and cannot be re-run into a different answer, so exit
+    ``1`` would name a remedy that does not exist. It is reported in the counts
+    and in ``errors``, and the destructive case is refused at ``2`` instead.
 
     A dry run always exits ``0``: it reports, it changes nothing, and a plan
     that found a backlog is a successful plan.
@@ -236,6 +250,7 @@ def render(report: ReplayReport, *, output_format: str) -> str:
         f"replayed:  {report.replayed} (store-wide, not target-scoped)",
         f"unsettled: {report.unsettled}",
         f"failed:    {report.failed}",
+        f"expired:   {report.expired_evidence} (targeted Observation(s) whose payload retention removed)",
         f"watermark: {'unknown' if report.watermark is None else report.watermark}",
         f"digest:    {report.digest or '(none)'}",
     ]

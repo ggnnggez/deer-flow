@@ -183,6 +183,18 @@ class StorageUnavailableError(Exception):
 #:   Belief triple a replace neither owns nor clears — so replacing it rewrites
 #:   history into ``running -> running``. The remedy for such a projector is
 #:   ``rebuild_projections()``, which clears the shared zone too.
+#: * ``replace_over_expired_evidence`` — ``--replace`` was asked for a target set
+#:   whose evidence is partly gone. A payload tombstoned by retention's tier 1
+#:   leaves its Observation standing, so the replay still targets it, mints for
+#:   it and re-pends it — and then settles that job ``completed`` having derived
+#:   nothing (``_settle_expired_evidence_job``). For a plain replay that is
+#:   merely un-derivable; for a ``--replace`` it is **destructive**, because the
+#:   owned tables were emptied first and the rows that expired cannot come back.
+#:   The window is guaranteed by the policy itself (``raw_payload_days <=
+#:   observation_days``, defaults 7 and 30), so this refusal is the one that
+#:   keeps a clean-looking exit code from covering unrecoverable row loss.
+#:   The remedy is a plain replay (re-derives what it can, reports the rest) or,
+#:   for a store whose read models are genuinely wrong, ``rebuild_projections()``.
 #:
 #: ``not_executable`` covers **two** conditions, deliberately, because they
 #: share that one remedy and a caller never needs to tell them apart: the
@@ -198,6 +210,7 @@ ReplayTargetRefusal = Literal[
     "time_filter_unsupported",
     "filtered_replace_unsupported",
     "replace_restore_unproven",
+    "replace_over_expired_evidence",
 ]
 
 
@@ -208,6 +221,12 @@ class ReplayTargetError(ValueError):
     cleared — so a refusal costs the caller nothing but the answer. It is a
     ``ValueError`` because it describes a bad argument: the store is fine, the
     request names something this build cannot do.
+
+    One member is decided by the **store** rather than by the arguments alone
+    (``replace_over_expired_evidence``, which needs to know whether the target
+    set's payloads are still there). It keeps the same guarantee the others do —
+    it is raised inside the mint's transaction *before* the first delete, so a
+    refused replace leaves the store exactly as it found it.
 
     The refusal is carried as :attr:`reason` (a
     :data:`ReplayTargetRefusal` member) rather than left to be parsed out of

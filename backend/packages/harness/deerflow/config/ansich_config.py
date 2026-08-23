@@ -50,6 +50,23 @@ class AnsichRetentionConfig(BaseModel):
     switch as a bound (``raw_payload_days: 0`` means "delete evidence on
     arrival"; ``cleanup_batch_size: 0`` means a batch that deletes nothing and
     therefore never terminates).
+
+    **``observation_days`` is also the raw-read access-audit retention period,
+    and that is worth knowing before it is lowered** (batch-final finding B3).
+    Spec §7's audit rows -- ``operator.action_*`` with
+    ``action_type="raw_payload_read"``, the system's only record of who obtained
+    raw bytes -- are ordinary Observations, and the Observation tier filters by
+    age alone with no ``kind`` predicate. So they expire exactly like a
+    heartbeat, and lowering this knob for storage reasons silently shortens that
+    trail with no validator objection and no log line. **The behaviour is
+    deliberate**: the audit of a read of one owner's data is itself data about
+    that owner, and pinning it outside retention would make the audit outlive
+    the thing audited -- the same reading spec:97 already ruled for
+    ``activate_version``'s audit anchor, and the same principle owner erasure
+    applies when it deletes audit rows as its eighth delete family. There is no
+    ``audit_days`` knob; 30 days is accepted on the record here, and "audit rows
+    need their own floor" is registered as a followup for the wiring batch
+    rather than assumed.
     """
 
     raw_payload_days: int = Field(default=7, ge=1)

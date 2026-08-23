@@ -1293,6 +1293,70 @@ async def test_the_projector_loop_routes_a_failing_tick_to_the_reporter(tmp_path
     assert all(isinstance(error, RuntimeError) for error in reported)
 
 
+# --- projection-drain failure reporting (F10-36 / batch-final B5) -----------
+#
+# `_project_pending`'s `except Exception: return 0` is the place RC6's one
+# deliberately-loud payload state goes to die. A raise inside the claim rolls
+# back its own claim, so `attempts` never increments, the job never reaches
+# `failed`, and -- because claims are ordered by `ingest_seq` -- one poison row
+# stalls every projection in the process while health still reports `reachable`
+# and `failed_jobs=0`. The swallow stays (the loop must survive); the silence
+# does not.
+
+
+def _drain_failure_records(caplog: pytest.LogCaptureFixture, level: int) -> list[logging.LogRecord]:
+    return [record for record in caplog.records if getattr(record, "event", None) == "ansich.projection.drain_failed" and record.levelno == level]
+
+
+@pytest.mark.anyio
+async def test_a_failing_projection_drain_is_never_silent(tmp_path, caplog: pytest.LogCaptureFixture):
+    """DEBUG with the traceback every time; WARNING at most once per window.
+
+    Driven through `_project_pending` itself rather than through the reporter,
+    because the finding is about the swallow: the call must still answer `0`
+    (the loop survives) *and* leave a record behind.
+    """
+
+    engine, session_factory, service = await _started_service(tmp_path, "process-health-drain-log.db")
+
+    # Gated to this test's own task, `only_test_driven_assessments`'s
+    # discipline applied to the projector half: the loop calls
+    # `_project_pending` on its own cadence, so an ungated failure would make
+    # the record counts below a function of how long the test took.
+    test_task = asyncio.current_task()
+
+    async def _fails_for_this_test_only(*, limit: int = 0) -> int:
+        if asyncio.current_task() is not test_task:
+            return 0
+        raise RuntimeError("claim exploded")
+
+    service._backend.project_pending = _fails_for_this_test_only  # type: ignore[method-assign]
+    try:
+        with caplog.at_level(logging.DEBUG, logger="ansich.service"):
+            assert await service._project_pending() == 0
+            assert await service._project_pending() == 0
+            first_debug = _drain_failure_records(caplog, logging.DEBUG)
+            first_warnings = _drain_failure_records(caplog, logging.WARNING)
+
+            # Step past the rate-limit window without sleeping through it.
+            service._last_projection_warning_at = time.monotonic() - 3600.0
+            assert await service._project_pending() == 0
+            later_warnings = _drain_failure_records(caplog, logging.WARNING)
+    finally:
+        await service.stop()
+        await engine.dispose()
+
+    assert len(first_debug) == 2
+    assert all(record.exc_info is not None for record in first_debug)
+    assert len(first_warnings) == 1
+    assert first_warnings[0].suppressed_projection_warning_count == 0
+    assert len(later_warnings) == 2
+    assert later_warnings[1].suppressed_projection_warning_count == 1
+    # The window is its own, not the assessment tick's: a noisy poll cadence
+    # must not be able to silence the slower incident, or the reverse.
+    assert service._last_assessment_warning_at is None
+
+
 # --- F10-33: the episode first-writer race no longer costs the tick ----------
 
 

@@ -34,6 +34,19 @@ alone, a replace of a projector that has not been shown to do so is refused
 too. Both live in ``_validate_replace_request``, with the reasoning at
 ``_REPLACE_PROVEN_PROJECTORS``.
 
+**Retention is the other half of what a report has to say** (batch-final
+findings B2 and B4). Two of this module's numbers were blind to a store that had
+run a retention pass, and both blindnesses were silent. A replayed Observation
+whose payload tier 1 tombstoned settles ``completed`` having derived nothing, so
+``ReplayReport.expired_evidence`` counts them and the digest is refused when it
+is non-zero -- otherwise spec §11's determinism condition reports a policy
+outcome as a violation, with nothing in either report to tell them apart. And a
+range retention (or an owner erasure) removed matched nothing at all, which read
+identically to a mistyped ``--task-id``; the report now names which, from the
+same two deletion marks the receipt ladder consults. ``--replace`` over expired
+evidence is refused outright rather than reported, because there the tables are
+emptied first and the loss is not recoverable.
+
 **What an accepted target does and does not assert.** ``_validate_replay_target``
 answers three questions -- registered name, declared version, executable in
 this build -- and the third one is checked with a proxy: the dispatch chain's
@@ -117,6 +130,35 @@ def _replace_notes(projector_name: str, *, replace: bool) -> list[str]:
     return [f"replace: {len(tables)} read-model table(s) owned by {projector_name} cleared and re-derived ({names})"]
 
 
+async def _empty_target_note(backend: SqlAnsichBackend, selector: ReplaySelector) -> str:
+    """Why nothing matched: a deletion, or a filter that missed (finding B4).
+
+    The two are indistinguishable in every number a report carries -- ``targeted``
+    is ``0`` and ``errors`` was empty -- and they call for opposite next moves:
+    check the ``--task-id``, or accept that the evidence is gone. The store can
+    answer it, and already does one rung over: the receipt ladder reads the same
+    two marks as one question (*has a deliberate deletion happened here*), the
+    horizon for retention's contiguous prefix and ``observation_cursor`` for an
+    owner erasure, which cannot raise the horizon when a survivor sits below the
+    range it removed.
+
+    The consult is deliberately weak in one direction and says so: a selector
+    that starts at or below the mark *may* have lost rows to a deletion, and this
+    note claims no more than that. A selector whose range begins above the mark
+    cannot have, so that case gets the plain answer.
+    """
+
+    horizon, cursor = await backend.observation_deletion_marks()
+    mark = max(horizon, cursor)
+    if mark > 0 and (selector.ingest_from is None or selector.ingest_from <= mark):
+        return (
+            f"no Observation matched, and this store has deleted evidence at or below ingest_seq {mark} "
+            f"(retention horizon {horizon}, erasure cursor {cursor}) -- a target set inside that range is "
+            "empty because the rows were removed, not because the filter missed"
+        )
+    return "no Observation matched this target set, and nothing has been deleted at or below it -- the filter, not retention, is why it is empty"
+
+
 async def plan_replay(
     backend: SqlAnsichBackend,
     *,
@@ -154,12 +196,24 @@ async def plan_replay(
     )
     unsettled = await backend.unsettled_job_count()
     failed = await backend.failed_projection_job_count(projector_name=projector_name, projector_version=projector_version)
+    expired_evidence = await backend.count_expired_evidence_targets(
+        projector_name=projector_name,
+        projector_version=projector_version,
+        selector=selector,
+    )
     errors = ["dry run: nothing was written, so no digest was computed"]
     errors.extend(_replace_notes(projector_name, replace=replace))
     if unsettled:
         errors.append(f"{unsettled} job(s) unsettled in the store before this replay")
     if failed:
         errors.append(f"{failed} job(s) durably failed for {projector_name}@{projector_version} before this replay")
+    if expired_evidence:
+        # The dry run is where an operator finds this out for a `--replace`,
+        # because the real pass refuses it (`replace_over_expired_evidence`)
+        # rather than reporting it.
+        errors.append(f"{expired_evidence} targeted Observation(s) carry retention-tombstoned payloads; a replay settles those jobs without deriving any rows{', and --replace over them is refused' if replace else ''}")
+    if minted + re_pended == 0:
+        errors.append(await _empty_target_note(backend, selector))
     return ReplayReport(
         projector_name=projector_name,
         projector_version=projector_version,
@@ -169,6 +223,7 @@ async def plan_replay(
         replayed=0,
         unsettled=unsettled,
         failed=failed,
+        expired_evidence=expired_evidence,
         errors=tuple(errors),
         watermark=await backend.projection_continuity_mark(),
         digest=None,
@@ -266,6 +321,21 @@ async def execute_replay(
     if failed:
         errors.append(f"{failed} job(s) durably failed for {projector_name}@{projector_version}; see GET /operations/failed-jobs")
 
+    # Read **after** the drive loop, not before the mint. A tombstone is
+    # permanent, so a payload tier 1 expires mid-pass is caught here and would
+    # have been missed by a count taken up front -- and that concurrent shape is
+    # the reachable one, since retention holds its own advisory key and never
+    # queues behind this pass's maintenance lock (finding B9).
+    expired_evidence = await backend.count_expired_evidence_targets(
+        projector_name=projector_name,
+        projector_version=projector_version,
+        selector=selector,
+    )
+    if expired_evidence:
+        errors.append(f"{expired_evidence} targeted Observation(s) carry retention-tombstoned payloads; their jobs settled without deriving any rows, so this pass re-derived less than its target set")
+    if minted + re_pended == 0:
+        errors.append(await _empty_target_note(backend, selector))
+
     digest: str | None = None
     if unsettled:
         errors.append("no digest: a digest over a store that still owes work describes a state nobody asked for")
@@ -276,6 +346,17 @@ async def execute_replay(
         # read model with holes in it and compares unequal against the same
         # history replayed successfully, with nothing but prose to say why.
         errors.append("no digest: durably failed jobs mean rows this projector owns were never written")
+    elif expired_evidence:
+        # The fourth clause, and the one that makes spec §11's determinism
+        # condition true as stated instead of true-until-retention-runs
+        # (finding B2). The rows this pass *did* write are correct; what is
+        # false is the comparison the digest exists for, because the same
+        # Observation set replayed before the sweep produced rows this one
+        # cannot. `unsettled` and `failed` are both blind to it -- an expired
+        # settle is `completed` -- so without this clause the digest is
+        # computed, `errors` is empty and the CLI exits 0 over evidence that is
+        # gone.
+        errors.append(f"no digest: {expired_evidence} targeted Observation(s) have expired evidence, so this read model is not comparable with one derived before the retention pass")
     elif not _PROJECTOR_OWNED_TABLES.get(projector_name):
         errors.append(f"no digest: {projector_name} owns no read-model table exclusively, and hashing the empty set would report determinism nobody established")
     else:
@@ -290,6 +371,7 @@ async def execute_replay(
         replayed=replayed,
         unsettled=unsettled,
         failed=failed,
+        expired_evidence=expired_evidence,
         errors=tuple(errors),
         watermark=await backend.projection_continuity_mark(),
         digest=digest,
