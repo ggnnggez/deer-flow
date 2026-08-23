@@ -489,6 +489,13 @@ function Metric({
         <AnsichMetricHelp description={description} />
       </span>
       <span
+        // The tone is stated as data, not only as a colour (T14 F1). Three
+        // distinct claims — normal, "worth noticing", "something is failing" —
+        // reach the reader through Tailwind classes, so a test separating them
+        // could only assert on the class names, and a palette rename would drop
+        // that assertion without a single red. The attribute is what the
+        // component *means*; the classes are how it looks.
+        data-tone={unknown ? "unknown" : tone}
         className={cn(
           "font-mono font-medium tabular-nums",
           unknown && "text-muted-foreground",

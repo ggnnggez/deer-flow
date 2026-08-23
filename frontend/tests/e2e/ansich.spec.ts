@@ -2355,6 +2355,10 @@ test("observability lens keeps retention's three states apart", async ({
   // F10: the value is a *known* state, so it must not be rendered through the
   // muted affordance this panel reserves for "nobody could read this".
   await expect(finished).not.toHaveClass(/text-muted-foreground/);
+  // T14 F1: and it is the *notice* tone specifically, not the destructive one —
+  // asserted on the attribute rather than the colour, because a Tailwind rename
+  // would take a class assertion with it and leave this test green.
+  await expect(finished).toHaveAttribute("data-tone", "notice");
   // Zero is a value here — ingest sequences start at 1, so it means nothing
   // has been deleted yet, not that the number is missing.
   await expect(
