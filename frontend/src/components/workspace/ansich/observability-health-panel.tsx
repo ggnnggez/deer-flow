@@ -10,6 +10,7 @@ import {
   formatAnsichLag,
   formatAnsichSequence,
   formatAnsichTimestamp,
+  getActiveVersionMismatchReport,
   getDatabaseHealthPresentation,
   type AnsichActiveVersionRow,
   type AnsichDatabaseHealthBadge,
@@ -81,6 +82,7 @@ export function AnsichObservabilityHealthPanel({
 
   const database = getDatabaseHealthPresentation(health.database);
   const badge = databaseHealthBadge(database);
+  const mismatches = getActiveVersionMismatchReport(health);
 
   return (
     <section
@@ -218,6 +220,39 @@ export function AnsichObservabilityHealthPanel({
             </table>
           </div>
         )}
+        {/* This process's own startup scan, not the store's answer — so it is
+            rendered whether or not the block above could be read. Its three
+            states come straight from the wire and the first two are never
+            merged: rows nobody read are unknown, not clean. */}
+        <div className="border-t px-4 py-3 text-sm">
+          {mismatches.state === "unknown" ? (
+            <p className="text-muted-foreground">
+              {copy.activeVersionMismatchesUnknown}
+            </p>
+          ) : mismatches.state === "clean" ? (
+            <p className="text-muted-foreground">
+              {copy.activeVersionMismatchesClean}
+            </p>
+          ) : (
+            <div className="space-y-1">
+              <p className="text-destructive flex items-center gap-1 font-medium">
+                {copy.activeVersionMismatches}
+                <AnsichMetricHelp
+                  description={copy.metricDescriptions.activeVersionMismatches}
+                />
+              </p>
+              {mismatches.rows.map((row) => (
+                <p key={row.key} className="font-mono text-xs">
+                  {row.key}@{row.active_version}
+                  <span className="text-muted-foreground">
+                    {" · "}
+                    {copy.activeVersionMismatchReason[row.reason]}
+                  </span>
+                </p>
+              ))}
+            </div>
+          )}
+        </div>
       </div>
 
       <div className="rounded-lg border">
@@ -260,14 +295,23 @@ export function AnsichObservabilityHealthPanel({
                       )
                 }
                 description={copy.metricDescriptions.retentionFinishedAt}
-                unknown={database.retentionLastRun.unfinished}
+                // Not `unknown`: a pass that started and recorded no
+                // completion is a **known** state, and this panel's whole
+                // discipline is that the muted treatment means "nobody could
+                // read this". It gets its own affordance instead — worth
+                // noticing (a crash, a kill, a deploy mid-sweep), but not a
+                // durable failure, so not the destructive one either.
+                tone={
+                  database.retentionLastRun.unfinished ? "notice" : "normal"
+                }
               />
               <Metric
                 label={copy.retentionHorizon}
-                value={formatAnsichCount(
-                  database.retentionLastRun.horizon,
-                  locale,
-                )}
+                // A sequence mark, not a quantity: it is compared against the
+                // raw `ingest_seq` in a log line or an API response, so it is
+                // rendered ungrouped — the same rendering "settled through"
+                // gets two blocks up, and for the same reason.
+                value={formatAnsichSequence(database.retentionLastRun.horizon)}
                 description={copy.metricDescriptions.retentionHorizon}
               />
             </div>
@@ -424,8 +468,19 @@ function Metric({
   label: string;
   value: string;
   description: string;
+  /**
+   * Nobody could read this number. It is the muted treatment, and it is
+   * reserved for exactly that claim — a *known* state that happens to be bad
+   * must never borrow it, or the reader loses the one distinction this panel
+   * is built on.
+   */
   unknown?: boolean;
-  tone?: "normal" | "attention";
+  /**
+   * `attention` is something failing; `notice` is a known state worth reading
+   * twice that is not a failure. Both are known — neither implies the muted
+   * unknown treatment above.
+   */
+  tone?: "normal" | "attention" | "notice";
 }) {
   return (
     <div className="flex flex-col gap-0.5 text-sm">
@@ -438,6 +493,7 @@ function Metric({
           "font-mono font-medium tabular-nums",
           unknown && "text-muted-foreground",
           tone === "attention" && "text-destructive",
+          tone === "notice" && "text-amber-700 dark:text-amber-300",
         )}
       >
         {value}

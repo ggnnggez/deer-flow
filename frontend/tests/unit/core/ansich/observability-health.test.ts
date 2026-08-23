@@ -6,6 +6,7 @@ import {
   formatAnsichCount,
   formatAnsichLag,
   formatAnsichSequence,
+  getActiveVersionMismatchReport,
   getDatabaseHealthPresentation,
 } from "@/core/ansich/presentation";
 import type { AnsichDatabaseHealth } from "@/core/ansich/types";
@@ -492,5 +493,77 @@ describe("getDatabaseHealthPresentation retention", () => {
     expect(view.retentionLastRun?.finishedAt).toBeNull();
     expect(view.retentionLastRun?.policy).toEqual([]);
     expect(view.retentionLastRun?.horizon).toBe(0);
+  });
+});
+
+describe("getActiveVersionMismatchReport", () => {
+  it("keeps “nobody read the rows” apart from “the rows are clean”", () => {
+    // The backend's own three states (T13): `null` means the active-version
+    // table was never read — a backend that cannot answer, or a service that
+    // has not started — and an empty list means it *was* read and every row
+    // names something this build can execute. Collapsing the first into the
+    // second would report a rolled-back deployment as sound.
+    expect(getActiveVersionMismatchReport(undefined).state).toBe("unknown");
+    expect(getActiveVersionMismatchReport({}).state).toBe("unknown");
+    expect(
+      getActiveVersionMismatchReport({ active_version_mismatches: null }).state,
+    ).toBe("unknown");
+    expect(
+      getActiveVersionMismatchReport({ active_version_mismatches: [] }).state,
+    ).toBe("clean");
+  });
+
+  it("lists mismatching rows in a stable order", () => {
+    const report = getActiveVersionMismatchReport({
+      active_version_mismatches: [
+        {
+          component_kind: "resolver",
+          component_name: "ansich-default",
+          active_version: "9.9.9",
+          reason: "unknown_version",
+        },
+        {
+          component_kind: "projector",
+          component_name: "task-usage",
+          active_version: "3",
+          reason: "unknown_version",
+        },
+        {
+          component_kind: "projector",
+          component_name: "task-structural",
+          active_version: "2",
+          reason: "unknown_component",
+        },
+      ],
+    });
+    expect(report.state).toBe("mismatched");
+    // Ordered by component identity rather than by whatever order the scan
+    // happened to produce, so two reads of an unchanged deployment render the
+    // same list instead of one that reshuffles.
+    expect(report.rows.map((row) => row.key)).toEqual([
+      "projector/task-structural",
+      "projector/task-usage",
+      "resolver/ansich-default",
+    ]);
+    expect(report.rows[0]?.reason).toBe("unknown_component");
+  });
+
+  it("never reports a mismatched row as clean", () => {
+    // The one direction that must not fail open: a row this build cannot
+    // honour is a deployment fact an operator has to see, and the panel's
+    // clean line would say the opposite.
+    const report = getActiveVersionMismatchReport({
+      active_version_mismatches: [
+        {
+          component_kind: "projector",
+          component_name: "task-structural",
+          active_version: "2",
+          reason: "unknown_component_kind",
+        },
+      ],
+    });
+    expect(report.state).not.toBe("clean");
+    expect(report.state).not.toBe("unknown");
+    expect(report.rows).toHaveLength(1);
   });
 });

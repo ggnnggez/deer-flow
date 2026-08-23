@@ -260,6 +260,20 @@ answers with one entry per component — so the panel renders `null` as an expli
 "unknown while the store cannot be read" line, never as "no components". No alert
 type was invented for any of this and no exhaustive switch changed.
 
+Beneath that table the panel reports `AnsichHealth.active_version_mismatches` —
+stored rows this build was started with and cannot execute, typically a rollback
+past the version a row names (`getActiveVersionMismatchReport`). It is the one
+field in that block that is **not** the store's answer but this worker's own
+startup scan, so it is rendered whether or not the `database` block could be
+read. Three states, and the first two are never merged: `null`/absent means the
+rows were not read and renders as explicitly unknown, `[]` means they were read
+and every one names something this build can run, and a non-empty list renders
+each row with the reason named rather than left to be inferred from the version
+string. Nothing crashes over a mismatch — each affected reader falls back to the
+code default — which is exactly why it has to be visible instead of inferred
+from a fallback nobody sees. Rows are ordered by component identity so two reads
+of an unchanged deployment render the same list.
+
 The panel's last block is **retention**: when the last time-tiered pass ran,
 whether it finished, how far Observation deletion has reached, and the policy
 that pass ran under. It has **three** states and only two of them come from the
@@ -270,15 +284,32 @@ than by the store — an ordinary state, not a fault. Rendering "retention has
 never run" for an outage would report a fault as a configuration. Within a real
 pass, `finished_at: null` means a pass started and no completion was recorded (a
 crash, a kill, a deploy mid-sweep) and is rendered as "did not finish", not
-folded into "never run". `observation_horizon_ingest_seq` is not a per-pass
-number but the store's durable claim about completed deletion, and `0` is a
-value — ingest sequences start at 1. The policy snapshot is rendered from the
+folded into "never run" — and it gets its own affordance rather than the muted
+one, which this panel reserves for "nobody could read this": a pass that died
+mid-sweep is a *known* state, and borrowing the unknown treatment for it would
+spend the one distinction the panel is built on.
+`observation_horizon_ingest_seq` is not a per-pass number but the store's
+durable claim about completed deletion, and `0` is a value — ingest sequences
+start at 1. It is a **sequence mark**, so it renders ungrouped
+(`formatAnsichSequence`) exactly as "settled through" does: an operator compares
+it against the raw `ingest_seq` in a log line. The policy snapshot is rendered from the
 *pass* rather than from current configuration, because the configuration may
 have changed since, and its chips are sorted by key so two reads never reorder
 them. The copy also states the convergence property, because it is the thing an
 operator would otherwise misread: retention converges over repeated passes
 rather than in one, so a store that still has rows to expire after a pass is
 normal and not stuck.
+
+The Scopes & effects view (`AnsichScopeEffectsPanel`) carries one standing
+honesty note (F10-21): no production path records an effect with a `scope_id`,
+and both scope-violation findings (`attempted_scope_violation`,
+`realized_scope_violation`) require one — so those two findings cannot be
+produced against real data at all today. Their absence from that view is a
+property of the instrumentation, not evidence about the Task, and without the
+note the silence reads as a clean bill of health for a check that never ran.
+What the view can actually report is policy denials and unverified effects. The
+note stays until effects carry a Scope binding; the fix is a separate decision
+about which Scope a tool call's target resource belongs to.
 
 Environment trends render `expired_points` beside the sparkline's point count
 (`ansichExpiredPointCount`). An expired sample is **not** a point and never

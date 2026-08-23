@@ -68,6 +68,11 @@ const HEALTH = {
   },
   evicted_producer_count: 0,
   unreported_global_lost_range_count: 0,
+  // `[]` is the *clean* answer — the startup scan read the active-version rows
+  // and every one of them names something this build can execute. It is not
+  // the same wire value as `null`, which means the rows were never read, and
+  // the panel must not render the two the same way.
+  active_version_mismatches: [],
 };
 const TASK = {
   task_id: TASK_ID,
@@ -1621,6 +1626,166 @@ test("task detail scopes its projection banner to this Task's own failures", asy
   await expect(health).not.toContainText("Lost observations");
 });
 
+test("a completed retry reports both halves, never the re-arm count alone", async ({
+  page,
+}) => {
+  mockLangGraphAPI(page, { threads: [] });
+  const degradedHealth = { ...HEALTH, status: "degraded", failed_jobs: 1 };
+  const jsonBody = (body: unknown) => ({
+    status: 200,
+    contentType: "application/json",
+    body: JSON.stringify(body),
+  });
+  await page.route(`**/api/ansich/tasks/${TASK_ID}`, (route) =>
+    route.fulfill(jsonBody({ task: TASK, projection_status: degradedHealth })),
+  );
+  await page.route(`**/api/ansich/tasks/${TASK_ID}/timeline`, (route) =>
+    route.fulfill(
+      jsonBody({
+        items: [],
+        next_cursor: null,
+        projection_status: degradedHealth,
+      }),
+    ),
+  );
+  await page.route("**/api/ansich/operations/failed-jobs?*", (route) =>
+    route.fulfill(
+      jsonBody({
+        items: [
+          {
+            job_id: "3d0a5d5c-2f1a-4a5c-8f5a-2f6b1c9d4e77",
+            kind: "projection",
+            name: "task_projector",
+            version: "1",
+            task_id: TASK_ID,
+            status: "failed",
+            attempts: 2,
+            last_error: "projection worker crashed",
+            available_at: "2026-07-17T12:00:05Z",
+          },
+        ],
+        projection_status: degradedHealth,
+      }),
+    ),
+  );
+  // The route's own shape (`ansich.py::retry_failed_jobs`): `retried` is
+  // `RetryOutcome.re_armed` and `unsettled` is every job the store still owed
+  // when the retry returned — including the two this retry never touched.
+  await page.route("**/api/ansich/operations/failed-jobs/retry*", (route) =>
+    route.fulfill(
+      jsonBody({
+        retried: 1,
+        unsettled: 3,
+        projection_status: degradedHealth,
+      }),
+    ),
+  );
+
+  await page.goto(`/workspace/ansich/tasks/${TASK_ID}`);
+  await page.getByRole("button", { name: "Failed jobs: 1" }).first().click();
+  const dialog = page.getByRole("dialog");
+  await dialog
+    .getByRole("button", { name: "Retry all failed jobs for this Task" })
+    .click();
+
+  // Both numbers, and never `retried` on its own: a re-armed job is projected
+  // afterwards by whichever worker's loop reaches it, so "1 re-armed" has
+  // never been a claim that the failures are gone.
+  await expect(dialog.getByText("Re-armed 1, still unsettled 3")).toBeVisible();
+  // And the hint says literally what the second number counts, so 3 is not
+  // read as "3 of my 1 retried job failed".
+  await expect(
+    dialog.getByText("including work this retry did not touch", {
+      exact: false,
+    }),
+  ).toBeVisible();
+});
+
+test("scopes & effects says the two violation findings are unreachable today", async ({
+  page,
+}) => {
+  mockLangGraphAPI(page, { threads: [] });
+  const jsonBody = (body: unknown) => ({
+    status: 200,
+    contentType: "application/json",
+    body: JSON.stringify(body),
+  });
+  await page.route(`**/api/ansich/tasks/${TASK_ID}`, (route) =>
+    route.fulfill(jsonBody({ task: TASK, projection_status: HEALTH })),
+  );
+  await page.route(`**/api/ansich/tasks/${TASK_ID}/timeline`, (route) =>
+    route.fulfill(
+      jsonBody({ items: [], next_cursor: null, projection_status: HEALTH }),
+    ),
+  );
+  await page.route(`**/api/ansich/tasks/${TASK_ID}/steps`, (route) =>
+    route.fulfill(
+      jsonBody({ items: [], system_operations: [], projection_status: HEALTH }),
+    ),
+  );
+  await page.route(`**/api/ansich/tasks/${TASK_ID}/budgets`, (route) =>
+    route.fulfill(
+      jsonBody({
+        budgets: { task_id: TASK_ID, budgets: [] },
+        health: [],
+        projection_status: HEALTH,
+      }),
+    ),
+  );
+  await page.route(`**/api/ansich/tasks/${TASK_ID}/usage?*`, (route) =>
+    route.fulfill(
+      jsonBody({
+        usage: {
+          task_id: TASK_ID,
+          local: [],
+          inclusive: [],
+          inclusive_status: "available",
+        },
+        scope: "local",
+        values: [],
+        sources: [],
+        projection_status: HEALTH,
+      }),
+    ),
+  );
+  // `TaskScopeView` (`ansich/safety.py`): a ScopeDescriptor plus the relation
+  // that bound it to this Task.
+  await page.route(`**/api/ansich/tasks/${TASK_ID}/scopes`, (route) =>
+    route.fulfill(
+      jsonBody({
+        scopes: {
+          task_id: TASK_ID,
+          scopes: [
+            {
+              scope_id: "scope:sandbox:" + "c".repeat(64),
+              scope_kind: "sandbox",
+              external_ref_hash: "c".repeat(64),
+              display_label: "sandbox-e2e",
+              parent_scope_id: null,
+              created_obs_id: "0e695124-12f7-48fd-bc4e-54058924d85a",
+              relation_role: "sandbox_boundary",
+              relation_obs_id: "1f695124-12f7-48fd-bc4e-54058924d85a",
+              inherited_from_task_id: null,
+            },
+          ],
+        },
+        projection_status: HEALTH,
+      }),
+    ),
+  );
+
+  await page.goto(`/workspace/ansich/tasks/${TASK_ID}?view=resources`);
+  await expect(page.getByText("sandbox-e2e")).toBeVisible();
+  // F10-21: no production effect carries a Scope binding, and both violation
+  // findings require one. Without this sentence their absence reads as a clean
+  // bill of health for a check that never ran.
+  await expect(
+    page.getByText("cannot be reached on any production path today", {
+      exact: false,
+    }),
+  ).toBeVisible();
+});
+
 test("release compare separates observed quality from the structural diff", async ({
   page,
 }) => {
@@ -1973,6 +2138,22 @@ const DATABASE_HEALTH = {
       audit_obs_id: "3f2504e0-4f89-41d3-9a0c-0305e82c3301",
     },
   ],
+  // A pass that ran and finished. `policy` is the snapshot the *pass* ran
+  // under — the four fields `RetentionPolicy` carries — deliberately not
+  // current configuration, which may have changed since; and the horizon is
+  // the store's durable claim about completed Observation deletion rather than
+  // anything this pass alone did.
+  retention_last_run: {
+    started_at: "2026-08-22T09:00:00Z",
+    finished_at: "2026-08-22T09:04:00Z",
+    policy: {
+      raw_payload_days: 7,
+      observation_days: 30,
+      structural_days: 90,
+      cleanup_batch_size: 500,
+    },
+    observation_horizon_ingest_seq: 4211,
+  },
 };
 
 test("operations observability lens reports the store's own projection ledger", async ({
@@ -1997,6 +2178,17 @@ test("operations observability lens reports the store's own projection ledger", 
       body: JSON.stringify({
         ...HEALTH,
         failed_jobs: 1,
+        // One stored row this build cannot execute — a rollback past the
+        // version it names. Nothing crashes over it (the reader falls back to
+        // the code default), which is exactly why it has to be visible here.
+        active_version_mismatches: [
+          {
+            component_kind: "resolver",
+            component_name: "ansich-default",
+            active_version: "9.9.9",
+            reason: "unknown_version",
+          },
+        ],
         database: DATABASE_HEALTH,
       }),
     }),
@@ -2051,6 +2243,126 @@ test("operations observability lens reports the store's own projection ledger", 
       .filter({ hasText: /^Failed jobs seen here/ })
       .last(),
   ).toContainText("1");
+
+  // Retention: a pass that ran and finished. The horizon is the store's
+  // durable claim about completed Observation deletion and is a sequence mark,
+  // so it renders ungrouped beside grouped counts.
+  await expect(
+    panel
+      .locator("div")
+      .filter({ hasText: /^Deleted through/ })
+      .last(),
+  ).toContainText("4211");
+  // The policy is the snapshot the *pass* ran under, not current
+  // configuration, and its chips are key-sorted so two reads of the same row
+  // never reorder them under the reader — the stub deliberately sends them in
+  // the policy's own field order, which is not alphabetical.
+  await expect(panel.getByText(/^[a-z_]+=\d+$/)).toHaveText([
+    "cleanup_batch_size=500",
+    "observation_days=30",
+    "raw_payload_days=7",
+    "structural_days=90",
+  ]);
+  await expect(
+    panel.getByText("No retention pass has ever run against this store.", {
+      exact: false,
+    }),
+  ).toHaveCount(0);
+
+  // A stored version this build cannot run is a deployment fact, and the
+  // reason is named rather than left to be inferred from the version string.
+  await expect(
+    panel.getByText("Stored versions this build cannot run"),
+  ).toBeVisible();
+  await expect(panel.getByText("resolver/ansich-default@9.9.9")).toBeVisible();
+  await expect(
+    panel.getByText("this build does not have that version"),
+  ).toBeVisible();
+});
+
+test("observability lens keeps retention's three states apart", async ({
+  page,
+}) => {
+  mockLangGraphAPI(page, { threads: [] });
+  // The two `null` states are the pair that matters: a store nobody could read
+  // knows nothing, while a reachable store nobody has ever swept is an
+  // ordinary store, because retention is driven by a caller rather than by the
+  // store itself. Both answer `retention_last_run: null` on the wire.
+  let retentionLastRun: unknown = null;
+  await page.route("**/api/ansich/operations/active-tasks?*", (route) =>
+    route.fulfill({
+      status: 200,
+      contentType: "application/json",
+      body: JSON.stringify({
+        items: [ACTIVE_TASK],
+        next_cursor: null,
+        projection_status: HEALTH,
+      }),
+    }),
+  );
+  await page.route("**/api/ansich/health", (route) =>
+    route.fulfill({
+      status: 200,
+      contentType: "application/json",
+      body: JSON.stringify({
+        ...HEALTH,
+        database: { ...DATABASE_HEALTH, retention_last_run: retentionLastRun },
+      }),
+    }),
+  );
+
+  await page.goto("/workspace/ansich/operations");
+  await page.getByRole("tab", { name: "Observability" }).click();
+  const panel = page.getByRole("region", { name: "Observability health" });
+  // Reachable and never swept: an ordinary state, and it says so instead of
+  // borrowing the unreadable-store sentence.
+  await expect(
+    panel.getByText("No retention pass has ever run against this store.", {
+      exact: false,
+    }),
+  ).toBeVisible();
+  await expect(
+    panel.getByText("When retention last ran is unknown", { exact: false }),
+  ).toHaveCount(0);
+  // The rows were read and are clean — which is a different claim from not
+  // having read them, and the panel makes it in its own words.
+  await expect(
+    panel.getByText("Every stored version names something this build can run."),
+  ).toBeVisible();
+
+  // A pass that started and recorded no completion: a crash, a kill, or a
+  // deploy mid-sweep. A real, known state — never folded into "never run".
+  retentionLastRun = {
+    started_at: "2026-08-22T09:00:00Z",
+    finished_at: null,
+    policy: null,
+    observation_horizon_ingest_seq: 0,
+  };
+  await page.reload();
+  await page.getByRole("tab", { name: "Observability" }).click();
+  await expect(
+    panel.getByText("No retention pass has ever run against this store.", {
+      exact: false,
+    }),
+  ).toHaveCount(0);
+  const finished = panel
+    .locator("div")
+    .filter({ hasText: /^Last pass finished/ })
+    .last()
+    .locator("span")
+    .last();
+  await expect(finished).toHaveText("did not finish");
+  // F10: the value is a *known* state, so it must not be rendered through the
+  // muted affordance this panel reserves for "nobody could read this".
+  await expect(finished).not.toHaveClass(/text-muted-foreground/);
+  // Zero is a value here — ingest sequences start at 1, so it means nothing
+  // has been deleted yet, not that the number is missing.
+  await expect(
+    panel
+      .locator("div")
+      .filter({ hasText: /^Deleted through/ })
+      .last(),
+  ).toContainText("0");
 });
 
 test("observability lens renders an unreadable store as unknown, never as zero", async ({
@@ -2076,6 +2388,9 @@ test("observability lens renders an unreadable store as unknown, never as zero",
         ...HEALTH,
         status: "degraded",
         failed_jobs: 2,
+        // The rows were never read — a backend that could not answer. Unknown,
+        // and never to be reported as a clean deployment.
+        active_version_mismatches: null,
         database: {
           status: "unreachable",
           projectors: [],
@@ -2083,6 +2398,7 @@ test("observability lens renders an unreadable store as unknown, never as zero",
           failed_jobs: null,
           stale_completion_count: null,
           active_versions: null,
+          retention_last_run: null,
         },
       }),
     }),
@@ -2105,6 +2421,26 @@ test("observability lens renders an unreadable store as unknown, never as zero",
       .last(),
   ).toContainText("—");
   await expect(panel.getByRole("table")).toHaveCount(0);
+
+  // Same `null` on the wire as a store nobody has swept, and a different
+  // sentence: reporting an outage as "retention has never run" would report a
+  // fault as a configuration.
+  await expect(
+    panel.getByText("When retention last ran is unknown", { exact: false }),
+  ).toBeVisible();
+  await expect(
+    panel.getByText("No retention pass has ever run against this store.", {
+      exact: false,
+    }),
+  ).toHaveCount(0);
+
+  // Unread active-version rows are unknown, never clean.
+  await expect(
+    panel.getByText("unknown, not clean", { exact: false }),
+  ).toBeVisible();
+  await expect(
+    panel.getByText("Every stored version names something this build can run."),
+  ).toHaveCount(0);
 
   // The endpoint still answers with the process block when storage is down, and
   // so does the panel.

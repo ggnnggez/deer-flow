@@ -488,6 +488,14 @@ export interface Translations {
         activated_expired: string;
         activated_unaudited: string;
       };
+      activeVersionMismatches: string;
+      activeVersionMismatchesUnknown: string;
+      activeVersionMismatchesClean: string;
+      activeVersionMismatchReason: {
+        unknown_component_kind: string;
+        unknown_component: string;
+        unknown_version: string;
+      };
       retention: string;
       retentionUnknown: string;
       retentionNeverRun: string;
@@ -507,6 +515,7 @@ export interface Translations {
         processFailedJobs: string;
         processLag: string;
         activeVersions: string;
+        activeVersionMismatches: string;
         retention: string;
         retentionStartedAt: string;
         retentionFinishedAt: string;
@@ -567,6 +576,7 @@ export interface Translations {
     scopesAndEffects: string;
     scopes: string;
     noScopes: string;
+    scopeViolationUnreachable: string;
     effectIntent: string;
     effectObserved: string;
     coverage: string;

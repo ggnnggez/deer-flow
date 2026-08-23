@@ -1,5 +1,6 @@
 import type {
   AnsichActiveVersion,
+  AnsichActiveVersionMismatch,
   AnsichActiveVersionOrigin,
   AnsichAlertType,
   AnsichDatabaseHealth,
@@ -641,6 +642,53 @@ export interface AnsichActiveVersionRow {
   isCodeDefault: boolean;
   activatedAt: string | null;
   activatedBy: string | null;
+}
+
+/** One unhonourable active-version row, shaped for the panel. */
+export interface AnsichActiveVersionMismatchRow extends AnsichActiveVersionMismatch {
+  /** `kind/name` — stable across reads, unique per component. */
+  key: string;
+}
+
+/**
+ * What this build's startup active-version scan can say.
+ *
+ * Three states because the wire has three, and the first two are the pair that
+ * must not be merged: `unknown` is "nobody read the rows" and `clean` is "they
+ * were read and every one names something this build can run". A `?? []` at
+ * the call site would collapse the first into the second and report a backend
+ * that could not answer as a sound deployment.
+ */
+export interface AnsichActiveVersionMismatchReport {
+  state: "unknown" | "clean" | "mismatched";
+  rows: AnsichActiveVersionMismatchRow[];
+}
+
+/**
+ * Project the process block's active-version mismatches for display.
+ *
+ * Rows are ordered by component identity rather than by whatever order the
+ * startup scan produced, so two reads of an unchanged deployment render the
+ * same list — the same discipline the retention policy chips follow.
+ */
+export function getActiveVersionMismatchReport(
+  health:
+    | { active_version_mismatches?: AnsichActiveVersionMismatch[] | null }
+    | null
+    | undefined,
+): AnsichActiveVersionMismatchReport {
+  const mismatches = health?.active_version_mismatches;
+  if (mismatches === null || mismatches === undefined) {
+    return { state: "unknown", rows: [] };
+  }
+  if (mismatches.length === 0) return { state: "clean", rows: [] };
+  const rows = mismatches
+    .map((entry) => ({
+      ...entry,
+      key: `${entry.component_kind}/${entry.component_name}`,
+    }))
+    .sort((left, right) => left.key.localeCompare(right.key));
+  return { state: "mismatched", rows };
 }
 
 /**

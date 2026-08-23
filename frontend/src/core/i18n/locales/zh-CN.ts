@@ -587,6 +587,15 @@ export const zhCN: Translations = {
         activated_expired: "已切换，审计记录已过期",
         activated_unaudited: "已切换，从未留下审计",
       },
+      activeVersionMismatches: "本次构建无法执行的存储版本",
+      activeVersionMismatchesUnknown:
+        "存储里的版本行是否都能被本次构建执行，这一点没有被读取过——是未知，而不是干净。",
+      activeVersionMismatchesClean: "存储里的每一条版本行，本次构建都能执行。",
+      activeVersionMismatchReason: {
+        unknown_component_kind: "本次构建没有这一类组件",
+        unknown_component: "本次构建没有这个组件",
+        unknown_version: "本次构建没有这个版本",
+      },
       retention: "保留策略",
       retentionUnknown: "存储读不到时，保留策略上次运行的时间是未知的。",
       retentionNeverRun:
@@ -621,6 +630,8 @@ export const zhCN: Translations = {
         processFailedJobs:
           "本 worker 自己看到的失败任务数。它只是参考：其它 worker 的失败不在其中，请与上方的权威口径对照。",
         processLag: "本进程内采集器自身的滞后，与存储侧积压落后多远是两回事。",
+        activeVersionMismatches:
+          "存储里存在、但本次构建执行不了的生效版本行——通常是回滚到了该行所指版本之前。它是本 worker 自己的启动扫描结果，不是存储侧的回答，因此无论存储读不读得到都会报告。它不会导致崩溃，也不会丢数据：受影响的读取各自回退到本次构建的代码默认版本，所以这是一条部署提示而不是故障。没有被读取过的行报告为未知，绝不报告为干净。",
         activeVersions:
           "每个带版本的组件当前以哪个版本为准。没有人切换过的组件跑的就是本次构建的默认版本，并会被明确标出——这张表记录的是“偏离默认”，因此没有存储行本身就是一个完整答案，而不是缺失。切换是一次显式且被审计的操作；“审计记录已过期”指切换确实发生过、其证据后来按保留策略老化掉了，而“从未留下审计”指压根没有写下证据，是唯一值得追问的状态。",
       },
@@ -681,6 +692,8 @@ export const zhCN: Translations = {
     scopesAndEffects: "Scope 与副作用",
     scopes: "作用域",
     noScopes: "尚未观测到 Task 作用域。",
+    scopeViolationUnreachable:
+      "「尝试越出作用域」「已发生作用域违规」这两类结论目前在生产路径上不可达：记录下来的副作用不携带 Scope 绑定，而这两类结论都要求它。因此它们在这里没有出现，并不说明本 Task 没有越权——这个视图真正能报告的是策略拒绝与未验证副作用。",
     effectIntent: "副作用意图",
     effectObserved: "已观测副作用",
     coverage: "观测覆盖度",

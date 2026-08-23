@@ -205,6 +205,38 @@ export interface AnsichHealth {
    * here so the gap is visible rather than inferred from its absence elsewhere.
    */
   unreported_global_lost_range_count: number;
+  /**
+   * What this process's startup active-version validation saw.
+   *
+   * Three states, and the first two must never be merged: `null`/absent means
+   * the rows were **not read** — a backend that could not answer, or one that
+   * predates the field — while `[]` means they were read and every one of them
+   * names something this build can execute. Reporting an unreadable table as a
+   * clean deployment is the same never-zero mistake the `database` block's
+   * `null`s exist to prevent, one level up.
+   *
+   * It is the one field here that is not about collection at all: a mismatch
+   * is a fact about the *deployment* (a row naming a version this build was
+   * rolled back past), and every reader it affects already falls back to the
+   * code default — which is why it is carried beside the status rather than
+   * routed into it.
+   */
+  active_version_mismatches?: AnsichActiveVersionMismatch[] | null;
+}
+
+/**
+ * One stored active-version row this build can no longer honour.
+ *
+ * `reason` says which question failed, and all three are statements about
+ * whether this build *knows* the version — never about whether that version
+ * behaves well against the evidence a particular store holds, which is a
+ * runtime condition handled at the read.
+ */
+export interface AnsichActiveVersionMismatch {
+  component_kind: string;
+  component_name: string;
+  active_version: string;
+  reason: "unknown_component_kind" | "unknown_component" | "unknown_version";
 }
 
 /**

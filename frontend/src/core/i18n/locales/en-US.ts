@@ -606,6 +606,16 @@ export const enUS: Translations = {
         activated_expired: "activated, audit expired",
         activated_unaudited: "activated, never audited",
       },
+      activeVersionMismatches: "Stored versions this build cannot run",
+      activeVersionMismatchesUnknown:
+        "Whether every stored version is one this build can run was not read — unknown, not clean.",
+      activeVersionMismatchesClean:
+        "Every stored version names something this build can run.",
+      activeVersionMismatchReason: {
+        unknown_component_kind: "this build has no component of that kind",
+        unknown_component: "this build does not have that component",
+        unknown_version: "this build does not have that version",
+      },
       retention: "Retention",
       retentionUnknown:
         "When retention last ran is unknown while the store cannot be read.",
@@ -643,6 +653,8 @@ export const enUS: Translations = {
           "When the last pass completed. “Did not finish” means a pass started and no completion was recorded — a crash, a kill, or a deploy mid-sweep — and is deliberately not shown the same way as a store nobody has ever swept.",
         retentionHorizon:
           "The ingest sequence at or below which Observation deletion is complete and contiguous. It is what lets a receipt for a deleted Observation answer “expired” instead of being mistaken for a lost write. Zero means nothing has been deleted yet — sequences start at 1.",
+        activeVersionMismatches:
+          "Stored active-version rows this build was started with and cannot execute — typically a rollback past the version a row names. It is this worker's own startup scan, not the store's answer, so it is reported whether or not the store can be read. Nothing crashes and nothing is lost: each affected reader falls back to the build's code default, which is why this is a deployment note rather than a failure. Rows that were never read are reported as unknown, never as clean.",
         activeVersions:
           "Which version of each versioned component is authoritative. A component nobody has switched runs the build's own default and is marked as such — the store records deviations, so no stored row is a complete answer rather than a missing one. A switch is a deliberate, audited command; “audit expired” means the switch happened and its evidence has since aged out under retention, while “never audited” means no evidence was ever recorded and is the one state worth asking about.",
       },
@@ -704,6 +716,8 @@ export const enUS: Translations = {
     scopesAndEffects: "Scopes & effects",
     scopes: "Scopes",
     noScopes: "No Task scopes were observed.",
+    scopeViolationUnreachable:
+      "Scope-violation findings (attempted and realized) cannot be reached on any production path today: recorded effects carry no Scope binding, and both findings require one. Their absence here says nothing about whether this Task stayed inside its Scopes \u2014 what this view can actually report is policy denials and unverified effects.",
     effectIntent: "Effect intent",
     effectObserved: "Observed effects",
     coverage: "Observation coverage",

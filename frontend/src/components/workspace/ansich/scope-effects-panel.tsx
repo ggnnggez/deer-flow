@@ -47,20 +47,33 @@ export function AnsichScopeEffectsPanel({
         <CardHeader>
           <CardTitle>{t.ansich.scopes}</CardTitle>
         </CardHeader>
-        <CardContent className="flex flex-wrap gap-2">
-          {scopes.length === 0 ? (
-            <p className="text-muted-foreground text-sm">{t.ansich.noScopes}</p>
-          ) : (
-            scopes.map((scope) => (
-              <Badge
-                key={`${scope.scope_id}:${scope.relation_role}`}
-                variant="outline"
-              >
-                {scope.scope_kind}: {scope.display_label} ·{" "}
-                {scope.relation_role}
-              </Badge>
-            ))
-          )}
+        <CardContent className="space-y-3">
+          <div className="flex flex-wrap gap-2">
+            {scopes.length === 0 ? (
+              <p className="text-muted-foreground text-sm">
+                {t.ansich.noScopes}
+              </p>
+            ) : (
+              scopes.map((scope) => (
+                <Badge
+                  key={`${scope.scope_id}:${scope.relation_role}`}
+                  variant="outline"
+                >
+                  {scope.scope_kind}: {scope.display_label} ·{" "}
+                  {scope.relation_role}
+                </Badge>
+              ))
+            )}
+          </div>
+          {/* F10-21, the honest half. Recorded effects carry no Scope binding
+              on any production path, so the two scope-violation conclusions
+              cannot be produced at all there. Their absence from this view is
+              therefore a property of the instrumentation, not evidence about
+              this Task — and without this line the silence reads as a clean
+              bill of health. */}
+          <p className="text-muted-foreground text-xs">
+            {t.ansich.scopeViolationUnreachable}
+          </p>
         </CardContent>
       </Card>
       {toolCalls.length === 0 ? (
