@@ -2010,11 +2010,12 @@ hashing — `ansich_content_occurrences.created_at` and
 `ansich_environment_*.updated_at` columns collateral. A determinism digest must
 not hash *when the projection ran*: today a `task-step` double replay agrees
 only because those rows are inserted if-absent and a replay never deletes them,
-so T5's `--replace` would otherwise make the §11 digests differ by construction
+so `--replace` would otherwise make the §11 digests differ by construction
 with nothing going red (the §11 test drives `task-heartbeat`, which has no such
-column). What that exclusion does **not** cover, and T5 must check before
-`--replace` ships: whether every owned table's primary key is derived from
-Observation content rather than minted fresh.
+column). What that exclusion does **not** cover is whether every owned table's
+primary key is derived from Observation content rather than minted fresh; that
+is the audit `--replace` shipped with, described under **the digest's
+primary-key audit** below.
 
 *A replay also refreshes the process-local failed-job count* (`_refresh_failed_job_count`,
 as `rebuild` and `retry` both do). The re-pend clears `failed` rows in the
@@ -2638,6 +2639,38 @@ residual-referrer check, so a blob two Tasks share survives the first one's
 erasure. One path rather than three, because an obligation discharged in three
 places is an obligation discharged in two.
 
+**Two operational residuals live in the registry rather than only in a task
+report, because an operator can be bitten by both** (F10-39, F10-40).
+*First, what still grows without a bound.* Tier 1 tombstones an aged blob's
+**externalized** body — `ansich_content_blobs` is a declared `created_at`-aged
+family in `_PAYLOAD_REFERRER_TIERS` — and the reclaim above takes a blob row and
+its body when a deleter orphans it. What no tier reclaims at all is the
+`inline_body` bytes of every blob under `inline_payload_max_bytes` (the majority
+of blobs by count), a blob row nothing has orphaned yet, and the tombstone
+shells tier 1 leaves behind by design. Closing that needs a fourth *reclaim*
+tier keyed on the blob's own age; it must **not** be done by loosening tier 1's
+orphan refusal, which is the guard T9 put there to close a real race — the
+remedy belongs at a deleter or in a new tier, never in the predicate.
+*Second, one loss is bounded and completely silent.* Tier 2 deliberately has no
+in-flight guard (a month-stuck job must not pin its evidence, the same reasoning
+that keeps `failed` out of `_IN_FLIGHT_JOB_STATUSES`). The friendly half of that
+is legible — the claimer's settle returns `False` and `stale_completion_count`
+moves — but if the claimer had already written rows referencing the doomed
+Observation, its transaction fails the foreign key, the blanket `except` routes
+it to `_record_projection_error`, and that handler's **first act** is
+`session.get(AnsichProjectionJobRow, job_id)` followed by `if job is None:
+return`. The job row went with its Observation, so it returns having written
+nothing: no durable error row (which would have violated
+`ansich_projection_errors.job_id` and raised a second time), no re-arm, no
+counter, no log. The rest of the batch survives — `project_pending`'s loop
+continues — so this is bounded and not batch poison, and no *state* is lost that
+policy had not already sentenced. It is recorded because the batch's own
+precedent argues the other way: `stale_completion_count` exists precisely
+because a correct-but-dropped write was judged worth a process-local counter,
+and this path is rarer and strictly less visible than that one. The PG tier arm
+scripts the friendly interleaving only; the FK variant is reasoned about, not
+exercised.
+
 **`RetentionReport.finished` answers "did the bound stop this pass", not "is the
 store fully expired".** Under cross-pass convergence a caller re-runs regardless:
 a tier that stopped at a pin has finished what *it* can do and reports `True`,
@@ -2992,12 +3025,26 @@ pin, both interleavings of the merge — response onto the winner's request and
 request onto the winner's response without downgrading `success` — the pure
 lattice table including both `failed` edges, the pre-fix bare insert reproduced
 as the `IntegrityError` it used to be, and the same pair for the heartbeat
-current-Belief race including its bounded extra Assertion) and
+current-Belief race including the extra same-verdict Assertion **per losing
+writer**; plus, from the ordering round, the **budget**-site loser and the
+**pass-2 re-reduce** — the latter is the only coverage of the mechanism
+F10-6's closed half rests on, and it asserts the three locks in order and the
+doubled Assertion scan, the same structural evidence the usage-summary test
+uses) and
 `tests/ansich/test_process_health_alerts.py` (a collision positioned with work
 on **both** sides of it inside one tick — a stale-heartbeat Task reconciled
 before it, a second losing producer's episode opened after it — proving the tick
 survives and the loser confirms onto the winner's row, plus the pre-fix bare
-insert reproduced as the whole-tick loss). **What the tier carries is a strict
+insert reproduced as the whole-tick loss, the **episode-pass exhaustion** branch
+with the bound shrunk to 1 — DEBUG event present, no raise, the rest of the tick
+still lands — and the entities withdrawal counted). One structural pin sits
+beside them, back in `test_rollup_serialization.py`:
+`test_every_alert_condition_field_survives_onto_the_episode_it_opens`
+asserts `set(AlertCondition.model_fields) - {"active"} <= set(AlertEpisode.model_fields)`,
+because the loser's re-decision rebuilds the condition from the candidate and a
+new required field on `AlertCondition` that does not ride onto `AlertEpisode`
+would be a `ValidationError` **inside the tick** — the whole-tick loss by the
+back door, on a path only the injected collision test reaches. **What the tier carries is a strict
 regression guard, not a live demonstration**, and the difference matters:
 `test_two_workers_assessing_the_same_task_never_duplicate_an_episode` is now
 strict (no round may raise, every round opens exactly one episode per Task)
@@ -3092,13 +3139,37 @@ where the requested row is not, since a denial discloses nothing and failing it
 twice would protect nobody. The **terminal** row degrades to a WARNING for the
 same asymmetry: by then the access is durably recorded and refusing the response
 would report a served read as an error while serving it anyway.
+**An *unauthenticated* probe is audited nowhere, and it leaves no
+application-level record either.** `AuthMiddleware.dispatch` returns its 401
+before `call_next`, so the route never runs, there is no actor to name, and
+confining the §7 trail to *authenticated* refusals is the honest reading of
+spec:112. The cost is worth stating exactly rather than assumed: the only record
+of such an attempt is the ASGI access log, which carries the request path — and
+therefore the probed payload id — with no actor and no §7 semantics. The
+middleware writes no log line of its own.
 
 `ansich.raw_read_max_bytes` (default 1 MiB, startup-only like the rest of the
 section, snapshotted into `app.state.ansich_raw_read_settings` beside the
 evaluation knobs) bounds one response; over it the read is refused with 413 and
-the refusal is audited. Bulk raw export stays out of scope (spec:118). Every
-answer these four routes can give carries `Cache-Control: no-store` — the 403,
-404, 410, 413 and 503 included — and a payload whose declared content type is
+the refusal is audited. That bound is measured on the **inner document**
+(`json.dumps(document, default=str, ensure_ascii=False)`), so it is an
+approximate bound on what crosses the wire and deliberately so: it over-counts
+separators against Starlette's compact `JSONResponse.render`, and it excludes
+the response envelope (`{"payload": …}`, the release wrapper, the ToolCall
+routes' `{role}_result` block), so a served body is somewhat larger than the
+number that was checked. The field description says "raw payload body" for that
+reason — it is not a hard content-length ceiling. Bulk raw export stays out of
+scope (spec:118). **Every answer the handler produces** carries
+`Cache-Control: no-store` — the 403,
+404, 410, 413 and 503 included. Two refusals are produced *outside* the handler
+and carry no `Cache-Control` at all: an over-length `purpose` is refused by
+FastAPI's own `RequestValidationError` handler (422) and an unauthenticated
+request by `AuthMiddleware.dispatch` (401). Neither is in RFC 7231 §6.1's
+heuristically cacheable set, so a shared cache will not store them absent
+explicit freshness — but the invariant is "every answer the handler produces",
+not "every answer these routes can give", and the difference is worth keeping
+straight because the 422 body echoes the caller's `purpose` beside a URL naming
+a payload id. And a payload whose declared content type is
 not JSON also gets `Content-Disposition: attachment`, the artifacts router's
 rule applied one layer in. `require_admin_user` now **returns** the user it
 authorized so the audited actor is the same object the authorization decision
@@ -3181,12 +3252,14 @@ everything nested inside. The **budgeted** terms are preStop sleep 5s
 they are the terms that carry a bound, not the whole list: the scheduled-task
 service stop sits between two of them with **no timeout at all**, and the OIDC
 close and `close_engine` are unbudgeted, which is part of what the buffer is
-for. This step's own worst case is 5s + up to 0.25s of per-step grace. The gateway chart's `terminationGracePeriodSeconds` was 45 and its
-comment budgeted only three of those terms, so the sum already did not fit
+for. This step's own worst case is 5s + up to 0.25s of per-step grace. The
+gateway chart's `terminationGracePeriodSeconds` was 45 and its comment budgeted
+only three of those terms, so the sum already did not fit
 before this sequence existed; P11-C raises it to **60** and writes the whole
 table into `values.yaml`, the deployment template, the chart README and
-`app.py`'s own caveat, which leaves 55s of budgeted terms + 5s of buffer. **A larger
-`shutdown_budget_ms` is only honoured if the pod's grace period is raised with
+`app.py`'s own caveat, which leaves 55s of budgeted terms + 5s of buffer.
+**A larger `shutdown_budget_ms` is only honoured if the pod's grace period is
+raised with
 it** — SIGKILL landing mid-sequence loses the process-loss bucket step 7 exists
 to write down, and the report that would have said so with it. One consequence
 to know: at 5s the writer's share is 2s, *below* `stop_drain_timeout_ms`'s 10s
@@ -3724,6 +3797,26 @@ This invokes `alembic revision --autogenerate` against the live ORM models. Revi
 - `migrations/versions/0026_ansich_environment.py` — environment-observability read models: per-Scope coverage, one current-state row per `(scope_id, environment_scope, metric)` with its trend counter, and at most one per-`tool_call_id` sample
 - `migrations/versions/0027_ansich_lease_generation.py` — `lease_generation` on both job tables (a per-job claim counter, because the process-lifetime `lease_owner` uuid makes an owner-only CAS an ABA) plus `ix_ansich_projection_jobs_projector_status`, whose name records the intent it was authored with (the health merge's per-projector status counts) and not what it turned out to serve: those counts filter on `status` alone and are served by the status-leading claim index, while this one's two real consumers are `_assess_projection_failures`' per-group evidence query and `_reconcile_spawn_usage`'s in-flight gate — see the health-merge paragraph above
 - `migrations/versions/0028_ansich_retention.py` — P11-C's **only** migration, so it carries every schema change that batch makes: payload tombstones (`ansich_payloads.body` becomes nullable beside new `deleted_at`/`policy` under `ck_ansich_payload_tombstone_one_of`, so a reader tells *present* from *expired by policy* from *missing*, and only the third stays a loud raise — `sha256`/`byte_size` are retained as the tombstone's lineage half, and all three tombstone columns move together so a tombstone without a `policy` stamp, which would prove *that* a body was deleted but not under which rule, is unwritable), the single-row `ansich_retention_state` (per-tier resume cursors — `structural_cursor` holds an `entity_id` and nothing else, since relations follow by CASCADE — the Observation deletion horizon receipt resolution consults, and the last run's timestamps/policy, every "not yet" field `None`, never epoch-zero), `ansich_active_versions` (`(component_kind, component_name) → active_version`, absent row meaning the code default, with `audit_obs_id` `ON DELETE SET NULL` so an expiring audit anchor degrades the evidence pointer rather than reverting the selection or pinning an Observation out of retention, plus the `audit_recorded` latch that keeps that NULL readable — an audit write can legitimately be degraded, so without a second column "the evidence expired" and "there never was any" are the same value in the one place the difference is the whole question; T6's writer sets the latch in the same statement as the pointer and never unsets it), and one data step: `DELETE FROM ansich_active_task_read_model`. That delete closes F10-32 by killing its premise instead of re-adjudicating it at deploy time — rows carrying the pre-P11-B stamp sit above every later tick's continuity mark, so the publish guard skips them forever (silently, for Tasks that have since stopped) while any job is durably failed. The rows are a pure read model, the next operations tick rebuilds them, and the whole cost is one to two seconds of an empty Running lens on the first startup after the upgrade. Two operational notes the revision's own docstring carries in full: the CHECK add is a *validating* `ALTER` on PostgreSQL (ACCESS EXCLUSIVE plus a full scan of `ansich_payloads`), and the `NOT VALID`/`VALIDATE` split is deliberately **not** used because alembic runs a revision in one transaction — the add's exclusive lock is held to commit, so the validate would run behind it anyway and only a two-phase deploy would help; and the downgrade refuses explicitly (a pre-flight count over all four RESTRICT referrers, raising) when a tombstoned payload is still referenced, because SQLite's migration connection has foreign keys off and would otherwise delete it silently, leaving the dangling references the tombstone exists to prevent
+**A revision can half-apply, and on SQLite it silently does.** Alembic runs a
+revision inside a transaction, but SQLite's DBAPI **autocommits DDL**, so a
+`raise` after an `op.drop_table` does not undo the drop: the migration reports a
+refusal while the tables are already gone. `0028` was written the wrong way
+round once and caught in review — a downgrade pre-flight that ran *after* two
+`_drop_table` calls would have permanently lost `ansich_retention_state` and
+`ansich_active_versions` while claiming nothing changed, and a re-upgrade would
+recreate them empty (a horizon of `0`, which is a lie the guard exists to
+prevent). The rule that came out of it is unconditional: **in every revision, a
+guard that can refuse runs before anything destructive, forever.**
+That rule was then audited across the whole chain rather than asserted for the
+one revision. **Result: zero instances in `0001`..`0027`.** No downgrade in that
+range contains a refusal at all — every guard in them is a `has_table` /
+`has_column` existence check that immediately precedes its own operation
+(idempotency, not refusal), so there is nothing whose order could be inverted;
+and the one data-preserving step that could have been stranded,
+`0009_ansich_content_blobs`' `_restore_observation_bodies()`, already runs before
+any drop. `0028` is the only revision in the chain that refuses, and its
+pre-flight is now its first statement, with survival assertions on both dialects.
+
 - `persistence/bootstrap.py` — `bootstrap_schema(engine, backend=...)`, the three-branch decision + locking
 - Tests: `tests/test_persistence_bootstrap.py` (branches), `tests/test_persistence_bootstrap_concurrency.py` (concurrency), `tests/test_persistence_bootstrap_regression.py` (issue #3682), `tests/test_persistence_migrations_env.py` (filter), `tests/blocking_io/test_persistence_bootstrap.py` (asyncio.to_thread anchor)
 
