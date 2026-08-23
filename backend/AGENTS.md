@@ -3112,6 +3112,160 @@ denial without reading, every outcome, both subject arms and the garbage the
 validator refuses, per-read uniqueness, the size limit, the headers) and
 `tests/ansich/test_replay.py::TestTheActivationAuditTakesTheFamilySubject`.
 
+**P11-C bounded shutdown and honest startup recovery** (spec §8).
+`AnsichService.stop()` is now spec §8's ordered sequence and it **returns a
+`ShutdownReport`**: seven steps, each with its own budget and its own recorded
+result — `stop_new_records`, `stop_assessor_cadence`,
+`drain_terminal_barriers`, `drain_writer`, `stop_projection_claiming`,
+`join_projector`, `drain_unreported_loss`. The Gateway lifespan logs the report
+one line per step (WARNING for a step that timed out or left work behind) and
+then closes the engine, which is deliberately the *lifespan's* step rather than
+the collector's: the engine belongs to the Gateway and several components share
+it, so spec §8's "close DB" cannot be inside a sequence that runs before them.
+What replaces it in the collector's seven is the process-loss drain, the one
+shutdown-time write nothing else performs.
+
+**The report is not a lifecycle status, and that is ruling H8-A.**
+`ansich/lifecycle.py` is untouched: its seven states and the 17-edge
+`LEGAL_TRANSITIONS` closure — whose *illegal complement* is a pinned merge
+gate — would have had to widen to carry a shutdown phase vocabulary, spending a
+proven invariant on wording. A shutdown phase lives in the report, where it can
+be as detailed as it likes and nothing derives a status from it.
+
+**Apportioning.** `ansich.shutdown_budget_ms` (25000, startup-only, no
+`config_version` bump — this batch bumped once at its first key) is the whole
+sequence's wall. Each step takes `min(its share, what is left)`, shares being
+`_SHUTDOWN_STEP_SHARES` (writer 0.4, claim-stop and join 0.2 each, barriers and
+loss drain 0.1 each), so an early finish rolls its remainder forward and one
+slow step cannot eat the budget. The writer's share is the largest because it
+is the only step holding rows nobody else can place — at the 25s default it is
+exactly `stop_drain_timeout_ms`'s own 10s, so the total budget clamps a
+*misconfigured* writer timeout without shortening the default one. **A step's
+timeout never aborts the steps after it**: they are independent, and skipping
+step 7 because step 4 wedged is precisely how the process-loss bucket used to
+be lost. A step with no budget left is still recorded, as
+`timed_out` with `detail="budget_exhausted"`, rather than being dropped. The
+25-vs-45 rationale is written at the config key: 25s sits under a pod's default
+45s `terminationGracePeriodSeconds` (the gateway chart's value) with room for
+the lifespan's own steps, because a budget the orchestrator will not honour is
+not a budget — SIGKILL would land mid-drain and the report nobody reads would
+say the shutdown was clean.
+
+**Two of the seven are new machinery rather than a wrapper.**
+*`stop_projection_claiming`* is a distinct signal, not `_running`: the
+projector's post-loop drain runs with `_running` already false and used to be
+`while await self._project_pending() > 0: pass`, which against a store that
+always has claimable work never ends. The step writes a deadline
+`_may_claim_projection()` reads **before every claim round**, so the backlog is
+finished if it can be and left to a peer worker (or the next start) if it
+cannot — the jobs are durable either way — and the step reports
+`claim_stop_deadline_reached` when the deadline rather than an empty store is
+why it stopped. *`join_projector`* bounds what is left, which is one
+`assess_operations()`; RC10's episode lock-then-read is what makes running that
+at shutdown survivable, because before it a collision discarded the whole tick
+and at shutdown there is no next tick to self-heal. The cancellation is
+explicit (`projector_task.cancel()` inside a `CancelledError` handler) because
+**an awaiter's cancellation does not propagate to the Task it awaits** — without
+it the loop would outlive `stop()` and project into a store the lifespan is
+about to close — and it is safe because the assessment is one transaction.
+
+**FC-5: `stop()` drains the unreported process-loss bucket, and is the first
+real caller of the `live` guard.** Loss that cannot be attributed to a Task
+becomes durable only when `_drain_unreported_global_ranges` writes it as
+`observability.lost`; that ran on the periodic paths only, so a range charged
+in the last window before a shutdown died with the process and the
+`observability_degradation` producer never saw it. The drain is an unbounded
+backend write, which is why it waited for a budget to exist; it now runs as
+step 7 under its own share. A range the report cursor has not walked past can
+still be *extended*, so the `live` guard leaves it — reporting it here and
+again later would count the same loss twice — and the step's `detail` carries
+`unreported_global_lost_ranges=N` so what was left is visible in the log as
+well as in health. A timeout on the step leaves exactly the same honest state.
+
+*Startup recovery* is two reads and one correlation, and every one of them is
+fail-open (Constraint 1): a recovery step that raised would turn a survivable
+restart into a Gateway that will not come up.
+
+* **The lease sweep** (D8-2, ruling RC12). `start()` moves `processing` rows
+  whose lease expired into their honest bucket — `attempts > 0 ⇒ retry`, else
+  `pending`, which is Global Constraint 7 held rather than restated — touching
+  **neither `attempts` nor `lease_generation`**. It is legibility, not
+  correctness: the claim path already treats an expired lease as claimable, and
+  what the sweep buys is that health stops counting phantom `processing` jobs
+  for work no worker holds. Leaving the generation alone has one consequence,
+  accepted out loud: a zombie worker still inside its own projection can
+  complete a row the sweep re-armed, which is the right outcome because that
+  write is the work it really did — and the moment any *live* worker claims the
+  row the generation moves and the ordinary CAS drops the zombie's write.
+  Bounded at `_LEASE_SWEEP_MAX_ROWS` (1000) per job table, ordered by `job_id`,
+  and `LeaseSweepReport.truncated` says so rather than letting the counts read
+  as the whole answer. It takes no maintenance lock: it creates and re-pends
+  nothing, so Global Constraint 4 is untouched, and queueing startup behind a
+  running rebuild would trade legibility for a slow boot.
+* **Active-version validation** (D8-5). `start()` calls T6's
+  `validate_active_versions()` and keeps its three answers apart: `None` is "not
+  read", `()` is "read and clean", a tuple is "these rows name something this
+  build cannot execute". A non-empty answer is a typed WARNING
+  (`ansich.startup.active_version_mismatch`) plus a new health field,
+  `AnsichHealth.active_version_mismatches` — **never a crash and never a status
+  change**. A mismatch is a fact about the deployment, not about the collector,
+  and every reader it affects already falls back to its code default; routing
+  it into `derive_status` would have meant a new `LifecycleInputs` signal and a
+  new legal edge in the clamp above. `None`-never-`()` applies here as
+  everywhere else: an unreadable table must not render as a verified
+  deployment.
+* **Orphan correlation** (D8-3). The lifespan hands
+  `reconcile_orphaned_inflight_runs`' Runs to
+  `AnsichService.record_orphaned_run_evidence()` **after** Ansich has started,
+  and the collector files one `observability.degraded` row per non-terminal
+  Task (`{"component": "run_lifecycle", "reason":
+  "orphaned_run_reconciliation"}`), through the ordinary queue and on a
+  deterministic `source_event_id` under a fixed producer instance, so a second
+  recovery of the same Run dedupes. **It never claims a terminal** (spec:127):
+  the RunManager's statement is about the *Run*, and Ansich's control Belief is
+  hard-fidelity evidence about what the Agent did, so `failed` would fabricate
+  a terminal nobody observed and `completed` would be worse. The Task's control
+  Belief stays exactly where its own evidence left it, with a durable row
+  saying why it will never move.
+
+**D8-4/RC13: `start()` restores nothing, and says so.** Producer health has no
+durable source — the accounting is per-process memory by construction — so
+after a crash there is nothing to restore *from*, and this build restores
+nothing: **zero** loss ranges are written for the previous process. A
+plausible-looking reconstruction would be exactly the fabricated
+`observability.*` row spec:7 forbids readers to misread. The deliverable is the
+honest docstring on `start()` and this sentence, not a mechanism.
+
+**D8-7: there is still no spool, and the counts are where that shows.** Whatever
+was queued when a process died is gone; nothing at the next start knows what it
+was. While a process lives, `AnsichHealth.dropped_count`, `.lost_ranges` and
+`.unreported_global_lost_range_count` report loss it charged, and the shutdown
+sequence's whole job is to shorten the window in which they are the *only*
+record (the writer drain places what it can, step 7 writes the process-wide
+bucket down). After the process is gone, only what reached storage remains.
+This is the P11-A limitation unchanged, restated here because §8 is where a
+reader looks for it — no new field is added for it, because the existing three
+already carry it.
+
+Tests: `tests/ansich/test_bounded_stop.py` (the seven step names and their
+order, an active Task plus a writer backlog inside the budget, a frozen step
+that times out while every later step still runs *and does its work*, the
+post-loop drain stopping at its deadline, and both FC-5 halves — the frozen
+range landing as `observability.lost` and the still-growing one honestly left),
+`tests/ansich/test_lifecycle.py` (the sweep's buckets on real rows with
+`attempts`/`lease_generation` untouched and a live peer's lease left alone,
+`start()` calling the sweep and surviving one that raises, the mismatch
+degradation and the three-answer rule, the orphan correlation asserted on
+Belief assertion rows, and RC13's zero fabricated ranges) and
+`tests/ansich/test_gateway_lifecycle.py` (the lifespan's two obligations: hand
+the orphaned Runs over after start, and log the report). One case on the
+two-worker PostgreSQL tier
+(`test_a_bounded_shutdown_and_a_lease_sweep_hold_beside_a_live_peer_on_postgres`):
+a collector shutting down beside a peer holding a committed lease leaves that
+peer's status, attempts and generation untouched, and the sweep's bulk
+`UPDATE ... WHERE job_id IN (...)` re-arms an expired lease on the real dialect
+while the peer's own completion still lands.
+
 **Workspace change review**: `packages/harness/deerflow/workspace_changes/`
 captures a pre-run and post-run snapshot of the thread-owned `workspace` and
 `outputs` directories. `runtime/runs/worker.py` performs the filesystem scan via

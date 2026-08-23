@@ -28,6 +28,7 @@ from ansich import (
     ContextStateView,
     ControlBelief,
     HardDeleteReport,
+    LeaseSweepReport,
     LlmAttemptView,
     NamedVersion,
     ObservationEnvelope,
@@ -1075,6 +1076,12 @@ _RETENTION_STATE_ID = 1
 #: and a retry that lands after the body expired settles as expired evidence
 #: instead (``_settle_expired_evidence_job``).
 _IN_FLIGHT_JOB_STATUSES = (*_CLAIMABLE_JOB_STATUSES, "processing")
+#: Rows the startup lease sweep reads per job table (D8-2, ruling RC12). The
+#: bound is what keeps `start()` from turning into a full scan of a table with
+#: no retention; a truncated sweep reports the flag rather than pretending its
+#: counts are the whole answer, and what it leaves is re-armed lazily by the
+#: claim path exactly as it was before the sweep existed.
+_LEASE_SWEEP_MAX_ROWS = 1000
 #: The relation predicate that makes a Task a member of a ``Scope``. It is the
 #: only index from an owner/thread back to its Tasks
 #: (``ix_ansich_relations_object_predicate`` reads it in the object direction),
@@ -4753,6 +4760,78 @@ class SqlAnsichBackend:
     async def initialize_metrics(self) -> None:
         await self._refresh_failed_job_count()
         await self._refresh_context_metrics()
+
+    async def sweep_expired_leases(
+        self,
+        *,
+        now: datetime | None = None,
+        limit: int = _LEASE_SWEEP_MAX_ROWS,
+    ) -> LeaseSweepReport:
+        """Move jobs whose lease expired out of ``processing`` (D8-2, ruling RC12).
+
+        A process that died mid-projection leaves its rows ``processing`` with
+        a lease nobody will renew. The claim path already treats such a row as
+        claimable — that is the correctness backstop and it is unchanged — so
+        what this buys is **legibility**: without it every health read keeps
+        counting phantom ``processing`` jobs for work no worker holds, which is
+        the one number an operator uses to decide whether projection is moving.
+
+        The bucket is the row's honest one: ``attempts > 0`` means the row was
+        attempted and belongs in ``retry``, ``attempts == 0`` means nothing has
+        tried it and it belongs in ``pending``. That is Global Constraint 7
+        (``pending ⟺ attempts == 0``) obeyed, and it is also why the sweep
+        **raises neither ``attempts`` nor ``lease_generation``**: the sweep is
+        not an attempt and not a claim. Leaving the generation alone means a
+        zombie worker still inside its own projection can complete a row this
+        re-armed — its compare-and-set still matches — and that is the right
+        outcome, because that write is the work it actually did; the moment any
+        *live* worker claims the row the generation moves and the ordinary CAS
+        drops the zombie's write as it always has.
+
+        Bounded twice over: at most ``limit`` rows per table, read in
+        ``job_id`` order so two passes cannot interleave into a cycle, and both
+        reads are served by each table's ``(status, ...)``-leading claim index.
+        A truncated sweep says so rather than reporting its counts as the whole
+        answer; what it left is re-armed lazily by the claim path exactly as
+        before.
+
+        Run at ``start()`` and nowhere else on the hot path. It is *not* under
+        the maintenance lock: it neither creates nor re-pends a job (Global
+        Constraint 4 is untouched — no ``ingest_seq`` moves and no read-model
+        row is affected), and serialising startup behind a running rebuild
+        would trade a legibility pass for a slow boot.
+        """
+
+        moment = _as_utc(now) if now is not None else datetime.now(UTC)
+        to_retry = 0
+        to_pending = 0
+        truncated = False
+        for model in (AnsichProjectionJobRow, AnsichAssessorJobRow):
+            async with self._session_factory() as session, session.begin():
+                rows = (
+                    await session.execute(
+                        select(model.job_id, model.attempts)
+                        .where(
+                            model.status == "processing",
+                            model.lease_expires_at.is_not(None),
+                            model.lease_expires_at <= moment,
+                        )
+                        .order_by(model.job_id)
+                        .limit(limit)
+                    )
+                ).all()
+                if not rows:
+                    continue
+                truncated = truncated or len(rows) >= limit
+                retry_ids = [str(job_id) for job_id, attempts in rows if int(attempts or 0) > 0]
+                pending_ids = [str(job_id) for job_id, attempts in rows if int(attempts or 0) == 0]
+                for status, job_ids in (("retry", retry_ids), ("pending", pending_ids)):
+                    if not job_ids:
+                        continue
+                    await session.execute(update(model).where(model.job_id.in_(job_ids), model.status == "processing").values(status=status, lease_owner=None, lease_expires_at=None))
+                to_retry += len(retry_ids)
+                to_pending += len(pending_ids)
+        return LeaseSweepReport(to_retry=to_retry, to_pending=to_pending, truncated=truncated)
 
     async def persist_and_project(self, observations: list[ObservationEnvelope]) -> int:
         processed = 0

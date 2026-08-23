@@ -175,6 +175,51 @@ async def _drain_inflight_runs(run_manager: RunManager) -> None:
         logger.exception("Failed to drain in-flight runs during shutdown")
 
 
+def _log_ansich_shutdown_report(report) -> None:
+    """Write the collector's shutdown report out, one line per step.
+
+    The report is the only account of a shutdown anybody gets — the process is
+    on its way out — so every step is logged whatever it did, in order. A step
+    that timed out or left work behind is logged at WARNING because that is the
+    line an operator greps for after a restart that lost rows; the clean ones
+    stay at INFO so a normal shutdown is one readable block rather than an
+    alarm.
+    """
+
+    if report is None:
+        return
+    for step in getattr(report, "steps", ()):
+        logger.log(
+            logging.INFO if step.ok else logging.WARNING,
+            "Ansich shutdown step %s: %s in %dms%s",
+            step.name,
+            "ok" if step.ok else ("timed out" if step.timed_out else "incomplete"),
+            step.duration_ms,
+            f" ({step.detail})" if step.detail else "",
+            extra={
+                "event": "ansich.shutdown.step",
+                "shutdown_step": step.name,
+                "shutdown_step_ok": step.ok,
+                "shutdown_step_timed_out": step.timed_out,
+                "shutdown_step_duration_ms": step.duration_ms,
+                "shutdown_step_detail": step.detail,
+            },
+        )
+    logger.log(
+        logging.INFO if report.completed else logging.WARNING,
+        "Ansich shutdown %s in %dms of a %dms budget",
+        "completed" if report.completed else "did not complete",
+        report.total_ms,
+        report.budget_ms,
+        extra={
+            "event": "ansich.shutdown.completed",
+            "shutdown_completed": report.completed,
+            "shutdown_total_ms": report.total_ms,
+            "shutdown_budget_ms": report.budget_ms,
+        },
+    )
+
+
 async def _publish_recovered_run_stream_end(
     bridge: StreamBridge,
     recovered_runs: list[RunRecord],
@@ -423,6 +468,19 @@ async def langgraph_runtime(app: FastAPI, startup_config: AppConfig) -> AsyncGen
             error="Gateway restarted before this run reached a durable final state.",
             before=now_iso(),
         )
+        # D8-3: correlate that reconciliation into Ansich. The Runs above are
+        # the external evidence spec 11 section 8 asks startup recovery to use;
+        # the collector files *unknown* evidence for each one's Task and never
+        # claims a terminal it did not observe. Fail-open like the rest of
+        # collection: this runs after the Ansich service started (above) and a
+        # failure inside it costs the correlation, never the Gateway.
+        ansich_service = getattr(app.state, "ansich_service", None)
+        if ansich_service is not None and recovered_runs:
+            try:
+                await ansich_service.record_orphaned_run_evidence([record.run_id for record in recovered_runs])
+            except Exception:
+                logger.exception("Ansich orphaned-run correlation failed; continuing startup")
+
         sb_config = getattr(config, "stream_bridge", None)
         cleanup_delay = getattr(sb_config, "recovered_stream_cleanup_delay_seconds", 60.0) if sb_config else 60.0
         await _publish_recovered_run_stream_end(app.state.stream_bridge, recovered_runs, cleanup_delay=cleanup_delay)
@@ -445,9 +503,13 @@ async def langgraph_runtime(app: FastAPI, startup_config: AppConfig) -> AsyncGen
             ansich_service = getattr(app.state, "ansich_service", None)
             if ansich_service is not None:
                 try:
-                    await ansich_service.stop()
+                    _log_ansich_shutdown_report(await ansich_service.stop())
                 except Exception:
                     logger.exception("Ansich shutdown failed; continuing Gateway shutdown")
+            # Deliberately the lifespan's own last step and not one of the
+            # collector's seven: the engine belongs to the Gateway, several
+            # components share it, and closing it from inside the collector's
+            # sequence would pull the store out from under whatever runs after.
             await close_engine()
 
 

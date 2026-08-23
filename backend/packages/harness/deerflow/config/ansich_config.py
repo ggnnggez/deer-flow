@@ -144,6 +144,19 @@ class AnsichConfig(BaseModel):
             "the drain could not place by then is charged as lost and reported in one warning."
         ),
     )
+    shutdown_budget_ms: int = Field(
+        default=25_000,
+        ge=1,
+        description=(
+            "startup-only: total budget for the collector's whole shutdown sequence (spec 11 section 8): "
+            "stop recording, stop this service's own timers, finish outstanding terminal barriers, drain "
+            "the writer, stop claiming new projection work, join the projector, and write the process-wide "
+            "loss bucket down. Each step takes the smaller of its own share and what is left, and a step "
+            "that times out does not stop the ones after it. The 25s default sits under a pod's default 45s "
+            "terminationGracePeriodSeconds with room for the Gateway lifespan's own steps, because a budget "
+            "the orchestrator will not honour is not a budget."
+        ),
+    )
     heartbeat_interval_seconds: int = Field(
         default=10,
         ge=1,

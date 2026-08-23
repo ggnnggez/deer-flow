@@ -1189,6 +1189,101 @@ class HardDeleteReport(BaseModel):
     batches: int = Field(ge=0)
 
 
+class LeaseSweepReport(BaseModel):
+    """What the startup lease sweep moved out of ``processing`` (D8-2, RC12).
+
+    A row left ``processing`` by a process that died still carries a lease
+    nobody will renew. The claim path already handles it — an expired lease is
+    claimable, which is the correctness backstop — so this sweep buys
+    *legibility*, not safety: without it health keeps reporting phantom
+    ``processing`` jobs for work no worker holds.
+
+    The bucket a row lands in is its honest one and is decided by
+    ``attempts``: a row that has been attempted goes to ``retry``, a row that
+    has not goes to ``pending``. That is Global Constraint 7 (``pending ⟺
+    attempts == 0``) obeyed rather than restated, which is why the sweep
+    **touches neither ``attempts`` nor ``lease_generation``**. Leaving the
+    generation alone is deliberate and has one consequence worth naming: a
+    zombie worker still inside its own projection can complete a row this
+    sweep re-armed, because its compare-and-set still matches. That write is
+    the work it really did, and if any *live* worker claims the row first the
+    generation moves and the zombie's write is dropped as usual — so the
+    ordinary CAS covers the case and re-arming without a bump is safe.
+
+    ``truncated`` is the bound saying so out loud: the sweep reads at most
+    ``limit`` rows per table so startup cannot turn into a full scan of a table
+    with no retention. A truncated sweep is not a failure — the claim path
+    re-arms whatever is left lazily — but a reader must not take the counts as
+    "all of them", so the flag is carried rather than inferred from a count
+    equal to the limit.
+    """
+
+    model_config = ConfigDict(frozen=True)
+
+    to_retry: int = Field(default=0, ge=0)
+    to_pending: int = Field(default=0, ge=0)
+    truncated: bool = False
+
+
+class ShutdownStep(BaseModel):
+    """One step of the bounded shutdown sequence, and how it ended (spec §8).
+
+    Every step is recorded whatever happened to it, because the report is the
+    only account of a shutdown anybody gets: the process is on its way out, so
+    a step that is merely *absent* from a report is indistinguishable from one
+    that was never reached.
+
+    ``ok`` and ``timed_out`` are two facts, not one negated: a step can end
+    ``ok=False`` without a timeout (it ran and reported something unfinished),
+    and every timeout is also not-ok. ``duration_ms`` is what the step actually
+    cost, including a timeout's own budget, so the durations sum to roughly
+    ``ShutdownReport.total_ms``.
+
+    ``detail`` is a short machine-ish string naming what was left behind
+    (``"queued=12"``, ``"outstanding_barriers=1"``) or ``None`` when there is
+    nothing to add. It is deliberately not a free-text sentence: it is read out
+    of a log line at 3am beside six of its siblings.
+    """
+
+    model_config = ConfigDict(frozen=True)
+
+    name: str = Field(min_length=1)
+    ok: bool
+    timed_out: bool = False
+    duration_ms: int = Field(ge=0)
+    detail: str | None = None
+
+
+class ShutdownReport(BaseModel):
+    """The whole of what ``AnsichService.stop()`` did, step by step (spec §8).
+
+    Spec §8 asks for seven ordered shutdown steps, each with its own timeout
+    and its own health/log result, and a total inside the Gateway's graceful
+    shutdown budget. This model is that result. It is **not** a lifecycle
+    status: ``ansich.lifecycle``'s seven states and their 17-edge clamp are a
+    merge gate, and adding a phase vocabulary there to describe shutdown
+    internals would spend a proven invariant on wording (ruling H8-A). A
+    shutdown phase lives here, where it can be as detailed as it likes and
+    nothing derives a status from it.
+
+    ``completed`` means every step reported ``ok``. It is deliberately not
+    "the budget was not exhausted": a step can finish inside its budget and
+    still leave work behind (a barrier still outstanding, a range still in the
+    bucket), and a shutdown that left something behind must not read as clean.
+
+    ``budget_ms`` is the whole budget the sequence was given, not the sum of
+    the per-step slices, so a reader can see how much of it ``total_ms``
+    spent.
+    """
+
+    model_config = ConfigDict(frozen=True)
+
+    steps: tuple[ShutdownStep, ...] = ()
+    total_ms: int = Field(ge=0)
+    budget_ms: int = Field(ge=0)
+    completed: bool
+
+
 class ReplaySelector(BaseModel):
     """Which Observations a replay aims at — the three filters, and nothing else.
 
@@ -1578,6 +1673,28 @@ class DatabaseHealth(BaseModel):
 
 
 class AnsichHealth(BaseModel):
+    """This process's own collection health, answered with zero IO.
+
+    ``active_version_mismatches`` is the one field here that is not about
+    collection at all: it is what ``start()``'s active-version validation (T6's
+    ``validate_active_versions``) saw. ``None`` means the rows were not read —
+    a backend that cannot answer, or a service that has not started — and an
+    empty tuple means they were read and every one of them names something this
+    build can execute. Never-zero applies as everywhere else: an unreadable
+    store must not render as a clean deployment.
+
+    **Why a field and not a status.** A mismatch is a fact about the
+    *deployment* (a row naming a version this build was rolled back past), not
+    about the collector, which is collecting perfectly well; every reader it
+    affects already falls back to the code default. Routing it into
+    ``status`` would mean a new ``LifecycleInputs`` signal and a new legal edge
+    in ``lifecycle.LEGAL_TRANSITIONS``, whose *illegal complement* is a pinned
+    merge gate — spending a proven invariant to carry a deployment note. So it
+    is carried beside the status, visible in the same read, and it is
+    accompanied by a typed startup WARNING rather than by a crash (Constraint
+    1: fail-open).
+    """
+
     model_config = ConfigDict(frozen=True)
 
     status: Literal["starting", "healthy", "degraded", "recovering", "failed", "shutting_down", "stopped"]
@@ -1608,6 +1725,7 @@ class AnsichHealth(BaseModel):
     writer: WriterHealth = WriterHealth()
     evicted_producer_count: int = 0
     unreported_global_lost_range_count: int = 0
+    active_version_mismatches: tuple[ActiveVersionMismatch, ...] | None = None
 
 
 class ControlBelief(BaseModel):

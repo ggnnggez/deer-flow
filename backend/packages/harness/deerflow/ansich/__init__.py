@@ -97,6 +97,7 @@ def create_sql_ansich_service(
     writer_backoff_max_ms: int = 5_000,
     writer_item_max_attempts: int = 2,
     stop_drain_timeout_ms: int = 10_000,
+    shutdown_budget_ms: int = 25_000,
     health_database_timeout_ms: int = 2_000,
     projector_lease_seconds: int = 30,
     projector_max_attempts: int = 5,
@@ -145,6 +146,7 @@ def create_sql_ansich_service(
         writer_backoff_max_ms=writer_backoff_max_ms,
         writer_item_max_attempts=writer_item_max_attempts,
         stop_drain_timeout_ms=stop_drain_timeout_ms,
+        shutdown_budget_ms=shutdown_budget_ms,
         health_database_timeout_ms=health_database_timeout_ms,
         hostname=hostname,
     )
@@ -182,6 +184,7 @@ def service_knobs_from_config(config) -> dict[str, object]:
         "writer_backoff_max_ms": config.writer_backoff_max_ms,
         "writer_item_max_attempts": config.writer_item_max_attempts,
         "stop_drain_timeout_ms": config.stop_drain_timeout_ms,
+        "shutdown_budget_ms": config.shutdown_budget_ms,
         "health_database_timeout_ms": config.health_database_timeout_ms,
     }
 

@@ -31,6 +31,22 @@ No test here sits through a real backoff except where the wait *is* the
 fixture: ``_ParkingService`` records the schedule the production code computed
 and returns immediately, and ``park_from`` makes one chosen wait real so a test
 can call ``stop()`` while the writer is held inside the per-item phase.
+
+**P11-C extends this file to the whole of spec §8's sequence**, of which the
+writer drain is now one step of seven. What the new tests are for:
+
+* the seven steps and their order are a contract — the lifespan logs them and
+  an operator reads them, so a rename or a reordering must go red;
+* a step that freezes must **not** take the steps after it with it. That is not
+  a nicety: the last step is the one that writes process-wide loss down, so
+  "abort on first timeout" would lose exactly the evidence a bad shutdown
+  produces;
+* the post-loop projection drain is bounded now. It used to be
+  ``while await self._project_pending() > 0: pass`` with nothing able to end
+  it, so a store that always had claimable work held the process open forever;
+* FC-5: the process-loss bucket is drained at stop, and a range that can still
+  grow is left in it — the first real exercise of the drain's ``live`` guard,
+  which existed for this caller and had never had one.
 """
 
 from __future__ import annotations
@@ -47,6 +63,22 @@ from ansich.memory import InMemoryAnsichBackend
 # Generous against a loaded machine and still an order of magnitude below "the
 # drain waited for the wedged write": every budget configured here is <= 2s.
 _STOP_CEILING_SECONDS = 10.0
+
+# Spec §8's ordering, step for step (spec:122), as `stop()` reports it. The
+# spec's seventh step is "close DB", which is deliberately **not** the
+# collector's: the engine belongs to the Gateway and several components share
+# it, so the lifespan closes it after this sequence. What takes its place here
+# is the process-loss drain (FC-5), the one shutdown-time write nothing else
+# performs.
+_SHUTDOWN_STEP_ORDER = (
+    "stop_new_records",
+    "stop_assessor_cadence",
+    "drain_terminal_barriers",
+    "drain_writer",
+    "stop_projection_claiming",
+    "join_projector",
+    "drain_unreported_loss",
+)
 
 
 def _observation(source_id: str, *, task_id: str | None = None) -> ObservationEnvelope:
@@ -426,3 +458,276 @@ async def test_a_stop_during_a_start_is_refused() -> None:
     assert service.get_health().status == "healthy"
     await asyncio.wait_for(service.stop(), timeout=30)
     assert service.get_health().status == "stopped"
+
+
+class _ScopeAwareBackend(_RecordingBackend):
+    """Storage that declares Scopes real, so the host mint lands and loss can be written.
+
+    ``projects_scope_entities`` is what makes ``_mint_host_scope`` write, which
+    is what gives ``AnsichService.host_scope_id`` a value, which is the gate on
+    the process-loss drain: a range with no Task is only writable against a
+    host ``Scope`` that actually exists. ``refuse_kinds`` is how a test stands
+    the collector in "the report could not be written" without a database.
+    """
+
+    projects_scope_entities = True
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.refuse_kinds: set[str] = set()
+
+    async def persist_and_project(self, observations: list[ObservationEnvelope]) -> int:
+        if any(observation.kind in self.refuse_kinds for observation in observations):
+            raise RuntimeError("storage refused this batch")
+        return await super().persist_and_project(observations)
+
+    def lost_rows(self) -> list[ObservationEnvelope]:
+        return [observation for observation in self.persisted if observation.kind == "observability.lost"]
+
+
+class _EndlessProjectorBackend(_RecordingBackend):
+    """A store whose projection queue never empties.
+
+    Not a pathology: it is what a busy multi-worker store looks like from one
+    worker at the moment it shuts down. The point is that the post-loop drain
+    has to stop *itself* — nothing else ever will.
+    """
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.rounds = 0
+
+    async def project_pending(self, *, limit: int = 100) -> int:
+        self.rounds += 1
+        await asyncio.sleep(0)
+        return 1
+
+
+class _FrozenBarrierService(AnsichService):
+    """A service whose terminal-barrier step never returns.
+
+    The freeze is injected at the step rather than at a backend, because the
+    claim under test is about the *sequence* — one step wedging must not cost
+    the six around it — and a step that hangs for its own budget is the
+    cheapest honest way to say so.
+    """
+
+    async def _drain_terminal_barriers(self, budget_seconds: float) -> str | None:
+        await asyncio.Event().wait()
+        return None
+
+
+def _steps(report) -> dict[str, object]:
+    return {step.name: step for step in report.steps}
+
+
+@pytest.mark.anyio
+async def test_the_report_names_the_seven_steps_in_spec_order() -> None:
+    """Structural. The order is spec §8's and the names are what the lifespan logs.
+
+    Pinned rather than left to the code because both halves are read by
+    somebody: the order is the *argument* — barriers before the writer drain,
+    claim-stop before the join — and the names end up in an operator's log.
+    """
+
+    backend = _RecordingBackend()
+    service = AnsichService(backend, batch_size=2, flush_interval_ms=10, shutdown_budget_ms=5_000)
+    await service.start()
+    assert service.record(_observation("run-report-shape")).accepted
+
+    report = await asyncio.wait_for(service.stop(), timeout=30)
+
+    assert tuple(step.name for step in report.steps) == _SHUTDOWN_STEP_ORDER
+    assert report.completed is True
+    assert report.budget_ms == 5_000
+    assert report.total_ms <= report.budget_ms
+    assert all(step.ok and not step.timed_out for step in report.steps)
+    # `stop()` is idempotent, and a second one has no steps to run: an empty
+    # report is complete rather than a shutdown that failed every step.
+    again = await asyncio.wait_for(service.stop(), timeout=30)
+    assert again.steps == ()
+    assert again.completed is True
+
+
+@pytest.mark.anyio
+async def test_an_active_task_and_a_writer_backlog_stop_inside_the_budget() -> None:
+    """§10's shutdown case: a live Task, a full queue, one budget, one report.
+
+    The flush interval is longer than the test, so every row is still queued
+    when ``stop()`` is called: the drain step is what places them, and the
+    report is what says it did.
+    """
+
+    backend = _RecordingBackend()
+    task_id = new_id()
+    service = AnsichService(backend, batch_size=10, flush_interval_ms=60_000, shutdown_budget_ms=5_000)
+    await service.start()
+    # An active Task — created and started, never terminal — plus a backlog
+    # behind it.
+    assert service.record(_observation("run-active", task_id=task_id)).accepted
+    backlog = [_observation(f"run-backlog-{index}") for index in range(50)]
+    assert all(receipt.accepted for receipt in service.record_batch(backlog))
+    assert service.get_health().queue_depth == 51
+
+    loop = asyncio.get_running_loop()
+    started_at = loop.time()
+    report = await asyncio.wait_for(service.stop(), timeout=30)
+    elapsed = loop.time() - started_at
+    health = service.get_health()
+
+    assert elapsed < _STOP_CEILING_SECONDS
+    assert report.completed is True
+    assert report.total_ms <= report.budget_ms
+    assert len(backend.landed) == 51
+    assert health.status == "stopped"
+    assert health.queue_depth == 0
+    assert health.dropped_count == 0
+    # The one step that had work to report says what it inherited; nothing was
+    # charged, so the drain step reports nothing.
+    assert _steps(report)["stop_new_records"].detail == "queued=51"
+    assert _steps(report)["drain_writer"].detail is None
+
+
+@pytest.mark.anyio
+async def test_a_frozen_step_times_out_and_every_later_step_still_runs() -> None:
+    """A step's timeout is its own. It never aborts the sequence.
+
+    The barrier step is frozen outright. Under an abort-on-first-failure
+    shutdown the writer would never drain (rows charged as lost that storage
+    would have taken) and the process-loss bucket would never be written — the
+    two things this sequence exists to do. So the report must show one step
+    timed out and the four after it having run anyway.
+    """
+
+    backend = _RecordingBackend()
+    service = _FrozenBarrierService(backend, batch_size=10, flush_interval_ms=60_000, shutdown_budget_ms=600)
+    await service.start()
+    assert all(receipt.accepted for receipt in service.record_batch([_observation(f"run-frozen-{index}") for index in range(4)]))
+
+    loop = asyncio.get_running_loop()
+    started_at = loop.time()
+    report = await asyncio.wait_for(service.stop(), timeout=30)
+    elapsed = loop.time() - started_at
+
+    assert elapsed < _STOP_CEILING_SECONDS
+    frozen = _steps(report)["drain_terminal_barriers"]
+    assert frozen.timed_out is True
+    assert frozen.ok is False
+    assert report.completed is False
+    # Every later step ran, and ran cleanly.
+    later = [step for step in report.steps if step.name in _SHUTDOWN_STEP_ORDER[3:]]
+    assert [step.name for step in later] == list(_SHUTDOWN_STEP_ORDER[3:])
+    assert all(step.ok for step in later)
+    # Not merely recorded — the work behind them happened: the backlog is
+    # durable rather than charged as loss.
+    assert len(backend.landed) == 4
+    assert service.get_health().dropped_count == 0
+
+
+@pytest.mark.anyio
+async def test_the_post_stop_projection_drain_stops_claiming_at_its_deadline() -> None:
+    """The unbounded post-loop drain is bounded, and by its own signal.
+
+    ``_running`` cannot express this: the drain runs with ``_running`` already
+    false, which is precisely why it used to spin forever against a store that
+    always had claimable work. The claim-stop step writes a deadline the loop
+    reads before every round, and reports that the deadline — not an empty
+    store — is why it stopped.
+    """
+
+    backend = _EndlessProjectorBackend()
+    service = AnsichService(backend, batch_size=10, flush_interval_ms=60_000, projector_poll_interval_ms=5, shutdown_budget_ms=500)
+    await service.start()
+    await _wait_until(lambda: backend.rounds > 0)
+
+    loop = asyncio.get_running_loop()
+    started_at = loop.time()
+    report = await asyncio.wait_for(service.stop(), timeout=30)
+    elapsed = loop.time() - started_at
+
+    assert elapsed < _STOP_CEILING_SECONDS
+    claim_stop = _steps(report)["stop_projection_claiming"]
+    assert claim_stop.ok is True
+    assert claim_stop.detail == "claim_stop_deadline_reached"
+    # The loop is joined, not abandoned: a projector still running here would
+    # project into a store the Gateway lifespan is about to close.
+    assert _steps(report)["join_projector"].ok is True
+    assert service._projector_task is None
+    assert service.get_health().status == "stopped"
+
+
+@pytest.mark.anyio
+async def test_stop_writes_the_process_loss_bucket_down(caplog: pytest.LogCaptureFixture) -> None:
+    """FC-5, the regression. Loss with no Task became durable at stop, or never.
+
+    The range is charged, then frozen by the ordinary reporting seam (the
+    cursor walks past it) while the drain is refused, so it is sitting in the
+    bucket with nobody left to write it — exactly the state a shutdown finds
+    after a bad last minute. Before this batch ``stop()`` never called the
+    drain, so that range died with the process and the
+    ``observability_degradation`` producer never saw it.
+    """
+
+    backend = _ScopeAwareBackend()
+    service = AnsichService(backend, batch_size=1, flush_interval_ms=10, shutdown_budget_ms=5_000, hostname="bounded-stop-host")
+    await service.start()
+    assert service.host_scope_id is not None
+
+    # A non-envelope item is charged process-wide: no envelope, so no Task and
+    # no producer to attribute it to.
+    assert service.record_batch((object(),))[0].accepted is False  # type: ignore[arg-type]
+    assert service.get_health().unreported_global_lost_range_count == 1
+
+    # Freeze the range without letting it out of the bucket: the seam advances
+    # the report cursor, the drain it ends with is refused.
+    backend.refuse_kinds = {"observability.lost"}
+    assert service.record(_observation("run-loss-seam")).accepted
+    await _wait_until(lambda: "task.created" in [observation.kind for observation in backend.persisted])
+    assert service.get_health().unreported_global_lost_range_count == 1
+    assert backend.lost_rows() == []
+    backend.refuse_kinds = set()
+
+    report = await asyncio.wait_for(service.stop(), timeout=30)
+    health = service.get_health()
+
+    lost_rows = backend.lost_rows()
+    assert len(lost_rows) == 1
+    assert lost_rows[0].subject_type == "scope"
+    assert lost_rows[0].subject_id == service.host_scope_id
+    assert health.unreported_global_lost_range_count == 0
+    # Reported is not un-charged: the loss is still loss.
+    assert health.dropped_count == 1
+    assert health.lost_ranges != ()
+    drain = _steps(report)["drain_unreported_loss"]
+    assert drain.ok is True
+    assert drain.detail is None
+
+
+@pytest.mark.anyio
+async def test_stop_leaves_a_still_growing_range_in_the_bucket() -> None:
+    """The ``live`` guard's first real caller, and it declines to write.
+
+    A range the report cursor has not walked past can still be *extended* in
+    place, so writing it at stop would report the same loss twice if anything
+    extended it afterwards. The honest answer is to leave it — and to keep
+    counting it, which is what makes the omission visible rather than silent.
+    """
+
+    backend = _ScopeAwareBackend()
+    service = AnsichService(backend, batch_size=1, flush_interval_ms=10, shutdown_budget_ms=5_000, hostname="bounded-stop-host")
+    await service.start()
+    assert service.host_scope_id is not None
+
+    assert service.record_batch((object(),))[0].accepted is False  # type: ignore[arg-type]
+    assert service.get_health().unreported_global_lost_range_count == 1
+
+    report = await asyncio.wait_for(service.stop(), timeout=30)
+    health = service.get_health()
+
+    assert backend.lost_rows() == []
+    assert health.unreported_global_lost_range_count == 1
+    # Not a failure: the step did what it could and says what is left, which is
+    # the same thing its own timeout would leave behind.
+    drain = _steps(report)["drain_unreported_loss"]
+    assert drain.ok is True
+    assert drain.detail == "unreported_global_lost_ranges=1"

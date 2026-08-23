@@ -5,7 +5,7 @@ import logging
 import socket
 import time
 from collections import OrderedDict, deque
-from collections.abc import Callable, Iterable
+from collections.abc import Awaitable, Callable, Iterable
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from threading import Lock
@@ -27,6 +27,7 @@ from ansich.contracts import (
     DatabaseHealth,
     FlushResult,
     HardDeleteReport,
+    LeaseSweepReport,
     LostRange,
     NamedVersion,
     ObservationEnvelope,
@@ -38,10 +39,13 @@ from ansich.contracts import (
     RetentionPolicy,
     RetentionReport,
     RetryOutcome,
+    ShutdownReport,
+    ShutdownStep,
     TaskLifecycleScope,
     TaskView,
     WriterHealth,
 )
+from ansich.control import TERMINAL_CONTROL_VALUES
 from ansich.environment import (
     EnvironmentHistoryView,
     TaskEnvironmentView,
@@ -88,6 +92,50 @@ _DROP_WARNING_INTERVAL_SECONDS = 60.0
 # suppressed is counted, so the next line says how much it stands for.
 _ASSESSMENT_WARNING_INTERVAL_SECONDS = 60.0
 _PRODUCER_ACCOUNT_LIMIT = 256
+#: How `stop()` apportions `shutdown_budget_ms` across its waiting steps.
+#:
+#: Fractions of the whole budget, not seconds, so one knob moves all of them;
+#: a step takes `min(its share, what is left)`, which is what lets an early
+#: finish roll its remainder forward. The two flag-setting steps are absent
+#: because they cannot wait.
+#:
+#: The split is deliberately uneven. `drain_writer` gets the largest share
+#: because it is the only step holding rows nobody else can place — everything
+#: it cannot place is charged as loss, permanently. `join_projector` and
+#: `stop_projection_claiming` get the middle shares: projection work is durable
+#: and a peer worker (or the next start) picks up whatever is left, so their
+#: cost is lag rather than data. The two smallest are already bounded
+#: elsewhere — a terminal barrier by its own caller's
+#: `terminal_flush_timeout_ms`, the loss drain by being one backend write — so
+#: their share is a backstop rather than a working budget.
+#:
+#: At the 25s default that is 2.5s / 10s / 5s / 5s / 2.5s, and the writer's
+#: share matching `stop_drain_timeout_ms`'s own 10s default is the point: the
+#: total budget clamps a *misconfigured* writer timeout without shortening the
+#: default one.
+_SHUTDOWN_STEP_SHARES: dict[str, float] = {
+    "drain_terminal_barriers": 0.1,
+    "drain_writer": 0.4,
+    "stop_projection_claiming": 0.2,
+    "join_projector": 0.2,
+    "drain_unreported_loss": 0.1,
+}
+#: How often a shutdown step that can only be observed by polling re-checks,
+#: and the grace the claim-stop step waits past its own deadline.
+_SHUTDOWN_POLL_INTERVAL_SECONDS = 0.005
+#: How long the step wrapper's own `wait_for` waits past the budget it handed
+#: the step.
+#:
+#: Three of the seven steps carry an inner deadline of their own — the writer
+#: drain cancels its task, the claim-stop step writes a deadline the loop
+#: reads — and an inner and an outer bound set to the *same* instant race:
+#: whichever fires first decides whether the step's own cleanup (charging the
+#: queue, recording why the drain stopped) runs at all. The grace makes the
+#: inner deadline always win, which leaves the wrapper as what it should be: a
+#: backstop for a step that ignores the budget it was given, not the working
+#: bound. The cost is bounded and stated — at most this much per step past the
+#: total, which is why it is 50ms and not a second.
+_SHUTDOWN_STEP_GRACE_SECONDS = 0.05
 # How many charged Observation ids the receipt path can still name. Loss is
 # already accounted permanently in `dropped_count` and `_lost_ranges`; this set
 # only answers "was *this* Observation one of them", which is a question that
@@ -162,6 +210,7 @@ class AnsichService:
         writer_backoff_max_ms: int = 5_000,
         writer_item_max_attempts: int = 2,
         stop_drain_timeout_ms: int = 10_000,
+        shutdown_budget_ms: int = 25_000,
         health_database_timeout_ms: int = 2_000,
         hostname: str | None = None,
         unavailable_reason: str | None = None,
@@ -190,6 +239,8 @@ class AnsichService:
             raise ValueError("writer_item_max_attempts must be positive")
         if stop_drain_timeout_ms < 1:
             raise ValueError("stop_drain_timeout_ms must be positive")
+        if shutdown_budget_ms < 1:
+            raise ValueError("shutdown_budget_ms must be positive")
         if health_database_timeout_ms < 1:
             raise ValueError("health_database_timeout_ms must be positive")
         self._capacity = queue_capacity
@@ -207,6 +258,12 @@ class AnsichService:
         # wired once rather than three times.
         self._writer_item_max_attempts = writer_item_max_attempts
         self._stop_drain_timeout_seconds = stop_drain_timeout_ms / 1000
+        # The whole of `stop()`, across all seven of its steps (spec §8). It is
+        # a *wall*, not a schedule: each step takes the smaller of its nominal
+        # share and whatever is left, and a step that finishes early hands the
+        # remainder to the ones after it — see `_SHUTDOWN_STEP_SHARES`.
+        self._shutdown_budget_ms = shutdown_budget_ms
+        self._shutdown_budget_seconds = shutdown_budget_ms / 1000
         # The database health merge's whole budget. It is a health read, so a
         # storage stall must cost the caller a bounded wait and an honest
         # `unreachable`, never the page.
@@ -222,6 +279,29 @@ class AnsichService:
         self._starting = False
         self._stopping = False
         self._stopped = False
+        # Shutdown's own signals, all of them read by `_projector_loop` and
+        # written only by `stop()`. They are deliberately plain flags rather
+        # than lifecycle states: `ansich.lifecycle`'s vocabulary is a merge gate
+        # and a shutdown phase belongs in the `ShutdownReport` (H8-A).
+        #
+        # `_assessment_cadence_stopped` silences the loop's *periodic*
+        # assessment so the one final assessment stays the last one, and
+        # `_projection_claim_deadline` is the claim-stop signal the loop checks
+        # **before** each claim round — `_running` alone cannot express it,
+        # because the post-loop drain runs with `_running` already false.
+        self._assessment_cadence_stopped = False
+        self._projection_claim_deadline: float | None = None
+        self._projection_claim_deadline_hit = False
+        self._projection_claim_finished: asyncio.Event | None = None
+        # What `start()`'s active-version validation saw, verbatim: `None`
+        # means "not read" (never started, or a backend that cannot answer) and
+        # `()` means "read and clean". Carried into health rather than into the
+        # status — see `AnsichHealth.active_version_mismatches`.
+        self._active_version_mismatches: tuple[ActiveVersionMismatch, ...] | None = None
+        # Producer sequence for the rows `start()`'s orphan-correlation hook
+        # records. Its own counter because those rows carry their own producer
+        # identity, and a producer sequence is a per-producer number.
+        self._recovery_producer_seq = 0
         self._backend = backend
         self._unavailable_reason = unavailable_reason
         self._record_sequence = 0
@@ -337,6 +417,7 @@ class AnsichService:
         writer_backoff_max_ms: int = 5_000,
         writer_item_max_attempts: int = 2,
         stop_drain_timeout_ms: int = 10_000,
+        shutdown_budget_ms: int = 25_000,
     ) -> AnsichService:
         return cls(
             InMemoryAnsichBackend(),
@@ -352,10 +433,11 @@ class AnsichService:
             writer_backoff_max_ms=writer_backoff_max_ms,
             writer_item_max_attempts=writer_item_max_attempts,
             stop_drain_timeout_ms=stop_drain_timeout_ms,
+            shutdown_budget_ms=shutdown_budget_ms,
         )
 
     async def start(self) -> None:
-        """Bring the collector up: bootstrap storage, then the writer and projector.
+        """Bring the collector up: recover what the last process left, then run.
 
         Raises ``RuntimeError`` if a ``stop()`` is in progress. The two calls
         exclude each other because a start landing inside a drain re-arms the
@@ -364,6 +446,37 @@ class AnsichService:
         charging rows behind a service reporting itself up. No ordering of the
         flag writes below makes that safe, so it is refused instead. Starting an
         already-running service stays a no-op.
+
+        **Startup recovery (spec §8) is two reads and nothing else, and every
+        one of them is fail-open** (Constraint 1): a recovery step that raised
+        would turn a survivable restart into a Gateway that will not come up.
+
+        * the **lease sweep** (D8-2, ruling RC12) moves `processing` rows whose
+          lease expired into their honest bucket. Bounded, logged with counts,
+          and legibility-only — see :class:`~ansich.contracts.LeaseSweepReport`.
+        * **active-version validation** (D8-5, T6) asks whether every
+          `ansich_active_versions` row names something this build can execute.
+          A mismatch is a deployment fact with a working fallback at every
+          read, so it is logged as a typed WARNING and carried in health
+          (`AnsichHealth.active_version_mismatches`); it never raises and never
+          moves the lifecycle status.
+
+        **What this deliberately does NOT do: restore producer health, and it
+        writes no lost range** (D8-4, ruling RC13). Producer health has no
+        durable source — the accounting is per-process memory by construction —
+        so after a crash there is nothing to restore *from*. The honest answer
+        is therefore to restore nothing and say so here, rather than to
+        reconstruct a plausible-looking one. In particular this start writes
+        **zero** loss ranges for the previous process: what it could charge
+        would be a guess, and spec:7's whole point is that a lost range is a
+        claim a reader is entitled to believe. Loss the previous process
+        charged and could not report is simply gone with it — the no-spool
+        limitation (D8-7), which `dropped_count`, `lost_ranges` and
+        `unreported_global_lost_range_count` report while the process lives and
+        nothing reports afterwards.
+
+        The correlation this build *can* honestly make is a separate call, made
+        by whoever holds the RunManager: see :meth:`record_orphaned_run_evidence`.
         """
 
         if self._stopping:
@@ -380,10 +493,17 @@ class AnsichService:
         self._started = False
         self._stopping = False
         self._stopped = False
+        self._assessment_cadence_stopped = False
+        self._projection_claim_deadline = None
+        self._projection_claim_deadline_hit = False
         try:
             initialize_metrics = getattr(self._backend, "initialize_metrics", None)
             if callable(initialize_metrics):
                 await initialize_metrics()
+            # Recovery runs before the loops exist, so this process's own claims
+            # cannot interleave with the sweep that describes the last one's.
+            await self._sweep_expired_leases_at_start()
+            await self._validate_active_versions_at_start()
             self._loop = asyncio.get_running_loop()
             self._wake_event = asyncio.Event()
             # A separate signal from `_wake_event` on purpose: new work must
@@ -391,6 +511,9 @@ class AnsichService:
             # that just refused a write), while shutdown always must.
             self._stop_event = asyncio.Event()
             self._projector_wake_event = asyncio.Event()
+            # Set by `_projector_loop` when it leaves the claiming phase for
+            # good, which is what `stop()`'s claim-stop step waits for.
+            self._projection_claim_finished = asyncio.Event()
             self._persist_lock = asyncio.Lock()
             self._projection_lock = asyncio.Lock()
             self._running = True
@@ -407,6 +530,159 @@ class AnsichService:
             raise
         finally:
             self._starting = False
+
+    async def _sweep_expired_leases_at_start(self) -> None:
+        """D8-2/RC12: re-arm jobs a dead process left leased, and say how many.
+
+        Fail-open and duck-typed: a backend without the sweep (the in-memory
+        one, the unavailable one) simply has no leases to sweep, and a sweep
+        that raises must not stop a Gateway from coming up — the claim path
+        re-arms an expired lease lazily either way, which is what makes this
+        step legibility rather than correctness.
+        """
+
+        sweep = getattr(self._backend, "sweep_expired_leases", None)
+        if not callable(sweep):
+            return
+        try:
+            report = await sweep()
+        except Exception:
+            logger.warning("Ansich startup lease sweep failed; expired leases will be re-claimed lazily", exc_info=True)
+            return
+        if report is None or (report.to_retry == 0 and report.to_pending == 0):
+            return
+        logger.info(
+            "Ansich startup lease sweep re-armed %d job(s) left processing by a previous process",
+            report.to_retry + report.to_pending,
+            extra={
+                "event": "ansich.startup.lease_sweep",
+                "swept_to_retry": report.to_retry,
+                "swept_to_pending": report.to_pending,
+                "swept_truncated": report.truncated,
+            },
+        )
+
+    async def _validate_active_versions_at_start(self) -> None:
+        """D8-5: ask whether every active-version row is executable by this build.
+
+        Three answers, kept apart (T6's contract): ``None`` is "not read",
+        ``()`` is "read and clean", and a non-empty tuple is "read, and these
+        rows name something this build cannot run". The result is stored under
+        the lock so `get_health()` — which does no IO — can report it, and a
+        non-empty answer is logged once as a typed WARNING naming every row.
+
+        It never raises (Constraint 1). Every reader of an unhonourable row
+        already falls back to the code default and says so at the read, so the
+        cost of a rolled-back deploy is a degraded-but-working deployment; a
+        crash here would make it an outage instead.
+        """
+
+        mismatches = await self.validate_active_versions()
+        with self._lock:
+            self._active_version_mismatches = mismatches
+        if not mismatches:
+            return
+        logger.warning(
+            "Ansich startup found %d active-version row(s) this build cannot execute; each affected read falls back to its code default",
+            len(mismatches),
+            extra={
+                "event": "ansich.startup.active_version_mismatch",
+                "mismatch_count": len(mismatches),
+                "mismatches": [
+                    {
+                        "component_kind": mismatch.component_kind,
+                        "component_name": mismatch.component_name,
+                        "active_version": mismatch.active_version,
+                        "reason": mismatch.reason,
+                    }
+                    for mismatch in mismatches
+                ],
+            },
+        )
+
+    async def record_orphaned_run_evidence(
+        self,
+        run_ids: Iterable[str],
+        *,
+        source_kind: str = "deerflow_run",
+    ) -> int:
+        """D8-3: file *unknown* evidence for each Task whose Run was orphaned.
+
+        The RunManager's startup reconciliation is the external evidence spec
+        §8 asks this to correlate with: it names the Runs that were in flight
+        when a process died. For each one that maps to an Ansich Task which is
+        still non-terminal, this records one ``observability.degraded``
+        Observation against that Task.
+
+        **It never claims a terminal, and that is the whole ruling** (spec:127).
+        Ansich's control Belief is hard-fidelity evidence about what the Agent
+        did; "the Gateway restarted before this Run reached a durable final
+        state" is a fact about the *Run*, and turning it into ``task.failed``
+        would fabricate a hard terminal nobody observed — while ``completed``
+        would be worse still. So what is written is the collector's existing
+        unknown-evidence shape: a degradation row naming the component and the
+        reason, which leaves the Task's control Belief exactly where the
+        evidence left it (``running``) and adds a durable row saying why it
+        will never move.
+
+        Written through the ordinary queue (``record``), so it is non-blocking
+        and charged like any other row, and keyed on a deterministic
+        ``source_event_id`` under a fixed producer instance, so a second
+        recovery of the same Run is absorbed by the backend's producer dedupe
+        rather than filing a second row.
+
+        Returns how many rows were recorded. Fail-open at every level: an
+        unresolvable Task, an unreadable store, a refused intake — each one
+        costs that Run its correlation and nothing else.
+        """
+
+        recorded = 0
+        for run_id in run_ids:
+            try:
+                task = await self.get_task_by_source(source_kind, run_id)
+            except Exception:
+                logger.debug("Ansich orphan correlation could not resolve run %s", run_id, exc_info=True)
+                continue
+            if task is None or task.control.value in TERMINAL_CONTROL_VALUES:
+                continue
+            self._recovery_producer_seq += 1
+            try:
+                receipt = self.record(
+                    ObservationEnvelope(
+                        kind="observability.degraded",
+                        occurred_at=datetime.now(UTC),
+                        task_id=task.task_id,
+                        subject_id=task.task_id,
+                        producer=Producer(
+                            name="ansich-startup-recovery",
+                            version="1",
+                            # Fixed rather than per-process: the dedupe key is
+                            # `(producer, instance, source_event_id)`, so a
+                            # per-process id would file this row again on every
+                            # restart that re-reconciles the same Run.
+                            instance_id="local",
+                        ),
+                        producer_seq=self._recovery_producer_seq,
+                        source_event_id=f"ansich:orphan-run:{run_id}",
+                        correlation_id=run_id,
+                        payload={
+                            "component": "run_lifecycle",
+                            "reason": "orphaned_run_reconciliation",
+                        },
+                    )
+                )
+            except Exception:
+                logger.debug("Ansich orphan correlation could not record evidence for run %s", run_id, exc_info=True)
+                continue
+            if receipt.accepted:
+                recorded += 1
+        if recorded:
+            logger.info(
+                "Ansich recorded unknown-outcome evidence for %d orphaned Run(s)",
+                recorded,
+                extra={"event": "ansich.startup.orphan_correlation", "orphaned_run_count": recorded},
+            )
+        return recorded
 
     @property
     def host_scope_id(self) -> str | None:
@@ -688,6 +964,11 @@ class AnsichService:
                 # Visible so an operator sees the gap instead of inferring it
                 # from a reported count that used to include it (RA8②).
                 unreported_global_lost_range_count=len(self._unreported_global_ranges),
+                # What `start()`'s validation saw, unchanged since: `None` for
+                # "not read" (never started, or a backend that cannot answer),
+                # `()` for "read and clean". A deployment fact carried beside
+                # the status rather than folded into it — see the field.
+                active_version_mismatches=self._active_version_mismatches,
             )
 
     async def get_database_health(self) -> DatabaseHealth:
@@ -837,11 +1118,10 @@ class AnsichService:
         does not implement it) yields ``None`` rather than a claim. ``()``
         means "read, and every row is honourable"; ``None`` means "not read".
 
-        Deliberately **not** called from ``start()`` here. The shutdown/startup
-        sequencing task owns where in ``start()`` this runs and what a mismatch
-        costs — a log line, a health degradation, or nothing — and building
-        that decision into this method would make it un-overridable by the one
-        caller entitled to make it.
+        ``start()`` is now that caller — ``_validate_active_versions_at_start``
+        stores the answer for health and logs a typed WARNING for a non-empty
+        one — but the decision stays *there* rather than here, so this method
+        remains the plain fail-open read every other caller can reuse.
         """
 
         provider = getattr(self._backend, "validate_active_versions", None)
@@ -852,6 +1132,22 @@ class AnsichService:
         except Exception:
             logger.debug("Ansich active-version validation failed", exc_info=True)
             return None
+
+    async def sweep_expired_leases(self) -> LeaseSweepReport | None:
+        """Re-arm jobs an expired lease left in ``processing`` (D8-2, RC12).
+
+        ``None`` on a backend that has no leases to sweep, which is not the
+        same statement as a sweep that found nothing — that answers a report
+        with zero counts. ``start()`` runs this itself; it stays public because
+        an operator tool has the same question, and it raises whatever the
+        backend raises so such a caller can see the failure `start()`
+        deliberately swallows.
+        """
+
+        sweep = getattr(self._backend, "sweep_expired_leases", None)
+        if not callable(sweep):
+            return None
+        return await sweep()
 
     def register_persistence_listener(
         self,
@@ -2044,73 +2340,337 @@ class AnsichService:
             return None
         return await get_detail(job_id=job_id, kind=kind)
 
-    async def stop(self) -> None:
-        """Drain what the writer still holds on a budget, then join the loops.
+    async def stop(self) -> ShutdownReport:
+        """Run spec §8's seven shutdown steps on one budget, and report each one.
 
         Raises ``RuntimeError`` if a ``start()`` is in progress: until it
         returns there are no loops to drain, and a stop that found none would
         return immediately and leave the half-built service coming up behind it.
-        Stopping an already-stopped service stays a no-op.
+        Stopping an already-stopped service stays a no-op and answers an empty
+        report — no step ran, and nothing was left behind, so it is
+        ``completed``.
 
-        RA7. ``stop_drain_timeout_ms`` is the whole of the writer's remaining
-        work, and it bounds the **attempt**, not the number of attempts: the
-        writer can be inside a ``persist_and_project`` that never answers, which
-        no count of retries can shorten, so the budget has to be able to take
-        the attempt away. What the drain could not place by then is charged and
-        reported once — see ``_drain_writer``.
+        **The seven steps, in order, each with its own budget and its own
+        recorded result** (:class:`~ansich.contracts.ShutdownStep`):
 
-        The projector keeps joining unconditionally: it holds no rows of its
-        own, so a slow projection delays shutdown without risking data.
+        1. ``stop_new_records`` — the intake refuses from here on.
+        2. ``stop_assessor_cadence`` — the loops' waits are cut short and the
+           *periodic* assessment falls silent, so the one final assessment in
+           step 6 is genuinely the last. **Boundary, stated honestly:** the
+           service stops the timers it owns. The outer Run heartbeat
+           (``AnsichTaskHeartbeat``) lives in ``runtime/runs/worker.py``,
+           outside this service and outside its reach; stopping it is the
+           Gateway lifespan's own step, and no flag here can do it.
+        3. ``drain_terminal_barriers`` — wait, bounded, for the ``flush_task``
+           calls already in flight. What the service can bound is exactly that:
+           a barrier that has *started* holds rows off the queue, and letting
+           the writer drain race one would charge rows a barrier is about to
+           place. It cannot bound a caller that has not called yet — intake is
+           already closed, so no new barrier can find work, and an Agent still
+           holding a stale reference gets ``service_not_running``.
+        4. ``drain_writer`` — the existing RA7 drain, now bounded by the
+           smaller of ``stop_drain_timeout_ms`` and what the shutdown budget
+           has left.
+        5. ``stop_projection_claiming`` — the claim-stop signal, which the
+           projector loop checks **before every claim round**. It is not
+           ``_running``: the post-loop drain runs with ``_running`` already
+           false, and that drain is precisely what must stop claiming. The
+           step's budget *is* the drain's deadline, so the backlog is finished
+           if it can be and abandoned to the next process (or to a peer worker)
+           if it cannot; a timeout here means the loop is wedged inside a claim.
+        6. ``join_projector`` — the bounded join. What remains after the drain
+           is one ``assess_operations()``, and RC10's episode lock-then-read is
+           what makes running it at shutdown survivable: before it, a collision
+           discarded the whole tick, and at shutdown there is no next tick to
+           self-heal. A timeout cancels the loop, which is safe because the
+           assessment is **one transaction** — a cancellation between
+           transactions leaves the store consistent, and one inside it rolls
+           back.
+        7. ``drain_unreported_loss`` — FC-5, and the first real caller of
+           ``_drain_unreported_global_ranges``'s ``live`` guard. Loss with no
+           Task is durable only once that drain writes it, and until this batch
+           nothing called it at shutdown, so the last window's process-wide
+           loss died with the process. A still-growing range is still left
+           behind — reporting it here and again later would count the same loss
+           twice — and it stays visible in
+           ``unreported_global_lost_range_count`` either way, which is also
+           what a timeout on this step leaves behind.
 
-        **What this does NOT drain: the unreported process-loss bucket.** Loss
-        that cannot be attributed to a Task is filed in
-        ``_unreported_global_ranges`` and becomes durable only when
-        ``_drain_unreported_global_ranges`` writes it as an
-        ``observability.lost`` Observation, which happens on the periodic paths
-        only. Nothing here calls it, so loss charged in the last window before a
-        stop never becomes durable and the ``observability_degradation``
-        producer never sees it. Deliberate for this batch (the drain is an
-        unbounded backend write, and shutdown budgeting is batch C's subject —
-        spec ``11-resilience-replay-and-retention.md`` §8, where this is
-        recorded); the ``live``-range guard inside the drain exists precisely so
-        that a shutdown caller can be added safely.
+        **Apportioning.** Each step takes ``min(its nominal share, whatever is
+        left of the budget)``; a step that finishes early leaves the remainder
+        to the ones after it, and the shares are the weights in
+        ``_SHUTDOWN_STEP_SHARES`` rather than an even split, because the writer
+        is the only step holding rows nobody else can place. A step that runs
+        out of budget entirely is still *recorded* — as timed out, without
+        running — because **a step's timeout never aborts the ones after it**:
+        the seven are independent, and skipping step 7 because step 4 wedged is
+        exactly how the process-loss bucket used to be lost.
+
+        Two residuals RA7 left, unchanged and still true: a backend that
+        shields itself from cancellation or blocks the loop synchronously can
+        still outlive any of these budgets, and the report is the only place a
+        shutdown that finished *inside* its budget having charged rows says so.
         """
 
         if self._starting:
             raise RuntimeError("cannot stop an Ansich service while it is starting")
         if not self._running:
-            return
-        # The drain is its own lifecycle phase: a backlog and write retries are
-        # expected while it runs, so health reports ``shutting_down`` rather
-        # than degradation until the loops have joined. Each flag is set before
-        # the one it replaces is cleared, so a reader on another thread never
-        # observes an in-between phase: `_stopping` goes up before `_running`
-        # comes down, and `_stopped` before `_stopping` is cleared below.
-        self._stopping = True
-        self._running = False
+            return ShutdownReport(steps=(), total_ms=0, budget_ms=self._shutdown_budget_ms, completed=True)
+        started_at = time.monotonic()
+        deadline = started_at + self._shutdown_budget_seconds
+        steps: list[ShutdownStep] = []
         try:
-            if self._stop_event is not None:
-                self._stop_event.set()
-            if self._wake_event is not None:
-                self._wake_event.set()
-            writer_task = self._writer_task
-            if writer_task is not None:
-                await self._drain_writer(writer_task)
-            self._writer_task = None
-            if self._projector_wake_event is not None:
-                self._projector_wake_event.set()
-            projector_task = self._projector_task
-            if projector_task is not None:
-                await projector_task
-            self._projector_task = None
+            steps.append(self._record_shutdown_step("stop_new_records", self._stop_new_records))
+            steps.append(self._record_shutdown_step("stop_assessor_cadence", self._stop_assessor_cadence))
+            steps.append(await self._run_shutdown_step("drain_terminal_barriers", self._drain_terminal_barriers, deadline=deadline))
+            steps.append(await self._run_shutdown_step("drain_writer", self._drain_writer_step, deadline=deadline))
+            steps.append(await self._run_shutdown_step("stop_projection_claiming", self._stop_projection_claiming, deadline=deadline))
+            steps.append(await self._run_shutdown_step("join_projector", self._join_projector, deadline=deadline))
+            steps.append(await self._run_shutdown_step("drain_unreported_loss", self._drain_unreported_loss_step, deadline=deadline))
         finally:
-            # The terminal state is written here so a loop that raises leaves a
+            self._writer_task = None
+            self._projector_task = None
+            # The terminal state is written here so a step that raises leaves a
             # stopped service instead of one that reports shutting down forever.
             self._stopped = True
             self._stopping = False
+        return ShutdownReport(
+            steps=tuple(steps),
+            total_ms=int((time.monotonic() - started_at) * 1000),
+            budget_ms=self._shutdown_budget_ms,
+            completed=all(step.ok for step in steps),
+        )
 
-    async def _drain_writer(self, writer_task: asyncio.Task[None]) -> None:
-        """Give the writer ``stop_drain_timeout_ms`` to finish, then take the loss.
+    def _record_shutdown_step(self, name: str, action: Callable[[], str | None]) -> ShutdownStep:
+        """Run one instantaneous shutdown step and record what it left behind.
+
+        Steps 1 and 2 set flags; they cannot block and therefore cannot be
+        given a timeout that would mean anything. They are still recorded,
+        because a report that listed only the waiting steps would make the
+        ordering — the whole subject of spec §8 — unreadable.
+        """
+
+        started_at = time.monotonic()
+        detail = action()
+        return ShutdownStep(name=name, ok=True, timed_out=False, duration_ms=int((time.monotonic() - started_at) * 1000), detail=detail)
+
+    async def _run_shutdown_step(
+        self,
+        name: str,
+        action: Callable[[float], Awaitable[str | None]],
+        *,
+        deadline: float,
+    ) -> ShutdownStep:
+        """Run one bounded shutdown step, whatever the step before it did.
+
+        The budget handed to ``action`` is ``min(share, remaining)``: the share
+        keeps one slow step from eating the whole budget, and the remaining
+        keeps the total inside it. A step with nothing left is recorded as
+        timed out **without being run** rather than being dropped — the caller
+        needs to know it never happened, and a zero-budget ``wait_for`` would
+        report the same thing after scheduling work that cannot finish.
+
+        The blanket ``except Exception`` is the same fail-open rule the rest of
+        this file follows, applied where it matters most: a shutdown step that
+        raised would take every later step with it, and the later steps are the
+        ones that write loss down.
+        """
+
+        started_at = time.monotonic()
+        remaining = deadline - started_at
+        budget = min(self._shutdown_budget_seconds * _SHUTDOWN_STEP_SHARES.get(name, 1.0), remaining)
+        if budget <= 0:
+            return ShutdownStep(name=name, ok=False, timed_out=True, duration_ms=0, detail="budget_exhausted")
+        try:
+            detail = await asyncio.wait_for(action(budget), timeout=budget + _SHUTDOWN_STEP_GRACE_SECONDS)
+        except TimeoutError:
+            return ShutdownStep(
+                name=name,
+                ok=False,
+                timed_out=True,
+                duration_ms=int((time.monotonic() - started_at) * 1000),
+                detail=self._shutdown_timeout_detail(name),
+            )
+        except Exception as error:  # pragma: no cover - defensive; see the docstring
+            logger.warning("Ansich shutdown step %s failed", name, exc_info=True)
+            return ShutdownStep(
+                name=name,
+                ok=False,
+                timed_out=False,
+                duration_ms=int((time.monotonic() - started_at) * 1000),
+                detail=f"error={type(error).__name__}",
+            )
+        return ShutdownStep(name=name, ok=True, timed_out=False, duration_ms=int((time.monotonic() - started_at) * 1000), detail=detail)
+
+    def _shutdown_timeout_detail(self, name: str) -> str | None:
+        """What a timed-out step left behind, read at the moment it timed out."""
+
+        if name == "drain_terminal_barriers":
+            with self._lock:
+                return f"outstanding_barriers={len(self._barrier_in_flight_tokens)}"
+        if name == "join_projector":
+            return "projector_cancelled"
+        if name == "drain_unreported_loss":
+            with self._lock:
+                return f"unreported_global_lost_ranges={len(self._unreported_global_ranges)}"
+        return None
+
+    def _stop_new_records(self) -> str | None:
+        """Step 1. Close intake, and say what the drain inherits.
+
+        The flag order is load-bearing and unchanged: `_stopping` goes up
+        before `_running` comes down, so a reader on another thread never
+        observes a service that is neither running nor stopping. From here
+        `record()` answers ``service_not_running`` and the queue can only
+        shrink.
+        """
+
+        self._stopping = True
+        self._running = False
+        with self._lock:
+            queued = len(self._queue)
+        return f"queued={queued}" if queued else None
+
+    def _stop_assessor_cadence(self) -> str | None:
+        """Step 2. Stop the timers this service owns — and only those.
+
+        Setting the three events is what ends the waits the loops are sitting
+        in; ``_assessment_cadence_stopped`` is what keeps a periodic assessment
+        from starting between here and step 6's final one.
+
+        **The heartbeat is not here, and cannot be.** ``AnsichTaskHeartbeat``
+        is started by ``runtime/runs/worker.py`` per Run, outside this service;
+        the Gateway lifespan stops it as its own step. Claiming it here would
+        be a report about something this code does not control.
+        """
+
+        self._assessment_cadence_stopped = True
+        if self._stop_event is not None:
+            self._stop_event.set()
+        if self._wake_event is not None:
+            self._wake_event.set()
+        if self._projector_wake_event is not None:
+            self._projector_wake_event.set()
+        return "service_timers_only"
+
+    async def _drain_terminal_barriers(self, budget_seconds: float) -> str | None:
+        """Step 3. Wait for the ``flush_task`` calls already in flight.
+
+        Each barrier is self-bounded by its caller's own
+        ``terminal_flush_timeout_ms``, so this wait is short by construction
+        and its budget is the smallest share. What it buys is ordering: a
+        barrier holds rows off the queue, and the writer drain that follows
+        must not charge rows somebody is mid-way through placing.
+        """
+
+        while True:
+            with self._lock:
+                outstanding = len(self._barrier_in_flight_tokens)
+            if outstanding == 0:
+                return None
+            await asyncio.sleep(_SHUTDOWN_POLL_INTERVAL_SECONDS)
+
+    async def _drain_writer_step(self, budget_seconds: float) -> str | None:
+        """Step 4. The RA7 drain, under the smaller of its knob and the budget."""
+
+        writer_task = self._writer_task
+        if writer_task is None:
+            return "no_writer"
+        charged = await self._drain_writer(writer_task, timeout_seconds=min(self._stop_drain_timeout_seconds, budget_seconds))
+        return f"charged={charged}" if charged else None
+
+    async def _stop_projection_claiming(self, budget_seconds: float) -> str | None:
+        """Step 5. Stop claiming new projection work, on this step's clock.
+
+        The deadline written here is read by ``_may_claim_projection`` before
+        every claim round, including the post-loop drain's — that drain is the
+        one place ``_running`` cannot express the rule, since it runs with
+        ``_running`` already false.
+
+        The wait carries a small grace past the deadline so the ordinary
+        outcome is reported as what it is: the drain stops claiming *because*
+        of the deadline and then sets its event, and a wait that expired at the
+        very same instant would have reported a wedge that did not happen. A
+        genuine timeout here therefore means the loop never came back from a
+        claim.
+        """
+
+        finished = self._projection_claim_finished
+        if self._projector_task is None or finished is None:
+            return "no_projector"
+        self._projection_claim_deadline = time.monotonic() + budget_seconds
+        if self._projector_wake_event is not None:
+            self._projector_wake_event.set()
+        await asyncio.wait_for(finished.wait(), timeout=budget_seconds + _SHUTDOWN_POLL_INTERVAL_SECONDS)
+        return "claim_stop_deadline_reached" if self._projection_claim_deadline_hit else None
+
+    async def _join_projector(self, budget_seconds: float) -> str | None:
+        """Step 6. Join the loop, bounding its one final assessment.
+
+        The cancellation handler is not defensive tidying: **an awaiter's
+        cancellation does not propagate to the Task it is awaiting.** When the
+        step budget expires the wrapper cancels *this coroutine*, and without
+        the explicit ``projector_task.cancel()`` the loop would go on running
+        after ``stop()`` returned — projecting into a store the Gateway
+        lifespan is about to close. Cancelling it is safe for the same reason
+        the budget is: what is left is one ``assess_operations()``, which is a
+        single transaction, so the cancellation either lands between
+        transactions or rolls one back.
+        """
+
+        projector_task = self._projector_task
+        if projector_task is None:
+            return "no_projector"
+        try:
+            await projector_task
+        except asyncio.CancelledError:
+            projector_task.cancel()
+            try:
+                await projector_task
+            except (asyncio.CancelledError, Exception):
+                pass
+            raise
+        return None
+
+    async def _drain_unreported_loss_step(self, budget_seconds: float) -> str | None:
+        """Step 7. FC-5. Write the process-loss bucket down while there is still time.
+
+        The drain is an unbounded backend write, which is exactly why it was
+        left out of ``stop()`` until this batch; it is bounded here by the step
+        budget. On a timeout the bucket keeps its ranges and the count keeps
+        reporting them — the same honest state the ``live`` guard leaves for a
+        range that can still grow.
+        """
+
+        await self._drain_unreported_global_ranges()
+        with self._lock:
+            remaining = len(self._unreported_global_ranges)
+        return f"unreported_global_lost_ranges={remaining}" if remaining else None
+
+    def _may_claim_projection(self) -> bool:
+        """Whether the projector loop may claim another round of work.
+
+        ``True`` for the whole of normal operation. Once ``stop()``'s
+        claim-stop step has written a deadline the answer flips at it, and the
+        loop records that the deadline — rather than an empty store — is why it
+        stopped.
+        """
+
+        deadline = self._projection_claim_deadline
+        if deadline is None:
+            return True
+        if time.monotonic() < deadline:
+            return True
+        self._projection_claim_deadline_hit = True
+        return False
+
+    async def _drain_writer(self, writer_task: asyncio.Task[None], *, timeout_seconds: float | None = None) -> int:
+        """Give the writer its budget to finish, then take the loss. Returns rows charged.
+
+        ``timeout_seconds`` is the shutdown sequence's own apportioning
+        (``min(stop_drain_timeout_ms, what is left of the budget)``); the knob's
+        value is the default for any other caller, which is what keeps the
+        drain's meaning identical whether or not a total budget is in play.
 
         RA7. The drain is not a separate writer: ``_writer_loop`` keeps running
         with ``_running`` already false, which is what turns its retry paths
@@ -2152,8 +2712,8 @@ class AnsichService:
             charged_before = self._dropped_count
             opened_ranges_from = len(self._lost_ranges)
         try:
-            await asyncio.wait_for(writer_task, timeout=self._stop_drain_timeout_seconds)
-            return
+            await asyncio.wait_for(writer_task, timeout=self._stop_drain_timeout_seconds if timeout_seconds is None else timeout_seconds)
+            return 0
         except TimeoutError:
             pass
         with self._lock:
@@ -2171,12 +2731,14 @@ class AnsichService:
             # discharged it. A later `_warn_batch_loss` inside the same 60s
             # window still carries the same figure — the shutdown line is extra
             # information, not a replacement for the rate-limited one.
+            charged = self._dropped_count - charged_before
             self._emit_drop_warning(
                 reason="stop_drain_timeout",
-                observation_count=self._dropped_count - charged_before,
+                observation_count=charged,
                 lost_ranges=tuple(self._lost_ranges[opened_ranges_from:]),
                 suppressed_warning_count=self._suppressed_drop_warning_count,
             )
+        return charged
 
     def _producer_account(self, producer_name: str, producer_instance_id: str) -> _ProducerAccount:
         """Return one producer instance's account, creating it on first sighting.
@@ -2685,6 +3247,19 @@ class AnsichService:
             await self._flush_batch()
 
     async def _projector_loop(self) -> None:
+        """Claim and project until the service stops, then drain and assess once.
+
+        Shutdown reaches this loop through two signals rather than one, and the
+        second exists because ``_running`` cannot express it. ``_running`` ends
+        the *main* loop; the drain below it runs with ``_running`` already
+        false and is exactly the part that must stop claiming, so it asks
+        ``_may_claim_projection()`` before every round — the deadline
+        ``stop()``'s claim-stop step writes. ``_assessment_cadence_stopped``
+        silences the periodic assessment so the final one below is genuinely
+        the last, which matters because at shutdown there is no next tick to
+        redo a discarded one (RC10).
+        """
+
         wake_event = self._projector_wake_event
         if wake_event is None:
             return
@@ -2693,7 +3268,7 @@ class AnsichService:
         while self._running:
             processed = await self._project_pending()
             current_time = loop.time()
-            if current_time >= next_assessment:
+            if current_time >= next_assessment and not self._assessment_cadence_stopped:
                 try:
                     await self.assess_operations()
                 except Exception as error:
@@ -2712,8 +3287,20 @@ class AnsichService:
             except TimeoutError:
                 pass
             wake_event.clear()
-        while await self._project_pending() > 0:
-            pass
+        try:
+            while self._may_claim_projection() and await self._project_pending() > 0:
+                pass
+        finally:
+            # Set whatever ended the drain — including a raise — because the
+            # claim-stop step waits on it, and a step that waited out its whole
+            # budget for an event nobody would ever set would report a wedge
+            # that had already finished.
+            if self._projection_claim_finished is not None:
+                self._projection_claim_finished.set()
+        # One final assessment, and only one. It is a single transaction, so a
+        # join that cancels it mid-flight rolls it back and leaves the store
+        # consistent; what it must not do is run *twice*, which is why the
+        # cadence above is silenced before this point.
         try:
             await self.assess_operations()
         except Exception as error:

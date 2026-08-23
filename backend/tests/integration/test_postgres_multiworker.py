@@ -2575,3 +2575,95 @@ async def test_hard_delete_erases_a_scope_beside_a_live_claimer_on_postgres() ->
         # `expired` rather than `failed` without any sweep having run.
         assert await worker_b.backend.observation_retention_horizon() >= len(observed)
         assert await worker_b.backend.get_observation_projection_status(observed[-1]) == "expired"
+
+
+@pytest.mark.integration
+@pytest.mark.anyio
+async def test_a_bounded_shutdown_and_a_lease_sweep_hold_beside_a_live_peer_on_postgres() -> None:
+    """Spec §8 against a peer that is holding a lease, on the real dialect.
+
+    Two halves, one script, because they are two ends of the same restart.
+
+    **Shutdown beside a live claimer.** Worker A's collector runs the seven
+    steps while worker B sits inside a job it claimed and committed. Nothing in
+    the sequence may reach across at B: the drain places A's own rows, the
+    projection steps stop A's own claiming, and B's lease, generation and
+    status must come out untouched — which is asserted from B's own session and
+    then proved by B's completion CAS still succeeding.
+
+    **The lease sweep on the dialect that runs the statement.** SQLite proves
+    the buckets; what it cannot prove is the bulk ``UPDATE ... WHERE job_id IN
+    (...)`` against a real server with another connection alive. So B's lease
+    is then expired by injection and A sweeps: the row re-arms to ``retry``
+    (``attempts > 0``), ``attempts`` and ``lease_generation`` are untouched, and
+    — the consequence RC12 accepts out loud — B's *own* completion still
+    succeeds afterwards, because a sweep is not a claim and takes nothing away
+    from the work that was really done.
+    """
+
+    async with _two_workers() as (_url, worker_a, worker_b):
+        task_id = new_id()
+        seeded = [_task_created(task_id, source_id="run-shutdown"), _task_started(task_id, source_id="run-shutdown")]
+        assert await worker_a.backend.persist_and_project(seeded) == len(seeded)
+        await _settle_everything(worker_a, worker_b)
+
+        # One job re-pended and claimed by B: a peer inside a committed lease,
+        # which is the only concurrency a shutdown really has to survive.
+        async with worker_a.sessions() as session, session.begin():
+            peer_job_id = await session.scalar(sa.select(AnsichProjectionJobRow.job_id).order_by(AnsichProjectionJobRow.job_id).limit(1))
+            assert peer_job_id is not None
+            await session.execute(
+                sa.update(AnsichProjectionJobRow).where(AnsichProjectionJobRow.job_id == peer_job_id).values(status="pending", attempts=0, lease_owner=None, lease_expires_at=None, available_at=datetime.now(UTC)),
+            )
+        claim = await worker_b.backend._claim_projection_job()
+        assert claim is not None and claim[0] == peer_job_id
+        claimed_generation = claim[-1]
+        peer_before = await _projection_job(worker_a, peer_job_id)
+        assert peer_before.status == "processing", "the peer's claim must be committed, or this proves nothing"
+
+        service = AnsichService(
+            worker_a.backend,
+            batch_size=10,
+            flush_interval_ms=60_000,
+            projector_poll_interval_ms=5,
+            operations_assessment_interval_ms=60_000,
+            shutdown_budget_ms=10_000,
+        )
+        only_test_driven_assessments(service)
+        await service.start()
+        backlog = [_heartbeat(task_id, run_id="run-shutdown", ordinal=index, offset_seconds=index) for index in range(1, 6)]
+        assert all(receipt.accepted for receipt in service.record_batch(backlog))
+        assert service.get_health().queue_depth == len(backlog)
+
+        report = await asyncio.wait_for(service.stop(), timeout=_SCRIPT_TIMEOUT_SECONDS)
+
+        assert report.completed is True, [step.model_dump() for step in report.steps]
+        assert report.total_ms <= report.budget_ms
+        health = service.get_health()
+        assert health.status == "stopped"
+        assert health.dropped_count == 0
+        assert health.queue_depth == 0
+        # The backlog is durable, read from the *other* worker's session.
+        async with worker_b.sessions() as session:
+            heartbeats = await session.scalar(sa.select(sa.func.count()).select_from(AnsichObservationRow).where(AnsichObservationRow.kind == "task.heartbeat"))
+        assert heartbeats == len(backlog)
+
+        # The peer is exactly where it was: a shutdown re-arms nobody else's work.
+        peer_after = await _projection_job(worker_b, peer_job_id)
+        assert (peer_after.status, peer_after.attempts, peer_after.lease_generation) == ("processing", peer_before.attempts, claimed_generation)
+
+        # Now the restart's half. The lease expires by injection, never by
+        # waiting, and A sweeps it into its honest bucket.
+        await _set_projection_lease(worker_b, peer_job_id, _EXPIRED_AT)
+        sweep = await worker_a.backend.sweep_expired_leases()
+
+        assert (sweep.to_retry, sweep.to_pending, sweep.truncated) == (1, 0, False)
+        swept = await _projection_job(worker_a, peer_job_id)
+        assert swept.status == "retry"
+        assert swept.attempts == peer_before.attempts
+        assert swept.lease_generation == claimed_generation
+        # RC12's accepted consequence, stated as a test rather than as prose:
+        # the sweep does not bump the generation, so the worker that was really
+        # doing the work can still land its own completion.
+        async with worker_b.sessions() as session, session.begin():
+            assert await worker_b.backend._complete_projection_job(session, job_id=peer_job_id, lease_generation=claimed_generation) is True

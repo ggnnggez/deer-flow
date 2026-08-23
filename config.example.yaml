@@ -1848,6 +1848,17 @@ ansich:
   # itself (a persist that never returns is cancelled), not just the queued
   # backlog; whatever cannot be placed by then is charged as lost and reported.
   stop_drain_timeout_ms: 10000
+  # Total budget for the whole shutdown sequence: stop recording, stop this
+  # service's timers, let terminal barriers finish, drain the writer, stop
+  # claiming projections, join the projector, and write the process-wide loss
+  # bucket down. Each step takes the smaller of its own share and what is left,
+  # and a step that times out never stops the ones after it. Kept under a
+  # Kubernetes pod's default 45s terminationGracePeriodSeconds (the gateway
+  # chart's value) with room for the lifespan's own steps -- run drain, memory
+  # flush, close_engine -- because a budget the pod cannot honour is not a
+  # budget: SIGKILL would land mid-drain and the report nobody reads would say
+  # the shutdown was clean.
+  shutdown_budget_ms: 25000
   # Outer Run liveness is independent of LangGraph/model/tool events. The stale
   # rule must allow at least two complete heartbeat intervals.
   heartbeat_interval_seconds: 10

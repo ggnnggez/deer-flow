@@ -9,15 +9,24 @@ actually walk and checks what the derivation does with it.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import itertools
+import logging
 from datetime import UTC, datetime
 
 import pytest
-from ansich import AnsichService, ObservationEnvelope, new_id
-from ansich.contracts import AnsichHealth
+from ansich import AnsichService, LeaseSweepReport, ObservationEnvelope, new_id
+from ansich.contracts import ActiveVersionMismatch, AnsichHealth
 from ansich.lifecycle import LEGAL_TRANSITIONS, LifecycleInputs, derive_status
 from ansich.memory import InMemoryAnsichBackend
 from pydantic import ValidationError
+from sqlalchemy import select, update
+from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
+from support.ansich_settle import only_test_driven_assessments
+
+from deerflow.ansich.persistence.models import AnsichBeliefAssertionRow, AnsichProjectionJobRow
+from deerflow.ansich.persistence.sql import SqlAnsichBackend
+from deerflow.persistence.base import Base
 
 # Spec 11 §2, enumerated edge for edge:
 #
@@ -586,3 +595,339 @@ async def test_a_restart_is_observed_as_starting_rather_than_a_jump_back() -> No
         assert service.get_health().status == "healthy"
     finally:
         await service.stop()
+
+
+# ---------------------------------------------------------------------------
+# Startup recovery (spec §8's second half): what `start()` repairs, what it
+# reports, and — RC13 — what it deliberately refuses to reconstruct.
+# ---------------------------------------------------------------------------
+
+# Past-dated under any clock (the suite-wide fixture-clock rule): a lease
+# expiry decision must never be settled between a fixture and the real clock.
+_EXPIRED_AT = datetime(2026, 1, 1, tzinfo=UTC)
+_LIVE_UNTIL = datetime(2099, 1, 1, tzinfo=UTC)
+
+
+class _ActiveVersionBackend(InMemoryAnsichBackend):
+    """A backend that answers active-version validation however a test needs.
+
+    The three answers are not two: ``None`` is "the rows could not be read",
+    ``()`` is "read and clean", and a tuple is "read, and these cannot be
+    executed". Collapsing the first into the second is the mistake this fixture
+    exists to make expressible.
+    """
+
+    def __init__(self, answer: tuple[ActiveVersionMismatch, ...] | None, *, raises: bool = False) -> None:
+        super().__init__()
+        self._answer = answer
+        self._raises = raises
+        self.calls = 0
+
+    async def validate_active_versions(self) -> tuple[ActiveVersionMismatch, ...] | None:
+        self.calls += 1
+        if self._raises:
+            raise RuntimeError("active-version table unreadable")
+        return self._answer
+
+
+@pytest.mark.anyio
+async def test_an_unhonourable_active_version_degrades_health_and_never_crashes(caplog: pytest.LogCaptureFixture) -> None:
+    """Constraint 1, at the one place a rollback is discovered.
+
+    A row naming a version this build was rolled back past is a deployment
+    fact, not a corrupt store: every reader it affects already falls back to
+    its code default. So it costs a typed WARNING and a health field, and the
+    lifecycle status is untouched — routing it into ``derive_status`` would
+    mean a new legal edge in a clamp whose illegal complement is a merge gate.
+    """
+
+    mismatch = ActiveVersionMismatch(
+        component_kind="resolver",
+        component_name="ansich-default",
+        active_version="9.9.9",
+        reason="unknown_version",
+    )
+    service = AnsichService(_ActiveVersionBackend((mismatch,)), flush_interval_ms=60_000)
+
+    with caplog.at_level(logging.WARNING, logger="ansich.service"):
+        await service.start()
+    try:
+        health = service.get_health()
+    finally:
+        await service.stop()
+
+    assert health.status == "healthy"
+    assert health.active_version_mismatches == (mismatch,)
+    (warning,) = [record for record in caplog.records if getattr(record, "event", None) == "ansich.startup.active_version_mismatch"]
+    assert warning.mismatch_count == 1
+    assert warning.mismatches == [
+        {
+            "component_kind": "resolver",
+            "component_name": "ansich-default",
+            "active_version": "9.9.9",
+            "reason": "unknown_version",
+        }
+    ]
+
+
+@pytest.mark.anyio
+async def test_an_unreadable_active_version_table_is_not_reported_as_a_clean_one() -> None:
+    """``None`` and ``()`` are different answers and health keeps them apart.
+
+    A store that could not answer must not render as a deployment somebody
+    verified. Both directions are asserted here because the tempting bug is one
+    line — ``or ()`` — and it is invisible from the clean side.
+    """
+
+    unreadable = AnsichService(_ActiveVersionBackend(None, raises=True), flush_interval_ms=60_000)
+    await unreadable.start()
+    try:
+        assert unreadable.get_health().active_version_mismatches is None
+    finally:
+        await unreadable.stop()
+
+    clean = AnsichService(_ActiveVersionBackend(()), flush_interval_ms=60_000)
+    await clean.start()
+    try:
+        assert clean.get_health().active_version_mismatches == ()
+    finally:
+        await clean.stop()
+
+    # A backend that does not implement the read at all is also "not read",
+    # never "clean": the in-memory backend has no active versions to have.
+    silent = AnsichService(InMemoryAnsichBackend(), flush_interval_ms=60_000)
+    await silent.start()
+    try:
+        assert silent.get_health().active_version_mismatches is None
+    finally:
+        await silent.stop()
+
+
+@pytest.mark.anyio
+async def test_start_after_a_crash_fabricates_no_lost_range() -> None:
+    """RC13/D8-4. Producer health has no durable source, so nothing is restored.
+
+    The previous process's queue died with it. This start has no evidence about
+    what was in it — that is the no-spool limitation (D8-7), stated rather than
+    papered over — so it writes **no** loss range and reports none. A
+    plausible-looking reconstruction here would be exactly the fabricated
+    `observability.*` row spec:7 forbids readers to misread.
+    """
+
+    backend = _RecordingLossBackend()
+    first = AnsichService(backend, flush_interval_ms=60_000)
+    await first.start()
+    # A crash: rows accepted, never flushed, and no `stop()` ever runs.
+    assert all(receipt.accepted for receipt in first.record_batch([_observation(f"run-crash-{index}") for index in range(3)]))
+    assert first.get_health().queue_depth == 3
+
+    second = AnsichService(backend, flush_interval_ms=60_000)
+    await second.start()
+    try:
+        health = second.get_health()
+    finally:
+        await second.stop()
+
+    assert health.dropped_count == 0
+    assert health.lost_ranges == ()
+    assert health.unreported_global_lost_range_count == 0
+    assert backend.loss_rows() == []
+
+
+class _RecordingLossBackend(InMemoryAnsichBackend):
+    """Keeps every write so a test can assert that *no* loss row was invented."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.written: list[ObservationEnvelope] = []
+
+    async def persist_and_project(self, observations: list[ObservationEnvelope]) -> int:
+        self.written.extend(observations)
+        return await super().persist_and_project(observations)
+
+    def loss_rows(self) -> list[ObservationEnvelope]:
+        return [observation for observation in self.written if observation.kind in {"observability.degraded", "observability.lost"}]
+
+
+class _SweepRecordingBackend(InMemoryAnsichBackend):
+    """A backend that answers the startup sweep, so `start()`'s call is observable."""
+
+    def __init__(self, report: LeaseSweepReport) -> None:
+        super().__init__()
+        self._report = report
+        self.calls = 0
+
+    async def sweep_expired_leases(self) -> LeaseSweepReport:
+        self.calls += 1
+        return self._report
+
+
+class _FailingSweepBackend(InMemoryAnsichBackend):
+    """A backend whose sweep raises: recovery is fail-open or it is not recovery."""
+
+    async def sweep_expired_leases(self) -> LeaseSweepReport:
+        raise RuntimeError("job table unreadable")
+
+
+@contextlib.asynccontextmanager
+async def _sql_backend(tmp_path, name: str):
+    engine = create_async_engine(f"sqlite+aiosqlite:///{tmp_path / name}.db")
+    async with engine.begin() as connection:
+        await connection.run_sync(Base.metadata.create_all)
+    sessions = async_sessionmaker(engine, expire_on_commit=False)
+    try:
+        yield SqlAnsichBackend(sessions), sessions
+    finally:
+        await engine.dispose()
+
+
+@pytest.mark.anyio
+async def test_the_lease_sweep_buckets_expired_leases_by_attempts(tmp_path) -> None:
+    """RC12, on real rows. The bucket is the row's honest one, and nothing else moves.
+
+    ``attempts > 0`` means the row was attempted, so it re-arms to ``retry``;
+    ``attempts == 0`` means nothing tried it, so it goes back to ``pending``.
+    That is Global Constraint 7 (``pending ⟺ attempts == 0``) held rather than
+    restated. ``attempts`` and ``lease_generation`` are untouched by design: the
+    sweep is neither an attempt nor a claim, and resetting the generation would
+    recreate the ABA the CAS exists to prevent.
+
+    A lease that has **not** expired belongs to a live worker and is left
+    alone — the sweep is about the dead process, not about taking work away
+    from a peer.
+    """
+
+    async with _sql_backend(tmp_path, "sweep") as (backend, sessions):
+        await backend.persist_and_project([_observation("run-sweep-a"), _observation("run-sweep-b")])
+        async with sessions() as session:
+            jobs = list(await session.scalars(select(AnsichProjectionJobRow).order_by(AnsichProjectionJobRow.job_id)))
+        assert len(jobs) >= 3, "two Observations should mint at least three projection jobs"
+        attempted, untried, live = jobs[0].job_id, jobs[1].job_id, jobs[2].job_id
+        async with sessions() as session, session.begin():
+            await session.execute(update(AnsichProjectionJobRow).where(AnsichProjectionJobRow.job_id == attempted).values(status="processing", attempts=3, lease_owner="dead-worker", lease_expires_at=_EXPIRED_AT, lease_generation=7))
+            await session.execute(update(AnsichProjectionJobRow).where(AnsichProjectionJobRow.job_id == untried).values(status="processing", attempts=0, lease_owner="dead-worker", lease_expires_at=_EXPIRED_AT, lease_generation=2))
+            await session.execute(update(AnsichProjectionJobRow).where(AnsichProjectionJobRow.job_id == live).values(status="processing", attempts=1, lease_owner="live-peer", lease_expires_at=_LIVE_UNTIL, lease_generation=4))
+
+        report = await backend.sweep_expired_leases()
+
+        assert report == LeaseSweepReport(to_retry=1, to_pending=1, truncated=False)
+        async with sessions() as session:
+            swept = {job.job_id: job for job in await session.scalars(select(AnsichProjectionJobRow))}
+        assert swept[attempted].status == "retry"
+        assert swept[attempted].attempts == 3
+        assert swept[attempted].lease_generation == 7
+        assert swept[untried].status == "pending"
+        assert swept[untried].attempts == 0
+        assert swept[untried].lease_generation == 2
+        # Untouched: somebody is still working on it.
+        assert swept[live].status == "processing"
+        assert swept[live].lease_owner == "live-peer"
+
+
+@pytest.mark.anyio
+async def test_start_runs_the_lease_sweep_and_survives_one_that_fails(caplog: pytest.LogCaptureFixture) -> None:
+    """The sweep is a `start()` step, and a failing one costs legibility only.
+
+    Separated from the row-level test above on purpose: with a live projector
+    loop the swept rows are claimed and projected within milliseconds, so a
+    test that asserted both at once would be asserting on a race. What matters
+    here is that `start()` calls it, logs the counts, and comes up either way —
+    the claim path re-arms an expired lease lazily, which is why a sweep that
+    raised must never be a failed startup.
+    """
+
+    swept = _SweepRecordingBackend(LeaseSweepReport(to_retry=2, to_pending=1, truncated=True))
+    service = AnsichService(swept, flush_interval_ms=60_000)
+    with caplog.at_level(logging.INFO, logger="ansich.service"):
+        await service.start()
+    await service.stop()
+
+    assert swept.calls == 1
+    (line,) = [record for record in caplog.records if getattr(record, "event", None) == "ansich.startup.lease_sweep"]
+    assert (line.swept_to_retry, line.swept_to_pending, line.swept_truncated) == (2, 1, True)
+
+    failing = AnsichService(_FailingSweepBackend(), flush_interval_ms=60_000)
+    with caplog.at_level(logging.WARNING, logger="ansich.service"):
+        await failing.start()
+    try:
+        assert failing.get_health().status == "healthy"
+    finally:
+        await failing.stop()
+
+
+@pytest.mark.anyio
+async def test_orphan_correlation_writes_unknown_evidence_and_never_a_terminal(tmp_path) -> None:
+    """D8-3/spec:127. The Run's reconciliation becomes evidence, not a verdict.
+
+    The RunManager can say a Run never reached a durable final state. It cannot
+    say what the Agent did, and Ansich's control Belief is hard-fidelity
+    evidence about exactly that — so this writes a degradation row naming the
+    reason and leaves the control Belief where the evidence left it. Asserted on
+    the Belief assertion rows rather than on the view, because the failure mode
+    worth catching is a *written* terminal, and a view can only show the one
+    the resolver selected.
+    """
+
+    async with _sql_backend(tmp_path, "orphan") as (backend, _sessions):
+        run_id = "run-orphaned-by-a-crash"
+        task_id = new_id()
+        service = AnsichService(backend, flush_interval_ms=20, operations_assessment_interval_ms=60_000)
+        only_test_driven_assessments(service)
+        await service.start()
+        try:
+            assert all(
+                receipt.accepted
+                for receipt in service.record_batch(
+                    [
+                        ObservationEnvelope.task_lifecycle(
+                            kind=kind,
+                            task_id=task_id,
+                            source_kind="deerflow_run",
+                            source_id=run_id,
+                            occurred_at=datetime(2026, 8, 19, 12, index, tzinfo=UTC),
+                            source_event_id=f"run:{run_id}:task:{kind}",
+                            producer_seq=index + 1,
+                        )
+                        for index, kind in enumerate(("task.created", "task.started"))
+                    ]
+                )
+            )
+            settled = await service.rebuild_until_settled()
+            assert settled.unsettled == 0
+            task = await service.get_task_by_source("deerflow_run", run_id)
+            assert task is not None and task.control.value == "running"
+
+            assert await service.record_orphaned_run_evidence([run_id]) == 1
+            # A second recovery of the same Run is absorbed by the producer
+            # dedupe rather than filing the correlation twice.
+            assert await service.record_orphaned_run_evidence([run_id]) == 1
+            assert await service.record_orphaned_run_evidence(["a-run-ansich-never-saw"]) == 0
+            await service.flush_task(task_id)
+            await service.rebuild_until_settled()
+
+            observations = await service.list_observations(task_id)
+            after = await service.get_task(task_id)
+        finally:
+            await service.stop()
+
+        degraded = [observation for observation in observations if observation.kind == "observability.degraded"]
+        assert len(degraded) == 1
+        assert degraded[0].payload == {"component": "run_lifecycle", "reason": "orphaned_run_reconciliation"}
+        assert degraded[0].subject_id == task_id
+        # The Task is exactly where its own evidence left it.
+        assert after is not None and after.control.value == "running"
+
+    async with _sql_backend(tmp_path, "orphan") as (_backend, sessions):
+        async with sessions() as session:
+            control_values = [
+                row.value_json["value"]
+                for row in await session.scalars(
+                    select(AnsichBeliefAssertionRow).where(
+                        AnsichBeliefAssertionRow.subject_id == task_id,
+                        AnsichBeliefAssertionRow.field_name == "control",
+                    )
+                )
+            ]
+        assert control_values, "the control assertions should still be there"
+        assert set(control_values) == {"created", "running"}
+        assert "completed" not in control_values
