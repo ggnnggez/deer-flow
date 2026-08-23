@@ -2004,12 +2004,14 @@ unchanged: `unsettled == 0` is a count at one known point, not proof.
 read-model tables, each table ordered by its own primary key, through
 `sha256_canonical` — ordered, because physical row order is an artefact of the
 interleaving and comparing it would answer the wrong question. It is `None` in
-three cases: `unsettled > 0` (a digest over a store that still owes work is a
+four cases: `unsettled > 0` (a digest over a store that still owes work is a
 lie with a checksum); `failed > 0` for the target `(projector, version)` — the
 same principle for the one state in which owned rows are *known* never to have
 been written, and `unsettled` structurally cannot see it because a durably
-failed job is settled, badly; and when the projector owns no table exclusively
-(an empty hash compares equal to every other empty hash). `_DIGEST_EXCLUDED_COLUMNS`
+failed job is settled, badly; `expired_evidence > 0` (the paragraph below —
+rows this pass could not derive because their evidence is gone); and when the
+projector owns no table exclusively (an empty hash compares equal to every other
+empty hash). `_DIGEST_EXCLUDED_COLUMNS`
 drops every `DateTime` column carrying a Python-side callable default before
 hashing — `ansich_content_occurrences.created_at` and
 `ansich_context_states.created_at` are the motivating pair, the two
@@ -2022,6 +2024,31 @@ column). What that exclusion does **not** cover is whether every owned table's
 primary key is derived from Observation content rather than minted fresh; that
 is the audit `--replace` shipped with, described under **the digest's
 primary-key audit** below.
+
+*The report knows what retention took* (batch-final findings B2 and B4; both
+were silent before). `ReplayReport.expired_evidence` counts the targeted
+Observations whose payload tier 1 tombstoned. Those jobs are minted, re-pended
+and settled **`completed`** having derived nothing (`_settle_expired_evidence_job`
+— a policy outcome, not a failure), so `unsettled` and `failed` are structurally
+blind to them, and a digest taken across a retention pass compares unequal
+against the same history replayed before it. It is therefore a **fourth
+digest-`None` clause**: refusing the number is what keeps "two digests differ"
+meaning "determinism is broken" rather than "somebody's retention ran". The
+count is read from the Observation and payload rows (so `--dry-run` answers it
+too) and *after* the drive loop, because the reachable shape is concurrent —
+retention holds its own advisory key and never queues behind this pass's
+maintenance lock. **`--replace` over such a target set is refused outright**
+(`replace_over_expired_evidence`, raised inside the mint's transaction before its
+first delete, so the store is untouched): a plain replay is merely un-derivable,
+while a replace empties the owned tables first and the expired rows do not come
+back — and `environment-projector` is both replace-proven and exactly the family
+this repo documents as crossing `inline_payload_max_bytes`. Separately, an empty
+target set now says **which kind of empty**: the report reads the same two
+deletion marks the receipt ladder consults (`observation_horizon_ingest_seq` for
+retention's contiguous prefix, `observation_cursor` for an owner erasure, which
+cannot raise the horizon when a survivor sits below the range it removed) and
+distinguishes "the rows were removed" from "the filter missed", which previously
+produced the identical `targeted: 0`, empty `errors`, exit `0`.
 
 *A replay also refreshes the process-local failed-job count* (`_refresh_failed_job_count`,
 as `rebuild` and `retry` both do). The re-pend clears `failed` rows in the
@@ -2471,7 +2498,19 @@ What replaces the orphan branch is an **obligation, not a mechanism**:
 this build orphans a payload durably (`_ensure_content_blob`'s losing-race
 branch deletes the payload it minted), so the rule costs nothing today — but it
 binds the Observation and structural tiers and the owner hard delete, which
-must delete the payload row outright rather than leaving it behind. Say the
+must delete the payload row outright rather than leaving it behind.
+**There is a fourth deleter and it discharges the obligation differently**
+(batch-final finding B1): `--replace` empties a projector's owned read-model
+tables with a bare whole-table `DELETE` and reclaims nothing. It cannot orphan a
+payload today, and that is now a *checked* property rather than an accident of
+the allowlist — membership in `_REPLACE_PROVEN_PROJECTORS` has a third
+mechanised condition, that the owned set closed under cascade touches no payload
+referrer at all (`TestReplaceOwnsNoPayloadReferrer`), with `task-safety` named as
+the counterexample it exists for: that projector owns
+`ansich_authorization_snapshots`, whose `payload_id` is a `RESTRICT` reference,
+and its cascade closure is empty, so only the missing restorability proof stands
+between a one-line allowlist edit and a permanent leak. A member that ever needs
+to own a referrer routes its delete through `_apply_plan_and_reclaim` first. Say the
 consequence plainly: **an orphaned body is not reclaimed by tier 1 in either
 direction** — never tombstoned, never swept — so if an owning deleter forgets
 its payload rows, those bytes accumulate with nothing to catch them, and the
@@ -2482,7 +2521,17 @@ explicitly, never a widening of this predicate back to what it was.
 loud** (RC6). `_hydrated_observation_payload` returns an `_ObservationPayload`
 rather than a dict: *present*, *expired by policy*, or — still a
 `RuntimeError` — *missing*, because a tombstone-less missing row is corruption
-and retention empties rows rather than deleting them. A row carrying neither an
+and retention empties rows rather than deleting them.
+**Read "loud" against F10-36 before believing it** (batch-final finding B5): on
+the claim path that raise happens *inside* `_claim_projection_job`, so it rolls
+back its own claim — `attempts` never increments, the job never reaches
+`failed` — and `AnsichService._project_pending` catches it. Since claims are
+ordered by `ingest_seq`, one such row is the lowest claimable job forever and
+**all** projection stalls process-wide. The swallow now logs (DEBUG always, a
+rate-limited WARNING naming F10-36), so the corruption is reported rather than
+silent; the stall is still F10-36's to fix. RC6's one deliberately-loud state is
+the one with the quietest consequence, and a reader of this paragraph should
+know that before concluding corruption will be noticed. A row carrying neither an
 inline payload nor a reference keeps its own `{}` answer and is **not** folded
 into expired (T2's F6 note): "carried nothing" and "carried something nobody can
 read" are different facts. The degrade differs by site because the cost differs.
@@ -2686,6 +2735,15 @@ health block, and its `None` means **never run** on a reachable store — which 
 ordinary, since retention is driven by a caller rather than by the store — while
 an unreachable block answers `None` too, so `status` is what tells the two
 apart.
+
+**`resumed_from_cursor` reads three positions, not two** (batch-final finding
+B6). It says whether this pass picked up where an earlier one stopped, and it
+used to read only `payload_cursor` and `structural_cursor` — which left the
+commonest resume in the whole tiering invisible, because tier 2 has no cursor
+column of its own: the Observation horizon *is* its resume position (§6
+deviation 3) and `observation_cursor` belongs to the owner hard delete. A
+non-zero horizon read before this pass moves it is the same statement the other
+two cursors make, so it is now the third term.
 
 **P11-C: the owner/thread hard delete** (spec §6's D6-2).
 `SqlAnsichBackend.hard_delete_scope(scope_id, *, batch_size)` erases one owner or
@@ -3021,7 +3079,17 @@ workers is now an expected consequence rather than a mystery. Restoring the
 transition gate means a read-check-then-lock pass (check unlocked, and if a
 write is needed take the lock and *re-check* under it) on the tick's hottest
 loop; it is the named next step, deliberately not taken in the same change as
-the correctness fix. The two *projector*-path writers
+the correctness fix. **Both of the tick's `FOR UPDATE` drivers are ordered, and
+the ordering is now itself pinned** (batch-final finding B7/R3): the budget rows
+sort by `(task_id, dimension, aggregation_scope)` and the heartbeat loop by
+`task_id`, each built by a module-level statement function
+(`_periodic_budget_rows_statement`, `_running_task_ids_statement`) so that
+`TestTheTickTraversalsAreOrdered` can compile them and assert the whole `ORDER BY`
+clause on both dialects. Before that nothing could see the ordering at all — the
+PostgreSQL deadlock arm scripts raw locks rather than driving these statements
+and SQLite cannot deadlock, so deleting either `ORDER BY` left the entire suite
+green, which is a finding and a tier arm one refactor away from being undone in
+silence. The two *projector*-path writers
 of the same table (`_project_control`, the ToolCall execution Belief) are
 deliberately **not** converted: there a collision costs one job transaction and a
 `retry`, which is the bounded self-healing case F10-6 already records.
@@ -3145,6 +3213,26 @@ where the requested row is not, since a denial discloses nothing and failing it
 twice would protect nobody. The **terminal** row degrades to a WARNING for the
 same asymmetry: by then the access is durably recorded and refusing the response
 would report a served read as an error while serving it anyway.
+**The audit rows expire under `ansich.retention.observation_days`, so that knob
+is also the access-audit retention period** (batch-final finding B3). They are
+ordinary Observations and retention's Observation tier filters by age alone —
+no `kind`, no `action_type` predicate — so the record of who obtained raw bytes
+ages out exactly like a heartbeat, at 30 days by default. **This is deliberate
+and privacy-consistent**: the audit of a read of one owner's data is data about
+that owner, and pinning it outside retention would make the audit outlive the
+evidence it describes, which is the same reading spec:97 already ruled for
+`activate_version`'s audit anchor (`ON DELETE SET NULL` plus the `audit_recorded`
+latch) and the same principle owner erasure applies when it deletes audit rows
+as its eighth delete family — a ruling about *privacy deletion* that says
+nothing about time, and reading it as coverage for this is a category error.
+What an operator must know is the coupling: there is no `audit_days` knob, so
+lowering `observation_days` for storage reasons shortens the §7 trail by the
+same amount, with no validator objection and no log line. 30 days is accepted on
+the record; "audit rows need their own floor" is registered for the wiring batch
+(F10-42) rather than assumed. The note also sits on
+`AnsichRetentionConfig`'s docstring, where the operator making that decision is
+looking.
+
 **An *unauthenticated* probe is audited nowhere, and it leaves no
 application-level record either.** `AuthMiddleware.dispatch` returns its 401
 before `call_next`, so the route never runs, there is no actor to name, and

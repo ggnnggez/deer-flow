@@ -43,12 +43,13 @@
 | F10-33 | 多 worker 下同一 host-Scope episode 并发碰撞 `uq_ansich_alert_episode`,一次碰撞丢掉**整轮** `assess_operations`(heartbeat/dwell/budget/environment 与两个生产者一起)——不腐蚀、下一轮自愈、已限速可见 | ✅ 已修复 | 2026-08-22 | `f1d52a79` |
 | F10-34 | PG tier 的 `_drain_projections` 在**退避中的 `retry` 作业**面前停手,调用方把它当成「投影已完结」——同文件的 `_settle_projections` 正是为这半件事存在的,只是那个调用点没用它。**不是 F10-30**(不是 settle 预算输给负载),也**不是 F10-26**(不是重建单轮被当成完成) | ✅ 已修复(测试侧;那个调用点已改用 `_settle_projections`) | 2026-08-22 | `f1d52a79` |
 | F10-35 | `ansich_current_beliefs` 首写者竞态的**整轮**爆炸半径:两 worker 的 1 Hz `assess_operations` 各自首写同一 `(task_id, "heartbeat")` 当前 Belief 行,`ansich_current_beliefs_pkey` 碰撞炸掉整个 tick 事务——与 F10-33 逐字同形,此前被 F10-31 的类型化容忍遮蔽 | ✅ 已修复 | 2026-08-22 | `f1d52a79` / `d2ca0392` |
-| F10-36 | **认领处的抛永远变不成一条运维可见的失败作业**:抛回滚自己的认领事务(`attempts` 不涨、作业到不了 `failed`),`_project_pending` 的 `except Exception: return 0` 吞掉它,而认领按 `ingest_seq` 排序——毒行一旦是最低可认领作业,**全进程投影永久静默停摆**,health 仍报 `reachable`/`failed_jobs=0` | ⬜ 未修复(既存形状;F10-29 的 hydrate 提前**扩大了它的暴露面**) | — | — |
+| F10-36 | **认领处的抛永远变不成一条运维可见的失败作业**:抛回滚自己的认领事务(`attempts` 不涨、作业到不了 `failed`),`_project_pending` 的 `except Exception: return 0` 吞掉它,而认领按 `ingest_seq` 排序——毒行一旦是最低可认领作业,**全进程投影永久静默停摆**,health 仍报 `reachable`/`failed_jobs=0` | ⚠️ 部分处理(方向 (c) 已落:那句 `except` 现在按窗限速打 DEBUG+WARNING;**停摆本身未修**,且与 RC6 的「响亮」第三态互为输入,见该条) | 2026-08-23 | `f5e57238` |
 | F10-37 | `_project_control` 不幂等:对一条已投影的 control 观测重放会撞 `ansich_transitions.evidence_obs_id` 唯一约束 ⇒ `retry` → `failed`,所以 `task-control` 的**普通**重放今天就是坏的(rebuild 不受影响) | ⬜ 未修复(已在 `_NON_IDEMPOTENT_PROJECTORS` 登记,CLI 两处 stderr 警告) | — | — |
-| F10-38 | owner/thread 强删除的两条 v1 不可解形状:被**类型拒绝**的实体 pin(host/workspace/sandbox/authorization/external_origin Scope、AgentRelease)与**互相 pin**(两个各自可删的 Scope 共用一个 Task,预检都过、谁都完不成)——都被如实拒绝,但 v1 无产品内补救 | ⬜ 未修复(v1 限制,已诚实拒绝并写死拒绝理由) | — | — |
+| F10-38 | owner/thread 强删除的**三条** v1 已知形状:被**类型拒绝**的实体 pin、**互相 pin**(两条都被如实拒绝),以及 `blocked` 之后到恢复之前的**复活窗口**(phase 2 已提交、Observation 还在,一次 replay/rebuild 会把 Task 行与读模型重新派生出来)| ⬜ 未修复(v1 限制,前两条已诚实拒绝;第三条已写在删除路径的 docstring 上) | — | — |
 | F10-39 | 保留策略下的无界增长残余:`ansich_content_blobs` 的 `inline_body`(阈值以下的正文,任何 tier 都不碰)、尚无 tier 触达的 blob 行,以及 tier 1 留下的 tombstone 空壳 | ⚠️ 部分收窄(T10 的 `_apply_plan_and_reclaim` 让三个删除者都回收自己弄成孤儿的 blob 行与正文;**不构成回收 tier**) | 2026-08-22 | `e764de4f` |
 | F10-40 | tier 2 删掉一条**活认领者**正在投影的观测时,投影方的外键失败经 `_record_projection_error` 的 `job is None` 早退**完全静默**:不计数、不打日志、不重臂,`stale_completion_count` 那条先例没有被套用 | ⬜ 未修复(有界、不毒批,但零可见性) | — | — |
 | F10-41 | **时间 retention 的三层没有任何调用者**:`run_retention` 只被测试调用——不在运维 tick 里、没有调度器条目、没有路由,所以 §6 测过的每一种保留状态在生产上都产不出来,`retention_last_run` 永远是 `None` | ⬜ 未修复(能力已落地、未接线;owner 强删除**不在**本条范围,它有路由) | — | — |
+| F10-42 | **P11-C 的遗留小项池**(批终审 B7 的分池 1/2 收口):T9b 的七条未路由小项、T6 的 N1–N4,以及批终审自己判为「登记即可」的两条(§7 审计行没有自己的下界;`--replace` 之外的三条 LOW 已就地修掉)| ⬜ 未修复(登记项,逐条带方向与归属) | — | — |
 
 留观标记:F10-10 的第 4 条证据(`test_step_attempt_and_context_are_queryable_after_projection`)**未证实**——只做了排除法,没拿到原始失败文本。若它再轮换红,**先抓失败文本再修**,不要按已有的三条诊断类推。另:F10-10 的门禁只被 Task 8 的验收负载证明过(`e53cefbc` 记录了这条边界),Task 9 的更重负载下仍有 2 条已上门禁的测试翻红,详见该条的「后续观察」。
 
@@ -641,7 +642,8 @@
 
 ## F10-36. 认领处的抛永远变不成一条运维可见的失败作业(全局静默停摆)
 
-- 状态:⬜ 未修复。**既存形状,P11-C 一处未动**;登记在此是因为 F10-29 的 hydrate 提前**扩大了它的暴露面**,而按旧措辞(「作业 durable failed」)读它会把人引向错的补救方向。来源:P11-C 批 Task 2 复审实测。
+- 状态:⚠️ 部分处理(2026-08-23,P11-C 批终审修复波,`f5e57238`)。**方向 (c) 已落,停摆本身仍未修。** `_project_pending` 的那句 `except` 现在把异常路由到 `_report_projection_failure`:每次都打一条带 traceback 的 DEBUG,并按自己的 60s 窗(不与评估 tick 共用,否则更快的轮询会把更慢的事故盖掉)打一条 WARNING,被压掉的条数骑在下一条上。登记在此的原因不变:F10-29 的 hydrate 提前**扩大了它的暴露面**,而按旧措辞(「作业 durable failed」)读它会把人引向错的补救方向。来源:P11-C 批 Task 2 复审实测。
+- **RC6 的「响亮」第三态就是本条的输入之一**(批终审 B5)。`_hydrated_observation_payload` 刻意让 *missing*(没有 tombstone 的缺失 payload = 损坏)继续抛 `RuntimeError`,理由是「这不是策略结果,应当被看见」。但在认领路径上那一抛正好落进本条:回滚自己的认领、永远到不了 `failed`、被这句 `except` 吞掉、并按 `ingest_seq` 把全进程的投影堵死。也就是说 **RC6 唯一刻意保持响亮的状态,后果是全系统最安静的那一个**——读 RC6 的人(spec、AGENTS、计划里都有那段)会合理地以为损坏会被发现。限速日志让它至少**被报告**;要让它变成一条运维可见的失败作业,仍然要本条的 (a) 或 (b)。两处 docstring(`_hydrated_observation_payload` 的 *missing* 段、`_project_pending`)现在互相指向本条。
 - 位置:`sql.py::_claim_projection_job`(抛出点)、`packages/ansich/ansich/service.py::_project_pending`(`service.py:4054-4065`,那句 `except Exception: return 0` 在 :4064-4065)、认领语句的 `ORDER BY AnsichObservationRow.ingest_seq`。
 - 现状,三段连锁,每一段都被单独实测过:
   1. **抛回滚自己的认领事务**,`attempts` 的自增随之回滚,所以那条作业**永远到不了 `failed`**——观测到的稳定态是 `status='pending', attempts=0`,永远。
@@ -667,6 +669,7 @@
 - 两条形状:
   1. **被类型拒绝的 pin。** 一次擦除只删一个 Scope。当该 Scope 名下某个 Task 的一条 Observation 是**外部**某实体的 *discovery* Observation 时,那个实体以 `RESTRICT` 证据指针把该行按住。若那个实体自己的擦除是**按类型被拒**的——host `Scope`,或 `workspace`/`sandbox`/`authorization`/`external_origin` 类的 Scope,或一条 AgentRelease——那么这次擦除**永远不可能完成**。`_refuse_unsatisfiable_pins` 在取到锁之后、第一笔删除之前就以 `unsatisfiable_pin` 答复,并且它**读的是那几条拒绝自己用的同一组常量**,所以新增一条类型拒绝会自动被它跟上。
   2. **互相 pin。** 两个 `owner`/`thread` Scope 的 provenance 穿过同一个 Task:每一个单独看都是可擦除的,预检因此都过,但**谁都完不成**——各自都被对方按住,答 `blocked` 并点名那条边。
+  3. **`blocked` 之后的复活窗口**(批终审 B8 补登,第三条形状)。`blocked` 是在 phase 5 的事务里抛的,所以 Scope 行作为恢复锚点留下(T10 F1 的设计,正确)——但 **phase 2 已经提交**:`ansich_tasks` 行、它的读模型与 assessor 作业都没了,而 Observation 与它们的投影作业还站着,两把锁随即释放。此时一次 `replay` 或 `rebuild_projections()` 会从幸存的 Observation 把 `ansich_tasks` 与读模型行**重新派生出来**——即一位 owner 要求擦除的数据,在「被 blocked」到「被恢复」之间被部分复活。**有界**:窗口由操作者自己的动作界定,恢复时又会从幸存的 `within_scope` 边重新走一遍。**为什么不是一行能修的**:phase 2 的提交是承重的(它解开 `ansich_content_occurrences` 的 `RESTRICT`,第二遍卫星扫描才走得动),幸存的 Scope 行按设计就是恢复句柄,两边都不能一挪了事。今天的诚实做法是「恢复那次擦除」,并且这段话写在 `_hard_delete_task` 的 docstring 上,免得下一个读代码的人以为 phase 2 的提交是随手写的。**上面三条候选修法里的 (3)(就地 tombstone 的擦除模式)同时也解掉这一条**:被 tombstone 抹掉的 payload 无法被重放派生回来。
 - **v1 没有产品内补救,这一点必须写明**,否则运维会以为「再跑一次」或「先删另一个」能救。今天唯一的出路是操作者用带外手段直接移除那些外部行。
 - 方向:三条,择一,`(3)` 最便宜:
   1. **多 Scope 擦除**——把一组 Scope 当作一个单位收下,`(2)` 随之消失,`(1)` 仍在。
@@ -708,3 +711,23 @@
 - 方向:接线,而不是改任何 §6 的代码。两条候选,建议前者:(a) 一个由 `scheduler` 驱动的周期性 pass(与 `config.yaml -> scheduler` 同一套开关),按 `RetentionPolicy` 从配置取三个 tier 年龄与 `cleanup_batch_size`,**并且必须循环**——`RetentionReport.finished` 回答的是「这一趟被上界停住了吗」而不是「库里空了」,跨 pass 收敛之下调用方无论如何都要再跑一趟(§6 的偏离 6 与 `backend/AGENTS.md` 的 `RetentionReport.finished` 段各写了一遍);(b) 一条 admin 路由,让运维手动触发一趟。无论哪条,接线的那一批都要顺带回答本文件里已经登记的两个相邻问题:`F10-39`(没有任何 tier 回收 `inline_body`/blob 行/tombstone 空壳,一旦真的开始跑,这条从「理论增长」变成「在增长」)与 `F10-40`(tier 2 撞上活认领者时那次完全静默的投影丢失,一旦真的开始跑就会真的发生)。
 - **三处记录互相指向,不要只读一处**:本条、`ansich/docs/plans/11-resilience-replay-and-retention.md` §6 实现状态的偏离 6、以及 `ansich/docs/plans/README.md` 的 P11-C 条目「明确没有清零的残留」那一段。
 - 归属:**下一个 retention 批次的第一件事**(接线先于任何新 tier;`F10-39` 要的回收 tier 排在它后面)。
+
+## F10-42. P11-C 的遗留小项池(批终审 B7 的分池 1/2 收口)
+
+- 状态:⬜ 未修复(**登记项**,不是缺陷)。来源:P11-C 批终审 B7——本批的残留纪律是「要么修、要么登记、要么点名」,绝大多数小项都做到了,只有三个子池没有被路由到任何比 SDD 目录更耐久的地方;SDD 目录一归档它们就没了。批终审修复波把其中能一行修掉的都修了,剩下的按本条登记,**逐条带方向与归属**。
+- **修复波里就地修掉的(不在本条名下,列出以免有人再去找)**:T9b F2(`resumed_from_cursor` 看不见 tier 2 中途恢复,= 批终审 B6)、T11 R3(两条恢复的 `ORDER BY` 无钉子,= B7/R3)、T14 F1(`Metric` 的 tone 只到 Tailwind class ⇒ 加 `data-tone` 属性并改断言)、T10 N7(`parent_scope` 拒绝没点名子 Scope,= B11)、T10 的 `sorted()` 对可空 4 元组(= B10)、B9(过期结算可达性的 docstring 更正)。T9b F10(「未完成」被渲染成「未知」)由 T14 结清;T12 的三条措辞项与 W3 由 T15 的 `262862a7` 结清(本波复核过:no-store 的范围限定、中间件不写日志那句、`raw_read_max_bytes` 的「近似上界/度量在内层文档」描述、`get_args(OperatorAuditActionType)` 的写入值断言都在)。
+- **分池 1:T9b 复审的七条**(原文在 `task-9b-review.md`,ledger:103):
+  1. **F1** — 一条 `>= 0` 的空断言;以及**没有**一条 Belief 读路径的用例跑在「证据已被清空」的库上。方向:把空断言换成有判别力的等式,并补一条「tier 2 清空之后 Belief 读路径仍然自洽」的用例。归属:下一次触达 Belief 读路径或 retention 用例的改动。
+  2. **F6** — auth snapshot 的回收**没有测试**。方向:补一条「删掉最后一条引用 `ansich_authorization_snapshots` 的行之后,它的 payload 行也走了」的用例。**与批终审 B1 相邻**:那正是 `--replace` 的第三条成员条件点名的同一张表(`task-safety` 拥有它),所以这条一旦补上,也是把那条允许清单往前推的一半功课。归属:下一次触达 `_apply_plan_and_reclaim` 或 `task-safety` 可重放性证明的改动。
+  3. **F7** — `_plan_cascade` 把「卡在哪」的原因丢掉了:horizon 停住这件事在健康面上看得见,**为什么**停住看不见。方向:让规划器把阻塞边带回来(`hard_delete_scope` 已经有这条通道,tier 2/3 没有),至少进日志。归属:下一次触达 retention tier 2/3 的改动。
+  4. **F8** — 认领者竞态的**响亮那一半**没有被记录:并发的 `RESTRICT` 插入会从 `run_retention` 里抛出来(有界,cursor 是持久的),但没有任何一处文档说过它。方向:一句话写在 `run_retention` 的 docstring 上。归属:同上。
+  5. **F9** — `max_batches=0` 的不对称:`None` 是「不设界」,`0` 却是「一层都不跑」,两者从签名上分不出来。方向:要么拒绝 `0`,要么在 docstring 上写死它的含义。归属:接线批次(它是第一个真的会传这个参数的调用者)。
+  6. **F11** — 没有路由级的连线用例(健康面上的 retention 块只在服务层被测过)。方向:一条走 `GET /api/ansich/health` 的用例。归属:下一次触达该路由的改动。
+- **分池 2:T6 复审的 N1–N4**(ledger:86):
+  1. **N1** — 守卫在重抛「与 resolver 无关的 `ValueError`」之前先打了 warning;更诚实的位置是**回退成功之后**再打。
+  2. **N2** — F8 的路由改动没有测试(参数默认就是那个常量,所以回退不会被发现),而且 `get_active_resolver` 的 fail-open 分支零覆盖。
+  3. **N3** — 守卫触发时,比较结果上盖的是一个**什么都没选中**的 resolver 的戳(「in force」说得过于慷慨)。
+  4. **N4** — 「同一个 30s 窗口里两个 worker 的戳可以不同,但结论永远相同」这条事实没有写进过时性那两段。
+  归属:下一次触达 active-version / resolver 选择的改动(四条都在同一处代码里,建议一并做)。
+- **§7 审计行需要自己的下界吗**(批终审 B3 的那一半)。行为本身是刻意的、已写在三处(spec §7 边界 6、`backend/AGENTS.md` 的 §7 段、`AnsichRetentionConfig` 的 docstring):审计行是普通 Observation,按 `observation_days` 过期,所以那个 knob 同时就是访问审计的保留期,默认 30 天。**登记的是这个问题本身**:合规要求更长时,是加一个 `audit_days`(第四个 tier 年龄,tier 2 加一条 `kind` 谓词),还是把审计行搬到一张不被 retention 走的表上。方向:前者更便宜且与现有三层同构;后者才真正把「审计」与「数据」分家,但要重新回答「读一位 owner 数据的审计是否也是那位 owner 的数据」。归属:**接线批次**(`F10-41`)——那是 retention 第一次真的会在生产上删东西的时刻,在那之前这个窗口一天都没有关过。
+- 归属:本条是一个池子,不是一件事;每一条自己的归属写在它那一行上。整体的 owner 是**下一个触达 Ansich 的批次**,它至少要把这份清单读一遍再决定哪些跟着自己的改动一起结掉。
