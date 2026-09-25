@@ -20,6 +20,7 @@ import logging
 from collections.abc import Awaitable, Callable
 from typing import override
 
+from deerflow_extension_api import ContentKind, provenance_kwargs
 from langchain.agents import AgentState
 from langchain.agents.middleware import AgentMiddleware
 from langchain.agents.middleware.types import ModelCallResult, ModelRequest, ModelResponse
@@ -137,7 +138,11 @@ class ToolReceiptMiddleware(AgentMiddleware[AgentState]):
             return request
         ledger_message = HumanMessage(
             content=ledger,
-            additional_kwargs={"hide_from_ui": True, _RECEIPT_CONTEXT_KEY: True},
+            additional_kwargs={
+                "hide_from_ui": True,
+                _RECEIPT_CONTEXT_KEY: True,
+                **provenance_kwargs(ContentKind.MIDDLEWARE_INJECTION, "tool_receipt_ledger"),
+            },
         )
         messages = insert_after_leading_system_messages(list(request.messages), [ledger_message])
         return request.override(messages=messages)

@@ -272,6 +272,104 @@ class TestPiiRedactionKeepsTheRecordedSummaryIdentity:
         assert redacted.state["summary_content_hash"] == "h-raw"
 
 
+class _Request:
+    """The slice of ``ModelRequest`` the request-side injectors touch."""
+
+    def __init__(self, messages, runtime=None, state=None):
+        self.messages = messages
+        self.runtime = runtime
+        self.state = state or {}
+
+    def override(self, **kwargs):
+        clone = _Request(list(self.messages), self.runtime, dict(self.state))
+        for key, value in kwargs.items():
+            setattr(clone, key, value)
+        return clone
+
+
+def _runtime():
+    from unittest.mock import MagicMock
+
+    runtime = MagicMock()
+    runtime.context = {"thread_id": "thread-1", "run_id": "run-1"}
+    return runtime
+
+
+def _assert_injection(message, producer_kind: str) -> None:
+    provenance = read_provenance(message)
+    assert provenance is not None, f"{producer_kind}: injected message carries no provenance stamp"
+    assert provenance.content_kind == "middleware_injection"
+    assert provenance.producer_kind == producer_kind
+
+
+class TestRequestSideInjectionsAreStamped:
+    """Every middleware-authored message the model sees names its producer.
+
+    These five injections reach the model as ``HumanMessage``s appended or
+    inserted at the model-call boundary. Unstamped, an observer at that
+    boundary can only file them as unknown user input — the one thing they
+    are not.
+    """
+
+    def test_the_todo_context_loss_reminder_is_stamped(self):
+        from deerflow.agents.middlewares.todo_middleware import TodoMiddleware
+
+        state = {"todos": [{"status": "pending", "content": "Deploy"}], "messages": [HumanMessage(content="hi")]}
+        update = TodoMiddleware().before_model(state, _runtime())
+
+        assert update is not None
+        [reminder] = update["messages"]
+        _assert_injection(reminder, "todo_reminder")
+        assert reminder.additional_kwargs["hide_from_ui"] is True
+
+    def test_the_todo_completion_reminder_is_stamped(self, monkeypatch):
+        from deerflow.agents.middlewares.todo_middleware import TodoMiddleware
+
+        middleware = TodoMiddleware()
+        monkeypatch.setattr(middleware, "_drain_completion_reminders", lambda runtime: ["Mark 'Deploy' complete if it is done."])
+
+        result = middleware._augment_request(_Request([HumanMessage(content="hi")], runtime=_runtime()))
+
+        _assert_injection(result.messages[-1], "todo_completion_reminder")
+        assert result.messages[-1].additional_kwargs["hide_from_ui"] is True
+
+    def test_the_tool_receipt_ledger_is_stamped(self):
+        from deerflow.agents.middlewares.tool_receipt_middleware import ToolReceiptMiddleware
+
+        result = ToolReceiptMiddleware()._inject(_Request([HumanMessage(content="hi")]), "[r1 write_file] ok")
+
+        [ledger] = [m for m in result.messages if m.content == "[r1 write_file] ok"]
+        _assert_injection(ledger, "tool_receipt_ledger")
+        assert ledger.additional_kwargs["hide_from_ui"] is True
+
+    def test_the_token_budget_warning_is_stamped(self):
+        from deerflow.agents.middlewares.token_budget_middleware import TokenBudgetMiddleware
+        from deerflow.config.token_budget_config import TokenBudgetConfig
+
+        middleware = TokenBudgetMiddleware.from_config(TokenBudgetConfig(max_tokens=1000, enabled=True))
+        result = middleware._inject_warnings(_Request([HumanMessage(content="hi")]), ["Budget is 80% consumed."])
+
+        _assert_injection(result.messages[-1], "token_budget")
+        assert result.messages[-1].name == "budget_warning"
+
+    def test_the_loop_detection_warning_is_stamped(self):
+        from deerflow.agents.middlewares.loop_detection_middleware import LoopDetectionMiddleware
+
+        result = LoopDetectionMiddleware(warn_threshold=3, hard_limit=5)._inject_warnings(_Request([HumanMessage(content="hi")]), ["Tool loop detected."])
+
+        _assert_injection(result.messages[-1], "loop_detection")
+        assert result.messages[-1].name == "loop_warning"
+
+    def test_the_tool_progress_hint_is_stamped(self):
+        from deerflow.agents.middlewares.tool_progress_middleware import ToolProgressMiddleware
+
+        middleware = ToolProgressMiddleware(stagnation_threshold=3, warn_escalation_count=2, inject_assessment=True, jaccard_threshold=0.8, min_words=5)
+        result = middleware._inject_hints(_Request([HumanMessage(content="hi")], runtime=_runtime()), ["web_search has stagnated."])
+
+        _assert_injection(result.messages[-1], "tool_progress")
+        assert result.messages[-1].name == "progress_hint"
+
+
 class TestSystemMessageCoalescingStamping:
     """The coalesced leading SystemMessage is stamped as a middleware injection."""
 

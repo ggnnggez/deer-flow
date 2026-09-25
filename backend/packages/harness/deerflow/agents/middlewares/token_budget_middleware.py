@@ -49,6 +49,7 @@ from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from typing import Any, override
 
+from deerflow_extension_api import ContentKind, provenance_kwargs
 from langchain.agents import AgentState
 from langchain.agents.middleware import AgentMiddleware
 from langchain.agents.middleware.types import ModelCallResult, ModelRequest, ModelResponse
@@ -363,7 +364,11 @@ class TokenBudgetMiddleware(AgentMiddleware[AgentState]):
             return request
 
         merged_text = "\n\n".join(warnings)
-        warning_msg = HumanMessage(content=merged_text, name="budget_warning")
+        warning_msg = HumanMessage(
+            content=merged_text,
+            name="budget_warning",
+            additional_kwargs=provenance_kwargs(ContentKind.MIDDLEWARE_INJECTION, "token_budget"),
+        )
 
         messages = getattr(request, "messages", [])
         new_messages = list(messages) + [warning_msg]

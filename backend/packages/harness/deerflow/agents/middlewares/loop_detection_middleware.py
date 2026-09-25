@@ -71,6 +71,7 @@ from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Literal, override
 
+from deerflow_extension_api import ContentKind, provenance_kwargs
 from langchain.agents import AgentState
 from langchain.agents.middleware import AgentMiddleware
 from langchain.agents.middleware.types import ModelCallResult, ModelRequest, ModelResponse
@@ -903,7 +904,11 @@ class LoopDetectionMiddleware(AgentMiddleware[AgentState]):
             return request
         new_messages = [
             *request.messages,
-            HumanMessage(content=self._format_warning_message(warnings), name="loop_warning"),
+            HumanMessage(
+                content=self._format_warning_message(warnings),
+                name="loop_warning",
+                additional_kwargs=provenance_kwargs(ContentKind.MIDDLEWARE_INJECTION, "loop_detection"),
+            ),
         ]
         return request.override(messages=new_messages)
 

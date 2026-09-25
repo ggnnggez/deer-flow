@@ -23,6 +23,7 @@ import threading
 from collections.abc import Awaitable, Callable
 from typing import Any, override
 
+from deerflow_extension_api import ContentKind, provenance_kwargs
 from langchain.agents.middleware import TodoListMiddleware
 from langchain.agents.middleware.todo import Todo
 from langchain.agents.middleware.types import ModelCallResult, ModelRequest, ModelResponse, hook_config
@@ -153,7 +154,7 @@ class TodoMiddleware(TodoListMiddleware):
         formatted = _format_todos(todos)
         reminder = HumanMessage(
             name=TODO_REMINDER_MESSAGE_NAME,
-            additional_kwargs={"hide_from_ui": True},
+            additional_kwargs={"hide_from_ui": True, **provenance_kwargs(ContentKind.MIDDLEWARE_INJECTION, "todo_reminder")},
             content=(
                 "<system_reminder>\n"
                 "Your todo list from earlier is no longer visible in the current context window, "
@@ -352,7 +353,7 @@ class TodoMiddleware(TodoListMiddleware):
             HumanMessage(
                 content=self._format_pending_completion_reminders(reminders),
                 name="todo_completion_reminder",
-                additional_kwargs={"hide_from_ui": True},
+                additional_kwargs={"hide_from_ui": True, **provenance_kwargs(ContentKind.MIDDLEWARE_INJECTION, "todo_completion_reminder")},
             ),
         ]
         return request.override(messages=new_messages)

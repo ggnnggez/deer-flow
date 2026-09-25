@@ -25,7 +25,12 @@ via `deerflow_extension_api.provenance.provenance_kwargs()`:
 `deerflow_producer_entity_id`. All are server-owned inbound metadata; stamp even
 without observers, since downstream cannot recover producers. Producers:
 DynamicContext (reminder/memory), DurableContext (contract/data),
-SystemMessageCoalescing, ViewImage, SkillActivation. Summarization/Title use
+SystemMessageCoalescing, ViewImage, SkillActivation, Todo (`todo_reminder` /
+`todo_completion_reminder`), ToolReceipt (`tool_receipt_ledger`), TokenBudget
+(`token_budget`), LoopDetection (`loop_detection`), ToolProgress
+(`tool_progress`) — every request-side `HumanMessage` a middleware authors.
+Rewrites of the user's own message (uploads manifest, input sanitization, PII
+redaction) and middleware-authored synthetic `ToolMessage`s are not stamped. Summarization/Title use
 `SystemOperationKind.SUMMARIZATION`/`.TITLE` model-call attribution; summaries
 enter via DurableContext's stamped `durable_context_data`, not separate
 messages. That block also declares `summary_content_hash` — the identity

@@ -694,6 +694,14 @@ This release closes that milestone with **765 merged pull requests**.
 
 #### Extensions & plugins
 
+- **extensions:** Every request-side `HumanMessage` a middleware authors now
+  carries a provenance stamp: the todo context-loss reminder
+  (`todo_reminder`) and completion reminder (`todo_completion_reminder`), the
+  tool receipt ledger (`tool_receipt_ledger`), the token budget warning
+  (`token_budget`), the loop-detection warning (`loop_detection`) and the tool
+  progress hint (`tool_progress`), all as `ContentKind.MIDDLEWARE_INJECTION`.
+  An observer at the model-call boundary previously had to file these as
+  unknown user input. No contract change. ([#TBD])
 - **extensions:** A message that carries a compaction summary now says which one.
   Summarization records `canonical_hash(summary)` in state as
   `summary_content_hash` next to `summary_text` (both compaction paths and the

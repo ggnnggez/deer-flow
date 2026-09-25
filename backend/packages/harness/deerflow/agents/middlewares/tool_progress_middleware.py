@@ -56,6 +56,7 @@ from collections.abc import Awaitable, Callable, Sequence
 from dataclasses import dataclass, field, replace
 from typing import TYPE_CHECKING, Literal, override
 
+from deerflow_extension_api import ContentKind, provenance_kwargs
 from langchain.agents import AgentState
 from langchain.agents.middleware import AgentMiddleware
 from langchain.agents.middleware.types import ModelCallResult, ModelRequest, ModelResponse
@@ -728,7 +729,11 @@ class ToolProgressMiddleware(AgentMiddleware[AgentState]):
         )
         new_messages = [
             *request.messages,
-            HumanMessage(content="\n\n".join(deduped), name="progress_hint"),
+            HumanMessage(
+                content="\n\n".join(deduped),
+                name="progress_hint",
+                additional_kwargs=provenance_kwargs(ContentKind.MIDDLEWARE_INJECTION, "tool_progress"),
+            ),
         ]
         return request.override(messages=new_messages)
 

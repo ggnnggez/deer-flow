@@ -527,6 +527,12 @@
   `open` 仍是默认值。([#5152])
 
 #### 扩展与插件
+- **扩展：** 中间件在请求侧生成的每条 `HumanMessage` 现在都带来源标记：todo 的上下文
+  丢失提醒（`todo_reminder`）与完成提醒（`todo_completion_reminder`）、工具回执账本
+  （`tool_receipt_ledger`）、token 预算警告（`token_budget`）、循环检测警告
+  （`loop_detection`）和工具进度提示（`tool_progress`），种类均为
+  `ContentKind.MIDDLEWARE_INJECTION`。此前模型调用边界上的观察者只能把它们记成
+  来源不明的用户输入。契约无变化。([#TBD])
 - **扩展：** 承载压缩摘要的消息现在会说明它承载的是哪一条。摘要压缩把
   `canonical_hash(summary)` 作为 `summary_content_hash` 记进状态、与 `summary_text`
   并列（两条压缩路径与手动 `/compact` 路由都写），durable-context 数据块通过新的来源
