@@ -260,8 +260,13 @@ Frozen dataclass, captured while both sides of the transform still exist.
 | `output_content_hash`     | `str`             |
 | `compacted_message_count` | `int`             |
 | `kept_message_count`      | `int`             |
+| `kept_content_hashes`     | `tuple[str, ...]` (default `()`, 0.2.5) |
+| `task_id`                 | `str \| None` (default `None`, 0.2.5) |
+| `run_id`                  | `str \| None` (default `None`, 0.2.5) |
+| `thread_id`               | `str \| None` (default `None`, 0.2.5) |
+| `emitted_at`              | `str \| None` (ISO-8601 UTC, default `None`, 0.2.5) |
 
-Hashes are `canonical_hash(message.content)` of the content passed directly, never a stringified copy. To match a message to an event, hash its `content` the same way.
+Hashes are `canonical_hash(message.content)` of the content passed directly, never a stringified copy. To match a message to an event, hash its `content` the same way. The identity fields are copied from the task's seeded `TaskInfo` and stay `None` when there is none.
 
 ## Services
 
@@ -528,5 +533,6 @@ The host's contract version as a dotted string, `"0.2.4"` for the contract this 
 | 0.2.2 | [#5647](https://github.com/bytedance/deer-flow/pull/5647) | Experimental `registry.plugin()` with `PluginContribution`, `BrowserModule`, `BackendAction`, `ModelTool`, `ActionContext`, `ToolContext`, `SettingsField` |
 | 0.2.3 | [#5727](https://github.com/bytedance/deer-flow/pull/5727), [#5685](https://github.com/bytedance/deer-flow/pull/5685) | Request-scoped run evidence: `resolve_run_evidence_reader`, `require_run_evidence_reader`, `RUN_EVIDENCE_READER_RESOLVER_KEY` (#5727). Packaged browser resources: `BrowserAssets`, and `PluginContribution.frontend` also accepts it (#5685) |
 | 0.2.4 | [#5842](https://github.com/bytedance/deer-flow/pull/5842) | Plugin resource authorization: `require_plugin_management`, `arequire_plugin_management`, `EXTENSION_PLUGIN_AUTHZ_RESOLVER_KEY`, `EXTENSION_PLUGIN_AUTHZ_RESOLVER_ASYNC_KEY` |
+| 0.2.5 | [#TBD](https://github.com/bytedance/deer-flow/pull/TBD) | `CompactionEvent.kept_content_hashes`, `task_id`, `run_id`, `thread_id`, `emitted_at`; the host seeds every task store with its `TaskInfo` |
 
 No release has removed a public name.

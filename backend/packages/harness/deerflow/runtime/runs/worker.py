@@ -1012,16 +1012,23 @@ async def run_agent(
         task_id = lead_task_id(run_id)
         if extensions.needs_task_store:
             task_store = ExtensionData(task_id)
+            # Seed the scope's identity so a hook that only holds the runtime — a
+            # contributed middleware, the compaction seam — can read it back with
+            # ``task_store.get(TaskInfo)`` without depending on a lifecycle hook.
+            task_store.set(
+                TaskInfo(
+                    task_id=task_id,
+                    run_id=run_id,
+                    thread_id=thread_id,
+                    kind="lead",
+                    agent_name=record.assistant_id,
+                )
+            )
 
         if extensions.has_task_lifecycle:
-            task_info = TaskInfo(
-                task_id=task_id,
-                run_id=run_id,
-                thread_id=thread_id,
-                kind="lead",
-                agent_name=record.assistant_id,
-            )
             assert task_store is not None
+            task_info = task_store.get(TaskInfo)
+            assert task_info is not None
             await notify_task_start(
                 extensions,
                 task_store,

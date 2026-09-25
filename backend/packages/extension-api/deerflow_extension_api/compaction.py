@@ -26,6 +26,18 @@ text later reaches a message (the ``durable_context_data`` block), but
 will not equal ``output_content_hash``. A consumer must join a compaction to what came
 after it through this event alone, never by re-hashing a later projection of the same
 text.
+
+The event also names the task it happened in. Compaction observers are notified
+outside the turn and receive a detached store, so an observer keeping per-task
+records (a context ledger, a residency matrix) could not otherwise tell whose
+context just shrank. ``task_id`` / ``run_id`` / ``thread_id`` are copied from the
+emitting task's ``TaskInfo`` — the identity ``on_task_start`` reported, which the
+host seeds into every task store — and stay ``None`` when the emitting runtime
+carries no seeded store; the host never substitutes a run id for a subagent's task
+id. ``emitted_at`` is the host's UTC wall-clock time taken synchronously at
+emission, before the notification is dispatched, so an observer can order the
+event against records it timestamped itself on the same host even though the
+notification arrives asynchronously.
 """
 
 from __future__ import annotations
@@ -46,6 +58,18 @@ class CompactionEvent:
     output_content_hash: str
     compacted_message_count: int
     kept_message_count: int
+    #: ``canonical_hash(message.content)`` for each message that survived the
+    #: compaction, in order — captured at the same moment as the sources. Empty
+    #: when no observer was registered at freeze time (the host skips the hashing
+    #: pass) and on events from a host older than this field.
+    kept_content_hashes: tuple[str, ...] = ()
+    #: The compacted task's identity, from its ``TaskInfo``; ``None`` when the
+    #: emitting runtime carried no seeded task store.
+    task_id: str | None = None
+    run_id: str | None = None
+    thread_id: str | None = None
+    #: ISO-8601 UTC timestamp taken at emission, before dispatch.
+    emitted_at: str | None = None
 
 
 class ContextCompactionObserver(Protocol):

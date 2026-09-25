@@ -309,10 +309,15 @@ class ContextCompactionObserver(Protocol):
 | `output_content_hash`     | 摘要文本的 `canonical_hash`                            |
 | `compacted_message_count` | 移除了多少条消息                                       |
 | `kept_message_count`      | 保留了多少条消息                                       |
+| `kept_content_hashes`     | 每条被保留消息的 `canonical_hash(message.content)`，按顺序（0.2.5） |
+| `task_id`、`run_id`、`thread_id` | 被压缩任务的身份，取自它的 `TaskInfo`；发出事件的运行时没有已播种的任务存储时为 `None`（0.2.5） |
+| `emitted_at`              | 发出事件时取得的 ISO-8601 UTC 时间，在分派之前（0.2.5）  |
 
 要把事件和你手里的消息对应起来，必须用完全相同的方式哈希：`canonical_hash(message.content)`，直接传入 content 本身。绝不要先转成字符串，因为多模态 content 是 dict 列表，`str()` 的结果取决于键顺序。也不要试图事后通过对模型看到的内容做哈希来找回摘要：提示词里带的是摘要经过截断和转义的渲染版本，它的哈希不会等于 `output_content_hash`。
 
 这个通知是即发即弃的。它被分派到通知循环，不会阻塞模型这一轮；观察者收到的是**分离**存储，因为在这个调用点没有活跃任务。没有注册压缩观察者时，宿主连哈希这一步也会跳过。
+
+正因为存储是分离的，任务身份改为随事件携带。`task_id`、`run_id`、`thread_id` 与该任务 `on_task_start` 收到的值相同：宿主会用每个任务的 `TaskInfo` 播种它的任务存储（见[运行时](/docs/harness/extensions/runtime)的"作用域与存储"），压缩点通过它持有的运行时把身份读回来。没有已播种存储的运行时——手动 `/compact`、没有 Gateway 包裹的 harness 运行——`task_id` 保持 `None`；宿主绝不会拿 run id 冒充子代理的 task id。`emitted_at` 在分派通知之前同步取得，所以在同一宿主上给自己的按任务记录打时间戳的观察者，即便通知稍后才到，也能把这次压缩排进正确的位置。
 
 ### 示例
 

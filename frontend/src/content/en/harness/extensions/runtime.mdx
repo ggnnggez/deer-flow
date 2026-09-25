@@ -101,6 +101,8 @@ The host hands extensions `ExtensionData` stores instead of letting them keep gl
 
 Every callback receives the store for the current scope, so you never need to capture one or check whether it is stale.
 
+The host seeds each task store with the scope's `TaskInfo` before any hook runs, so a hook that only holds the runtime — a contributed middleware, a compaction observer reading the event's identity — can learn which task it is in with `task_store.get(TaskInfo)`. Treat that entry as read-only; it is the same value `on_task_start` receives. A subagent executed without a parent run id has no identity to seed, and the entry is absent.
+
 A task store is allocated only when at least one middleware contributor, task-lifecycle contributor, system-model observer, or context-compaction observer is registered. An extension that registers only services, routers, or assembly observers costs a run nothing.
 
 The app store is shared by every extension in the process. It is safe because stores are keyed by type, as described below.

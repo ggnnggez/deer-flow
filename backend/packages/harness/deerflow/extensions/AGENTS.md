@@ -207,7 +207,12 @@ Lead runs and subagents allocate an `ExtensionData` task store only when middlew
 task-lifecycle, or system-model observation is registered; services and routers are
 app-scoped and do not allocate one. Middleware and system-call sites recover the
 live store through `EXTENSION_TASK_STORE_KEY` / `task_store_from_runtime()`; lifecycle
-contributors receive that same store directly. Each task resolves the immutable
+contributors receive that same store directly. The run worker and the subagent executor
+seed each store with the scope's `TaskInfo` (`task_store.set(TaskInfo(...))`) right after
+allocating it, whether or not a lifecycle contributor is registered, and the lifecycle
+notification reuses that seeded object — so `task_store.get(TaskInfo)` answers "which
+task am I in" from any hook that only holds the runtime; a subagent with no parent run id
+seeds nothing rather than a half-true identity. Each task resolves the immutable
 loaded-extension snapshot once and binds that same object through task-store allocation,
 hooks, and synchronous agent construction, so a concurrent singleton replacement cannot
 mix two extension generations without changing the LangGraph graph-factory ABI. The
@@ -260,8 +265,12 @@ resets the loop only after in-flight run/subagent drain ordering is complete.
 described: `DeerFlowSummarizationMiddleware.compact_state()` / `acompact_state()` hash each
 about-to-be-removed message's content before the summary model call, then — once a summary
 is produced and the pre-compaction hooks have run — build a `CompactionEvent` (transform
-kind/version, source content hashes, the produced summary's content hash, and the
-compacted/kept message counts) and call `notify_context_compacted()`. Once
+kind/version, source content hashes, the produced summary's content hash, the
+compacted/kept message counts, the kept messages' content hashes frozen under the same
+observer gate, the task identity read from the seeded `TaskInfo` plus the runtime's
+`run_id` / `thread_id` — `task_id` stays `None` on a runtime without a seeded store, never a
+run id standing in for a subagent's task — and a UTC `emitted_at` taken synchronously
+before dispatch) and call `notify_context_compacted()`. Once
 `_maybe_summarize`/`_amaybe_summarize` remove the source messages from state, that mapping
 cannot be reconstructed, so the event is the only record of it. The event is keyed on
 `canonical_hash(message.content)` directly — never a stringified copy, which would defeat

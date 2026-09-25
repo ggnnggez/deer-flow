@@ -7,6 +7,7 @@ from state — it has to be emitted at the moment of the transform.
 
 from __future__ import annotations
 
+from datetime import datetime, timedelta
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
@@ -25,6 +26,24 @@ def test_event_records_both_ends_of_the_transform():
     )
     assert event.source_content_hashes == ("h1", "h2")
     assert event.output_content_hash == "h3"
+
+
+def test_identity_and_kept_hashes_default_to_absent_for_older_emitters():
+    """Additive contract release: an event built with only the 0.2.0 fields still constructs,
+    and every field added since reads as "not known" rather than as a value."""
+    event = CompactionEvent(
+        transform_kind="summarization",
+        transform_version="1",
+        source_content_hashes=("h1",),
+        output_content_hash="h3",
+        compacted_message_count=1,
+        kept_message_count=1,
+    )
+    assert event.task_id is None
+    assert event.run_id is None
+    assert event.thread_id is None
+    assert event.kept_content_hashes == ()
+    assert event.emitted_at is None
 
 
 def test_source_hashes_are_a_tuple_so_the_event_cannot_be_mutated_after_emission():
@@ -101,10 +120,16 @@ def _messages() -> list:
     ]
 
 
-def _runtime(thread_id: str | None = "thread-1") -> SimpleNamespace:
+def _runtime(thread_id: str | None = "thread-1", run_id: str | None = "run-1", task_store=None) -> SimpleNamespace:
     context = {}
     if thread_id is not None:
         context["thread_id"] = thread_id
+    if run_id is not None:
+        context["run_id"] = run_id
+    if task_store is not None:
+        from deerflow_extension_api import EXTENSION_TASK_STORE_KEY
+
+        context[EXTENSION_TASK_STORE_KEY] = task_store
     return SimpleNamespace(context=context)
 
 
@@ -150,6 +175,18 @@ class TestSummarizationEmitsTheEvent:
             canonical_hash("assistant-1"),
         )
         assert event.output_content_hash == canonical_hash("compressed summary")
+        # The kept side is captured at the same moment as the removed side: after
+        # this turn the preserved tail is all that is left, so "which messages
+        # survived this compaction" is only knowable here.
+        assert event.kept_content_hashes == (
+            canonical_hash("user-2"),
+            canonical_hash("assistant-2"),
+        )
+        assert event.thread_id == "thread-1"
+        assert event.run_id == "run-1"
+        assert event.task_id is None, "no task store on this runtime: the host must not guess a task id"
+        emitted = datetime.fromisoformat(event.emitted_at)
+        assert emitted.tzinfo is not None and emitted.utcoffset() == timedelta(0)
 
     @pytest.mark.asyncio
     async def test_no_event_is_emitted_when_the_trigger_does_not_fire(self, monkeypatch):
@@ -169,6 +206,67 @@ class TestSummarizationEmitsTheEvent:
 
         assert result is None
         assert events == []
+
+
+class TestTheEventNamesTheTaskItHappenedIn:
+    """Observers receive a detached store, so the task identity has to ride in the event.
+
+    The host seeds every task store with the scope's ``TaskInfo`` before any hook
+    runs; the compaction seam reads it back through the runtime the middleware
+    already holds. Without a seeded store the field stays ``None`` — the host never
+    guesses (a subagent's task id is not its run id).
+    """
+
+    @pytest.mark.asyncio
+    async def test_a_seeded_task_store_yields_the_task_id(self, monkeypatch):
+        from deerflow_extension_api import ExtensionData, TaskInfo
+
+        from deerflow.agents.middlewares import summarization_middleware
+
+        events = []
+        monkeypatch.setattr(summarization_middleware, "notify_context_compacted", lambda event, extensions=None: events.append(event))
+        store = ExtensionData("call-7")
+        store.set(TaskInfo(task_id="sub-9", run_id="run-1", thread_id="thread-1", kind="subagent", parent_task_id="run-1"))
+
+        result = await _middleware().abefore_model({"messages": _messages()}, _runtime(task_store=store))
+
+        assert result is not None
+        [event] = events
+        assert event.task_id == "sub-9"
+        assert event.run_id == "run-1"
+        assert event.thread_id == "thread-1"
+
+    @pytest.mark.asyncio
+    async def test_an_unseeded_store_leaves_the_task_id_absent(self, monkeypatch):
+        from deerflow_extension_api import ExtensionData
+
+        from deerflow.agents.middlewares import summarization_middleware
+
+        events = []
+        monkeypatch.setattr(summarization_middleware, "notify_context_compacted", lambda event, extensions=None: events.append(event))
+
+        await _middleware().abefore_model({"messages": _messages()}, _runtime(task_store=ExtensionData("run-1")))
+
+        [event] = events
+        assert event.task_id is None
+
+    def test_the_sync_path_carries_the_same_identity(self, monkeypatch):
+        from deerflow_extension_api import ExtensionData, TaskInfo
+
+        from deerflow.agents.middlewares import summarization_middleware
+
+        events = []
+        monkeypatch.setattr(summarization_middleware, "notify_context_compacted", lambda event, extensions=None: events.append(event))
+        store = ExtensionData("run-1")
+        store.set(TaskInfo(task_id="run-1", run_id="run-1", thread_id="thread-1", kind="lead"))
+
+        result = _middleware().before_model({"messages": _messages()}, _runtime(task_store=store))
+
+        assert result is not None
+        [event] = events
+        assert event.task_id == "run-1"
+        assert event.kept_content_hashes == (canonical_hash("user-2"), canonical_hash("assistant-2"))
+        assert event.emitted_at is not None
 
 
 class TestAnInstallWithNoObserverPaysNothing:
@@ -213,3 +311,4 @@ class TestAnInstallWithNoObserverPaysNothing:
         # The middleware still calls notify (which would itself no-op on the
         # empty observer tuple); what it must not do is compute the hashes.
         assert [e.source_content_hashes for e in events] == [()]
+        assert [e.kept_content_hashes for e in events] == [()]

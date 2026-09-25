@@ -260,8 +260,13 @@ class ContextCompactionObserver(Protocol):
 | `output_content_hash`     | `str`             |
 | `compacted_message_count` | `int`             |
 | `kept_message_count`      | `int`             |
+| `kept_content_hashes`     | `tuple[str, ...]`（默认 `()`，0.2.5） |
+| `task_id`                 | `str \| None`（默认 `None`，0.2.5） |
+| `run_id`                  | `str \| None`（默认 `None`，0.2.5） |
+| `thread_id`               | `str \| None`（默认 `None`，0.2.5） |
+| `emitted_at`              | `str \| None`（ISO-8601 UTC，默认 `None`，0.2.5） |
 
-哈希是对直接传入的内容计算的 `canonical_hash(message.content)`，从不是字符串化后的副本。要把某条消息与事件对应起来，请用同样的方式哈希它的 `content`。
+哈希是对直接传入的内容计算的 `canonical_hash(message.content)`，从不是字符串化后的副本。要把某条消息与事件对应起来，请用同样的方式哈希它的 `content`。身份字段取自任务已播种的 `TaskInfo`，没有时保持 `None`。
 
 ## 服务
 
@@ -527,5 +532,6 @@ class ReleasePolicyProvider(Protocol):
 | 0.2.2 | [#5647](https://github.com/bytedance/deer-flow/pull/5647) | 实验性的 `registry.plugin()`，以及 `PluginContribution`、`BrowserModule`、`BackendAction`、`ModelTool`、`ActionContext`、`ToolContext`、`SettingsField` |
 | 0.2.3 | [#5727](https://github.com/bytedance/deer-flow/pull/5727)、[#5685](https://github.com/bytedance/deer-flow/pull/5685) | 请求级运行证据：`resolve_run_evidence_reader`、`require_run_evidence_reader`、`RUN_EVIDENCE_READER_RESOLVER_KEY`（#5727）。打包的浏览器资源：`BrowserAssets`，`PluginContribution.frontend` 也接受它（#5685） |
 | 0.2.4 | [#5842](https://github.com/bytedance/deer-flow/pull/5842) | 插件资源授权：`require_plugin_management`、`arequire_plugin_management`、`EXTENSION_PLUGIN_AUTHZ_RESOLVER_KEY`、`EXTENSION_PLUGIN_AUTHZ_RESOLVER_ASYNC_KEY` |
+| 0.2.5 | [#TBD](https://github.com/bytedance/deer-flow/pull/TBD) | `CompactionEvent.kept_content_hashes`、`task_id`、`run_id`、`thread_id`、`emitted_at`；宿主用各任务的 `TaskInfo` 播种任务存储 |
 
 至今没有任何版本移除过公开名称。

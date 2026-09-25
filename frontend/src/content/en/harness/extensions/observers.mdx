@@ -312,10 +312,15 @@ Summarization replaces many messages with one summary. Afterwards, nothing in st
 | `output_content_hash`     | `canonical_hash` of the summary text                           |
 | `compacted_message_count` | How many messages were removed                                 |
 | `kept_message_count`      | How many messages were kept                                    |
+| `kept_content_hashes`     | `canonical_hash(message.content)` for each kept message, in order (0.2.5) |
+| `task_id`, `run_id`, `thread_id` | The compacted task's identity, copied from its `TaskInfo`; `None` when the emitting runtime has no seeded task store (0.2.5) |
+| `emitted_at`              | ISO-8601 UTC time taken at emission, before dispatch (0.2.5)   |
 
 To match an event against messages you hold, hash exactly the same way: `canonical_hash(message.content)`, passing the content itself. Never stringify it first, because multimodal content is a list of dicts and `str()` depends on key order. Do not try to rediscover the summary later by hashing what the model is shown: the prompt carries a bounded, escaped rendering of the summary, whose hash will not match `output_content_hash`.
 
 The notification is fire-and-forget. It is dispatched to the notification loop without blocking the model turn, and the observer receives a **detached** store, because there is no live task at that call site. When no compaction observer is registered, the host skips the hashing pass too.
+
+Because the store is detached, the task identity rides in the event instead. `task_id`, `run_id` and `thread_id` are the same values the task's `on_task_start` reported: the host seeds every task store with its `TaskInfo` (see [Scopes and stores](/docs/harness/extensions/runtime#scopes-and-stores)), and the compaction seam reads it back through the runtime it holds. A runtime without a seeded store — a manual `/compact`, a harness run with no Gateway around it — leaves `task_id` as `None`; the host never substitutes a run id for a subagent's task id. `emitted_at` is taken synchronously before the notification is dispatched, so an observer that timestamps its own per-task records on the same host can order the compaction against them even though the notification arrives later.
 
 ### Example
 

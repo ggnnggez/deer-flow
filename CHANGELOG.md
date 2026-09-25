@@ -694,6 +694,16 @@ This release closes that milestone with **765 merged pull requests**.
 
 #### Extensions & plugins
 
+- **extensions:** `CompactionEvent` now names the task it happened in (`task_id`,
+  `run_id`, `thread_id`, copied from the task's `TaskInfo`), lists the messages
+  that survived the compaction as `kept_content_hashes`, and carries an
+  `emitted_at` UTC timestamp taken before dispatch. Compaction observers are
+  notified with a detached store, so an extension keeping per-task context
+  records could not tell whose context had shrunk or which messages remained.
+  The host now seeds every task store with the scope's `TaskInfo`, readable as
+  `task_store.get(TaskInfo)` from any middleware or observer hook. Every new
+  field defaults to absent, so extensions written against 0.2.4 keep working;
+  `deerflow-extension-api` moves to 0.2.5. ([#TBD])
 - **extensions:** An out-of-tree Python extension system: extensions can
   contribute middleware, task-lifecycle and system-model observers, Gateway
   services, and HTTP routers, and are managed with `deerflow extensions`

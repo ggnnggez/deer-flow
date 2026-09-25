@@ -7,7 +7,7 @@ from types import ModuleType, SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
-from deerflow_extension_api import EXTENSION_TASK_STORE_KEY, ExtensionData
+from deerflow_extension_api import EXTENSION_TASK_STORE_KEY, ExtensionData, TaskInfo
 from langchain_core.messages import AIMessage
 from langgraph.checkpoint.memory import InMemorySaver
 
@@ -242,6 +242,41 @@ async def test_lead_middleware_receives_a_run_scoped_store(_isolated_extensions)
 
     assert agent.task_store is not None
     assert agent.task_store.scope_id == record.run_id
+
+
+@pytest.mark.anyio
+async def test_lead_task_store_is_seeded_with_the_scope_task_info(_isolated_extensions):
+    """A hook that only holds the runtime — a middleware, the compaction seam — can
+    still learn which task it is in: the host writes the scope's ``TaskInfo`` into the
+    store before any hook runs, whether or not a lifecycle contributor is registered.
+    """
+    registry = ExtensionRegistry()
+    with registry.attributed_to("demo:install"):
+        registry.middlewares(_MiddlewareContributor())
+    set_loaded_extensions(registry.build())
+
+    run_manager = RunManager()
+    record = await run_manager.create("thread-ext-seeded")
+    agent = _TaskStoreReadingAgent()
+
+    await run_agent(
+        _bridge(),
+        run_manager,
+        record,
+        ctx=RunContext(checkpointer=InMemorySaver()),
+        agent_factory=lambda *, config: agent,
+        graph_input={},
+        config={},
+    )
+
+    assert agent.task_store is not None
+    assert agent.task_store.get(TaskInfo) == TaskInfo(
+        task_id=record.run_id,
+        run_id=record.run_id,
+        thread_id="thread-ext-seeded",
+        kind="lead",
+        agent_name=record.assistant_id,
+    )
 
 
 @pytest.mark.anyio

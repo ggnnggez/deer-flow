@@ -527,6 +527,13 @@
   `open` 仍是默认值。([#5152])
 
 #### 扩展与插件
+- **扩展：** `CompactionEvent` 现在会说明它发生在哪个任务里（`task_id`、`run_id`、
+  `thread_id`，取自该任务的 `TaskInfo`），用 `kept_content_hashes` 列出压缩后仍
+  保留的消息，并携带在分派前取得的 UTC 时间戳 `emitted_at`。压缩观察者收到的是
+  分离存储，此前按任务记录上下文的扩展无法得知是谁的上下文被压缩、还剩哪些消息。
+  宿主现在会用作用域的 `TaskInfo` 播种每个任务存储，任何中间件或观察者钩子都可以
+  通过 `task_store.get(TaskInfo)` 读取。所有新字段默认为空，基于 0.2.4 编写的扩展
+  无需改动；`deerflow-extension-api` 升至 0.2.5。([#TBD])
 - **扩展：** 新增 out-of-tree Python 扩展系统，可贡献中间件、任务生命周期与系统模型
   observer、Gateway 服务和 HTTP 路由，并用 `deerflow extensions` 管理。([#4636]、
   [#4684]、[#4780])

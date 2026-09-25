@@ -229,6 +229,31 @@ async def test_subagent_without_parent_run_skips_lifecycle_but_keeps_task_store(
     assert recorder.starts == []
     assert recorder.stops == []
     assert seen["context"][EXTENSION_TASK_STORE_KEY].scope_id == result.task_id
+    # No run id means no ``TaskInfo`` can be built, so nothing is seeded — the
+    # store stays empty rather than carrying a half-true identity.
+    assert seen["context"][EXTENSION_TASK_STORE_KEY].get(TaskInfo) is None
+
+
+@pytest.mark.asyncio
+async def test_subagent_task_store_is_seeded_with_its_task_info(monkeypatch, env):
+    """The same ``TaskInfo`` the lifecycle hook receives is readable from the store by
+    any hook that only holds the runtime (a middleware, the compaction seam)."""
+    recorder = _Recorder()
+    set_loaded_extensions(_loaded(recorder))
+    executor = _executor(env)
+    seen: dict = {}
+    monkeypatch.setattr(env.SubagentExecutor, "_build_initial_state", _noop_initial_state)
+    monkeypatch.setattr(
+        env.SubagentExecutor,
+        "_create_agent",
+        lambda self, tools, **kwargs: _CompletingAgent(seen),
+    )
+
+    result = await executor._aexecute("do the thing")
+
+    [info] = recorder.starts
+    assert info.task_id == result.task_id
+    assert seen["context"][EXTENSION_TASK_STORE_KEY].get(TaskInfo) == info
 
 
 @pytest.mark.asyncio

@@ -1440,16 +1440,24 @@ class SubagentExecutor:
         task_info: TaskInfo | None = None
         if loaded_extensions.needs_task_store:
             task_store = ExtensionData(result.external_task_id or result.task_id)
+            if self.run_id:
+                # Seed the scope's identity (the same ``TaskInfo`` the lifecycle
+                # hook receives) so middleware and the compaction seam can read it
+                # from the store; without a run id there is no identity to seed.
+                task_store.set(
+                    TaskInfo(
+                        task_id=result.task_id,
+                        run_id=self.run_id,
+                        thread_id=self.thread_id or "",
+                        kind="subagent",
+                        parent_task_id=lead_task_id(self.run_id),
+                        agent_name=self.config.name,
+                    )
+                )
         if loaded_extensions.has_task_lifecycle and self.run_id:
-            task_info = TaskInfo(
-                task_id=result.task_id,
-                run_id=self.run_id,
-                thread_id=self.thread_id or "",
-                kind="subagent",
-                parent_task_id=lead_task_id(self.run_id),
-                agent_name=self.config.name,
-            )
             assert task_store is not None
+            task_info = task_store.get(TaskInfo)
+            assert task_info is not None
         elif loaded_extensions.has_task_lifecycle:
             logger.debug(
                 "[trace=%s] Subagent %s has no run_id; skipping extension task lifecycle",

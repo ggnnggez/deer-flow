@@ -6,6 +6,7 @@ import html
 import logging
 from collections.abc import Mapping
 from dataclasses import dataclass
+from datetime import UTC, datetime
 from typing import Any, Literal, Protocol, override, runtime_checkable
 
 from deerflow_extension_api import CompactionEvent, canonical_hash
@@ -91,6 +92,31 @@ def _resolve_thread_id(runtime: Runtime) -> str | None:
             return None
         thread_id = config_data.get("configurable", {}).get("thread_id")
     return thread_id
+
+
+def _compaction_task_identity(runtime: Runtime) -> tuple[str | None, str | None, str | None]:
+    """Name the task a compaction happened in, from what the runtime already carries.
+
+    The host seeds every task store with the scope's ``TaskInfo`` (run worker and
+    subagent executor), so the identity ``on_task_start`` reported is readable here
+    without a lifecycle hook. ``run_id`` / ``thread_id`` prefer the runtime context
+    the worker installs and fall back to the seeded info. A runtime with no seeded
+    store — a manual ``/compact``, a harness run with no Gateway around it — yields
+    ``None`` for the task id, never a guess: a subagent's task id is not its run id,
+    and a wrong identity is worse than an absent one.
+    """
+    from deerflow_extension_api import TaskInfo, task_store_from_runtime
+
+    store = task_store_from_runtime(runtime)
+    info = store.get(TaskInfo) if store is not None else None
+    context = runtime.context if runtime.context else {}
+    run_id = context.get("run_id") or (info.run_id if info is not None else None)
+    thread_id = _resolve_thread_id(runtime) or (info.thread_id if info is not None else None)
+    return (
+        info.task_id if info is not None else None,
+        run_id if isinstance(run_id, str) and run_id else None,
+        thread_id if isinstance(thread_id, str) and thread_id else None,
+    )
 
 
 def _resolve_agent_name(runtime: Runtime) -> str | None:
@@ -629,10 +655,26 @@ class DeerFlowSummarizationMiddleware(SummarizationMiddleware):
         precisely to normalize that away (sorted keys via ``canonical_json``);
         stringifying first throws the normalization away before it runs.
         """
-        extensions = getattr(self, "_extensions", None)
-        if extensions is None or not extensions.context_compaction_observers:
+        if not self._compaction_is_observed():
             return ()
         return tuple(canonical_hash(message.content) for message in messages_to_summarize)
+
+    def _freeze_compaction_kept(self, preserved_messages: list[AnyMessage]) -> tuple[str, ...]:
+        """Hash each surviving message's content, under the same gate as the sources.
+
+        The kept side is captured at the same moment as the removed side: once this
+        turn completes, the preserved tail is all that remains in state, so "which
+        messages survived this compaction" is only answerable here — and an observer
+        that saw the removed hashes alone could not tell a kept message from one that
+        was never in the window.
+        """
+        if not self._compaction_is_observed():
+            return ()
+        return tuple(canonical_hash(message.content) for message in preserved_messages)
+
+    def _compaction_is_observed(self) -> bool:
+        extensions = getattr(self, "_extensions", None)
+        return extensions is not None and bool(extensions.context_compaction_observers)
 
     def _record_compaction(
         self,
@@ -641,7 +683,12 @@ class DeerFlowSummarizationMiddleware(SummarizationMiddleware):
         summary: str,
         compacted_message_count: int,
         kept_message_count: int,
+        kept_content_hashes: tuple[str, ...] = (),
+        runtime: Runtime | None = None,
     ) -> None:
+        task_id = run_id = thread_id = None
+        if runtime is not None:
+            task_id, run_id, thread_id = _compaction_task_identity(runtime)
         event = CompactionEvent(
             transform_kind=_COMPACTION_TRANSFORM_KIND,
             transform_version=_COMPACTION_TRANSFORM_VERSION,
@@ -649,6 +696,14 @@ class DeerFlowSummarizationMiddleware(SummarizationMiddleware):
             output_content_hash=canonical_hash(summary),
             compacted_message_count=compacted_message_count,
             kept_message_count=kept_message_count,
+            kept_content_hashes=kept_content_hashes,
+            task_id=task_id,
+            run_id=run_id,
+            thread_id=thread_id,
+            # Taken here, synchronously, before the fire-and-forget dispatch: the
+            # observer runs later on another loop, so its own clock says nothing
+            # about when the context actually shrank.
+            emitted_at=datetime.now(UTC).isoformat(),
         )
         notify_context_compacted(event, extensions=self._extensions)
 
@@ -673,6 +728,7 @@ class DeerFlowSummarizationMiddleware(SummarizationMiddleware):
             return None
         messages_to_summarize, preserved_messages, previous_summary, total_tokens = prepared
         source_content_hashes = self._freeze_compaction_sources(messages_to_summarize)
+        kept_content_hashes = self._freeze_compaction_kept(preserved_messages)
         summary = self._summarize_with(messages_to_summarize, previous_summary=previous_summary)
         if summary is None:
             if raise_on_failure:
@@ -688,6 +744,8 @@ class DeerFlowSummarizationMiddleware(SummarizationMiddleware):
             summary=summary,
             compacted_message_count=len(messages_to_summarize),
             kept_message_count=len(preserved_messages),
+            kept_content_hashes=kept_content_hashes,
+            runtime=runtime,
         )
         task_history = None
         if self._task_continuity_config is not None:
@@ -718,6 +776,7 @@ class DeerFlowSummarizationMiddleware(SummarizationMiddleware):
         from deerflow_extension_api import task_store_from_runtime
 
         source_content_hashes = self._freeze_compaction_sources(messages_to_summarize)
+        kept_content_hashes = self._freeze_compaction_kept(preserved_messages)
         summary = await self._asummarize_with(
             messages_to_summarize,
             previous_summary=previous_summary,
@@ -734,6 +793,8 @@ class DeerFlowSummarizationMiddleware(SummarizationMiddleware):
             summary=summary,
             compacted_message_count=len(messages_to_summarize),
             kept_message_count=len(preserved_messages),
+            kept_content_hashes=kept_content_hashes,
+            runtime=runtime,
         )
         task_history = None
         if self._task_continuity_config is not None:
