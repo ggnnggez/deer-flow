@@ -527,6 +527,12 @@
   `open` 仍是默认值。([#5152])
 
 #### 扩展与插件
+- **示例：** 上下文留存扩展带上了它的页面：侧栏入口与
+  `/workspace/extensions/community.context-residency/board`，以及会话菜单里为当前会话
+  打开该页的动作。看板展示一个任务按道划分的逐请求组成、带压缩边界的块 × 请求留存矩阵，
+  以及从请求到块到压缩的下钻面板；不完整清单中的缺席画作未知，从不画作移出。它是一个
+  自包含的 React 包（`frontend/` → `static/dist`，列在 `ui_manifest.json` 中），通过
+  `BrowserAssets` 注册，无需改动宿主前端。([#TBD])
 - **示例：** 新增上下文留存扩展（`examples/deerflow-extension-context-residency`），
   按任务记录每次模型请求携带了哪些内容块：在 `MODEL_PHYSICAL` 记录每次真实 provider
   调用及其最终请求的成员清单（消息与工具 schema，哈希方式与宿主一致），在

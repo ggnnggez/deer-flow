@@ -21,6 +21,13 @@ The [Jev context pruning example](../examples/deerflow-extension-jev-context/REA
 combines a catalog contribution with public middleware hooks to shorten old read-only
 tool results. It requires deployment opt-in and a separate Jev API key.
 
+The [context residency example](../examples/deerflow-extension-context-residency/README.md)
+records which content blocks each model request carried and serves an
+administrator page for it: a React bundle built from the package's `frontend/`
+sources into `static/dist` and registered with `BrowserAssets`, mounted in the
+host's Shadow DOM with its own stylesheet, reading the extension's own admin
+routes with the host session.
+
 ## Registration and execution
 
 `registry.plugin(...)` returns `True` when accepted. Its default public protocol

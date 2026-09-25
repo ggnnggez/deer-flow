@@ -235,6 +235,19 @@ class TestProbesThroughTheHost:
         assert contributor.contribute_middlewares(None, AgentBuildContext(scope=AgentScope.LEAD)) == ()
         assert contributor.contribute_middlewares(None, AgentBuildContext(scope=AgentScope.SUBAGENT)) == ()
 
+    def test_the_page_is_registered_as_packaged_assets(self, ctxres):
+        from deerflow_extension_api import BrowserAssets
+
+        loaded, _ = _load()
+        ((_, plugin),) = loaded.plugins
+        assert plugin.namespace == "community.context-residency"
+        assert isinstance(plugin.frontend, BrowserAssets)
+        assert plugin.frontend.module == "context-residency.v1"
+        manifest = Path(plugin.frontend.root) / "ui_manifest.json"
+        assert manifest.is_file()
+        for relative in ("static/dist/index.mjs", "static/dist/styles.css"):
+            assert (Path(plugin.frontend.root) / relative).is_file(), relative
+
     def test_enabled_contributes_both_probes_to_lead_and_subagent(self, ctxres):
         loaded, _ = _load()
         ((_, contributor),) = loaded.middleware_contributors

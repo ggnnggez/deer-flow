@@ -36,6 +36,9 @@ def main():
         assert not diagnostics, diagnostics
         ((_, plugin),) = loaded.plugins
         assert plugin.namespace == "community.context-residency" and plugin.enabled == enabled
+        assert plugin.frontend is not None and plugin.frontend.module == "context-residency.v1"
+        assert (Path(plugin.frontend.root) / "ui_manifest.json").is_file()
+        assert (Path(plugin.frontend.root) / "static/dist/index.mjs").is_file()
         ((_, contributor),) = loaded.middleware_contributors
         for scope in (AgentScope.LEAD, AgentScope.SUBAGENT):
             placements = contributor.contribute_middlewares(None, AgentBuildContext(scope=scope))

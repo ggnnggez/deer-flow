@@ -87,6 +87,27 @@ travel with members, not blocks.
 - Nothing here says the model *used* a block; it says the block was in the
   request.
 
+## The page
+
+The package ships a workspace page (`assets-v1`): **Context residency** in the
+sidebar, at `/workspace/extensions/community.context-residency/board`, plus a
+conversation-menu action that opens the page for the current conversation. The
+page lists the recorded tasks of a conversation (`?thread=<id>`), or opens one
+task directly (`?task=<id>`, optionally `?step=<seq>` to start on that step),
+and renders the board: a per-request composition band by lane, a block × request
+residency matrix, and a drill panel (request → block → compaction). Presence
+cells follow the rules above — an unknown cell is drawn as `?`, never as absent.
+
+The page is a self-contained React bundle: `frontend/` holds the sources, and
+`pnpm --dir frontend install && pnpm --dir frontend build` writes
+`deerflow_extension_context_residency/static/dist/{index.mjs,styles.css}`, the
+two files `ui_manifest.json` lists. The built files are committed so the wheel
+installs without a JavaScript toolchain; rebuild them after changing
+`frontend/src`. It mounts inside the host's Shadow DOM with its own stylesheet
+and follows the host theme through the host's CSS variables. Hosts older than
+extension API 0.2.3 refuse `BrowserAssets`; the package logs that and installs
+capture and the admin API without the page.
+
 ## API
 
 Both routes require an administrator; the host's session authentication
@@ -104,6 +125,9 @@ applies and personal access tokens are refused on contributed routes.
 ## Verify
 
 ```bash
+pnpm --dir examples/deerflow-extension-context-residency/frontend install
+pnpm --dir examples/deerflow-extension-context-residency/frontend test
+pnpm --dir examples/deerflow-extension-context-residency/frontend build
 cd backend && uv run pytest tests/test_context_residency_extension.py -q
 uv build --wheel examples/deerflow-extension-context-residency --out-dir /tmp/ctxres-wheel
 uv pip install --python backend/.venv/bin/python --no-deps --target /tmp/ctxres-installed /tmp/ctxres-wheel/*.whl

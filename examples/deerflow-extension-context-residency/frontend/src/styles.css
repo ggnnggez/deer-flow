@@ -1,0 +1,34 @@
+@import "tailwindcss";
+
+/*
+ * Mounted inside the host's Shadow DOM. Utility classes are scoped here; the
+ * host's theme variables (`--background`, `--border`, …) inherit through the
+ * shadow boundary, so colours follow the host theme and its dark mode without
+ * a dark variant of our own.
+ */
+@theme inline {
+  --color-background: var(--background, oklch(0.985 0 0));
+  --color-foreground: var(--foreground, oklch(0.145 0 0));
+  --color-card: var(--card, oklch(1 0 0));
+  --color-card-foreground: var(--card-foreground, oklch(0.145 0 0));
+  --color-muted: var(--muted, oklch(0.97 0 0));
+  --color-muted-foreground: var(--muted-foreground, oklch(0.556 0 0));
+  --color-primary: var(--primary, oklch(0.2 0 0));
+  --color-primary-foreground: var(--primary-foreground, oklch(0.985 0 0));
+  --color-secondary: var(--secondary, oklch(0.945 0 0));
+  --color-secondary-foreground: var(--secondary-foreground, oklch(0.205 0 0));
+  --color-border: var(--border, oklch(0.922 0 0));
+  --color-ring: var(--ring, oklch(0.58 0.18 255));
+  --color-destructive: var(--destructive, oklch(0.577 0.245 27.325));
+}
+
+@layer base {
+  :host {
+    color: var(--color-foreground);
+    font-size: 14px;
+    line-height: 1.45;
+  }
+  * {
+    border-color: var(--color-border);
+  }
+}

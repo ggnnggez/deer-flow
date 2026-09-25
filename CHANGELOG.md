@@ -694,6 +694,15 @@ This release closes that milestone with **765 merged pull requests**.
 
 #### Extensions & plugins
 
+- **examples:** The context residency extension ships its page: a sidebar entry
+  and `/workspace/extensions/community.context-residency/board`, plus a
+  conversation-menu action that opens it for the current conversation. The
+  board shows one task's per-request composition by lane, a block × request
+  residency matrix with compaction boundaries, and a drill panel from request
+  to block to compaction; an absence inside an incomplete inventory is drawn
+  as unknown, never as removal. It is a self-contained React bundle
+  (`frontend/` → `static/dist`, listed in `ui_manifest.json`) registered with
+  `BrowserAssets`, so it needs no host frontend change. ([#TBD])
 - **examples:** A context residency extension
   (`examples/deerflow-extension-context-residency`) records, per task, which
   content blocks every model request carried: one attempt per physical
