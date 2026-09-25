@@ -66,6 +66,7 @@ from deerflow_extension_api.provenance import (
     MESSAGE_CONTENT_KIND_KEY,
     MESSAGE_PRODUCER_ENTITY_ID_KEY,
     MESSAGE_PRODUCER_KIND_KEY,
+    MESSAGE_SUMMARY_CONTENT_HASH_KEY,
     PROVENANCE_KEYS,
     ContentKind,
     MessageProvenance,
@@ -98,7 +99,7 @@ from deerflow_extension_api.state import ExtensionData
 
 #: Contract version. Before 1.0, minors may break and patches are additive.
 #: From 1.0 on, bump the major for breaking changes.
-API_VERSION = "0.2.5"
+API_VERSION = "0.2.6"
 
 __all__ = [
     "ModelInvocationError",
@@ -127,6 +128,7 @@ __all__ = [
     "MESSAGE_CONTENT_KIND_KEY",
     "MESSAGE_PRODUCER_ENTITY_ID_KEY",
     "MESSAGE_PRODUCER_KIND_KEY",
+    "MESSAGE_SUMMARY_CONTENT_HASH_KEY",
     "PROVENANCE_KEYS",
     "AgentAssemblyDescriptor",
     "AgentAssemblyObserver",

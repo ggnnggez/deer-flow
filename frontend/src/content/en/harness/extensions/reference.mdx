@@ -380,7 +380,8 @@ Middleware that injects messages stamps them, so an observer can tell an injecte
 | `MESSAGE_CONTENT_KIND_KEY`       | `"deerflow_content_kind"`       |
 | `MESSAGE_PRODUCER_KIND_KEY`      | `"deerflow_producer_kind"`      |
 | `MESSAGE_PRODUCER_ENTITY_ID_KEY` | `"deerflow_producer_entity_id"` |
-| `PROVENANCE_KEYS`                | `frozenset` of the three keys. The host treats them as server-owned and strips caller-supplied values from untrusted input |
+| `MESSAGE_SUMMARY_CONTENT_HASH_KEY` | `"deerflow_summary_content_hash"` (0.2.6) |
+| `PROVENANCE_KEYS`                | `frozenset` of the four keys. The host treats them as server-owned and strips caller-supplied values from untrusted input |
 
 ### `ContentKind`
 
@@ -388,15 +389,15 @@ Middleware that injects messages stamps them, so an observer can tell an injecte
 
 ### `MessageProvenance`
 
-Frozen dataclass: `content_kind: str`, `producer_kind: str`, `producer_entity_id: str | None = None`.
+Frozen dataclass: `content_kind: str`, `producer_kind: str`, `producer_entity_id: str | None = None`, `summary_content_hash: str | None = None` (0.2.6). The last is set on a message that renders a compaction summary and equals the `CompactionEvent.output_content_hash` of the compaction that produced it — the identity the host records at compaction, never a rehash of the rendering.
 
-### `provenance_kwargs(content_kind, producer_kind, *, producer_entity_id=None) -> dict[str, str]`
+### `provenance_kwargs(content_kind, producer_kind, *, producer_entity_id=None, summary_content_hash=None) -> dict[str, str]`
 
-The `additional_kwargs` fragment to merge into a message you produce. `producer_entity_id` is omitted when `None`.
+The `additional_kwargs` fragment to merge into a message you produce. `producer_entity_id` and `summary_content_hash` are omitted when `None`.
 
 ### `read_provenance(message: object) -> MessageProvenance | None`
 
-Read a stamp from `message.additional_kwargs`. Returns `None` when either required key is missing or not a string.
+Read a stamp from `message.additional_kwargs`. Returns `None` when either required key is missing or not a string; a malformed optional field reads as `None` without discarding the stamp.
 
 ## Release policies and hashing
 
@@ -534,5 +535,6 @@ The host's contract version as a dotted string, `"0.2.4"` for the contract this 
 | 0.2.3 | [#5727](https://github.com/bytedance/deer-flow/pull/5727), [#5685](https://github.com/bytedance/deer-flow/pull/5685) | Request-scoped run evidence: `resolve_run_evidence_reader`, `require_run_evidence_reader`, `RUN_EVIDENCE_READER_RESOLVER_KEY` (#5727). Packaged browser resources: `BrowserAssets`, and `PluginContribution.frontend` also accepts it (#5685) |
 | 0.2.4 | [#5842](https://github.com/bytedance/deer-flow/pull/5842) | Plugin resource authorization: `require_plugin_management`, `arequire_plugin_management`, `EXTENSION_PLUGIN_AUTHZ_RESOLVER_KEY`, `EXTENSION_PLUGIN_AUTHZ_RESOLVER_ASYNC_KEY` |
 | 0.2.5 | [#TBD](https://github.com/bytedance/deer-flow/pull/TBD) | `CompactionEvent.kept_content_hashes`, `task_id`, `run_id`, `thread_id`, `emitted_at`; the host seeds every task store with its `TaskInfo` |
+| 0.2.6 | [#TBD](https://github.com/bytedance/deer-flow/pull/TBD) | `MESSAGE_SUMMARY_CONTENT_HASH_KEY`, `MessageProvenance.summary_content_hash`, `provenance_kwargs(summary_content_hash=)`; summarization records `summary_content_hash` in state and the durable-context data block declares the summary it carries |
 
 No release has removed a public name.

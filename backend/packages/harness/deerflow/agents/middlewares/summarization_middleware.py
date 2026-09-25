@@ -73,6 +73,9 @@ class ContextCompactionResult:
     preserved_messages: tuple[AnyMessage, ...]
     total_tokens: int
     task_history: dict | None = None
+    #: ``canonical_hash(summary_text)`` as produced — the identity the compaction
+    #: event carries as ``output_content_hash`` and state records next to the text.
+    summary_content_hash: str | None = None
 
 
 @runtime_checkable
@@ -680,7 +683,7 @@ class DeerFlowSummarizationMiddleware(SummarizationMiddleware):
         self,
         source_content_hashes: tuple[str, ...],
         *,
-        summary: str,
+        output_content_hash: str,
         compacted_message_count: int,
         kept_message_count: int,
         kept_content_hashes: tuple[str, ...] = (),
@@ -693,7 +696,7 @@ class DeerFlowSummarizationMiddleware(SummarizationMiddleware):
             transform_kind=_COMPACTION_TRANSFORM_KIND,
             transform_version=_COMPACTION_TRANSFORM_VERSION,
             source_content_hashes=source_content_hashes,
-            output_content_hash=canonical_hash(summary),
+            output_content_hash=output_content_hash,
             compacted_message_count=compacted_message_count,
             kept_message_count=kept_message_count,
             kept_content_hashes=kept_content_hashes,
@@ -739,9 +742,10 @@ class DeerFlowSummarizationMiddleware(SummarizationMiddleware):
         # duplicate that work on the next attempt. Messages are still removed after
         # this returns (in _maybe_summarize), so hooks run before they are gone.
         self._fire_hooks(messages_to_summarize, preserved_messages, runtime)
+        summary_content_hash = canonical_hash(summary)
         self._record_compaction(
             source_content_hashes,
-            summary=summary,
+            output_content_hash=summary_content_hash,
             compacted_message_count=len(messages_to_summarize),
             kept_message_count=len(preserved_messages),
             kept_content_hashes=kept_content_hashes,
@@ -758,6 +762,7 @@ class DeerFlowSummarizationMiddleware(SummarizationMiddleware):
             preserved_messages=tuple(preserved_messages),
             total_tokens=total_tokens,
             task_history=task_history,
+            summary_content_hash=summary_content_hash,
         )
 
     async def acompact_state(
@@ -788,9 +793,10 @@ class DeerFlowSummarizationMiddleware(SummarizationMiddleware):
             return None
         # Fire hooks only once a replacement summary exists (see compact_state).
         self._fire_hooks(messages_to_summarize, preserved_messages, runtime)
+        summary_content_hash = canonical_hash(summary)
         self._record_compaction(
             source_content_hashes,
-            summary=summary,
+            output_content_hash=summary_content_hash,
             compacted_message_count=len(messages_to_summarize),
             kept_message_count=len(preserved_messages),
             kept_content_hashes=kept_content_hashes,
@@ -807,6 +813,7 @@ class DeerFlowSummarizationMiddleware(SummarizationMiddleware):
             preserved_messages=tuple(preserved_messages),
             total_tokens=total_tokens,
             task_history=task_history,
+            summary_content_hash=summary_content_hash,
         )
 
     def _maybe_summarize(self, state: AgentState, runtime: Runtime) -> dict | None:
@@ -819,6 +826,7 @@ class DeerFlowSummarizationMiddleware(SummarizationMiddleware):
                 *result.preserved_messages,
             ],
             "summary_text": result.summary_text,
+            "summary_content_hash": result.summary_content_hash,
             **({"task_history": result.task_history} if result.task_history is not None else {}),
         }
 
@@ -832,6 +840,7 @@ class DeerFlowSummarizationMiddleware(SummarizationMiddleware):
                 *result.preserved_messages,
             ],
             "summary_text": result.summary_text,
+            "summary_content_hash": result.summary_content_hash,
             **({"task_history": result.task_history} if result.task_history is not None else {}),
         }
 

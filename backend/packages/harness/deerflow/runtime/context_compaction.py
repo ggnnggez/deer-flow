@@ -207,6 +207,7 @@ async def compact_thread_context(
         {
             "messages": Overwrite(list(result.preserved_messages)),
             "summary_text": result.summary_text,
+            "summary_content_hash": getattr(result, "summary_content_hash", None),
             **({"task_history": result.task_history} if getattr(result, "task_history", None) is not None else {}),
         },
         as_node="manual_compaction",

@@ -269,6 +269,58 @@ class TestTheEventNamesTheTaskItHappenedIn:
         assert event.emitted_at is not None
 
 
+class TestTheSummaryCarrierJoinsTheEvent:
+    """The compaction records the summary's identity next to the summary text, and
+    the message that later renders the summary declares that same identity — so a
+    consumer joins event to carrier by equality, never by re-hashing a bounded,
+    escaped rendering (the trap ``compaction.py`` documents)."""
+
+    @pytest.mark.asyncio
+    async def test_the_state_update_records_the_hash_the_event_carries(self, monkeypatch):
+        from deerflow.agents.middlewares import summarization_middleware
+
+        events = []
+        monkeypatch.setattr(summarization_middleware, "notify_context_compacted", lambda event, extensions=None: events.append(event))
+
+        update = await _middleware().abefore_model({"messages": _messages()}, _runtime())
+
+        [event] = events
+        assert update["summary_content_hash"] == event.output_content_hash == canonical_hash("compressed summary")
+
+    @pytest.mark.asyncio
+    async def test_the_durable_context_block_declares_that_hash(self, monkeypatch):
+        from deerflow_extension_api import read_provenance
+        from langchain.agents.middleware.types import ModelRequest
+
+        from deerflow.agents.middlewares import summarization_middleware
+        from deerflow.agents.middlewares.durable_context_middleware import DurableContextMiddleware
+
+        events = []
+        monkeypatch.setattr(summarization_middleware, "notify_context_compacted", lambda event, extensions=None: events.append(event))
+        update = await _middleware().abefore_model({"messages": _messages()}, _runtime())
+
+        request = ModelRequest(
+            model=SimpleNamespace(),
+            messages=[],
+            state={
+                "summary_text": update["summary_text"],
+                "summary_content_hash": update["summary_content_hash"],
+                "delegations": [],
+                "skill_context": [],
+            },
+        )
+        carriers = [m for m in DurableContextMiddleware()._inject(request).messages if "durable_context_data" in (m.additional_kwargs or {})]
+        assert carriers, "expected the durable-context data block"
+        assert read_provenance(carriers[0]).summary_content_hash == events[0].output_content_hash
+
+    def test_the_thread_state_declares_the_channel(self):
+        from typing import get_type_hints
+
+        from deerflow.agents.thread_state import ThreadState
+
+        assert "summary_content_hash" in get_type_hints(ThreadState)
+
+
 class TestAnInstallWithNoObserverPaysNothing:
     """Hashing the sources is an O(context-size) canonical-JSON pass.
 

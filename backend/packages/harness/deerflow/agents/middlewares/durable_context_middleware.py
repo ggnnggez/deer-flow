@@ -297,8 +297,14 @@ class DurableContextMiddleware(AgentMiddleware[AgentState]):
 
     def _inject(self, request: ModelRequest) -> ModelRequest:
         state = request.state or {}
+        summary_text = state.get("summary_text")
+        # The identity the compaction recorded for this summary. Never rehash the
+        # text here: it is a bounded, escaped rendering by the time the model sees
+        # it, and PII redaction may already have rewritten the request-local copy.
+        # A summary compacted before the identity was recorded declares nothing.
+        recorded_hash = state.get("summary_content_hash") if summary_text else None
         data_block = _render_durable_context_data(
-            redact_text(state.get("summary_text"), self._pii_redaction_config),
+            redact_text(summary_text, self._pii_redaction_config),
             state.get("delegations") or [],
             state.get("skill_context") or [],
             (state.get("task_notes") or {}) if self._task_continuity_enabled else None,
@@ -325,7 +331,11 @@ class DurableContextMiddleware(AgentMiddleware[AgentState]):
                     additional_kwargs={
                         "hide_from_ui": True,
                         _DURABLE_CONTEXT_DATA_KEY: True,
-                        **provenance_kwargs(ContentKind.DURABLE_CONTEXT, "durable_context_data"),
+                        **provenance_kwargs(
+                            ContentKind.DURABLE_CONTEXT,
+                            "durable_context_data",
+                            summary_content_hash=recorded_hash if isinstance(recorded_hash, str) else None,
+                        ),
                     },
                 ),
             ],

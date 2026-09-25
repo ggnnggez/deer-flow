@@ -694,6 +694,18 @@ This release closes that milestone with **765 merged pull requests**.
 
 #### Extensions & plugins
 
+- **extensions:** A message that carries a compaction summary now says which one.
+  Summarization records `canonical_hash(summary)` in state as
+  `summary_content_hash` next to `summary_text` (both compaction paths and the
+  manual `/compact` route), and the durable-context data block declares it
+  through the new `summary_content_hash` provenance field
+  (`MESSAGE_SUMMARY_CONTENT_HASH_KEY`, `MessageProvenance.summary_content_hash`,
+  `provenance_kwargs(summary_content_hash=...)`). The value equals the
+  `CompactionEvent.output_content_hash` of the compaction that produced the
+  summary, so an observer joins event to carrier by equality instead of
+  rehashing the bounded, escaped rendering — which PII redaction may also have
+  rewritten. The key is server-owned like the other provenance keys;
+  `deerflow-extension-api` moves to 0.2.6. ([#TBD])
 - **extensions:** `CompactionEvent` now names the task it happened in (`task_id`,
   `run_id`, `thread_id`, copied from the task's `TaskInfo`), lists the messages
   that survived the compaction as `kept_content_hashes`, and carries an

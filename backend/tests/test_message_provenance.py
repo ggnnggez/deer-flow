@@ -9,8 +9,10 @@ from deerflow_extension_api import (
     MESSAGE_CONTENT_KIND_KEY,
     MESSAGE_PRODUCER_ENTITY_ID_KEY,
     MESSAGE_PRODUCER_KIND_KEY,
+    MESSAGE_SUMMARY_CONTENT_HASH_KEY,
     PROVENANCE_KEYS,
     ContentKind,
+    canonical_hash,
     provenance_kwargs,
     read_provenance,
 )
@@ -49,6 +51,40 @@ def test_optional_fields_round_trip_when_supplied():
     assert provenance.producer_entity_id == "run-7"
 
 
+def test_a_summary_carrier_declares_the_summary_it_renders():
+    """A message that renders a compaction summary names it by the hash the
+    compaction event used, because the rendering's own hash never matches."""
+    message = HumanMessage(
+        content="<durable_context_data>bounded, escaped rendering</durable_context_data>",
+        additional_kwargs=provenance_kwargs(
+            ContentKind.DURABLE_CONTEXT,
+            "durable_context_data",
+            summary_content_hash="h-summary",
+        ),
+    )
+    provenance = read_provenance(message)
+    assert provenance is not None
+    assert provenance.summary_content_hash == "h-summary"
+
+
+def test_the_summary_hash_is_omitted_rather_than_written_as_none():
+    kwargs = provenance_kwargs(ContentKind.DURABLE_CONTEXT, "durable_context_data")
+    assert MESSAGE_SUMMARY_CONTENT_HASH_KEY not in kwargs
+
+
+def test_read_ignores_a_non_string_summary_hash_but_keeps_the_stamp():
+    message = HumanMessage(
+        content="hi",
+        additional_kwargs={
+            **provenance_kwargs(ContentKind.DURABLE_CONTEXT, "durable_context_data"),
+            MESSAGE_SUMMARY_CONTENT_HASH_KEY: 7,
+        },
+    )
+    provenance = read_provenance(message)
+    assert provenance is not None
+    assert provenance.summary_content_hash is None
+
+
 def test_read_returns_none_for_an_unstamped_message():
     assert read_provenance(HumanMessage(content="hi")) is None
 
@@ -71,6 +107,7 @@ def test_every_key_is_declared_in_the_exported_set():
         MESSAGE_CONTENT_KIND_KEY,
         MESSAGE_PRODUCER_KIND_KEY,
         MESSAGE_PRODUCER_ENTITY_ID_KEY,
+        MESSAGE_SUMMARY_CONTENT_HASH_KEY,
     }
 
 
@@ -127,7 +164,7 @@ class TestDynamicContextMemoryStamping:
 class TestDurableContextStamping:
     """The authority contract and the data block are distinct producers."""
 
-    def _inject(self, *, summary_text: str = "a compacted summary"):
+    def _inject(self, *, summary_text: str | None = "a compacted summary", summary_content_hash: str | None = None, delegations: list | None = None):
         from types import SimpleNamespace
 
         from langchain.agents.middleware.types import ModelRequest
@@ -135,12 +172,60 @@ class TestDurableContextStamping:
         from deerflow.agents.middlewares.durable_context_middleware import DurableContextMiddleware
 
         middleware = DurableContextMiddleware()
+        state = {"summary_text": summary_text, "delegations": delegations or [], "skill_context": []}
+        if summary_content_hash is not None:
+            state["summary_content_hash"] = summary_content_hash
         request = ModelRequest(
             model=SimpleNamespace(),
             messages=[],
-            state={"summary_text": summary_text, "delegations": [], "skill_context": []},
+            state=state,
         )
         return middleware._inject(request)
+
+    @staticmethod
+    def _data_block(result):
+        data_messages = [m for m in result.messages if "durable_context_data" in (m.additional_kwargs or {})]
+        assert data_messages, "expected the durable-context data block"
+        return data_messages[0]
+
+    _DELEGATION = {
+        "id": "call_1",
+        "description": "research auth",
+        "subagent_type": "general-purpose",
+        "status": "completed",
+        "result_brief": "JWT",
+        "result_sha256": "x" * 64,
+        "result_ref": "tm_1",
+        "created_at": "2026-06-30T00:00:00Z",
+    }
+
+    def test_the_data_block_declares_the_summary_it_carries(self):
+        """The block renders a bounded, escaped projection of the summary, so its
+        own content hash can never match the compaction event; it declares the
+        identity the compaction recorded instead."""
+        recorded = canonical_hash("a compacted summary")
+        result = self._inject(summary_text="a compacted summary", summary_content_hash=recorded)
+        provenance = read_provenance(self._data_block(result))
+        assert provenance is not None
+        assert provenance.summary_content_hash == recorded
+
+    def test_the_declared_hash_is_the_recorded_one_not_a_rehash_of_the_rendering(self):
+        """PII redaction rewrites ``summary_text`` in the request before this block
+        renders it. The identity recorded at compaction rides in its own channel,
+        so redaction cannot break the join."""
+        result = self._inject(summary_text="[EMAIL_1] asked for a refund", summary_content_hash="h-recorded-at-compaction")
+        assert read_provenance(self._data_block(result)).summary_content_hash == "h-recorded-at-compaction"
+
+    def test_a_block_without_a_summary_declares_none(self):
+        result = self._inject(summary_text=None, summary_content_hash="h-stale", delegations=[self._DELEGATION])
+        assert read_provenance(self._data_block(result)).summary_content_hash is None
+
+    def test_a_summary_compacted_before_the_hash_was_recorded_declares_none(self):
+        """Older checkpoints carry a summary but no recorded identity. Declaring a
+        rehash of the text would be a guess (it may already be redacted), so the
+        block declares nothing."""
+        result = self._inject(summary_text="legacy summary", summary_content_hash=None)
+        assert read_provenance(self._data_block(result)).summary_content_hash is None
 
     def test_the_authority_contract_is_stamped_as_a_middleware_injection(self):
         from langchain_core.messages import SystemMessage
@@ -161,6 +246,30 @@ class TestDurableContextStamping:
         assert provenance is not None
         assert provenance.content_kind == "durable_context"
         assert provenance.producer_kind == "durable_context_data"
+
+
+class TestPiiRedactionKeepsTheRecordedSummaryIdentity:
+    """PII redaction rewrites ``summary_text`` in a request-local state copy before
+    the durable-context block renders it. The recorded identity travels with that
+    copy, so the block downstream still declares the hash the compaction recorded."""
+
+    def test_the_request_local_summary_rewrite_carries_the_hash_through(self):
+        from types import SimpleNamespace
+
+        from langchain.agents.middleware.types import ModelRequest
+
+        from deerflow.agents.middlewares.pii_redaction_middleware import PiiRedactionMiddleware
+        from deerflow.config.pii_redaction_config import PiiRedactionConfig
+
+        request = ModelRequest(
+            model=SimpleNamespace(),
+            messages=[HumanMessage(content="hi")],
+            state={"summary_text": "Alice alice@example.com", "summary_content_hash": "h-raw"},
+        )
+        redacted = PiiRedactionMiddleware(PiiRedactionConfig(enabled=True))._process_request(request)
+
+        assert redacted.state["summary_text"] == "Alice [EMAIL_1]"
+        assert redacted.state["summary_content_hash"] == "h-raw"
 
 
 class TestSystemMessageCoalescingStamping:
@@ -233,6 +342,7 @@ class TestStateWritesCannotForgeServerOwnedMetadata:
         return {
             MESSAGE_CONTENT_KIND_KEY: "memory",
             MESSAGE_PRODUCER_KIND_KEY: "dynamic_context_memory",
+            MESSAGE_SUMMARY_CONTENT_HASH_KEY: "h-forged",
             TOOL_TRANSFORMS_KEY: [{"kind": "sanitized", "by": "ToolResultSanitizationMiddleware", "version": "1"}],
             # Caller-owned: ``hide_from_ui`` survives, because three frontend
             # senders use it purely to hide a context message. What it must not

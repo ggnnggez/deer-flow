@@ -292,6 +292,11 @@ class ThreadState(AgentState):
     task_notes: Annotated[dict | None, TaskNotesChannel(dict | None, merge_task_notes)]
     task_history: NotRequired[dict | None]
     summary_text: NotRequired[str | None]
+    # ``canonical_hash`` of ``summary_text`` as the compaction produced it, recorded
+    # at the same moment (it equals the compaction event's ``output_content_hash``).
+    # Renderers declare this value on the message that carries the summary; they
+    # never rehash the text, which request-scoped PII redaction may have rewritten.
+    summary_content_hash: NotRequired[str | None]
     background_tasks: NotRequired[list[BackgroundTaskState]]
 
 

@@ -14,6 +14,14 @@ declaration makes that checkable.
 
 Values are plain strings, not enum members, so an unknown producer from a newer
 host degrades to an unrecognised string rather than an import error.
+
+One stamp says what a message *carries* rather than what it is: a message that
+renders a compaction summary declares ``summary_content_hash``, the
+``canonical_hash`` the compaction event recorded for that summary. The message's
+own content hash can never serve that purpose — the prompt carries a bounded,
+escaped projection of the summary, and PII redaction may have rewritten the text
+before it was rendered — so the identity is recorded once, at compaction, and
+declared verbatim by whichever message carries it later.
 """
 
 from __future__ import annotations
@@ -24,6 +32,9 @@ from enum import StrEnum
 MESSAGE_CONTENT_KIND_KEY = "deerflow_content_kind"
 MESSAGE_PRODUCER_KIND_KEY = "deerflow_producer_kind"
 MESSAGE_PRODUCER_ENTITY_ID_KEY = "deerflow_producer_entity_id"
+#: ``canonical_hash`` of the compaction summary a message carries; equals the
+#: ``CompactionEvent.output_content_hash`` of the compaction that produced it.
+MESSAGE_SUMMARY_CONTENT_HASH_KEY = "deerflow_summary_content_hash"
 
 #: Every key this contract owns. The host treats all of them as server-owned and
 #: strips caller-supplied values from untrusted input.
@@ -32,6 +43,7 @@ PROVENANCE_KEYS: frozenset[str] = frozenset(
         MESSAGE_CONTENT_KIND_KEY,
         MESSAGE_PRODUCER_KIND_KEY,
         MESSAGE_PRODUCER_ENTITY_ID_KEY,
+        MESSAGE_SUMMARY_CONTENT_HASH_KEY,
     }
 )
 
@@ -51,6 +63,9 @@ class MessageProvenance:
     content_kind: str
     producer_kind: str
     producer_entity_id: str | None = None
+    #: Set on a message that renders a compaction summary: the hash the
+    #: compaction recorded for it, never a rehash of the rendering.
+    summary_content_hash: str | None = None
 
 
 def provenance_kwargs(
@@ -58,6 +73,7 @@ def provenance_kwargs(
     producer_kind: str,
     *,
     producer_entity_id: str | None = None,
+    summary_content_hash: str | None = None,
 ) -> dict[str, str]:
     """Build the ``additional_kwargs`` fragment a producer merges into its message.
 
@@ -70,6 +86,8 @@ def provenance_kwargs(
     }
     if producer_entity_id is not None:
         kwargs[MESSAGE_PRODUCER_ENTITY_ID_KEY] = str(producer_entity_id)
+    if summary_content_hash is not None:
+        kwargs[MESSAGE_SUMMARY_CONTENT_HASH_KEY] = str(summary_content_hash)
     return kwargs
 
 
@@ -88,8 +106,10 @@ def read_provenance(message: object) -> MessageProvenance | None:
     if not isinstance(content_kind, str) or not isinstance(producer_kind, str):
         return None
     entity_id = kwargs.get(MESSAGE_PRODUCER_ENTITY_ID_KEY)
+    summary_hash = kwargs.get(MESSAGE_SUMMARY_CONTENT_HASH_KEY)
     return MessageProvenance(
         content_kind=content_kind,
         producer_kind=producer_kind,
         producer_entity_id=entity_id if isinstance(entity_id, str) else None,
+        summary_content_hash=summary_hash if isinstance(summary_hash, str) else None,
     )

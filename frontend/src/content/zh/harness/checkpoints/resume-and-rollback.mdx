@@ -121,6 +121,7 @@ updated_config = await accessor.aupdate(
     {
         "messages": Overwrite(list(result.preserved_messages)),
         "summary_text": result.summary_text,
+        "summary_content_hash": result.summary_content_hash,
         "task_history": result.task_history,
     },
     as_node="manual_compaction",

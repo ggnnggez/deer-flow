@@ -28,7 +28,11 @@ DynamicContext (reminder/memory), DurableContext (contract/data),
 SystemMessageCoalescing, ViewImage, SkillActivation. Summarization/Title use
 `SystemOperationKind.SUMMARIZATION`/`.TITLE` model-call attribution; summaries
 enter via DurableContext's stamped `durable_context_data`, not separate
-messages. Memory only queues extraction; recall uses DynamicContext's
+messages. That block also declares `summary_content_hash` — the identity
+summarization records in state (`ThreadState.summary_content_hash`, next to
+`summary_text`, on both compaction paths and the manual `/compact` route) —
+never a rehash of the rendered or PII-redacted text; a summary from before
+the identity was recorded declares nothing. Memory only queues extraction; recall uses DynamicContext's
 `dynamic_context_memory` stamp.
 
 **Middleware self-description.** Behaviour-configurable middleware implements

@@ -66,6 +66,7 @@ class _FakeCompactionMiddleware:
         messages_to_summarize, preserved_messages, _previous_summary, total_tokens = prepared
         return SimpleNamespace(
             summary_text="COMPRESSED SUMMARY",
+            summary_content_hash="h-compressed",
             messages_to_summarize=tuple(messages_to_summarize),
             preserved_messages=tuple(preserved_messages),
             total_tokens=total_tokens,
@@ -117,6 +118,7 @@ async def test_compact_thread_context_reads_materialized_state_and_overwrites_me
     assert isinstance(written_values["messages"], Overwrite)
     assert written_values["messages"].value == [messages[-1]]
     assert written_values["summary_text"] == "COMPRESSED SUMMARY"
+    assert written_values["summary_content_hash"] == "h-compressed"
     assert as_node == "manual_compaction"
     assert middleware.prepare_calls == 1
     assert middleware.runtime_contexts == [

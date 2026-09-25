@@ -12,7 +12,7 @@ The summarization feature uses LangChain's `SummarizationMiddleware` to monitor 
 2. Triggers summarization when thresholds are met
 3. Keeps recent messages intact while summarizing older exchanges
 4. Maintains AI/Tool message pairs together for context continuity
-5. Stores the summary in `ThreadState.summary_text` and projects it ephemerally through durable context data
+5. Stores the summary in `ThreadState.summary_text` — with its `canonical_hash` in `ThreadState.summary_content_hash`, the identity the compaction event and the durable-context data block both declare — and projects it ephemerally through durable context data
 
 ## Todo reminders
 
@@ -338,7 +338,7 @@ middlewares such as title generation, memory queuing, and clarification:
 ### State Management
 
 - Summarization configuration is loaded from `config.yaml`
-- Generated summaries are stored in `ThreadState.summary_text`, not as regular `messages`
+- Generated summaries are stored in `ThreadState.summary_text`, not as regular `messages`; `ThreadState.summary_content_hash` records the summary's `canonical_hash` at the same moment (both compaction paths and the manual `/compact` route), and the durable-context data block declares it as `summary_content_hash` provenance so observers can join a `CompactionEvent` to the message that carries its summary without rehashing the rendering
 - The message reducer removes compacted raw messages while the checkpointer persists `summary_text`
 - DurableContextMiddleware projects `summary_text` back into later model calls as hidden durable context data
 

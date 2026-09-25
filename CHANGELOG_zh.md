@@ -527,6 +527,15 @@
   `open` 仍是默认值。([#5152])
 
 #### 扩展与插件
+- **扩展：** 承载压缩摘要的消息现在会说明它承载的是哪一条。摘要压缩把
+  `canonical_hash(summary)` 作为 `summary_content_hash` 记进状态、与 `summary_text`
+  并列（两条压缩路径与手动 `/compact` 路由都写），durable-context 数据块通过新的来源
+  标记字段 `summary_content_hash`（`MESSAGE_SUMMARY_CONTENT_HASH_KEY`、
+  `MessageProvenance.summary_content_hash`、`provenance_kwargs(summary_content_hash=...)`）
+  声明它。该值等于产出这条摘要的那次压缩的 `CompactionEvent.output_content_hash`，
+  观察者据此按相等把事件和承载消息对应起来，而不是对经过截断、转义、可能还被 PII
+  脱敏改写过的渲染结果重新哈希。该键与其他来源标记键一样归服务端所有；
+  `deerflow-extension-api` 升至 0.2.6。([#TBD])
 - **扩展：** `CompactionEvent` 现在会说明它发生在哪个任务里（`task_id`、`run_id`、
   `thread_id`，取自该任务的 `TaskInfo`），用 `kept_content_hashes` 列出压缩后仍
   保留的消息，并携带在分派前取得的 UTC 时间戳 `emitted_at`。压缩观察者收到的是

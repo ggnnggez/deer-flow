@@ -313,7 +313,7 @@ class ContextCompactionObserver(Protocol):
 | `task_id`、`run_id`、`thread_id` | 被压缩任务的身份，取自它的 `TaskInfo`；发出事件的运行时没有已播种的任务存储时为 `None`（0.2.5） |
 | `emitted_at`              | 发出事件时取得的 ISO-8601 UTC 时间，在分派之前（0.2.5）  |
 
-要把事件和你手里的消息对应起来，必须用完全相同的方式哈希：`canonical_hash(message.content)`，直接传入 content 本身。绝不要先转成字符串，因为多模态 content 是 dict 列表，`str()` 的结果取决于键顺序。也不要试图事后通过对模型看到的内容做哈希来找回摘要：提示词里带的是摘要经过截断和转义的渲染版本，它的哈希不会等于 `output_content_hash`。
+要把事件和你手里的消息对应起来，必须用完全相同的方式哈希：`canonical_hash(message.content)`，直接传入 content 本身。绝不要先转成字符串，因为多模态 content 是 dict 列表，`str()` 的结果取决于键顺序。也不要试图事后通过对模型看到的内容做哈希来找回摘要：提示词里带的是摘要经过截断和转义的渲染版本，它的哈希不会等于 `output_content_hash`。要在后续请求里找到承载摘要的消息，改读它的来源标记：durable-context 数据块会声明 `summary_content_hash`（0.2.6），它等于产出该摘要的那次压缩的 `output_content_hash`。宿主在压缩时把这个身份和摘要文本一起记进状态，所以之后 PII 脱敏改写文本也不会破坏这次对应；在记录身份之前压缩出的摘要不声明任何值。
 
 这个通知是即发即弃的。它被分派到通知循环，不会阻塞模型这一轮；观察者收到的是**分离**存储，因为在这个调用点没有活跃任务。没有注册压缩观察者时，宿主连哈希这一步也会跳过。
 

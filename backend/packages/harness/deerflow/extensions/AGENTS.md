@@ -270,7 +270,12 @@ compacted/kept message counts, the kept messages' content hashes frozen under th
 observer gate, the task identity read from the seeded `TaskInfo` plus the runtime's
 `run_id` / `thread_id` — `task_id` stays `None` on a runtime without a seeded store, never a
 run id standing in for a subagent's task — and a UTC `emitted_at` taken synchronously
-before dispatch) and call `notify_context_compacted()`. Once
+before dispatch) and call `notify_context_compacted()`. The same `canonical_hash(summary)`
+is written to state as `summary_content_hash` beside `summary_text` (both compaction paths
+and the manual `/compact` route), and `DurableContextMiddleware` declares it on the
+`durable_context_data` block through the `summary_content_hash` provenance field, so a
+consumer joins the event to the message that carries the summary by equality instead of
+rehashing the bounded, escaped — and possibly PII-redacted — rendering. Once
 `_maybe_summarize`/`_amaybe_summarize` remove the source messages from state, that mapping
 cannot be reconstructed, so the event is the only record of it. The event is keyed on
 `canonical_hash(message.content)` directly — never a stringified copy, which would defeat
