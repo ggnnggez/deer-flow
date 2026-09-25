@@ -694,6 +694,17 @@ This release closes that milestone with **765 merged pull requests**.
 
 #### Extensions & plugins
 
+- **examples:** A context residency extension
+  (`examples/deerflow-extension-context-residency`) records, per task, which
+  content blocks every model request carried: one attempt per physical
+  provider call at `MODEL_PHYSICAL` with the exact final request's member
+  inventory (messages and tool schemas, hashed the way the host hashes),
+  one step per logical decision at `MODEL_LOGICAL`, the task from the
+  lifecycle hooks, and every compaction from the compaction observer with
+  the hashes it declared. Metadata only, in four `ctxres_` tables the
+  extension creates itself; two admin routes serve a task's attempts,
+  blocks and positioned compactions. Presence is never precomputed and
+  removals are never inferred from absence. ([#TBD])
 - **extensions:** Every request-side `HumanMessage` a middleware authors now
   carries a provenance stamp: the todo context-loss reminder
   (`todo_reminder`) and completion reminder (`todo_completion_reminder`), the

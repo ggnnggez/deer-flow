@@ -527,6 +527,12 @@
   `open` 仍是默认值。([#5152])
 
 #### 扩展与插件
+- **示例：** 新增上下文留存扩展（`examples/deerflow-extension-context-residency`），
+  按任务记录每次模型请求携带了哪些内容块：在 `MODEL_PHYSICAL` 记录每次真实 provider
+  调用及其最终请求的成员清单（消息与工具 schema，哈希方式与宿主一致），在
+  `MODEL_LOGICAL` 记录每个逻辑决策，从生命周期钩子记录任务，从压缩观察者记录每次压缩
+  及其声明的哈希。仅元数据，存在扩展自建的四张 `ctxres_` 表中；两条管理员路由返回任务
+  的 attempt、块与已定位的压缩。留存状态从不预计算，移出也从不由缺席推断。([#TBD])
 - **扩展：** 中间件在请求侧生成的每条 `HumanMessage` 现在都带来源标记：todo 的上下文
   丢失提醒（`todo_reminder`）与完成提醒（`todo_completion_reminder`）、工具回执账本
   （`tool_receipt_ledger`）、token 预算警告（`token_budget`）、循环检测警告
