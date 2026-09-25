@@ -4,7 +4,7 @@ import { createElement } from "react";
 import { createRoot } from "react-dom/client";
 
 import { backendBaseFromModuleUrl } from "./api";
-import { ResidencyApp } from "./app";
+import { ResidencyApp, type Tab } from "./app";
 
 /**
  * The plugin module the host loads (`assets-v1`). One page surface, mounted
@@ -15,11 +15,18 @@ import { ResidencyApp } from "./app";
 const NAMESPACE = "community.context-residency";
 const SURFACE_ID = "board";
 
-function readSearch(): { threadId: string | null; taskId: string | null; stepSeq: number | null } {
+function readSearch(): { tab: Tab | null; query: string | null; taskId: string | null; stepSeq: number | null } {
   const params = new URLSearchParams(window.location.search);
   const step = params.get("step");
   const stepSeq = step !== null && /^\d+$/.test(step) ? Number(step) : null;
-  return { threadId: params.get("thread"), taskId: params.get("task"), stepSeq };
+  const tab = params.get("tab");
+  return {
+    tab: tab === "tasks" || tab === "health" || tab === "board" ? tab : null,
+    // The conversation-menu action arrives as `?thread=`; it becomes the index query.
+    query: params.get("q") ?? params.get("thread"),
+    taskId: params.get("task"),
+    stepSeq,
+  };
 }
 
 interface SurfaceContext {
@@ -54,7 +61,8 @@ function mountBoard(root: HTMLElement, context: SurfaceContext) {
       base: backendBaseFromModuleUrl(import.meta.url),
       locale: context.locale,
       signal: context.signal,
-      initialThreadId: search.threadId ?? context.threadId ?? null,
+      initialTab: search.tab,
+      initialQuery: search.query ?? context.threadId ?? null,
       initialTaskId: search.taskId,
       initialStepSeq: search.stepSeq,
     }),

@@ -407,6 +407,82 @@ async def _record_a_task(ctxres, service, *, member_text=("system", "user", "too
     return first, second
 
 
+async def _record_more_tasks(ctxres, service):
+    """Two more tasks beside task-1: a running lead (no stop yet) and a failed subagent."""
+    R = ctxres.recorder
+    inventory = ctxres.inventory.inventory
+    user = HumanMessage(content="second conversation", id="user-9")
+    members = inventory("task-2", [user], SystemMessage(content="sys"), [])
+    handle = service.handle
+    handle.put(R.TaskStarted("task-2", "run-2", "thread-2", "lead", None, "planner", "2026-09-25T01:00:00+00:00"))
+    handle.put(R.AttemptRequested("b1", "task-2", "s1", 1, 1, "2026-09-25T01:00:01+00:00", "deepseek-v4-flash", "complete", members, context_window_tokens=128_000))
+    handle.put(R.AttemptFinished("b1", "responded", "2026-09-25T01:00:02+00:00"))
+    handle.put(R.StepClosed("task-2", "s1", "b1", "2026-09-25T01:00:02+00:00"))
+    handle.put(R.TaskStarted("task-3", "run-1", "thread-1", "subagent", "task-1", "researcher", "2026-09-25T00:00:03+00:00"))
+    handle.put(R.AttemptRequested("c1", "task-3", "s1", 1, 1, "2026-09-25T00:00:04+00:00", "m", "incomplete", members[:1]))
+    handle.put(R.AttemptFinished("c1", "failed", "2026-09-25T00:00:05+00:00"))
+    handle.put(R.StepClosed("task-3", "s1", None, "2026-09-25T00:00:05+00:00"))
+    handle.put(R.TaskStopped("task-3", "failed", "2026-09-25T00:00:06+00:00"))
+    assert await service.flush() == 9
+
+
+class TestContextWindow:
+    """100% of the composition bar is the model's context window, so each attempt records it."""
+
+    def _request(self, store, *, context_extra=None, model=None):
+        context = {EXTENSION_TASK_STORE_KEY: store, **(context_extra or {})}
+        return SimpleNamespace(runtime=SimpleNamespace(context=context), messages=[HumanMessage(content="hi", id="u")], system_message=None, tools=[], model=model or SimpleNamespace(model_name="deepseek-v4-flash"))
+
+    def _app_config(self, entries):
+        by_name = {entry.name: entry for entry in entries}
+        return SimpleNamespace(models=entries, get_model_config=lambda name: by_name.get(name))
+
+    def test_the_window_comes_from_the_configured_model_named_by_the_run(self, ctxres):
+        handle = ctxres.recorder.RecorderHandle(10)
+        app_config = self._app_config([SimpleNamespace(name="fast", model="deepseek-v4-flash", context_window=128_000)])
+        request = self._request(_seeded_store(), context_extra={"app_config": app_config, "model_name": "fast"})
+
+        ctxres.probes.AttemptProbe(handle).wrap_model_call(request, lambda r: "ok")
+
+        [requested] = [e for e in handle.drain() if isinstance(e, ctxres.recorder.AttemptRequested)]
+        assert requested.context_window_tokens == 128_000
+        assert requested.model_name == "fast"
+
+    def test_the_window_falls_back_to_the_provider_model_id_then_to_the_options(self, ctxres):
+        handle = ctxres.recorder.RecorderHandle(10)
+        app_config = self._app_config([SimpleNamespace(name="other", model="deepseek-v4-flash", context_window=64_000)])
+        by_provider = self._request(_seeded_store(), context_extra={"app_config": app_config})
+        ctxres.probes.AttemptProbe(handle).wrap_model_call(by_provider, lambda r: "ok")
+        [first] = [e for e in handle.drain() if isinstance(e, ctxres.recorder.AttemptRequested)]
+        assert first.context_window_tokens == 64_000
+
+        options = ctxres.package.Options(enabled=True, context_windows={"deepseek-v4-flash": 32_000})
+        ctxres.probes.AttemptProbe(handle, options).wrap_model_call(self._request(_seeded_store()), lambda r: "ok")
+        [second] = [e for e in handle.drain() if isinstance(e, ctxres.recorder.AttemptRequested)]
+        assert second.context_window_tokens == 32_000
+
+        options = ctxres.package.Options(enabled=True, default_context_window=8_000)
+        ctxres.probes.AttemptProbe(handle, options).wrap_model_call(self._request(_seeded_store()), lambda r: "ok")
+        [third] = [e for e in handle.drain() if isinstance(e, ctxres.recorder.AttemptRequested)]
+        assert third.context_window_tokens == 8_000
+
+    def test_a_requested_model_the_run_did_not_get_is_not_trusted(self, ctxres):
+        """The host falls back to its default model when a request is not allowed: the provider id wins."""
+        handle = ctxres.recorder.RecorderHandle(10)
+        app_config = self._app_config([SimpleNamespace(name="big", model="gpt-5", context_window=400_000), SimpleNamespace(name="fast", model="deepseek-v4-flash", context_window=128_000)])
+        request = self._request(_seeded_store(), context_extra={"app_config": app_config, "model_name": "big"})
+        ctxres.probes.AttemptProbe(handle, ctxres.package.Options(enabled=True)).wrap_model_call(request, lambda r: "ok")
+        requested = next(event for event in handle.drain() if isinstance(event, ctxres.recorder.AttemptRequested))
+        assert requested.model_name == "deepseek-v4-flash"
+        assert requested.context_window_tokens == 128_000
+
+    def test_an_unknown_window_stays_absent_rather_than_guessed(self, ctxres):
+        handle = ctxres.recorder.RecorderHandle(10)
+        ctxres.probes.AttemptProbe(handle).wrap_model_call(self._request(_seeded_store()), lambda r: "ok")
+        [requested] = [e for e in handle.drain() if isinstance(e, ctxres.recorder.AttemptRequested)]
+        assert requested.context_window_tokens is None
+
+
 class TestWriterAndReader:
     @pytest.mark.asyncio
     async def test_the_projection_answers_attempts_blocks_and_positioned_compactions(self, ctxres, tmp_path):
@@ -436,6 +512,81 @@ class TestWriterAndReader:
         assert data["blocks"][second[2].block_id]["kind"] == "summary"
         assert compaction["before_tokens"] == data["attempts"][0]["estimated_tokens"]
         assert compaction["after_tokens"] == data["attempts"][1]["estimated_tokens"]
+        assert data["attempts"][0]["context_window_tokens"] is None
+
+    @pytest.mark.asyncio
+    async def test_the_task_list_aggregates_filters_sorts_and_pages(self, ctxres, tmp_path):
+        _, service = _load()
+        await service.start(ExtensionRuntimeDeps(session_factory=_sqlite_factory(tmp_path)))
+        try:
+            await _record_a_task(ctxres, service)
+            await _record_more_tasks(ctxres, service)
+            sf = service.session_factory
+            everything = await ctxres.read.list_tasks(sf)
+            running = await ctxres.read.list_tasks(sf, outcome="running")
+            subagents = await ctxres.read.list_tasks(sf, kind="subagent")
+            by_thread = await ctxres.read.list_tasks(sf, query="THREAD-2")
+            compacted = await ctxres.read.list_tasks(sf, has_compactions=True)
+            incomplete = await ctxres.read.list_tasks(sf, incomplete_only=True)
+            by_peak = await ctxres.read.list_tasks(sf, sort="peak", direction="desc")
+            page = await ctxres.read.list_tasks(sf, limit=1, offset=1)
+        finally:
+            await service.stop()
+
+        assert everything["total"] == 3
+        assert [t["task_id"] for t in everything["tasks"]] == ["task-2", "task-3", "task-1"], "newest first by default"
+        one = next(t for t in everything["tasks"] if t["task_id"] == "task-1")
+        assert (one["steps"], one["attempts"], one["compactions"], one["incomplete_attempts"]) == (2, 2, 1, 0)
+        assert one["peak_tokens"] > 0 and one["peak_attempt_id"] in {"a1", "a2"}
+        assert set(one["peak_by_kind"]) <= {"system_prompt", "user_input", "tool_result_visible", "summary"}
+        assert one["outcome"] == "completed" and one["duration_seconds"] == 6
+        two = next(t for t in everything["tasks"] if t["task_id"] == "task-2")
+        assert two["outcome"] is None and two["stopped_at"] is None and two["peak_context_window"] == 128_000
+        assert [t["task_id"] for t in running["tasks"]] == ["task-2"]
+        assert [t["task_id"] for t in subagents["tasks"]] == ["task-3"]
+        assert [t["task_id"] for t in by_thread["tasks"]] == ["task-2"]
+        assert [t["task_id"] for t in compacted["tasks"]] == ["task-1"]
+        assert [t["task_id"] for t in incomplete["tasks"]] == ["task-3"]
+        assert by_peak["tasks"][0]["task_id"] == "task-1"
+        assert page["total"] == 3 and [t["task_id"] for t in page["tasks"]] == ["task-3"]
+
+    @pytest.mark.asyncio
+    async def test_the_health_read_reports_storage_quality_and_diagnostics(self, ctxres, tmp_path):
+        _, service = _load()
+        await service.start(ExtensionRuntimeDeps(session_factory=_sqlite_factory(tmp_path)))
+        try:
+            await _record_a_task(ctxres, service)
+            await _record_more_tasks(ctxres, service)
+            service.handle.dropped = 3
+            service.handle.last_drop_at = "2026-09-25T00:00:07+00:00"
+            health = await ctxres.read.health(service, stale_after_minutes=60)
+        finally:
+            await service.stop()
+
+        assert health["status"]["running"] is True and health["status"]["dropped"] == 3
+        assert health["storage"]["backend"] == "sqlite"
+        # task-1: two attempts of three members; task-2: one of two; task-3: one of one.
+        assert health["storage"]["rows"] == {"ctxres_tasks": 3, "ctxres_attempts": 4, "ctxres_members": 9, "ctxres_compactions": 1}
+        assert health["storage"]["earliest_task_started_at"] == "2026-09-25T00:00:00+00:00"
+        quality = health["quality"]
+        assert (quality["attempts_total"], quality["attempts_complete"], quality["attempts_incomplete"]) == (4, 3, 1)
+        assert (quality["compactions_total"], quality["compactions_positioned"], quality["compactions_unanchored"]) == (1, 1, 0)
+        assert quality["tasks_open"] == 1 and quality["tasks_stale"] == 1, "task-2 never stopped and started long ago"
+        kinds = [(d["level"], d["code"]) for d in health["diagnostics"]]
+        assert ("warning", "events_dropped") in kinds
+        assert ("warning", "stale_tasks") in kinds
+        assert ("ok", "contract") in kinds
+        assert health["config"]["table_prefix"] == "ctxres_" and health["config"]["max_attempts"] == 500
+        assert isinstance(health["throughput"], list)
+
+    @pytest.mark.asyncio
+    async def test_health_without_a_database_says_so_instead_of_failing(self, ctxres):
+        _, service = _load()
+        await service.start(ExtensionRuntimeDeps(session_factory=None))
+        health = await ctxres.read.health(service, stale_after_minutes=60)
+        assert health["status"]["running"] is False
+        assert health["storage"] is None and health["quality"] is None
+        assert ("error", "not_recording") in [(d["level"], d["code"]) for d in health["diagnostics"]]
 
     @pytest.mark.asyncio
     async def test_the_read_cap_keeps_the_earliest_attempts_and_says_so(self, ctxres, tmp_path):
@@ -504,3 +655,28 @@ class TestRoutes:
         assert set(body) == {"task_id", "task", "attempts", "blocks", "compressions", "attempts_truncated", "projection_status"}
         assert body["projection_status"]["running"] is True and body["projection_status"]["dropped"] == 0
         assert listing.status_code == 200 and [t["task_id"] for t in listing.json()["tasks"]] == ["task-1"]
+
+    @pytest.mark.asyncio
+    async def test_the_list_and_health_routes(self, ctxres, tmp_path):
+        _, service = _load()
+        async with httpx.AsyncClient(transport=httpx.ASGITransport(app=_app(service, admin=True)), base_url="http://test") as http:
+            offline = await http.get("/api/context-residency/health")
+        assert offline.status_code == 200 and offline.json()["status"]["running"] is False
+
+        await service.start(ExtensionRuntimeDeps(session_factory=_sqlite_factory(tmp_path)))
+        try:
+            await _record_a_task(ctxres, service)
+            await _record_more_tasks(ctxres, service)
+            async with httpx.AsyncClient(transport=httpx.ASGITransport(app=_app(service, admin=True)), base_url="http://test") as http:
+                listed = await http.get("/api/context-residency/tasks", params={"kind": "lead", "sort": "started", "direction": "asc", "limit": 10})
+                health = await http.get("/api/context-residency/health")
+            async with httpx.AsyncClient(transport=httpx.ASGITransport(app=_app(service, admin=False)), base_url="http://test") as http:
+                denied = await http.get("/api/context-residency/tasks")
+        finally:
+            await service.stop()
+
+        assert listed.status_code == 200
+        assert [t["task_id"] for t in listed.json()["tasks"]] == ["task-1", "task-2"]
+        assert listed.json()["total"] == 2
+        assert health.status_code == 200 and health.json()["storage"]["rows"]["ctxres_tasks"] == 3
+        assert denied.status_code == 403

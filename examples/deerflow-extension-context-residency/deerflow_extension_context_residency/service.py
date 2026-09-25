@@ -4,9 +4,12 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import time
+from collections import deque
+from datetime import UTC, datetime
 from typing import Any
 
-from sqlalchemy import insert, update
+from sqlalchemy import insert, inspect, update
 
 from .inventory import ESTIMATOR_NAME, ESTIMATOR_VERSION
 from .options import Options
@@ -19,10 +22,25 @@ from .recorder import (
     StepClosed,
     TaskStarted,
     TaskStopped,
+    now_iso,
 )
 from .store import attempts, compactions, members, metadata, tasks
 
 logger = logging.getLogger(__name__)
+
+TABLE_PREFIX = "ctxres_"
+THROUGHPUT_MINUTES = 60
+
+
+def _ensure_columns(sync_connection: Any) -> None:
+    """Create the tables, then add columns a table created by an older build lacks."""
+    metadata.create_all(sync_connection)
+    inspector = inspect(sync_connection)
+    present = {column["name"] for column in inspector.get_columns(attempts.name)}
+    for column in attempts.columns:
+        if column.name not in present:
+            column_type = column.type.compile(dialect=sync_connection.dialect)
+            sync_connection.exec_driver_sql(f"ALTER TABLE {attempts.name} ADD COLUMN {column.name} {column_type}")
 
 
 class ResidencyService:
@@ -42,6 +60,13 @@ class ResidencyService:
         self._stopping = False
         self.flushed = 0
         self.write_failures = 0
+        self.started_at: str | None = None
+        self._started_monotonic: float | None = None
+        self.last_flush_at: str | None = None
+        self.last_batch_events = 0
+        self.last_batch_ms = 0.0
+        #: (minute, events written) for the last hour, oldest first.
+        self._throughput: deque[tuple[str, int]] = deque(maxlen=THROUGHPUT_MINUTES)
 
     @property
     def running(self) -> bool:
@@ -55,13 +80,15 @@ class ResidencyService:
         self.session_factory = session_factory
         await self.ensure_schema()
         self._stopping = False
+        self.started_at = now_iso()
+        self._started_monotonic = time.monotonic()
         self._writer_task = asyncio.create_task(self._writer(), name="context-residency-writer")
 
     async def ensure_schema(self) -> None:
         assert self.session_factory is not None
         async with self.session_factory() as session:
             connection = await session.connection()
-            await connection.run_sync(lambda sync_connection: metadata.create_all(sync_connection))
+            await connection.run_sync(_ensure_columns)
             await session.commit()
 
     async def stop(self) -> None:
@@ -94,6 +121,7 @@ class ResidencyService:
         events = self.handle.drain()
         if not events:
             return 0
+        started = time.monotonic()
         try:
             async with self.session_factory() as session:
                 async with session.begin():
@@ -104,7 +132,18 @@ class ResidencyService:
             logger.exception("context-residency: dropped %d event(s) after a failed write", len(events))
             return 0
         self.flushed += len(events)
+        self.last_flush_at = now_iso()
+        self.last_batch_events = len(events)
+        self.last_batch_ms = round((time.monotonic() - started) * 1000, 2)
+        self._count_throughput(len(events))
         return len(events)
+
+    def _count_throughput(self, written: int) -> None:
+        minute = datetime.now(UTC).strftime("%Y-%m-%dT%H:%MZ")
+        if self._throughput and self._throughput[-1][0] == minute:
+            self._throughput[-1] = (minute, self._throughput[-1][1] + written)
+        else:
+            self._throughput.append((minute, written))
 
     async def _apply(self, session: Any, event: Event) -> None:
         if isinstance(event, TaskStarted):
@@ -142,6 +181,7 @@ class ResidencyService:
                     estimated_tokens=sum(member.estimated_tokens for member in event.members),
                     estimator_name=ESTIMATOR_NAME,
                     estimator_version=ESTIMATOR_VERSION,
+                    context_window_tokens=event.context_window_tokens,
                 )
             )
             if event.members:
@@ -194,10 +234,21 @@ class ResidencyService:
             "enabled": self.options.enabled,
             "running": self.running,
             "queue_depth": self.handle.depth,
+            "queue_capacity": self.handle.capacity,
             "accepted": self.handle.accepted,
             "dropped": self.handle.dropped,
             "flushed": self.flushed,
             "write_failures": self.write_failures,
             "estimator": f"{ESTIMATOR_NAME}@{ESTIMATOR_VERSION}",
             "max_attempts": self.options.max_attempts,
+            "flush_interval_ms": self.options.flush_interval_ms,
+            "table_prefix": TABLE_PREFIX,
+            "started_at": self.started_at,
+            "uptime_seconds": round(time.monotonic() - self._started_monotonic) if self._started_monotonic is not None and self.running else None,
+            "last_flush_at": self.last_flush_at,
+            "last_event_at": self.handle.last_put_at,
+            "last_drop_at": self.handle.last_drop_at,
+            "last_batch_events": self.last_batch_events,
+            "last_batch_ms": self.last_batch_ms,
+            "throughput": [{"minute": minute, "events": count} for minute, count in self._throughput],
         }

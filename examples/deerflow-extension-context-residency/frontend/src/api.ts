@@ -1,4 +1,4 @@
-import type { ResidencyResponse, ThreadTasksResponse } from "./contracts";
+import type { HealthResponse, ResidencyResponse, TaskListResponse, TaskSort, ThreadTasksResponse } from "./contracts";
 
 /**
  * The extension's own routes, called with the host session. The backend base
@@ -41,4 +41,44 @@ export function fetchTaskResidency(base: string, taskId: string, signal?: AbortS
 
 export function fetchThreadTasks(base: string, threadId: string, signal?: AbortSignal): Promise<ThreadTasksResponse> {
   return getJson(`${base}/api/context-residency/threads/${encodeURIComponent(threadId)}/tasks`, signal);
+}
+
+export interface TaskListQuery {
+  query?: string;
+  kind?: "" | "lead" | "subagent";
+  outcome?: "" | "running" | "completed" | "failed" | "aborted";
+  /** ISO timestamp; only tasks started at or after it. */
+  since?: string | null;
+  hasCompactions?: boolean;
+  incompleteOnly?: boolean;
+  sort?: TaskSort;
+  direction?: "asc" | "desc";
+  limit?: number;
+  offset?: number;
+}
+
+/** The query string for the task index; empty filters are left out so the server applies its defaults. */
+export function taskListSearchParams(query: TaskListQuery): URLSearchParams {
+  const params = new URLSearchParams();
+  const text = query.query?.trim();
+  if (text) params.set("query", text);
+  if (query.kind) params.set("kind", query.kind);
+  if (query.outcome) params.set("outcome", query.outcome);
+  if (query.since) params.set("since", query.since);
+  if (query.hasCompactions) params.set("has_compactions", "true");
+  if (query.incompleteOnly) params.set("incomplete_only", "true");
+  if (query.sort) params.set("sort", query.sort);
+  if (query.direction) params.set("direction", query.direction);
+  if (query.limit !== undefined) params.set("limit", String(query.limit));
+  if (query.offset) params.set("offset", String(query.offset));
+  return params;
+}
+
+export function fetchTaskList(base: string, query: TaskListQuery, signal?: AbortSignal): Promise<TaskListResponse> {
+  const params = taskListSearchParams(query).toString();
+  return getJson(`${base}/api/context-residency/tasks${params ? `?${params}` : ""}`, signal);
+}
+
+export function fetchHealth(base: string, signal?: AbortSignal): Promise<HealthResponse> {
+  return getJson(`${base}/api/context-residency/health`, signal);
 }

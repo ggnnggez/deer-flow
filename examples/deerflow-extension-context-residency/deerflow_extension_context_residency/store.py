@@ -46,6 +46,7 @@ attempts = Table(
     Column("estimated_tokens", Integer, nullable=False),
     Column("estimator_name", String(64), nullable=False),
     Column("estimator_version", String(16), nullable=False),
+    Column("context_window_tokens", Integer, nullable=True),
     Index("ix_ctxres_attempts_task_order", "task_id", "step_seq", "attempt_no"),
 )
 

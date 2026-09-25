@@ -45,6 +45,9 @@ class AttemptRequested:
     #: could not be — an absence in an incomplete inventory is unknown, not a removal.
     status: str
     members: tuple[Member, ...]
+    #: The model's context window in tokens, when the host or the options declare
+    #: it; ``None`` otherwise. 100% of the composition bar.
+    context_window_tokens: int | None = None
 
 
 @dataclass(frozen=True)
@@ -102,14 +105,22 @@ class RecorderHandle:
         self._lock = threading.Lock()
         self.accepted = 0
         self.dropped = 0
+        self.last_put_at: str | None = None
+        self.last_drop_at: str | None = None
+
+    @property
+    def capacity(self) -> int:
+        return self._capacity
 
     def put(self, event: Event) -> bool:
         with self._lock:
             if len(self._events) >= self._capacity:
                 self.dropped += 1
+                self.last_drop_at = now_iso()
                 return False
             self._events.append(event)
             self.accepted += 1
+            self.last_put_at = now_iso()
             return True
 
     def drain(self, limit: int | None = None) -> list[Event]:

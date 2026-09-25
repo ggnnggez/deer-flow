@@ -2,6 +2,7 @@ import { RefreshCwIcon, ScissorsIcon } from "lucide-react";
 import type { CSSProperties, KeyboardEvent, MutableRefObject, ReactNode } from "react";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 
+import { formatPercent, windowComposition } from "./console";
 import type { ResidencyAttempt, ResidencyResponse } from "./contracts";
 import { formatTimestamp, shortId, type Messages } from "./i18n";
 import {
@@ -44,7 +45,7 @@ const MAX_COLW = 56;
 const MIN_COLW = 4;
 
 /** Cool categorical lane palette — never red/amber/green (status channels). */
-const LANE_SEGMENT_CLASS: Record<ResidencyLane, string> = {
+export const LANE_SEGMENT_CLASS: Record<ResidencyLane, string> = {
   system: "bg-indigo-500/75",
   tool_schema: "bg-slate-400/60",
   memory: "bg-violet-500/75",
@@ -95,7 +96,7 @@ function attemptLabel(attempt: ResidencyAttempt): string {
   return attempt.attempt_no > 1 ? `${base}·a${attempt.attempt_no}` : base;
 }
 
-function laneLabel(t: Messages, lane: ResidencyLane): string {
+export function laneLabel(t: Messages, lane: ResidencyLane): string {
   switch (lane) {
     case "system":
       return t.laneSystem;
@@ -877,6 +878,10 @@ function AttemptPanel({
   const [memberSort, setMemberSort] = useState<ResidencyMemberSort>("context");
   const total = residencyAttemptTotal(attempt, measure);
   const laneSizes = residencyAttemptLaneSizes(attempt, response.blocks, measure);
+  // 100% of the bar is the model's context window when one was recorded; each
+  // lane is its absolute share of that window and the rest is free. Without a
+  // recorded window the request itself is 100%, and the header says which.
+  const composition = windowComposition(laneSizes, total, attempt.context_window_tokens ?? null, measure);
   const incomplete = attempt.status === "incomplete";
   const rowByBlock = new Map(model.rows.map((row) => [row.blockId, row]));
   return (
@@ -908,33 +913,65 @@ function AttemptPanel({
           {incomplete ? `+ (${t.lowerBound})` : ""} {measure}
         </span>
       </div>
-      <div>
-        <div className="text-muted-foreground mb-1 text-[10px] font-semibold tracking-wide uppercase">{t.composition}</div>
-        <div className="flex h-3 overflow-hidden rounded">
-          {laneSizes.map(({ lane, size }) => (
+      <div data-residency-composition={composition.basis}>
+        <div className="mb-1 flex flex-wrap items-baseline justify-between gap-x-2">
+          <div className="text-muted-foreground text-[10px] font-semibold tracking-wide uppercase">{t.composition}</div>
+          <div className="text-muted-foreground text-[10px]">
+            {composition.capacity !== null ? t.compositionWindow(`${formatSize(composition.capacity, measure)} ${measure}`) : t.compositionRequest}
+          </div>
+        </div>
+        <div className={cn("bg-muted relative flex h-3 overflow-hidden rounded", composition.overflow && "ring-destructive/70 ring-1")}>
+          {composition.segments.map(({ lane, size, share, width }) => (
             <span
               key={lane}
               className={LANE_SEGMENT_CLASS[lane]}
-              style={{ width: `${total > 0 ? (size / total) * 100 : 0}%` }}
-              title={`${laneLabel(t, lane)} · ${formatShare(size, total)}`}
+              style={{ width: `${width * 100}%` }}
+              title={`${laneLabel(t, lane)} · ${formatSize(size, measure)} ${measure} · ${formatPercent(share)}`}
             />
           ))}
           {incomplete ? (
-            <span className="min-w-[6%] flex-1 border border-dashed bg-[repeating-linear-gradient(135deg,transparent_0_3px,var(--color-border)_3px_5px)]" />
+            <span
+              className={cn(
+                "border border-dashed bg-[repeating-linear-gradient(135deg,transparent_0_3px,var(--color-border)_3px_5px)]",
+                composition.basis === "window" ? "w-[4%] shrink-0" : "min-w-[6%] flex-1",
+              )}
+            />
           ) : null}
         </div>
         <div className="mt-1 flex flex-wrap gap-x-3 gap-y-0.5 text-[11px]">
-          {laneSizes.map(({ lane, size }) => (
+          {composition.segments.map(({ lane, share }) => (
             <span key={lane} className="text-muted-foreground inline-flex items-center gap-1">
               <span className={cn("size-1.5 rounded-[2px]", LANE_SEGMENT_CLASS[lane])} />
-              {laneLabel(t, lane)} <b className="text-foreground font-medium">{formatShare(size, total)}</b>
+              {laneLabel(t, lane)} <b className="text-foreground font-medium">{formatPercent(share)}</b>
             </span>
           ))}
+          {composition.freeShare !== null ? (
+            <span className="text-muted-foreground inline-flex items-center gap-1">
+              <span className="bg-muted size-1.5 rounded-[2px] border" />
+              {t.free}{" "}
+              <b className="text-foreground font-medium">
+                {incomplete ? "≤ " : ""}
+                {formatPercent(composition.freeShare)}
+              </b>
+            </span>
+          ) : null}
         </div>
+        {composition.capacity !== null && composition.usedShare !== null ? (
+          <div className="text-muted-foreground mt-1 text-[11px]">
+            {t.used}:{" "}
+            <span className="text-foreground font-mono font-medium">
+              {formatSize(total, measure)}
+              {incomplete ? "+" : ""} / {formatSize(composition.capacity, measure)} {measure} · {formatPercent(composition.usedShare)}
+            </span>
+            {composition.overflow ? <span className="text-destructive ml-2 font-medium">{t.overflow(formatPercent(composition.usedShare - 1))}</span> : null}
+          </div>
+        ) : null}
       </div>
       <div>
         <div className="mb-1 flex items-center justify-between gap-2">
-          <div className="text-muted-foreground text-[10px] font-semibold tracking-wide uppercase">{t.members}</div>
+          <div className="text-muted-foreground text-[10px] font-semibold tracking-wide uppercase">
+            {t.members} · <span className="font-normal tracking-normal normal-case">{t.membersOfRequest}</span>
+          </div>
           <div className="flex items-center gap-0.5 rounded-md border p-0.5">
             {(["context", "share"] as const).map((value) => (
               <Button

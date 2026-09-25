@@ -694,6 +694,23 @@ This release closes that milestone with **765 merged pull requests**.
 
 #### Extensions & plugins
 
+- **examples:** The context residency page becomes a console. A **task index**
+  tab lists every recorded task with steps, attempts, compactions, inventory
+  completeness and the peak request (filters by kind, outcome, time range,
+  compactions and incomplete inventories; grouped by conversation or flat;
+  sortable; paged), and pasting a full task id opens its board. A **health**
+  tab shows the extension's own recording state: queue, accepted / written /
+  dropped / write-failure counters, per-minute write throughput, table row
+  counts, inventory and compaction-positioning quality, diagnostics with
+  remedies, and a read-only echo of the plugin configuration. Two new admin
+  routes serve them, `GET /api/context-residency/tasks` and
+  `GET /api/context-residency/health`. Each attempt now records the model's
+  **context window** (the model config's `context_window`, else the plugin's
+  `context_windows` / `default_context_window`, never guessed), and the
+  board's composition bar treats that window as 100%: each lane shows its
+  absolute share of the window, the remainder is free, and a request larger
+  than the window is flagged; without a recorded window the bar says the
+  request itself is 100%. ([#TBD])
 - **examples:** The context residency extension ships its page: a sidebar entry
   and `/workspace/extensions/community.context-residency/board`, plus a
   conversation-menu action that opens it for the current conversation. The

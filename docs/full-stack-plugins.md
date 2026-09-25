@@ -23,7 +23,8 @@ tool results. It requires deployment opt-in and a separate Jev API key.
 
 The [context residency example](../examples/deerflow-extension-context-residency/README.md)
 records which content blocks each model request carried and serves an
-administrator page for it: a React bundle built from the package's `frontend/`
+administrator page for it — a task index, the extension's own health, and a
+per-task board — as a React bundle built from the package's `frontend/`
 sources into `static/dist` and registered with `BrowserAssets`, mounted in the
 host's Shadow DOM with its own stylesheet, reading the extension's own admin
 routes with the host session.

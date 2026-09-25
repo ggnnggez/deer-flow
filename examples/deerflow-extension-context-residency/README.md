@@ -23,6 +23,9 @@ plugins:
       max_attempts: 500        # attempts returned per task read; the response says when it was cut
       queue_capacity: 20000    # buffered events between flushes; a full buffer drops and counts
       flush_interval_ms: 100
+      stale_task_after_minutes: 60   # a task with no stop event after this long is flagged on the health tab
+      # context_windows: {deepseek-v4-flash: 128000}   # fallback when the model config declares no context_window
+      # default_context_window: 128000                  # fallback for every other model
 ```
 
 Install the package next to the host (`deerflow extensions install
@@ -35,6 +38,16 @@ capture stays off and the routes answer `503`.
 Requires `deerflow-extension-api` 0.2.6 or later: the compaction event's task
 identity and kept hashes, and the summary carrier's `summary_content_hash`
 provenance, are what the compaction rows are joined on.
+
+Each attempt also records the model's **context window** when the host knows
+it: the run's configured model's `context_window` from `config.yaml` (the same
+field the summarization fraction trigger uses) while that entry names the
+provider model that actually ran — the host falls back to its default model
+when a request is not on the allowlist, and then the provider model id is
+matched against the configured models instead — else the plugin's own
+`context_windows` map (by configured name or provider model id), else
+`default_context_window`. A window is never guessed from a model name; an
+unknown window is stored as absent and the page says so.
 
 ## What it records
 
@@ -91,12 +104,37 @@ travel with members, not blocks.
 
 The package ships a workspace page (`assets-v1`): **Context residency** in the
 sidebar, at `/workspace/extensions/community.context-residency/board`, plus a
-conversation-menu action that opens the page for the current conversation. The
-page lists the recorded tasks of a conversation (`?thread=<id>`), or opens one
-task directly (`?task=<id>`, optionally `?step=<seq>` to start on that step),
-and renders the board: a per-request composition band by lane, a block × request
-residency matrix, and a drill panel (request → block → compaction). Presence
-cells follow the rules above — an unknown cell is drawn as `?`, never as absent.
+conversation-menu action that opens the page for the current conversation. It
+has three tabs:
+
+- **Tasks** — the index of every recorded task: filter by kind, outcome, time
+  range, compactions or incomplete inventories; group by conversation (leads
+  first, subagents indented under their parent) or flat; sort by start, duration,
+  attempts, compactions, incomplete inventories or peak context; 50 per page.
+  Each row carries steps / attempts (with retries), compaction count, inventory
+  completeness, and the peak request's size, composition by lane and share of the
+  window. The search box matches task id, conversation id or agent name;
+  pasting a full task id opens its board directly, even outside the current
+  filters. `?q=<text>` (or `?thread=<id>` from the conversation action) seeds the
+  query, `?task=<id>` opens a board (optionally `?step=<seq>`), `?tab=health`
+  opens the health tab.
+- **Health** — the extension's own recording state, refreshed every 15 s while
+  open: recording / not recording, database and table prefix, last write and
+  event, uptime; queue depth, accepted, written, dropped and write-failure
+  counters; write throughput per minute for the last hour; row counts per table
+  and the database file; inventory completeness, compaction positioning and
+  stale tasks; diagnostics with a remedy each (dropped events, write failures,
+  buffer pressure, stale tasks, unanchored compactions, incomplete inventories,
+  contract); and a read-only echo of the plugin configuration. A warning dot on
+  the tab means a diagnostic is not `ok`.
+- **Board** — one task: a per-request composition band by lane, a block ×
+  request residency matrix, and a drill panel (request → block → compaction).
+  Presence cells follow the rules above — an unknown cell is drawn as `?`, never
+  as absent. The request panel's **composition bar treats the model's context
+  window as 100%**: each lane shows its absolute share of the window, the rest of
+  the bar is free, and a request larger than the window is flagged with how far
+  it overflows. When no window was recorded the bar falls back to the request as
+  100% and says so; the member list always shows shares of the request.
 
 The page is a self-contained React bundle: `frontend/` holds the sources, and
 `pnpm --dir frontend install && pnpm --dir frontend build` writes
@@ -110,17 +148,19 @@ capture and the admin API without the page.
 
 ## API
 
-Both routes require an administrator; the host's session authentication
+All routes require an administrator; the host's session authentication
 applies and personal access tokens are refused on contributed routes.
 
 | Route | Answer |
 | --- | --- |
-| `GET /api/context-residency/tasks/{task_id}` | `task`, `attempts` (each with its ordered `members`), `blocks` (identity metadata keyed by block id), `compressions`, `attempts_truncated`, `projection_status` |
+| `GET /api/context-residency/tasks` | The task index: `tasks` (each task with `steps`, `attempts`, `incomplete_attempts`, `compactions`, `peak_tokens`, `peak_attempt_id`, `peak_context_window`, `peak_by_kind`, `last_attempt_at`, `duration_seconds`), `total`, `limit`, `offset`, `sort`, `direction`, `projection_status`. Query: `query` (task id, conversation id or agent name substring), `kind`, `outcome` (`running` = no stop event recorded), `since` (ISO), `has_compactions`, `incomplete_only`, `sort` (`started`, `last`, `duration`, `attempts`, `compactions`, `incomplete`, `peak`), `direction`, `limit` (≤ 500), `offset` |
+| `GET /api/context-residency/tasks/{task_id}` | `task`, `attempts` (each with its ordered `members` and `context_window_tokens`), `blocks` (identity metadata keyed by block id), `compressions`, `attempts_truncated`, `projection_status` |
 | `GET /api/context-residency/threads/{thread_id}/tasks` | The lead and subagent tasks recorded for a conversation |
+| `GET /api/context-residency/health` | `status` (the counters plus queue capacity, timestamps of the last write, event and drop, uptime, last batch, per-minute `throughput`), `storage` (backend, database, file size, row counts, earliest record), `quality` (complete / incomplete attempts, positioned / unanchored compactions, open and stale tasks), `diagnostics` (`level`, `code`, `title`, `detail`, `remedy`, `affected`), `config` (the options, versions and placements). Answers `200` even while not recording, with `storage` and `quality` null |
 
-`404` for an unknown task, `503` while the service is not recording. The
-`status` plugin action returns the same `projection_status` counters
-(accepted, dropped, flushed, write failures, queue depth).
+`404` for an unknown task, `503` from the task routes while the service is not
+recording. The `status` plugin action returns the same `projection_status`
+counters (accepted, dropped, flushed, write failures, queue depth).
 
 ## Verify
 
